@@ -20,7 +20,7 @@
 
 ## Python 训练栈（`nn/`）
 
-详细命令见 **`nn/README.md`**。概要：
+**词表（`build_vocab`）→ Rust 生成 XRSH → `train_policy` / ONNX** 的完整步骤见 **`nn/README.md`** 中「数据集创建与使用流程」。
 
 ```bash
 cd nn
@@ -46,5 +46,5 @@ cargo run -p xiangqi_dataset    # 训练侧数据集/标注 CLI（当前占位�
 | `ARCHITECTURE.md` | 产品与方法边界、crate 划分、数据格式、里程碑摘要 |
 | `MILESTONES.md` | P0–P3 里程碑定义与依赖顺序 |
 | `TODO.md` | 分阶段执行清单（勾选推进） |
-| `crates/xiangqi_dataset/README.md` | `pgn-shards` / `jsonl-shards` 与 **XQB** 格式 |
+| `crates/xiangqi_dataset/README.md` | `pgn-shards` / `jsonl-shards` 与 **XRSH**（`.xrsh`）格式 |
 | `agents.md` | 给自动化助手 / Agent 的仓库约定 |

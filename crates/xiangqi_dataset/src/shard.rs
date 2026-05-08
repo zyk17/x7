@@ -1,11 +1,12 @@
-//! 二进制分片 `XQB` v1：按局聚合，便于按 `game_id` 并行生成。
+//! 二进制分片 **XRSH**（Xiangqi Review Shard）v1：按局聚合，便于按 `game_id` 并行生成。
+//! 扩展名 `.xrsh`，与市面其它 `.xqb` 棋谱格式区分。
 
 use anyhow::{bail, Context, Result};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
-pub const FORMAT_NAME: &str = "xqb_v1";
+pub const FORMAT_NAME: &str = "xrsh_v1";
 
 /// 单样本（一行训练数据）。
 #[derive(Debug, Clone)]
@@ -51,7 +52,7 @@ fn write_prefix_list(w: &mut impl Write, pfx: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// 写入单个分片文件：`shard_{index:05}.xqb`
+/// 写入单个分片文件：`shard_{index:05}.xrsh`
 pub fn write_shard(path: &Path, vocab_hash: &[u8; 32], games: &[EncodedGame]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
@@ -59,12 +60,12 @@ pub fn write_shard(path: &Path, vocab_hash: &[u8; 32], games: &[EncodedGame]) ->
     let f = File::create(path).with_context(|| path.display().to_string())?;
     let mut w = BufWriter::new(f);
 
-    // 头 64 字节
-    w.write_all(b"XQB\0")?;
+    // 头 64 字节（魔数 `"XRSH"`，勿与市面 `.xqb` 棋谱混淆）
+    w.write_all(b"XRSH")?;
     w.write_all(&1u32.to_le_bytes())?;
     w.write_all(vocab_hash)?;
     w.write_all(&(games.len() as u32).to_le_bytes())?;
-    w.write_all(&[0u8; 24])?; // 保留
+    w.write_all(&[0u8; 20])?; // 保留（共 64 字节头）
 
     for g in games {
         write_str_u16(&mut w, &g.game_id)?;
@@ -109,4 +110,20 @@ pub fn write_pack_meta(
     let p = out_dir.join("pack_meta.json");
     std::fs::write(&p, serde_json::to_string_pretty(&meta)?)?;
     Ok(())
+}
+
+/// 校验文件头（魔数、格式版本、词表哈希、本文件内对局数）。
+pub fn read_shard_header(path: &Path) -> Result<(u32, [u8; 32], u32)> {
+    let mut f = File::open(path).with_context(|| path.display().to_string())?;
+    let mut buf = [0u8; 64];
+    f.read_exact(&mut buf)
+        .with_context(|| format!("读取头 64 字节 {}", path.display()))?;
+    if buf[0..4] != *b"XRSH" {
+        bail!("非 XRSH review shard 文件: {}", path.display());
+    }
+    let ver = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&buf[8..40]);
+    let n_games = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+    Ok((ver, hash, n_games))
 }

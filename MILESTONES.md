@@ -5,7 +5,7 @@
 | 阶段 | 目标 | 主要交付 / Crate |
 |------|------|------------------|
 | **P0** | **完整象棋规则 + 合法 UCI**，与 **pikafish-rust / Pikafish** 语义对齐 | `crates/xiangqi_core`：已从 pikafish-rust 迁入 `types`/`board`/`movegen`/`misc`；`legal_moves_uci`、perft 测试；可选：与 pyffish 抽样对拍 |
-| **P1** | **数据管线**：PGN / JSONL → **二进制 shards**，**按局并行** | `crates/xiangqi_dataset`：**`XQB` v1**、`pack_meta.json`（`vocab_sha256`）；CLI 见 crate `README.md`；训练侧读取器归 **P2** |
+| **P1** | **数据管线**：PGN / JSONL → **二进制 shards**（**XRSH** `.xrsh`），**按局并行** | `crates/xiangqi_dataset`：**`xrsh_v1`**、`pack_meta.json`（`vocab_sha256`）；CLI 见 crate `README.md`；Python 读取见 **`nn.dataset_xrsh`** |
 | **P2** | **Python 训练**接入二进制数据包 + **多头网络** | `nn/`：`Dataset`/loader、损失与 ONNX 契约扩展（policy + 辅助头）；标签管线与 P1 输出衔接 |
 | **P3** | **引擎**：搜索 + UCI | `crates/engin`：**Alpha-Beta**、**TT**、**move ordering**、**UCI 协议**；挂接 `xiangqi_core` + ONNX |
 

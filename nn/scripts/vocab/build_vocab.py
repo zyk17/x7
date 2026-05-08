@@ -32,6 +32,7 @@ def main() -> None:
 
     moves = sorted(seen)
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    # serde 反序列化 `VocabFile { moves }` 会忽略多余字段；`size` 仅供人工查阅，与指纹无关
     args.out.write_text(
         json.dumps({"moves": moves, "size": len(moves)}, ensure_ascii=False, indent=2),
         encoding="utf-8",

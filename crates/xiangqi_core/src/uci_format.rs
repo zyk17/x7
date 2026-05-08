@@ -45,7 +45,7 @@ fn parse_half_pyffish(b: &[u8]) -> Option<(Square, usize)> {
         num = num.saturating_mul(10).saturating_add((b[j] - b'0') as u32);
         j += 1;
     }
-    if num < 1 || num > 10 {
+    if !(1..=10).contains(&num) {
         return None;
     }
     let rank_u8 = (num - 1) as u8;
@@ -71,4 +71,25 @@ pub fn uci_to_move(pos: &Position, s: &str) -> Option<Move> {
         return None;
     }
     Some(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Piece;
+
+    #[test]
+    fn parse_double_digit_rank_on_to_square() {
+        // 纵坐标 10：后半「i10」共 4 字符
+        let m = parse_pyffish_uci("i8i10").expect("i8i10");
+        assert_eq!(square_to_algebraic(m.to_sq()), "i10");
+    }
+
+    #[test]
+    fn roundtrip_start_legal_first() {
+        let pos = Position::from_fen(START_FEN).unwrap();
+        let u = crate::legal_moves_uci(&pos).into_iter().next().expect("legal");
+        let mv = parse_pyffish_uci(&u).expect("parse");
+        assert!(pos.piece_on(mv.from_sq()) != Piece::NO_PIECE);
+    }
 }

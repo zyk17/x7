@@ -14,74 +14,98 @@ pip install -e ".[train]"   # PyTorch 训练与 ONNX 导出
 
 核心运行时：`pyffish`（规则与合法着）、`tqdm`。训练额外需要 `torch`。
 
-### 小规模试跑（smock）
+**训练数据**：仅支持 **XRSH**（Rust `xiangqi_dataset` 生成的 `shard_*.xrsh` + `pack_meta.json`）。
 
-已有 `data/smock_train.jsonl` / `data/smock_val.jsonl` 与 `data/smock_vocab.json` 时：
+---
 
-```bash
-python scripts/train/train_policy.py --train-jsonl data/smock_train.jsonl --val-jsonl data/smock_val.jsonl --vocab data/smock_vocab.json --out data/checkpoints/smock_policy.pt --width 64 --blocks 4 --batch-size 256 --epochs 2
-python scripts/export/export_onnx.py --checkpoint data/checkpoints/smock_policy.pt --out data/smock_policy.onnx
+## 数据集创建与使用流程（总览）
+
+整体分为两段：**先用 Rust 产出 XRSH**，**再用 Python 训练 / 导出 ONNX**。词表必须由 **`scripts/vocab/build_vocab.py`** 从 JSONL 汇总得到；**XRSH 与训练必须使用同一份 `move_vocab.json`**（`pack_meta.json` 里的 `vocab_sha256` 会校验）。
+
+```mermaid
+flowchart LR
+  subgraph create["① 创建数据集 XRSH"]
+    J[JSONL 语料]
+    V["build_vocab.py → move_vocab.json"]
+    R["xiangqi_dataset:\npgn-shards / jsonl-shards"]
+    X["XRSH 目录\npack_meta + shard_*.xrsh"]
+    J --> V
+    V --> R
+    J --> R
+    P[PGN 语料] --> R
+    R --> X
+  end
+  subgraph use["② 使用"]
+    T["train_policy.py\n--train-xrsh-dir / --val-xrsh-dir"]
+    E["export_onnx.py"]
+    X --> T
+    V --> T
+    T --> E
+  end
 ```
 
-（`train_policy` 的 `--epochs` 默认值为 `10`；试跑可显式写 `--epochs 2` 等。）
+| 阶段 | 谁做 | 输入 | 输出 |
+|------|------|------|------|
+| 词表 | Python `scripts/vocab/build_vocab.py` | 一条或多条 JSONL（扫描 `human_move_pyffish`） | `move_vocab.json` |
+| 分片 | Rust `cargo run -p xiangqi_dataset -- …` | 同上词表 + PGN **或** JSONL | 每个语料一个目录：`pack_meta.json`、`shard_*.xrsh` |
+| 训练 | Python `scripts/train/train_policy.py` | 训练/验证 **XRSH 目录** + **同一词表** | `policy.pt` |
+| 部署（可选） | `scripts/export/export_onnx.py` | checkpoint | `.onnx` |
 
-默认 `--device cuda`；仅 CPU 环境或无 CUDA 版 PyTorch 时再显式加 `--device cpu`（脚本也会自动退回 CPU）。
+**划分 train / val 的推荐方式**：按**不同语料文件**分别生成 XRSH（例如 dpxq → `xrsh_train`，WXF → `xrsh_val`），而不是在同一大 JSONL 里按局随机切分。
 
-## 数据管线
+### 词表 → XRSH（命令）
 
-### A. 按语料划分 train / val
-
-**东萍 dpxq 全量作训练、WXF 全量作验证**：两库**无重叠棋局**。
+**1. 词表**（在 `nn/` 下执行；可指定多个 `--jsonl` 覆盖 train∪val 出现过的走法）：
 
 ```bash
-python scripts/data_pgn/extract_rows.py --pgn pgns/dpxq-99813games.pgns --out data/train.jsonl
-python scripts/data_pgn/extract_rows.py --pgn pgns/WXF-41743games.pgns --out data/val.jsonl
+python scripts/vocab/build_vocab.py --jsonl data/train.jsonl --jsonl data/val.jsonl --out data/move_vocab.json
 ```
 
-**词表**（建议 train∪val）：
+**2a. PGN → XRSH**（在**仓库根目录**执行，每个 PGN 输出到独立目录）：
 
 ```bash
-python scripts/data_pgn/build_vocab.py --jsonl data/train.jsonl --jsonl data/val.jsonl --out data/move_vocab.json
+cargo run -p xiangqi_dataset -- pgn-shards --pgn pgns/dpxq-99813games.pgns --vocab data/move_vocab.json --out-dir data/xrsh_train --jobs 0 --games-per-shard 500
+cargo run -p xiangqi_dataset -- pgn-shards --pgn pgns/WXF-41743games.pgns --vocab data/move_vocab.json --out-dir data/xrsh_val --jobs 0 --games-per-shard 500
 ```
 
-### B. 单库或合并后再按比例划分
+**2b. 已有 JSONL → XRSH**（仍在仓库根目录）：
 
 ```bash
-python scripts/data_pgn/extract_rows.py --pgn pgns/dpxq-99813games.pgns --pgn pgns/WXF-41743games.pgns --out data/all.jsonl
-python scripts/data_pgn/split_jsonl_by_game.py --in data/all.jsonl --train-out data/train.jsonl --val-out data/val.jsonl --val-ratio 0.05
+cargo run -p xiangqi_dataset -- jsonl-shards --jsonl data/train.jsonl --vocab data/move_vocab.json --out-dir data/xrsh_train --jobs 0
+cargo run -p xiangqi_dataset -- jsonl-shards --jsonl data/val.jsonl --vocab data/move_vocab.json --out-dir data/xrsh_val --jobs 0
 ```
 
-## 训练
+Rust 子命令与字段说明见 **`crates/xiangqi_dataset/README.md`**。
+
+### 训练与导出
 
 ```bash
-python scripts/train/train_policy.py --train-jsonl data/train.jsonl --val-jsonl data/val.jsonl --train-pack-dir data/pack_train --val-pack-dir data/pack_val --vocab data/move_vocab.json --out data/checkpoints/policy.pt --device cuda --epochs 30
-```
-
-**数 GB 级 JSONL（推荐 mmap）**：
-
-```bash
-python scripts/data_pgn/build_jsonl_index.py --jsonl data/train.jsonl --vocab data/move_vocab.json --out-dir data/index_train --weight-by-fen
-python scripts/data_pgn/build_jsonl_index.py --jsonl data/val.jsonl --vocab data/move_vocab.json --out-dir data/index_val
-python scripts/train/train_policy.py --train-jsonl data/train.jsonl --val-jsonl data/val.jsonl --train-index-dir data/index_train --val-index-dir data/index_val --vocab data/move_vocab.json --out data/checkpoints/policy.pt --device cuda --epochs 30
-```
-
-验证集索引**不要**加 `--weight-by-fen`。
-
-### 离线 policy 包（千万级推荐）
-
-```bash
-python scripts/data_pgn/materialize_policy_pack.py --jsonl data/train.jsonl --index-dir data/index_train --vocab data/move_vocab.json --out-dir data/pack_train
-python scripts/data_pgn/materialize_policy_pack.py --jsonl data/val.jsonl --index-dir data/index_val --vocab data/move_vocab.json --out-dir data/pack_val
-python scripts/train/train_policy.py --train-jsonl data/train.jsonl --val-jsonl data/val.jsonl --train-pack-dir data/pack_train --val-pack-dir data/pack_val --vocab data/move_vocab.json --out data/checkpoints/policy.pt --device cuda
-```
-
-## 导出 ONNX
-
-```bash
+cd nn
+python scripts/train/train_policy.py --train-xrsh-dir data/xrsh_train --val-xrsh-dir data/xrsh_val --vocab data/move_vocab.json --out data/checkpoints/policy.pt --device cuda --epochs 30
 python scripts/export/export_onnx.py --checkpoint data/checkpoints/policy.pt --out data/policy.onnx
 ```
 
-静态 **batch=1**，输入 `board`：`float32[1,15,10,9]`，输出 `logits`：`float32[1,V]`。
+静态 **batch=1**，输入 `board`：`float32[1,15,10,9]`。默认训练带 **多头**，ONNX 输出 **`logits`**（`float32[1,V]`）及 **`attack` / `danger` / `tactical`**（各 `float32[1]`，**导出图中已为 sigmoid 概率**）；仅单 policy 时加训练参数 `--no-aux-heads`，导出则仅 `logits`。
+
+---
+
+### 小规模试跑（smock）
+
+已有 `data/smock_train.jsonl`、`data/smock_val.jsonl` 与 `data/smock_vocab.json` 时，先在**仓库根目录**生成 XRSH，再进入 `nn/` 训练：
+
+```bash
+cargo run -p xiangqi_dataset -- jsonl-shards --jsonl nn/data/smock_train.jsonl --vocab nn/data/smock_vocab.json --out-dir nn/data/smock_xrsh_train --jobs 0
+cargo run -p xiangqi_dataset -- jsonl-shards --jsonl nn/data/smock_val.jsonl --vocab nn/data/smock_vocab.json --out-dir nn/data/smock_xrsh_val --jobs 0
+cd nn
+python scripts/train/train_policy.py --train-xrsh-dir data/smock_xrsh_train --val-xrsh-dir data/smock_xrsh_val --vocab data/smock_vocab.json --out data/checkpoints/smock_policy.pt --width 64 --blocks 4 --batch-size 256 --epochs 2 --device cpu
+python scripts/export/export_onnx.py --checkpoint data/checkpoints/smock_policy.pt --out data/smock_policy.onnx
+```
+
+（路径可按实际数据位置调整；试跑建议 `--epochs 2`、`--device cpu` 等。）
+
+默认 `--device cuda`；仅 CPU 时可显式 `--device cpu`。
+
+---
 
 ## 测试
 

@@ -1,4 +1,4 @@
-//! ICCS 纵线记谱 → pyffish UCI（与 `nn/src/notation_iccs.py` 一致）。
+//! ICCS 纵线记谱 → pyffish UCI（历史 Python 实现已移除；单源为本模块）。
 
 use anyhow::{anyhow, bail, Result};
 
@@ -30,17 +30,32 @@ pub fn iccs_move_to_pyffish(mv: &str) -> Result<String> {
         if b.len() < 4 {
             bail!("无法解析 ICCS 着法: {mv:?}");
         }
-        let mut split = 0usize;
-        for i in 1..b.len() {
-            if matches!(b[i], b'a'..=b'i' | b'A'..=b'I') {
-                split = i;
-                break;
-            }
-        }
+        let split = b
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, &ch)| matches!(ch, b'a'..=b'i' | b'A'..=b'I'))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         if split == 0 {
             bail!("无法解析 ICCS 着法: {mv:?}");
         }
         (&t[..split], &t[split..])
     };
     Ok(iccs_half_to_pyffish(a)? + &iccs_half_to_pyffish(b)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iccs_pair_to_pyffish() {
+        assert_eq!(iccs_move_to_pyffish("c3-c4").unwrap(), "c4c5");
+    }
+
+    #[test]
+    fn iccs_compact() {
+        assert_eq!(iccs_move_to_pyffish("c3c4").unwrap(), "c4c5");
+    }
 }

@@ -2,6 +2,16 @@
 //!
 //! 规则与走子生成来自 **pikafish-rust**（与 Pikafish 对齐），经 `xiangqi_core` 打包为库 API。
 //! Zobrist 使用全局 `OnceLock`（种子 `1070372`），与参考引擎一致。
+//!
+//! 以下为自 Pikafish 移植代码的常见告警抑制（transmute、区间判断风格等与上游一致）。
+#![allow(clippy::missing_transmute_annotations)]
+#![allow(clippy::cast_abs_to_unsigned)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::if_same_then_else)]
 
 pub mod board;
 pub mod misc;

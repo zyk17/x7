@@ -22,21 +22,22 @@
 
 **当前阶段：MVP 已可用**
 
-- [x] 输入：**PGN**（ICCS / UCI，与 `dataset_pgn` 对齐）+ **`jsonl-shards`** 读 JSONL
-- [x] 输出：**`XQB` v1**（`shard_NNNNN.xqb`）+ `pack_meta.json`
-- [x] `vocab_sha256` 与 Python 词表指纹一致；`format: xqb_v1`
+- [x] 输入：**PGN**（ICCS / UCI，Rust `encode`）+ **`jsonl-shards`** 读 JSONL
+- [x] 输出：**XRSH** v1（`shard_NNNNN.xrsh`，魔数 `XRSH`）+ `pack_meta.json`
+- [x] `vocab_sha256` 与 Python 词表指纹一致；`format: xrsh_v1`
 - [x] CLI：`pgn-shards` / `jsonl-shards`，`--jobs`、`--games-per-shard`
-- [ ] Python / PyTorch **读取 XQB** 的 Dataset（并入 P2）；可选 Rust **读回校验** 单测
+- [x] Python **`PolicyXrshDataset`**（`nn.dataset_xrsh`，`--train-xrsh-dir`）
+- [x] Rust：单元测试（`iccs` / `pgn` / `vocab`）、集成冒烟 `tests/jsonl_smoke.rs`（JSONL → XRSH + `read_shard_header` + `pack_meta`）
 
 ---
 
 ## P2 — `nn/`：二进制训练包 + 多头网络
 
-- [ ] `Dataset` / DataLoader 读取 P1 二进制（mmap）
-- [ ] 模型：shared trunk + **policy** + **attack / danger / tactical**（头数与标签定义见 ARCHITECTURE）
-- [ ] 损失与权重策略；验证指标
-- [ ] **ONNX 导出**：多输出契约文档化
-- [ ] 与现有 `policy_pack_v2` 迁移/共存策略（若仍保留 JSONL 路径）
+- [x] `Dataset` / DataLoader 读取 P1 **XRSH**（`.xrsh`，当前整目录载入；mmap 优化可选）
+- [x] 模型：shared trunk + **policy** + **attack / danger / tactical**（头数与标签定义见 ARCHITECTURE / `aux_pseudo_labels.py`）
+- [x] 损失与权重策略；验证指标（`--aux-loss-weight`；验证打印 `val_aux_mse`）
+- [x] **ONNX 导出**：多输出契约见 **ARCHITECTURE.md**（`export_onnx.py`：`logits` + 可选三标量头）
+- [x] 训练路径收敛为 **XRSH only**（已移除 JSONL mmap / `policy_pack_v2` Python 管线）
 
 ---
 
@@ -53,4 +54,4 @@
 ## 已完成（归档区）
 
 - **2026-05**：P0 主体 — 自 pikafish-rust 并入 `types` / `misc` / `board` / `movegen`；`Position::from_fen`、`global_zobrist`、`legal_moves_uci`；`tests/perft.rs`（depth 1–3 = 44 / 1926 / 80069）。
-- **2026-05**：P1 MVP — `xiangqi_dataset`：`pgn-shards` / `jsonl-shards`，`XQB` v1，`pack_meta.json`；`uci_format` 与 pyffish 纵坐标 1～10 对齐。
+- **2026-05**：P1 MVP — `xiangqi_dataset`：`pgn-shards` / `jsonl-shards`，XRSH（`.xrsh`），`pack_meta.json`；`uci_format` 与 pyffish 纵坐标 1～10 对齐。

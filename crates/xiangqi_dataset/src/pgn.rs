@@ -1,4 +1,4 @@
-//! PGN 读取与 movetext 清理（对齐 `nn/src/pgn.py`）。
+//! PGN 读取与 movetext 清理（历史 Python `nn/src/pgn.py` 已移除；单源为本模块）。
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -168,4 +168,25 @@ fn parse_one_game_chunk(chunk: &str) -> Option<ParsedGame> {
         headers,
         movetext_raw: movetext_lines.join(" "),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_comments_nested() {
+        let s = "1. c3-c4 {note} ( 2. d4 ) c5-c6";
+        let t = strip_comments_and_variations(s);
+        assert!(!t.contains('{'));
+        assert!(!t.contains('('));
+    }
+
+    #[test]
+    fn parse_headers_one_game() {
+        let raw = "[Event \"smoke\"]\n[Site \"?\"]\n\nc3-c4";
+        let g = read_pgn_games(raw);
+        assert_eq!(g.len(), 1);
+        assert!(g[0].headers.contains_key("Event"));
+    }
 }

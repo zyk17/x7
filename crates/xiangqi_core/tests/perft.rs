@@ -20,8 +20,8 @@ fn perft(pos: &Position, depth: i32) -> u64 {
         return count as u64;
     }
     let mut nodes = 0;
-    for i in 0..count {
-        let mv = moves[i].mv;
+    for em in moves[..count].iter() {
+        let mv = em.mv;
         assert!(
             mv.is_ok(),
             "Legal move gen produced invalid move raw={:x}",
@@ -71,10 +71,10 @@ fn test_do_undo_move() {
     let count = generate(&pos, GenType::Legal, &mut moves);
     assert!(count > 0);
 
-    for i in 0..count {
+    for em in moves[..count].iter() {
         let fen0 = pos.fen();
-        pos.do_move(moves[i].mv);
-        pos.undo_move(moves[i].mv);
+        pos.do_move(em.mv);
+        pos.undo_move(em.mv);
         assert_eq!(pos.fen(), fen0, "do/undo mismatch");
     }
 }

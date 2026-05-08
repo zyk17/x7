@@ -24,7 +24,7 @@ pub fn starting_fen(game: &ParsedGame) -> Result<String> {
     Ok(START_FEN.to_string())
 }
 
-/// 与 `dataset_pgn._moves_for_game` 对齐。
+/// PGN 记谱 → pyffish UCI 列表（Python 侧同名逻辑已移除；仅此 Rust 实现）。
 pub fn moves_for_game(game: &ParsedGame) -> Result<(Vec<String>, String)> {
     let fmt = pgn_format(&game.headers);
     let text = &game.movetext_raw;
@@ -126,7 +126,7 @@ pub fn encode_game(
     }))
 }
 
-/// 从 JSONL 的一行（`extract_rows` 格式）编码；用于已生成的语料。
+/// 从 JSONL 的一行编码（字段：`fen` / `root_fen` / `uci_prefix` / `human_move_pyffish` / …）。
 pub fn encode_jsonl_line(line: &str, vocab: &HashMap<String, i32>) -> Result<Option<EncodedRow>> {
     let v: serde_json::Value = serde_json::from_str(line)?;
     let Some(fen) = v["fen"].as_str().map(str::to_string) else {

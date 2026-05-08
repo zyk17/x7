@@ -24,7 +24,8 @@ class ResBlock(nn.Module):
 class PolicyResNet(nn.Module):
     """
     Input: [B, in_planes, 10, 9]
-    Output: [B, num_moves] logits（推理时用合法 mask 限制 softmax）。
+    Output: ``aux_heads=False`` 时 ``[B, num_moves]`` logits；
+    ``aux_heads=True`` 时返回 ``(logits, attack, danger, tactical)``，后三者为未经 sigmoid 的标量 logit。
     """
 
     def __init__(
@@ -33,8 +34,11 @@ class PolicyResNet(nn.Module):
         width: int = 128,
         num_blocks: int = 8,
         num_moves: int = 4096,
+        *,
+        aux_heads: bool = False,
     ) -> None:
         super().__init__()
+        self.aux_heads = bool(aux_heads)
         self.stem = nn.Sequential(
             nn.Conv2d(in_planes, width, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(width),
@@ -43,11 +47,23 @@ class PolicyResNet(nn.Module):
         self.blocks = nn.Sequential(*[ResBlock(width) for _ in range(num_blocks)])
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(width, num_moves)
+        if self.aux_heads:
+            self.fc_attack = nn.Linear(width, 1)
+            self.fc_danger = nn.Linear(width, 1)
+            self.fc_tactical = nn.Linear(width, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.blocks(self.stem(x))
         h = self.pool(h).flatten(1)
-        return self.fc(h)
+        logits = self.fc(h)
+        if not self.aux_heads:
+            return logits
+        a = self.fc_attack(h).squeeze(-1)
+        d = self.fc_danger(h).squeeze(-1)
+        t = self.fc_tactical(h).squeeze(-1)
+        return logits, a, d, t
 
 
 def masked_log_softmax(logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
@@ -104,3 +120,34 @@ def policy_cross_entropy(
     if reduction == "mean":
         return nll.mean()
     return nll
+
+
+def aux_heads_sigmoid_mse(
+    pred_attack: torch.Tensor,
+    pred_danger: torch.Tensor,
+    pred_tactical: torch.Tensor,
+    tgt_attack: torch.Tensor,
+    tgt_danger: torch.Tensor,
+    tgt_tactical: torch.Tensor,
+    *,
+    sample_weight: torch.Tensor | None = None,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """辅助头：sigmoid 后与 [0,1] 伪标签做逐元素 MSE。"""
+    if reduction not in ("mean", "none"):
+        raise ValueError("reduction 须为 mean 或 none")
+    pa = torch.sigmoid(pred_attack)
+    pd = torch.sigmoid(pred_danger)
+    pt = torch.sigmoid(pred_tactical)
+    err = (pa - tgt_attack) ** 2 + (pd - tgt_danger) ** 2 + (pt - tgt_tactical) ** 2
+    err = err / 3.0
+    if sample_weight is not None:
+        if sample_weight.shape != pred_attack.shape:
+            raise ValueError("sample_weight 形状须与 pred_* 一致 [B]")
+        err = err * sample_weight
+        if reduction == "mean":
+            return err.sum() / sample_weight.sum().clamp(min=1e-8)
+        return err
+    if reduction == "mean":
+        return err.mean()
+    return err

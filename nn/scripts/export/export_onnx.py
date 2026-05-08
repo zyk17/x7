@@ -8,11 +8,27 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from nn import PolicyResNet
+
+
+class PolicyOnnxExport(nn.Module):
+    """导出用包装：辅助头在图中即 sigmoid(logit)，与训练标签 [0,1] 语义一致。"""
+
+    def __init__(self, inner: PolicyResNet) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        out = self.inner(x)
+        if not self.inner.aux_heads:
+            return out
+        logits, a, d, t = out
+        return logits, torch.sigmoid(a), torch.sigmoid(d), torch.sigmoid(t)
 
 
 def main() -> None:
@@ -25,23 +41,41 @@ def main() -> None:
     width = int(ckpt["width"])
     blocks = int(ckpt["blocks"])
     n_moves = int(ckpt["n_moves"])
-    model = PolicyResNet(width=width, num_blocks=blocks, num_moves=n_moves)
-    model.load_state_dict(ckpt["model"])
+    sd = ckpt["model"]
+    aux_heads = bool(ckpt.get("aux_heads", False))
+    if not aux_heads and "fc_attack.weight" in sd:
+        aux_heads = True
+    model = PolicyResNet(
+        width=width, num_blocks=blocks, num_moves=n_moves, aux_heads=aux_heads
+    )
+    model.load_state_dict(sd, strict=True)
     model.eval()
+    export_mod = PolicyOnnxExport(model)
 
     dummy = torch.zeros(1, 15, 10, 9)
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    out_names = (
+        ["logits", "attack", "danger", "tactical"]
+        if aux_heads
+        else ["logits"]
+    )
     # dynamo=False：使用 TorchScript 导出路径，无需 onnxscript（PyTorch 2.x 默认 dynamo=True）
     torch.onnx.export(
-        model,
+        export_mod,
         dummy,
         str(args.out),
         input_names=["board"],
-        output_names=["logits"],
+        output_names=out_names,
         opset_version=17,
         dynamo=False,
     )
-    print(f"exported -> {args.out} moves={n_moves} width={width} blocks={blocks}")
+    tail = ""
+    if aux_heads:
+        tail = "（attack/danger/tactical 已为 sigmoid 概率）"
+    print(
+        f"exported -> {args.out} moves={n_moves} width={width} blocks={blocks} "
+        f"outputs={out_names}{tail}"
+    )
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@
 
 - **来源**：特级大师棋谱（ICCS / PGN）；人类 **不自对弈** 生成主标签。
 - **样本**：`position → move`；划分必须 **按整局 `game_id`**，禁止局面级随机切分导致泄漏。
-- **坐标**：棋谱侧 ICCS → **pyffish UCI**（与皮卡鱼 / 77 象棋一致）；权威解析见 Python 包 `notation_iccs`、`board`（在向 Rust 迁移规则前仍以 pyffish 为准）。
+- **坐标**：棋谱侧 ICCS → **pyffish UCI**（与皮卡鱼 / 77 象棋一致）；ICCS 解析在 **`crates/xiangqi_dataset/src/iccs.rs`**；训练步合法集仍以 **pyffish**（Python `board`）为准。
 
 ### 路线摘要（实现以代码与本文件里程碑为准）
 
@@ -79,27 +79,27 @@
 
 | 区域 | 路径 | 说明 |
 |------|------|------|
-| 数据与棋谱 | `constants.py`、`board.py`、`notation_iccs.py`、`pgn.py`、`dataset_pgn.py` | ICCS ↔ UCI、行迭代 |
+| 数据与规则面 | `constants.py`、`board.py`（pyffish） | 训练步合法集等；**语料物化**在 Rust（`xiangqi_dataset` → **XRSH**） |
 | 增强 | `augment_mirror.py` | 水平镜像 |
-| 神经网络 | `nn/` | `fen_tensor`、`model`、`dataset`、`policy_pack`、`materialize_pack` 等 |
+| 神经网络 | `nn/` | `fen_tensor`、`model`、`dataset_xrsh`、`policy_pack`（词表指纹）、`xrsh_io` 等 |
 
-脚本：`nn/scripts/data_pgn/*`、`nn/scripts/train/train_policy.py`、`nn/scripts/export/export_onnx.py`。
+脚本：`nn/scripts/vocab/build_vocab.py`；`nn/scripts/train/train_policy.py`（**仅 XRSH**）、`export/export_onnx.py`。
 
 ## 数据管线（现状）
 
-- **JSONL 行**：`fen`、`root_fen`、`uci_prefix`、`human_move_pyffish`、`game_id`、`pgn_source` 等（详见 `extract_rows`）。
-- **大规模训练（Python）**：`build_jsonl_index` → mmap；可选 **`policy_pack_v2`** 离线包（`nn` 内 `materialize_policy_pack`）。
-- **二进制分片（Rust，`xiangqi_dataset`）**：**`XQB` v1**（`shard_*.xqb`）  
+- **训练用数据**：**XRSH** 分片（`shard_*.xrsh` + `pack_meta.json`），由 Rust **`xiangqi_dataset`** 从 PGN 或 JSONL 生成。中间 **JSONL** 仍可用于 `build_vocab.py` 与 `jsonl-shards` 输入，但 **`train_policy` 不再直接读 JSONL / mmap 索引 / policy npy 包**。
+- **二进制分片（Rust，`xiangqi_dataset`）**：**XRSH**（Xiangqi Review Shard）v1，文件 **`shard_*.xrsh`**（魔数 `XRSH`，勿与市面 `.xqb` 棋谱混淆）  
   - 子命令 **`pgn-shards`**：读 PGN / `.pgns`，按局 **Rayon 并行** 编码；**`jsonl-shards`**：读已有 JSONL。  
-  - 每样本含：`fen`、`root_fen`、`uci_prefix`、**词表下标**的合法着列表、`target`、`ply`；`pack_meta.json` 含 **`vocab_sha256`**（与 Python `vocab_fingerprint_ordered_moves` 一致）。  
-  - 细节与 CLI 见 **`crates/xiangqi_dataset/README.md`**。P2 在 `nn` 侧增加 XQB 读取器后即可替代或并存 `policy_pack_v2`。
+  - 每样本含：`fen`、`root_fen`、`uci_prefix`、**词表下标**的合法着列表、`target`、`ply`；`pack_meta.json` 含 **`format: xrsh_v1`**、**`vocab_sha256`**（与 Python `vocab_fingerprint_ordered_moves` 一致）。  
+  - 细节与 CLI 见 **`crates/xiangqi_dataset/README.md`**。Python 训练仅 **`nn.dataset_xrsh.PolicyXrshDataset`**（`train_policy.py --train-xrsh-dir`）。
 
 ## 模型与 ONNX（Python）
 
 - **输入**：`float32[1,15,10,9]`。
-- **输出**：`float32[1,V]` policy logits；推理时对非法位掩码后再 softmax。
-
-路线上的 **多头（attack / danger / tactical）** 需在契约中追加输出名与形状；当前代码以 **单 policy** 为主。
+- **输出**：
+  - **仅 policy**：`logits`，`float32[1,V]`；推理时对非法位掩码后再 softmax。
+  - **多头（`aux_heads`，默认训练开启）**：在上述基础上追加 **`attack`、`danger`、`tactical`**，均为 **`float32[1]`**。**ONNX 图中**三辅助输出已含 **sigmoid**（见 `export_onnx.py` 的 `PolicyOnnxExport`），数值约在 `[0,1]`；训练仍对原始 logit 做 sigmoid 后与伪标签对齐。
+  - 伪标签见 `nn/src/nn/aux_pseudo_labels.py`：须传入 XRSH 中的 **`root_fen` / `uci_prefix`**，且机动与吃子比例默认基于 **Rust 物化的合法 UCI 表**（与 policy mask 同源）；物质项仍读当前 `fen`。规则权威长期迁往 Rust 预计算见里程碑。
 
 ## Rust Crate 划分
 
