@@ -1,0 +1,58 @@
+# 仓库级忽略（统一在此维护）
+
+# --- IDE / 编辑器本地环境 ---
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+.history/
+
+# --- Rust ---
+/target/
+**/*.rs.bk
+
+# --- Python 打包与构建产物 ---
+dist/
+build/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.egg
+
+# --- Python 工具缓存 ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# --- 虚拟环境 ---
+venv/
+.venv/
+
+# --- 数据集、棋谱、训练权重（体积大 / 本机生成）---
+# 原有脚本产出与 checkpoint 等放在 data/，统一不入库；若在仓库根外另有目录可同名忽略
+data/
+datasets/
+checkpoints/
+pgns/
+*.jsonl
+*.zst
+
+# 常见模型权重（若需提交极小示例文件，可用 git add -f）
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# --- 日志与临时文件 ---
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+/.cursorrules

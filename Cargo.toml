@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xiangqi_core",
+    "crates/xiangqi_dataset",
+    "crates/engin",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"

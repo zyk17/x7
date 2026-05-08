@@ -1,0 +1,9 @@
+[package]
+name = "engin"
+version = "0.1.0"
+edition.workspace = true
+description = "End-user UCI chess engine: search + xiangqi_core + NN backend (ONNX). No dataset tooling."
+publish = false
+
+[dependencies]
+xiangqi_core = { path = "../xiangqi_core" }

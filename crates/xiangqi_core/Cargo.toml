@@ -1,0 +1,10 @@
+[package]
+name = "xiangqi_core"
+version = "0.1.0"
+edition.workspace = true
+description = "Chinese chess rules, board representation, and move generation (foundation for dataset tooling and search)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
