@@ -4,6 +4,14 @@
 
 ---
 
+## 产品与方法论（全员对齐）
+
+- **定位**：**人类认知驱动的搜索**——模型主要学习 **人类棋谱与局面语义**（policy、危险、先手权等），用于 **候选空间与剪枝先验**；**不是**「堆一个大网络替代 Pikafish 式静态评估」。
+- **分工**：**机器话 / 战术穷尽 / 物质与深度验证** → **`engin` 搜索 + `xiangqi_core`**；**人类风格与大局观** → **`nn/` 小网络 + ONNX**。
+- **文档**：原则性表述以 **`ARCHITECTURE.md`**、根目录 **`README.MD`**、**`.cursorrules`**、**`agents.md`** 为准。
+
+---
+
 ## 推进顺序（先读这段，减轻混乱）
 
 仓库里 **P0→P1→P2** 仍成立，但近期容易「乱」的根因是：**policy 监督来自 Rust（XRSH），辅助头伪标签曾走 pyffish**，存在双规则源风险。下面按**依赖**排序，不必样样并行。
@@ -73,23 +81,23 @@
 
 ---
 
-## P4 — Value Head
+## P4 — Value Head（人类局面感，非引擎真理头）
 
-**目标：补齐局面真值估计，为搜索稳定性和资源分配提供基础信号**
+**目标：提供与人类棋感一致的「局面好坏」信号，服务剪枝、志向窗口与资源分配；终极战术对错仍主要由搜索验证。**
 
-- [ ] 在 `PolicyResNet` 上扩展可选 `value head`
-- [ ] 明确 value 输出契约：范围、激活方式、ONNX 输出名
-- [ ] 设计第一版 value 标签来源与回归目标
-- [ ] 在 `xiangqi_dataset` 中落地 value 标签写入 XRSH
+- [ ] 在 `PolicyResNet` 上扩展可选 **value head**（契约与现有 `export_onnx.py` / `engin` 对齐则沿用；否则显式修订文档）
+- [ ] **标签哲学**：优先 **人类局面理解**（棋谱结果、舒适/危机启发、或多任务人类 proxy）；若以引擎为 Teacher，仅作 **可选对照/实验**，并在 `ARCHITECTURE.md` 标注用途
+- [ ] 明确 value 输出契约：范围、激活方式、ONNX 输出名（与「非引擎 cp 真理」叙述一致）
+- [ ] 在 `xiangqi_dataset` / 管线中落地 value 相关字段（若写入 XRSH，须同步 **`ARCHITECTURE.md`** 与 pack 版本说明）
 - [ ] 在 `train_policy.py` 中加入 value loss、权重和验证指标
 - [ ] 为 value 头补充 smoke / shape / loss 测试
-- [ ] 在 `engin` 中预留 value 推理消费接口
+- [ ] 在 `engin` 中保持/完善 value **可选**消费接口（叶子评估：NN value 与物质 fallback 的协作关系见 `eval.rs`）
 
 ---
 
 ## P5 — Search-aware Heads
 
-**目标：让辅助头直接服务搜索，而不是只做训练增强**
+**目标：让人类语义头直接驱动搜索调度（扩深/剪枝/宽度），而不是仅作训练正则**
 
 - [ ] 固化 `danger` 的定义、标签生成和搜索消费方式
 - [ ] 新增 `volatility` head：定义标签与训练目标
@@ -101,28 +109,28 @@
 
 ---
 
-## P6 — Search Distillation
+## P6 — Search Distillation（可选增强）
 
-**目标：学习“搜索资源应该放哪里”**
+**目标：学习「何处值得加深」的注意力，**补充**人类 policy；主线仍是人类认知驱动的搜索，而非用蒸馏取代大师棋感。**
 
 - [ ] 定义蒸馏数据格式：visit count / principal variation / node stats
-- [ ] 选择蒸馏来源：本仓引擎搜索日志或外部参考搜索样本
+- [ ] 选择蒸馏来源：本仓引擎搜索日志或外部参考搜索样本（用途与边界写入 `ARCHITECTURE.md` 小结）
 - [ ] 在数据管线中支持搜索分布样本导出
 - [ ] 设计训练目标：best move 监督之外的分布监督
-- [ ] 比较 policy-only 与 visit distillation 的收益差异
+- [ ] 比较 policy-only 与 visit distillation 的收益差异（含风格/剪枝效率维度）
 - [ ] 建立固定测试集，评估对 move ordering 与搜索命中率的提升
 
 ---
 
 ## P7 — Dynamic Search
 
-**目标：由模型输出控制搜索深度、宽度与剪枝策略**
+**目标：由「人类语义头 +（可选）value」驱动搜索深度、宽度与剪枝；算力花在模型圈定的关键枝上。**
 
-- [ ] 在 `engin` 中定义 head 信号到搜索参数的映射表
+- [ ] 在 `engin` 中定义 head 信号到搜索参数的映射表（文档写清：人类先验 → 参数，避免暗含「单一 NN 棋力」）
 - [ ] 将 `danger` 接入 extension / reduction 判定
 - [ ] 将 `volatility` 接入宽度分配 / top-k 搜索
 - [ ] 将 `forcing` 接入 singular extension / forcing line 深搜
-- [ ] 评估 `value` 对 aspiration / pruning / null move 的帮助
+- [ ] 评估 **人类感 value** 对 aspiration / pruning / null move 的帮助（与物质/搜索真理的配合）
 - [ ] 建立固定时间预算基准，比较节点利用率与战术命中率
 - [ ] 形成可回归测试的搜索配置集
 
