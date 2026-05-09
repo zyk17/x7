@@ -7,7 +7,7 @@
 - **模型（轻量 ResNet）**：主要学习 **人类特征**——大师棋谱上的 **policy**、以及与「大局观、危险、先手感」等一致的 **语义头**；目的是给出 **人类风格的候选空间与剪枝先验**，而不是把皮卡鱼式 **NNUE/终评** 照搬进小网络当唯一真理。
 - **搜索（Alpha-Beta + TT + 选择性扩展）**：承担 **战术深度、静态评估 fallback、穷举验证** 等 **机器侧行为**；算力主要花在「模型圈定值得算的变化」上，而不是盲目炸树。
 
-一句话：**人类顶尖棋感指路 + 算力在关键枝上纵深验证**；目标是在剪枝与方向上超越纯引擎惯性，在深度上超越人类时限。
+一句话：**人类顶尖棋感指路 + 算力在关键枝上纵深验证**；目标是在剪枝与方向上超越纯引擎惯性，在深度上超越人类时限。短期先服务复盘系统，长期再把这些语义沉淀到搜索引擎里。
 
 本仓库为 **Monorepo**：
 
@@ -18,7 +18,16 @@
 | **`crates/xiangqi_dataset`** | Rust **可执行文件**：**维护者专用**——二进制 dataset、并行标注、语料工具（不随引擎分发给终端用户） |
 | **`nn/`** | Python：数据管线、ResNet policy 训练、ONNX 导出（`torch` 为可选 `[train]`） |
 
-**产品边界、方法论、网络与搜索分工、数据契约与路线图** 见 **`ARCHITECTURE.md`**。中期研发目标见 **`工程目标.md`**。
+**产品边界、方法论、网络与搜索分工、数据契约与路线图** 见 **`ARCHITECTURE.md`**。中期研发目标见 **`工程目标.md`**，近期执行入口见 **`NEXT_STEPS.md`**。
+
+## 双主线
+
+- **短期主产品：复盘系统**
+  - 模型需要输出**可解释**的人类候选着与局面语义
+- **长期路线：搜索引擎**
+  - 搜索用来验证这些语义是否真的有用，并逐步把它们转化成搜索收益
+
+所以模型与搜索不是替代关系，而是互相校验、互相增强。
 
 ## 能力上下限与数据路线（讨论性说明，非 KPI）
 
@@ -52,7 +61,7 @@ pytest
 cargo build -p xiangqi_core
 cargo run -p engin                   # **UCI**：自 stdin 读协议（GUI 对弈）；`setoption name PolicyFile value …` / `VocabFile value …` 可接 ONNX + `move_vocab.json` 用 policy 选着
 cargo run -p engin -- --onnx-smoke   # 加载 data/policy.onnx 对起始局面推理（路径见 --help）
-cargo run -p xiangqi_dataset    # 训练侧数据集/标注 CLI（当前占位）
+cargo run -p xiangqi_dataset -- <子命令> …   # 维护者：**PGN/JSONL → XRSH**（`pgn-shards` / `jsonl-shards`，见 `crates/xiangqi_dataset/README.md`）
 ```
 
 （`cargo run` 传给**二进制**的参数必须写在 **`--` 之后**；若写 `cargo run --onnx-smoke` 会被当成 Cargo 自己的选项而报错。）
@@ -65,8 +74,9 @@ cargo run -p xiangqi_dataset    # 训练侧数据集/标注 CLI（当前占位�
 |------|------|
 | `ARCHITECTURE.md` | 人类认知驱动搜索、产品与契约、crate 划分、数据格式、里程碑摘要 |
 | `MILESTONES.md` | P0–P7 里程碑定义与依赖顺序 |
-| `TODO.md` | 分阶段执行清单（勾选推进） |
+| `TODO.md` | 阶段索引与近期主线 |
 | `工程目标.md` | P3 之后的中期工程目标：value、搜索控制头、蒸馏、动态搜索 |
+| `NEXT_STEPS.md` | 接下来 2～6 周的实际执行计划：P3 做实、benchmark、ablation、head 收益归因 |
 | `crates/xiangqi_dataset/README.md` | `pgn-shards` / `jsonl-shards` 与 **XRSH**（`.xrsh`）格式 |
 | `agents.md` | 给自动化助手 / Agent 的仓库约定 |
 | `docs/design-summary.md` | 人类认知驱动搜索、能力边界与 Elo 声明的 **归档摘要**（非数据契约） |
