@@ -76,25 +76,25 @@
 
 #### A1. 补齐 P3 最小验收
 
-- [ ] 完成 `engin` 与 `xiangqi_core` 的走子、合法性、终局判定联调
-- [ ] 明确 `go depth` / `go movetime` / `go infinite` 的稳定行为
-- [ ] 确认 TT、静止搜索、迭代加深、根排序的行为不漂移
-- [ ] 为 UCI 主循环建立最小回归用例
+- [x] 完成 `engin` 与 `xiangqi_core` 的走子、合法性、终局判定联调（`tests/p3_integration.rs`）
+- [ ] 明确 `go depth` / `go movetime` / `go infinite` 的稳定行为（文档化 + 更多用例）
+- [ ] 确认 TT、静止搜索、迭代加深、根排序的行为不漂移（基准黄金输出）
+- [x] 为 UCI 主循环建立最小回归用例（`uci_dialog_smoke` + ablation 对话测试）
 
 #### A2. 建立 benchmark harness
 
-- [ ] 新建固定 FEN 基准集：开局、中局战术、将杀、复杂静面
-- [ ] 固定输出：`bestmove`、PV、depth、seldepth、nodes、nps、time
-- [ ] 支持固定 `depth` 与固定 `movetime` 两种模式
-- [ ] 输出 JSON 或 CSV，便于横向比较不同模型和不同开关
+- [x] 新建固定 FEN 基准集（`engin::benchmark::DEFAULT_BENCHMARK_FENS`，可扩展）
+- [x] 固定输出：`bestmove`、depth、seldepth、nodes、nps、time_ms、score_cp（NDJSON）
+- [ ] 支持固定 `movetime` 与 **PV 多着** 输出（当前 `info` 仅单行 PV）
+- [ ] 输出 CSV 可选
 
 #### A3. 建立 ablation 开关
 
-- [ ] 支持 `policy on/off`
-- [ ] 支持 `aux heads on/off`
-- [ ] 支持 `value on/off`
-- [ ] 支持根节点 policy 排序开关
-- [ ] 支持叶子 value 评估开关
+- [x] UCI：`UsePolicyOrdering`（根 policy 排序）
+- [x] UCI：`UseNNLeaf`（叶子是否允许 NN value；关则物质差）
+- [ ] `aux`（attack/danger/tactical）待搜索消费后再加开关
+- [x] 根节点 policy 排序 ≡ `UsePolicyOrdering`
+- [x] 叶子 value ≡ `UseNNLeaf`（无 ONNX 时恒为物质）
 
 验收标准：
 

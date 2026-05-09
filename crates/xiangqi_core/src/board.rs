@@ -447,7 +447,6 @@ impl Zobrist {
 // StateInfo — incremental state that gets pushed/popped on do_move/undo_move
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone)]
 pub struct StateInfo {
     // ── Copied when making a move ──
     pub pawn_key: Key,
@@ -461,7 +460,6 @@ pub struct StateInfo {
     // ── Recomputed each time ──
     pub key: Key,
     pub checkers_bb: Bitboard,
-    pub previous: Option<Box<StateInfo>>,
     pub blockers_for_king: [Bitboard; 2],
     pub pinners: [Bitboard; 2],
     pub check_squares: [Bitboard; PIECE_TYPE_NB],
@@ -482,7 +480,6 @@ impl Default for StateInfo {
             plies_from_null: 0,
             key: 0,
             checkers_bb: 0,
-            previous: None,
             blockers_for_king: [0; 2],
             pinners: [0; 2],
             check_squares: [0; PIECE_TYPE_NB],
@@ -491,6 +488,22 @@ impl Default for StateInfo {
             r#move: Move::none(),
         }
     }
+}
+
+/// Minimal snapshot before [`Position::do_move`]: keys/counters and last-move metadata.
+/// `checkers_bb` / pinners / `check_squares` etc. are recomputed in [`Position::undo_move`].
+#[derive(Debug, Clone, Copy)]
+pub struct UndoFrame {
+    pub pawn_key: Key,
+    pub minor_piece_key: Key,
+    pub non_pawn_key: [Key; 2],
+    pub major_material: [Value; 2],
+    pub check10: [i16; 2],
+    pub rule60: i32,
+    pub plies_from_null: i32,
+    pub key: Key,
+    pub captured_piece: Piece,
+    pub r#move: Move,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -522,6 +535,9 @@ pub struct Position {
     /// Bloom filter for fast repetition detection.
     pub filter: BloomFilter,
 
+    /// Compact undo snapshots (see [`UndoFrame`]), pushed by [`Self::do_move`].
+    pub undo_stack: Vec<UndoFrame>,
+
     /// Zobrist keys (initialized once globally).
     pub zobrist: &'static Zobrist,
 }
@@ -537,6 +553,7 @@ impl Position {
             side_to_move: Color::White,
             game_ply: 0,
             filter: BloomFilter::new(),
+            undo_stack: Vec::new(),
             zobrist,
         }
     }
@@ -866,6 +883,11 @@ impl Position {
         let from = m.from_sq();
         let to = m.to_sq();
         let pc = self.piece_on(from);
+        let captured = self.piece_on(to);
+        // 与 `do_move` 一致：不允许「吃将」；伪合法生成仍可能产生此类目标格。
+        if captured != Piece::NO_PIECE && type_of(captured) == PieceType::King {
+            return false;
+        }
         let occupied = (self.occupancy() ^ square_bb(from)) | square_bb(to);
 
         // King move: destination must not be attacked
@@ -948,21 +970,30 @@ impl Position {
         );
 
         // ── Snapshot old state values before modifying self.state ──
-        let old_st = self.state.clone();
-        let old_pawn_key = old_st.pawn_key;
-        let old_minor_key = old_st.minor_piece_key;
-        let old_non_pawn_key = old_st.non_pawn_key;
-        let old_major_mat = old_st.major_material;
-        let old_check10 = old_st.check10;
-        let old_rule60 = old_st.rule60;
-        let old_plies_from_null = old_st.plies_from_null;
-        let old_key = old_st.key;
+        let old_pawn_key = self.state.pawn_key;
+        let old_minor_key = self.state.minor_piece_key;
+        let old_non_pawn_key = self.state.non_pawn_key;
+        let old_major_mat = self.state.major_material;
+        let old_check10 = self.state.check10;
+        let old_rule60 = self.state.rule60;
+        let old_plies_from_null = self.state.plies_from_null;
+        let old_key = self.state.key;
 
         // Bloom filter
         self.filter.set(old_key, self.filter.get(old_key).wrapping_add(1));
 
-        // Save old state
-        self.state.previous = Some(Box::new(old_st));
+        self.undo_stack.push(UndoFrame {
+            pawn_key: self.state.pawn_key,
+            minor_piece_key: self.state.minor_piece_key,
+            non_pawn_key: self.state.non_pawn_key,
+            major_material: self.state.major_material,
+            check10: self.state.check10,
+            rule60: self.state.rule60,
+            plies_from_null: self.state.plies_from_null,
+            key: self.state.key,
+            captured_piece: self.state.captured_piece,
+            r#move: self.state.r#move,
+        });
 
         // ── Initialize new state ──
         self.state.r#move = m;
@@ -1061,15 +1092,26 @@ impl Position {
             self.put_piece(captured, to);
         }
 
-        // Pop previous state (this restores side, keys, checkers, etc.)
-        if let Some(prev) = self.state.previous.take() {
-            self.state = *prev;
-        }
+        let prev = self.undo_stack.pop().expect("undo_move: empty undo_stack");
+        self.state.pawn_key = prev.pawn_key;
+        self.state.minor_piece_key = prev.minor_piece_key;
+        self.state.non_pawn_key = prev.non_pawn_key;
+        self.state.major_material = prev.major_material;
+        self.state.check10 = prev.check10;
+        self.state.rule60 = prev.rule60;
+        self.state.plies_from_null = prev.plies_from_null;
+        self.state.key = prev.key;
+        self.state.captured_piece = prev.captured_piece;
+        self.state.r#move = prev.r#move;
 
-        // Restore side-to-move and ply (were in the previous state but StateInfo
-        // doesn't store them — Position owns them directly)
+        // Restore side-to-move and ply (StateInfo doesn't store them — Position owns them)
         self.side_to_move = !self.side_to_move;
         self.game_ply -= 1;
+
+        let us = self.side_to_move;
+        let them = !us;
+        self.state.checkers_bb = self.checkers_to(them, self.king_square(us));
+        self.set_check_info();
     }
 
     // ── Board manipulation ───────────────────────────────────────────────────
@@ -1109,6 +1151,7 @@ impl Position {
         self.board = [Piece::NO_PIECE; SQUARE_NB];
         self.piece_count = [0; PIECE_NB];
         self.mid_encoding = [0; 2]; // TODO: BalanceEncoding
+        self.undo_stack.clear();
 
         // Parse piece placement (ranks 9 down to 0)
         let ranks: Vec<&str> = parts[0].split('/').collect();
@@ -1243,8 +1286,18 @@ impl Position {
 
     // ── Key access ───────────────────────────────────────────────────────────
 
+    /// 置换表等用的完整键：在 [`Self::state`] 的 Zobrist 上混入 **rule60** 与 **重复检测过滤器**（见 [`Self::adjust_key60`]）。
     pub fn key(&self) -> Key {
         self.adjust_key60(self.state.key)
+    }
+
+    /// **未**经 `rule60` / 重复状态调整的 Zobrist，仅随 **棋子摆放** 与 **行棋方** 变化。
+    ///
+    /// 与典型「棋盘平面 + 行棋方」神经网络输入的等价类一致；若 value 网络不消费走子历史，
+    /// 用它做缓存键可避免与 [`Self::key`] 相同的局面因反复着法计数不同而重复推理。
+    #[inline]
+    pub fn nn_input_key(&self) -> Key {
+        self.state.key
     }
 
     fn adjust_key60(&self, k: Key) -> Key {

@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use xiangqi_core::{uci_to_move, Position, START_FEN};
 
 use crate::policy_onnx::PolicyOnnx;
-use crate::search::{root_search_iterative, RootSearchShared, SearchLimits};
+use crate::eval::{NNLeafMode, NnEvalSession};
+use crate::search::{root_search_iterative, RootSearchShared, SearchAblation, SearchLimits};
 use crate::tt::TranspositionTable;
 
 static UCI_STDOUT_LOCK: Mutex<()> = Mutex::new(());
@@ -32,6 +33,10 @@ struct GoParams {
     depth: Option<u32>,
     movetime: Option<u64>,
     nodes: Option<u64>,
+}
+
+fn parse_uci_check(s: &str) -> bool {
+    matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "on")
 }
 
 fn parse_go(args: &str) -> GoParams {
@@ -72,6 +77,11 @@ fn parse_setoption(line: &str) -> Option<(String, Option<String>)> {
         return Some((name, Some(val)));
     }
     Some((rest.trim().to_string(), None))
+}
+
+/// P3 联调 / 集成测试：解析完整 `position …` 行（与 UCI 状态机内逻辑一致）。
+pub fn parse_position_uci(line: &str) -> Result<Position, String> {
+    parse_position(line)
 }
 
 fn parse_position(line: &str) -> Result<Position, String> {
@@ -148,6 +158,8 @@ struct Engine {
     hash_mb: u32,
     threads: u32,
     multipv: u32,
+    /// ONNX 在搜索中的消融（`UsePolicyOrdering` / `NNLeafMode`）。
+    ablation: SearchAblation,
     search_stop: Option<Arc<AtomicBool>>,
     search_join: Option<JoinHandle<()>>,
 }
@@ -165,6 +177,7 @@ impl Engine {
             hash_mb: 16,
             threads: 1,
             multipv: 1,
+            ablation: SearchAblation::ALL_ON,
             search_stop: None,
             search_join: None,
         }
@@ -213,6 +226,8 @@ impl Engine {
         uci_out_line("option name Threads type spin default 1 min 1 max 512");
         uci_out_line("option name MultiPV type spin default 1 min 1 max 16");
         uci_out_line("option name Clear Hash type button");
+        uci_out_line("option name UsePolicyOrdering type check default true");
+        uci_out_line("option name NNLeafMode type combo var Off var MainLeafOnly var AllLeaf default MainLeafOnly");
         uci_out_line("uciok");
     }
 
@@ -264,6 +279,18 @@ impl Engine {
                     g.clear();
                 }
             }
+            "UsePolicyOrdering" => {
+                if let Some(ref v) = value {
+                    self.ablation.policy_ordering = parse_uci_check(v);
+                }
+            }
+            "NNLeafMode" => {
+                if let Some(ref v) = value {
+                    if let Some(m) = NNLeafMode::parse_uci(v) {
+                        self.ablation.nn_leaf_mode = m;
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -275,6 +302,7 @@ impl Engine {
         let tt = Arc::clone(&self.tt);
         let vocab = self.vocab.clone();
         let vocab_size = self.vocab_size;
+        let ablation = self.ablation;
         let stop = Arc::new(AtomicBool::new(false));
         self.search_stop = Some(stop.clone());
         let multipv = self.multipv.max(1);
@@ -311,12 +339,15 @@ impl Engine {
                     return;
                 }
             };
+            let mut nn_eval = NnEvalSession::default();
             let mut shared = RootSearchShared {
                 policy: &policy,
                 vocab: &vocab,
                 vocab_size,
                 tt: &mut tt_guard,
                 stop: Some(&stop),
+                ablation,
+                nn_eval: &mut nn_eval,
             };
             let bm = match root_search_iterative(&mut pos, max_depth, &mut shared, limits) {
                 Some(r) => {
@@ -431,6 +462,8 @@ pub fn run_uci_for_test<R: BufRead, W: Write>(reader: R, writer: &mut W) -> io::
                 reply("option name Threads type spin default 1 min 1 max 512")?;
                 reply("option name MultiPV type spin default 1 min 1 max 16")?;
                 reply("option name Clear Hash type button")?;
+                reply("option name UsePolicyOrdering type check default true")?;
+                reply("option name NNLeafMode type combo var Off var MainLeafOnly var AllLeaf default MainLeafOnly")?;
                 reply("uciok")?;
             }
             "isready" => {
@@ -461,12 +494,15 @@ pub fn run_uci_for_test<R: BufRead, W: Write>(reader: R, writer: &mut W) -> io::
                     continue;
                 };
                 let mut tt_guard = engine.tt.lock().unwrap();
+                let mut nn_eval = NnEvalSession::default();
                 let mut shared = RootSearchShared {
                     policy: &engine.policy,
                     vocab: &engine.vocab,
                     vocab_size: engine.vocab_size,
                     tt: &mut tt_guard,
                     stop: None,
+                    ablation: engine.ablation,
+                    nn_eval: &mut nn_eval,
                 };
                 let bm = match root_search_iterative(&mut pos, max_depth, &mut shared, SearchLimits::none()) {
                     Some(r) => {

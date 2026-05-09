@@ -61,6 +61,8 @@ pytest
 cargo build -p xiangqi_core
 cargo run -p engin                   # **UCI**：自 stdin 读协议（GUI 对弈）；`setoption name PolicyFile value …` / `VocabFile value …` 可接 ONNX + `move_vocab.json` 用 policy 选着
 cargo run -p engin -- --onnx-smoke   # 加载 data/policy.onnx 对起始局面推理（路径见 --help）
+cargo run -p engin -- --bench --depth 4   # P3 基准：NDJSON（资源路径同上）；`--nn-leaf off|main|all`、`--no-nn-leaf`、`--nn-eval-budget N`、`--no-policy-ordering`、`--require-onnx`
+cargo run -p engin -- --value-probe --depth 4   # 小评测：`nn-leaf off` vs `main`，Markdown 表（见 `docs/value-probe.md`）
 cargo run -p xiangqi_dataset -- <子命令> …   # 维护者：**PGN/JSONL → XRSH**（`pgn-shards` / `jsonl-shards`，见 `crates/xiangqi_dataset/README.md`）
 ```
 

@@ -79,7 +79,13 @@ impl PolicyOnnx {
 
     /// FEN → 平面 → 推理。
     pub fn eval_fen(&mut self, fen: &str) -> Result<PolicyOutputs, Error> {
-        let board = crate::fen_to_planes(fen).map_err(Error::new)?;
+        let board = crate::fen_tensor::fen_to_planes(fen).map_err(Error::new)?;
+        self.eval_board(&board)
+    }
+
+    /// [`xiangqi_core::Position`] → 平面 → 推理（搜索热路径，无 FEN 分配）。
+    pub fn eval_position(&mut self, pos: &xiangqi_core::Position) -> Result<PolicyOutputs, Error> {
+        let board = crate::fen_tensor::position_to_planes(pos).map_err(Error::new)?;
         self.eval_board(&board)
     }
 }

@@ -83,9 +83,9 @@
 - [x] **迭代加深**（`go` / `go depth`）；**movetime** / **nodes** 在搜索内检查（不再先睡眠再搜）；**infinite** 配合 **stop** 与节点内轮询
 - [x] **Move ordering**：TT + MVV-LVA + 杀手 + 根 policy logit；静止阶段仅 MVV-LVA（不吃 ONNX）
 - [x] ONNX Runtime 加载 P2 导出模型 + **单次局面推理**：`engin::PolicyOnnx`（输入名 `board`，输出 `logits` + 可选 `attack`/`danger`/`tactical`）；`cargo run -p engin -- --onnx-smoke [PATH]`；`cargo test -p engin` 在存在 `data/policy.onnx` 时起推理冒烟
-- [ ] 与 `xiangqi_core` 走子、合法性、终局判定联调
-- [ ] 建立固定 FEN benchmark 集与统一输出格式
-- [ ] 建立 `policy/value/aux` 开关，支持 ablation
+- [x] 与 `xiangqi_core` 走子、合法性、终局判定联调（`crates/engin/tests/p3_integration.rs` + `parse_position_uci`）
+- [x] 建立固定 FEN benchmark 集与统一输出格式（`engin::benchmark`、`engin --bench [--depth N]`，NDJSON）
+- [x] 建立搜索侧消融：`setoption name UsePolicyOrdering` / `UseNNLeaf`（**attack/danger/tactical** 当前不进入搜索树，无独立开关；见 `NEXT_STEPS`）
 - [x] **ONNX 契约回归**：`nn/tests/test_policy_onnx_contract.py` 校验 `data/policy.onnx` 的 I/O 名与形状（与 `export_onnx.py` 一致；**`data/` 被 gitignore**，本地放入导出文件后跑 `pytest` 即执行）
 
 ---

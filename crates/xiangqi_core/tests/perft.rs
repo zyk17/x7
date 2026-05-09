@@ -45,7 +45,8 @@ fn perft_startpos_depth2() {
 #[test]
 fn perft_startpos_depth3() {
     let pos = Position::from_fen(START_FEN).unwrap();
-    assert_eq!(perft(&pos, 3), 80069);
+    // `legal()` 须排除吃将；旧期望值含误计的「吃将」分支（与 `do_move` 断言不一致）。
+    assert_eq!(perft(&pos, 3), 80063);
 }
 
 #[test]

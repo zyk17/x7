@@ -15,6 +15,28 @@ pub fn move_to_uci(m: Move) -> String {
     format!("{}{}", square_to_algebraic(m.from_sq()), square_to_algebraic(m.to_sq()))
 }
 
+/// 将着法写成与 [`move_to_uci`] 相同的 **ASCII**（`a`～`i` + 纵坐标 1～10），写入 `buf`，返回字节数（≤8）。
+#[inline]
+pub fn write_move_uci_bytes(m: Move, buf: &mut [u8; 8]) -> usize {
+    #[inline]
+    fn write_sq(s: Square, dst: &mut [u8]) -> usize {
+        let f = file_of(s) as u8;
+        let r = rank_of(s) as u32 + 1;
+        dst[0] = b'a' + f;
+        if r < 10 {
+            dst[1] = b'0' + r as u8;
+            2
+        } else {
+            dst[1] = b'1';
+            dst[2] = b'0';
+            3
+        }
+    }
+    let n0 = write_sq(m.from_sq(), &mut buf[..]);
+    let n1 = write_sq(m.to_sq(), &mut buf[n0..]);
+    n0 + n1
+}
+
 /// 从 pyffish 风格 UCI 串解析着法（**不** 校验局面）；纵坐标为 **1～10**（盘面条纹为 值−1）。
 pub fn parse_pyffish_uci(s: &str) -> Option<Move> {
     let s = s.trim().to_ascii_lowercase();
@@ -71,6 +93,14 @@ pub fn uci_to_move(pos: &Position, s: &str) -> Option<Move> {
 mod tests {
     use super::*;
     use crate::types::Piece;
+
+    #[test]
+    fn write_move_uci_bytes_matches_move_to_uci() {
+        let m = parse_pyffish_uci("b2e2").expect("b2e2");
+        let mut buf = [0u8; 8];
+        let n = write_move_uci_bytes(m, &mut buf);
+        assert_eq!(std::str::from_utf8(&buf[..n]).unwrap(), move_to_uci(m));
+    }
 
     #[test]
     fn parse_double_digit_rank_on_to_square() {

@@ -4,18 +4,25 @@
 
 use std::io;
 
+pub mod benchmark;
 pub mod eval;
 pub mod fen_tensor;
 pub mod policy_onnx;
 pub mod search;
 pub mod tt;
 pub mod uci;
+pub mod value_probe;
 pub mod vocab;
 
-pub use search::{root_search_iterative, RootSearchShared, SearchLimits};
+pub use benchmark::{default_benchmark_fen_strings, resolve_data_file, BenchJsonMeta, BenchSessionParams};
+pub use value_probe::{
+    markdown_table_off_vs_main, ValueProbeCase, ValueProbeTableArgs, VALUE_PROBE_CASES,
+};
+pub use eval::{NNLeafMode, NnEvalSession, NnEvalSite};
+pub use search::{root_search_iterative, RootSearchShared, RootSearchResult, SearchAblation, SearchLimits};
 pub use tt::TranspositionTable;
+pub use uci::parse_position_uci;
 
-pub use fen_tensor::fen_to_planes;
 pub use policy_onnx::{PolicyOnnx, PolicyOutputs};
 pub use xiangqi_core::START_FEN;
 

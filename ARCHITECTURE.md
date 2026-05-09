@@ -154,7 +154,7 @@
 |--------|------|------|------|
 | **`xiangqi_core`** | `crates/xiangqi_core` | 库 | 类型、规则、合法着（实现自 **pikafish-rust** 迁入，见 crate 内 `README.md`）；搜索与工具共用 |
 | **`xiangqi_dataset`** | `crates/xiangqi_dataset` | **维护者** | 数据集生成、标注、语料工具 CLI（**不** 随引擎分发） |
-| **`engin`** | `crates/engin` | **终端用户** | **UCI（stdin/stdout）** + `xiangqi_core` + **`ort`**；**`setoption`**：`PolicyFile` / `VocabFile` / `Hash` / `Threads` / `MultiPV` / **`Clear Hash`**；**`go`** 支持 `infinite`+`stop`（后台线程）；无搜索树时 `bestmove` 由 policy（若已加载且词表维匹配）或合法着首项给出 |
+| **`engin`** | `crates/engin` | **终端用户** | **UCI（stdin/stdout）** + `xiangqi_core` + **`ort`**；**`setoption`**：`PolicyFile` / `VocabFile` / `Hash` / `Threads` / `MultiPV` / **`Clear Hash`** / **`UsePolicyOrdering`** / **`NNLeafMode`**（`Off` / `MainLeafOnly` / `AllLeaf`，默认主搜索叶子 ONNX；P3 消融）；**`go`** 支持 `infinite`+`stop`（后台线程）；**`--bench`** 输出搜索基准 NDJSON（默认解析 **`data/policy.onnx`**、**`data/move_vocab.json`**，或 **`ENGIN_DATA_DIR`** / **`--data-dir`** / **`--onnx`** / **`--vocab`**；含 **`nn_eval_*`** 归因字段）；**`--value-probe`** 输出固定 FEN 集上 **`Off` vs `MainLeafOnly`** 的 Markdown 对照表（见 **`docs/value-probe.md`**）；无搜索树时 `bestmove` 由 policy（若已加载且词表维匹配）或合法着首项给出 |
 
 规则逻辑始终在 **`xiangqi_core`**；`engin` 另依赖 **`ort`/`ndarray`** 做推理；`xiangqi_dataset` 仅依赖核心库。
 
