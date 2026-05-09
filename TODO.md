@@ -62,10 +62,13 @@
 
 ## P3 — `engin`：搜索 + UCI
 
-- [ ] UCI：`uci` / `isready` / `position` / `go` / `stop` / `quit` 等最小闭环
-- [ ] **Alpha-Beta** + **置换表 TT**
-- [ ] **Move ordering**（静态启发 + 日后 policy 排序接口）
-- [ ] ONNX Runtime（或约定后端）加载 P2 模型；节点上推理接口
+- [x] UCI 最小闭环：`uci`（含 **id**、**option**、**uciok**）/ `isready` / `ucinewgame` / **`setoption`**（含 **Clear Hash** 按钮项）/ `position startpos|fen …` + `moves` / `go`（`depth` `movetime` `infinite` `ponder` `nodes`）/ `stop` / `ponderhit` / `quit`；**无参数启动 `engin` 即 UCI（stdin/stdout）**
+- [x] **Alpha-Beta** + **静止搜索**（吃子延伸；被将军时全应将）+ **置换表 TT**
+- [x] **迭代加深**（`go` / `go depth`）；**movetime** / **nodes** 在搜索内检查（不再先睡眠再搜）；**infinite** 配合 **stop** 与节点内轮询
+- [x] **Move ordering**：TT + MVV-LVA + 杀手 + 根 policy logit；静止阶段仅 MVV-LVA（不吃 ONNX）
+- [x] ONNX Runtime 加载 P2 导出模型 + **单次局面推理**：`engin::PolicyOnnx`（输入名 `board`，输出 `logits` + 可选 `attack`/`danger`/`tactical`）；`cargo run -p engin -- --onnx-smoke [PATH]`；`cargo test -p engin` 在存在 `data/policy.onnx` 时起推理冒烟
+- [ ] 搜索树 **每层** policy 推理（可选，重；当前仅在根排序 + 叶子评估）
+- [x] **ONNX 契约回归**：`nn/tests/test_policy_onnx_contract.py` 校验 `data/policy.onnx` 的 I/O 名与形状（与 `export_onnx.py` 一致；**`data/` 被 gitignore**，本地放入导出文件后跑 `pytest` 即执行）
 - [ ] 与 `xiangqi_core` 走子、合法性、终局判定联调
 
 ---

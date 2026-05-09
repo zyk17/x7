@@ -13,15 +13,13 @@ pub struct VocabFile {
 
 /// 解析 JSON 字符串（测试 / 内存调用）。
 pub fn load_vocab_json_str(text: &str) -> Result<(HashMap<String, i32>, [u8; 32])> {
-    let v: VocabFile =
-        serde_json::from_str(text).context("词表 JSON 解析失败（需要 moves 数组）")?;
+    let v: VocabFile = serde_json::from_str(text).context("词表 JSON 解析失败（需要 moves 数组）")?;
     Ok(hash_vocab_moves(v.moves))
 }
 
 /// 加载词表并计算与 Python `vocab_fingerprint_ordered_moves` 一致的 SHA-256（32 字节）。
 pub fn load_vocab(path: &Path) -> Result<(HashMap<String, i32>, [u8; 32])> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("读取词表 {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("读取词表 {}", path.display()))?;
     load_vocab_json_str(&text)
 }
 
@@ -32,11 +30,7 @@ fn hash_vocab_moves(moves: Vec<String>) -> (HashMap<String, i32>, [u8; 32]) {
         hasher.update(b"\0");
     }
     let hash: [u8; 32] = hasher.finalize().into();
-    let map: HashMap<String, i32> = moves
-        .into_iter()
-        .enumerate()
-        .map(|(i, m)| (m, i as i32))
-        .collect();
+    let map: HashMap<String, i32> = moves.into_iter().enumerate().map(|(i, m)| (m, i as i32)).collect();
     (map, hash)
 }
 

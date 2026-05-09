@@ -15,7 +15,10 @@ pub fn now() -> TimePoint {
 /// boost::hash_combine 风格混合（用于杂凑种子）。
 #[inline]
 pub fn hash_combine(seed: &mut u64, v: u64) {
-    *seed ^= v.wrapping_add(0x9e3779b9).wrapping_add(*seed << 6).wrapping_add(*seed >> 2);
+    *seed ^= v
+        .wrapping_add(0x9e3779b9)
+        .wrapping_add(*seed << 6)
+        .wrapping_add(*seed >> 2);
 }
 
 // ── xorshift64* PRNG ───────────────────────────────────────────────────────────

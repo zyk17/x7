@@ -27,8 +27,17 @@
 
 ## 测试
 
-- Python：`cd nn && pytest`（无 `torch` 时跳过 NN smoke）。
-- Rust：`cargo test -p xiangqi_core`。
+- Python：`cd nn && .venv\Scripts\python.exe -m pytest`（或 `pytest`，均在 venv 下；无 `torch` 时跳过 NN smoke）。
+- Rust：`cargo test -p xiangqi_core`；`cargo test -p engin`（含 `PolicyOnnx` / FEN 平面单测；若存在 `data/policy.onnx` 则跑 ORT 推理冒烟；首编译可能经 `ort` 拉取 ONNX Runtime）。
+
+## Rust 格式与静态检查
+
+提交或合并前建议在仓库根目录执行：
+
+- **`cargo fmt --all`** — 格式规则见根目录 **`rustfmt.toml`**；仅检查可加 **`cargo fmt --all -- --check`**。
+- **`cargo clippy --workspace --all-targets`** — 消除可避免告警（本项目常规修正：`manual_contains`、`needless_range_loop`、`explicit_auto_deref`、`too_many_arguments` 等）。
+
+Python 侧无强制格式化命令；本地可用 Black/isort 等**手动**保持一致。
 
 ## 勿做
 

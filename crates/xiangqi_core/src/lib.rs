@@ -21,12 +21,8 @@ pub mod uci_format;
 
 pub use board::{global_zobrist, Position, Zobrist};
 pub use movegen::{generate, ExtMove, GenType};
-pub use types::{
-    Color, File, Key, Move, Piece, PieceType, Rank, Square, Value, MAX_MOVES as TYPES_MAX_MOVES,
-};
-pub use uci_format::{
-    move_to_uci, parse_pyffish_uci, square_to_algebraic, uci_to_move, START_FEN,
-};
+pub use types::{Color, File, Key, Move, Piece, PieceType, Rank, Square, Value, MAX_MOVES as TYPES_MAX_MOVES};
+pub use uci_format::{move_to_uci, parse_pyffish_uci, square_to_algebraic, uci_to_move, START_FEN};
 
 /// 与 pyffish 一致的 **合法着** UCI 列表（已过滤将帅照面等）。
 pub fn legal_moves_uci(pos: &Position) -> Vec<String> {

@@ -104,12 +104,7 @@ pub fn write_shard(path: &Path, vocab_hash: &[u8; 32], games: &[EncodedGame]) ->
 }
 
 /// 写出 `pack_meta.json`（与 Python 侧 `pack_meta.json` 字段风格接近）。
-pub fn write_pack_meta(
-    out_dir: &Path,
-    vocab_hash: &[u8; 32],
-    shard_count: usize,
-    source_note: &str,
-) -> Result<()> {
+pub fn write_pack_meta(out_dir: &Path, vocab_hash: &[u8; 32], shard_count: usize, source_note: &str) -> Result<()> {
     let hex: String = vocab_hash.iter().map(|b| format!("{b:02x}")).collect();
     let meta = serde_json::json!({
         "format": FORMAT_NAME,

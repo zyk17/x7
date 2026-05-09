@@ -56,12 +56,7 @@ fn jsonl_jobs_serial_equals_parallel_shards() {
     let jl = dir.path().join("many.jsonl");
     fs::write(
         &jl,
-        format!(
-            "{}\n{}\n{}\n",
-            line("game_z"),
-            line("game_a"),
-            line("game_m")
-        ),
+        format!("{}\n{}\n{}\n", line("game_z"), line("game_a"), line("game_m")),
     )
     .expect("jsonl");
 

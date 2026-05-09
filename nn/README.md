@@ -82,7 +82,7 @@ Rust 子命令与字段说明见 **`crates/xiangqi_dataset/README.md`**。
 ```bash
 cd nn
 python scripts/train/train_policy.py --train-xrsh-dir ../data/xrsh_train --val-xrsh-dir ../data/xrsh_val --vocab ../data/move_vocab.json --out ../data/checkpoints/policy.pt --device cuda --epochs 30
-python scripts/export/export_onnx.py --checkpoint ../data/checkpoints/policy.pt --out ../data/policy.onnx
+python scripts/export/export_onnx.py --checkpoint ..\data\checkpoints\policy.best.pt --out ../data/policy.onnx
 ```
 
 静态 **batch=1**，输入 `board`：`float32[1,15,10,9]`。默认训练带 **多头**，ONNX 输出 **`logits`**（`float32[1,V]`）及 **`attack` / `danger` / `tactical`**（各 `float32[1]`，**导出图中已为 sigmoid 概率**）；仅单 policy 时加训练参数 `--no-aux-heads`，导出则仅 `logits`。
@@ -115,6 +115,8 @@ pytest
 ```
 
 未安装 `torch` 时会跳过 `tests/test_nn_smoke.py`。
+
+仓库根 **`data/policy.onnx`**（gitignore）存在时，`tests/test_policy_onnx_contract.py` 会校验输出名为 **`logits` / `attack` / `danger` / `tactical`** 及 **`board`** 输入形状 **`[1,15,10,9]`**；若另装 **`onnxruntime`**，会追加一次 Runtime 全零输入冒烟。
 
 ### xiangqi_core ↔ pyffish 合法 UCI 对拍
 

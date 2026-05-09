@@ -24,8 +24,8 @@ class ResBlock(nn.Module):
 class PolicyResNet(nn.Module):
     """
     Input: [B, in_planes, 10, 9]
-    Output: ``aux_heads=False`` 时 ``[B, num_moves]`` logits；
-    ``aux_heads=True`` 时返回 ``(logits, attack, danger, tactical)``，后三者为未经 sigmoid 的标量 logit。
+    Output: 视 ``aux_heads`` / ``value_head`` 组合返回 logits 或元组；
+    辅助头为未经 sigmoid 的 logit；value 为未经 tanh 的标量 logit（训练对 ``tanh(value)`` 与目标做 MSE）。
     """
 
     def __init__(
@@ -36,9 +36,11 @@ class PolicyResNet(nn.Module):
         num_moves: int = 4096,
         *,
         aux_heads: bool = False,
+        value_head: bool = False,
     ) -> None:
         super().__init__()
         self.aux_heads = bool(aux_heads)
+        self.value_head = bool(value_head)
         self.stem = nn.Sequential(
             nn.Conv2d(in_planes, width, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(width),
@@ -51,19 +53,23 @@ class PolicyResNet(nn.Module):
             self.fc_attack = nn.Linear(width, 1)
             self.fc_danger = nn.Linear(width, 1)
             self.fc_tactical = nn.Linear(width, 1)
+        if self.value_head:
+            self.fc_value = nn.Linear(width, 1)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         h = self.blocks(self.stem(x))
         h = self.pool(h).flatten(1)
         logits = self.fc(h)
-        if not self.aux_heads:
+        if not self.aux_heads and not self.value_head:
             return logits
-        a = self.fc_attack(h).squeeze(-1)
-        d = self.fc_danger(h).squeeze(-1)
-        t = self.fc_tactical(h).squeeze(-1)
-        return logits, a, d, t
+        out: list[torch.Tensor] = [logits]
+        if self.aux_heads:
+            out.append(self.fc_attack(h).squeeze(-1))
+            out.append(self.fc_danger(h).squeeze(-1))
+            out.append(self.fc_tactical(h).squeeze(-1))
+        if self.value_head:
+            out.append(self.fc_value(h).squeeze(-1))
+        return tuple(out) if len(out) > 1 else logits
 
 
 def masked_log_softmax(logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
@@ -144,6 +150,30 @@ def aux_heads_sigmoid_mse(
     if sample_weight is not None:
         if sample_weight.shape != pred_attack.shape:
             raise ValueError("sample_weight 形状须与 pred_* 一致 [B]")
+        err = err * sample_weight
+        if reduction == "mean":
+            return err.sum() / sample_weight.sum().clamp(min=1e-8)
+        return err
+    if reduction == "mean":
+        return err.mean()
+    return err
+
+
+def value_head_tanh_mse(
+    pred_value: torch.Tensor,
+    tgt_value: torch.Tensor,
+    *,
+    sample_weight: torch.Tensor | None = None,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """``tanh(logit)`` 与 [-1,1] 目标（如 2*attack-1）的 MSE。"""
+    if reduction not in ("mean", "none"):
+        raise ValueError("reduction 须为 mean 或 none")
+    pv = torch.tanh(pred_value)
+    err = (pv - tgt_value) ** 2
+    if sample_weight is not None:
+        if sample_weight.shape != pred_value.shape:
+            raise ValueError("sample_weight 形状须与 pred_value 一致 [B]")
         err = err * sample_weight
         if reduction == "mean":
             return err.sum() / sample_weight.sum().clamp(min=1e-8)

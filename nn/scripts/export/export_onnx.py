@@ -17,7 +17,7 @@ from nn import PolicyResNet
 
 
 class PolicyOnnxExport(nn.Module):
-    """导出用包装：辅助头在图中即 sigmoid(logit)，与训练标签 [0,1] 语义一致。"""
+    """导出用包装：辅助头为 sigmoid(logit)；value 为 tanh(logit)，与引擎叶子评估一致。"""
 
     def __init__(self, inner: PolicyResNet) -> None:
         super().__init__()
@@ -25,10 +25,20 @@ class PolicyOnnxExport(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         out = self.inner(x)
-        if not self.inner.aux_heads:
+        if isinstance(out, torch.Tensor):
             return out
-        logits, a, d, t = out
-        return logits, torch.sigmoid(a), torch.sigmoid(d), torch.sigmoid(t)
+        parts = list(out)
+        logits = parts[0]
+        i = 1
+        outs: list[torch.Tensor] = [logits]
+        if self.inner.aux_heads:
+            outs.extend(
+                torch.sigmoid(parts[i + k]) for k in range(3)
+            )
+            i += 3
+        if self.inner.value_head:
+            outs.append(torch.tanh(parts[i]))
+        return tuple(outs)
 
 
 def main() -> None:
@@ -45,8 +55,15 @@ def main() -> None:
     aux_heads = bool(ckpt.get("aux_heads", False))
     if not aux_heads and "fc_attack.weight" in sd:
         aux_heads = True
+    value_head = bool(ckpt.get("value_head", False))
+    if not value_head and "fc_value.weight" in sd:
+        value_head = True
     model = PolicyResNet(
-        width=width, num_blocks=blocks, num_moves=n_moves, aux_heads=aux_heads
+        width=width,
+        num_blocks=blocks,
+        num_moves=n_moves,
+        aux_heads=aux_heads,
+        value_head=value_head,
     )
     model.load_state_dict(sd, strict=True)
     model.eval()
@@ -54,11 +71,11 @@ def main() -> None:
 
     dummy = torch.zeros(1, 15, 10, 9)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    out_names = (
-        ["logits", "attack", "danger", "tactical"]
-        if aux_heads
-        else ["logits"]
-    )
+    out_names = ["logits"]
+    if aux_heads:
+        out_names += ["attack", "danger", "tactical"]
+    if value_head:
+        out_names.append("value")
     # dynamo=False：使用 TorchScript 导出路径，无需 onnxscript（PyTorch 2.x 默认 dynamo=True）
     torch.onnx.export(
         export_mod,
@@ -69,9 +86,12 @@ def main() -> None:
         opset_version=17,
         dynamo=False,
     )
-    tail = ""
+    tail_parts: list[str] = []
     if aux_heads:
-        tail = "（attack/danger/tactical 已为 sigmoid 概率）"
+        tail_parts.append("attack/danger/tactical 已为 sigmoid 概率")
+    if value_head:
+        tail_parts.append("value 已为 tanh")
+    tail = f"（{'；'.join(tail_parts)}）" if tail_parts else ""
     print(
         f"exported -> {args.out} moves={n_moves} width={width} blocks={blocks} "
         f"outputs={out_names}{tail}"

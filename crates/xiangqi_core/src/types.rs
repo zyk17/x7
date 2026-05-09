@@ -124,16 +124,96 @@ pub const DEPTH_ENTRY_OFFSET: Depth = -3;
 #[repr(u8)]
 #[allow(non_camel_case_types)]
 pub enum Square {
-    SQ_A0, SQ_B0, SQ_C0, SQ_D0, SQ_E0, SQ_F0, SQ_G0, SQ_H0, SQ_I0,
-    SQ_A1, SQ_B1, SQ_C1, SQ_D1, SQ_E1, SQ_F1, SQ_G1, SQ_H1, SQ_I1,
-    SQ_A2, SQ_B2, SQ_C2, SQ_D2, SQ_E2, SQ_F2, SQ_G2, SQ_H2, SQ_I2,
-    SQ_A3, SQ_B3, SQ_C3, SQ_D3, SQ_E3, SQ_F3, SQ_G3, SQ_H3, SQ_I3,
-    SQ_A4, SQ_B4, SQ_C4, SQ_D4, SQ_E4, SQ_F4, SQ_G4, SQ_H4, SQ_I4,
-    SQ_A5, SQ_B5, SQ_C5, SQ_D5, SQ_E5, SQ_F5, SQ_G5, SQ_H5, SQ_I5,
-    SQ_A6, SQ_B6, SQ_C6, SQ_D6, SQ_E6, SQ_F6, SQ_G6, SQ_H6, SQ_I6,
-    SQ_A7, SQ_B7, SQ_C7, SQ_D7, SQ_E7, SQ_F7, SQ_G7, SQ_H7, SQ_I7,
-    SQ_A8, SQ_B8, SQ_C8, SQ_D8, SQ_E8, SQ_F8, SQ_G8, SQ_H8, SQ_I8,
-    SQ_A9, SQ_B9, SQ_C9, SQ_D9, SQ_E9, SQ_F9, SQ_G9, SQ_H9, SQ_I9,
+    SQ_A0,
+    SQ_B0,
+    SQ_C0,
+    SQ_D0,
+    SQ_E0,
+    SQ_F0,
+    SQ_G0,
+    SQ_H0,
+    SQ_I0,
+    SQ_A1,
+    SQ_B1,
+    SQ_C1,
+    SQ_D1,
+    SQ_E1,
+    SQ_F1,
+    SQ_G1,
+    SQ_H1,
+    SQ_I1,
+    SQ_A2,
+    SQ_B2,
+    SQ_C2,
+    SQ_D2,
+    SQ_E2,
+    SQ_F2,
+    SQ_G2,
+    SQ_H2,
+    SQ_I2,
+    SQ_A3,
+    SQ_B3,
+    SQ_C3,
+    SQ_D3,
+    SQ_E3,
+    SQ_F3,
+    SQ_G3,
+    SQ_H3,
+    SQ_I3,
+    SQ_A4,
+    SQ_B4,
+    SQ_C4,
+    SQ_D4,
+    SQ_E4,
+    SQ_F4,
+    SQ_G4,
+    SQ_H4,
+    SQ_I4,
+    SQ_A5,
+    SQ_B5,
+    SQ_C5,
+    SQ_D5,
+    SQ_E5,
+    SQ_F5,
+    SQ_G5,
+    SQ_H5,
+    SQ_I5,
+    SQ_A6,
+    SQ_B6,
+    SQ_C6,
+    SQ_D6,
+    SQ_E6,
+    SQ_F6,
+    SQ_G6,
+    SQ_H6,
+    SQ_I6,
+    SQ_A7,
+    SQ_B7,
+    SQ_C7,
+    SQ_D7,
+    SQ_E7,
+    SQ_F7,
+    SQ_G7,
+    SQ_H7,
+    SQ_I7,
+    SQ_A8,
+    SQ_B8,
+    SQ_C8,
+    SQ_D8,
+    SQ_E8,
+    SQ_F8,
+    SQ_G8,
+    SQ_H8,
+    SQ_I8,
+    SQ_A9,
+    SQ_B9,
+    SQ_C9,
+    SQ_D9,
+    SQ_E9,
+    SQ_F9,
+    SQ_G9,
+    SQ_H9,
+    SQ_I9,
 }
 
 pub const SQUARE_ZERO: usize = 0;
@@ -161,7 +241,15 @@ impl Square {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum File {
-    FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileI,
+    FileA,
+    FileB,
+    FileC,
+    FileD,
+    FileE,
+    FileF,
+    FileG,
+    FileH,
+    FileI,
 }
 
 pub const FILE_NB: usize = 9;
@@ -181,7 +269,16 @@ impl File {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Rank {
-    Rank0, Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, Rank9,
+    Rank0,
+    Rank1,
+    Rank2,
+    Rank3,
+    Rank4,
+    Rank5,
+    Rank6,
+    Rank7,
+    Rank8,
+    Rank9,
 }
 
 pub const RANK_NB: usize = 10;
@@ -233,7 +330,9 @@ pub const fn make_square(f: File, r: Rank) -> Square {
 
 /// Mirror rank: A0 ↔ A9
 pub const fn flip_rank(s: Square) -> Square {
-    make_square(file_of(s), unsafe { std::mem::transmute(RANK_NB as u8 - 1 - rank_of(s) as u8) })
+    make_square(file_of(s), unsafe {
+        std::mem::transmute(RANK_NB as u8 - 1 - rank_of(s) as u8)
+    })
 }
 
 /// Mirror file: A0 ↔ I0
@@ -257,8 +356,8 @@ pub enum PieceType {
     Knight,
     Bishop,
     King,
-    KnightTo,  // special: "by knight" direction for path checking
-    PawnTo,    // special: "pawn attack to" direction
+    KnightTo, // special: "by knight" direction for path checking
+    PawnTo,   // special: "pawn attack to" direction
 }
 
 pub const PIECE_TYPE_NB: usize = 8;
@@ -292,17 +391,33 @@ impl Piece {
     pub const B_BISHOP: Piece = Piece(14);
     pub const B_KING: Piece = Piece(15);
 
-    pub fn to_usize(self) -> usize { self.0 as usize }
-    pub fn to_u8(self) -> u8 { self.0 }
+    pub fn to_usize(self) -> usize {
+        self.0 as usize
+    }
+    pub fn to_u8(self) -> u8 {
+        self.0
+    }
 }
 
 pub const PIECE_NB: usize = 16;
 
 pub const PIECE_VALUE: [Value; PIECE_NB] = [
-    VALUE_ZERO, ROOK_VALUE, ADVISOR_VALUE, CANNON_VALUE,
-    PAWN_VALUE, KNIGHT_VALUE, BISHOP_VALUE, VALUE_ZERO,
-    VALUE_ZERO, ROOK_VALUE, ADVISOR_VALUE, CANNON_VALUE,
-    PAWN_VALUE, KNIGHT_VALUE, BISHOP_VALUE, VALUE_ZERO,
+    VALUE_ZERO,
+    ROOK_VALUE,
+    ADVISOR_VALUE,
+    CANNON_VALUE,
+    PAWN_VALUE,
+    KNIGHT_VALUE,
+    BISHOP_VALUE,
+    VALUE_ZERO,
+    VALUE_ZERO,
+    ROOK_VALUE,
+    ADVISOR_VALUE,
+    CANNON_VALUE,
+    PAWN_VALUE,
+    KNIGHT_VALUE,
+    BISHOP_VALUE,
+    VALUE_ZERO,
 ];
 
 pub const fn make_piece(c: Color, pt: PieceType) -> Piece {
@@ -369,6 +484,11 @@ impl Move {
 
     pub const fn raw(self) -> u16 {
         self.0
+    }
+
+    /// 从 `raw()` 编码还原（如置换表条目）；不校验格子范围。
+    pub const fn from_raw(raw: u16) -> Self {
+        Move(raw)
     }
 }
 

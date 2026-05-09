@@ -33,9 +33,12 @@ pytest
 
 ```bash
 cargo build -p xiangqi_core
-cargo run -p engin              # 用户侧 UCI 引擎（当前占位）
+cargo run -p engin                   # **UCI**：自 stdin 读协议（GUI 对弈）；`setoption name PolicyFile value …` / `VocabFile value …` 可接 ONNX + `move_vocab.json` 用 policy 选着
+cargo run -p engin -- --onnx-smoke   # 加载 data/policy.onnx 对起始局面推理（路径见 --help）
 cargo run -p xiangqi_dataset    # 训练侧数据集/标注 CLI（当前占位）
 ```
+
+（`cargo run` 传给**二进制**的参数必须写在 **`--` 之后**；若写 `cargo run --onnx-smoke` 会被当成 Cargo 自己的选项而报错。）
 
 **当前优先**：见根目录 **`TODO.md`**「推进顺序」。规则实现已在 **`xiangqi_core`**（合法着、perft）；下一步重点是 **与 pyffish / Pikafish 行为对拍**，再放心大规模造数；棋谱规则边界可参考本地 **`c:\projects\Pikafish`**、结构对齐 **`c:\projects\pikafish-rust`**（不纳入本仓库）。
 

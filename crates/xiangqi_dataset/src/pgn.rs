@@ -111,20 +111,14 @@ pub fn pgn_format(headers: &std::collections::HashMap<String, String>) -> String
 /// 与 Python 一致：以 `[Event` 作为新对局起点。
 pub fn read_pgn_games(raw: &str) -> Vec<ParsedGame> {
     let raw = raw.replace("\r\n", "\n").replace('\r', "\n");
-    let event_starts: Vec<usize> = event_line_re()
-        .find_iter(&raw)
-        .map(|m| m.start())
-        .collect();
+    let event_starts: Vec<usize> = event_line_re().find_iter(&raw).map(|m| m.start()).collect();
     if event_starts.is_empty() {
         return Vec::new();
     }
     let mut games = Vec::new();
     for i in 0..event_starts.len() {
         let start = event_starts[i];
-        let end = event_starts
-            .get(i + 1)
-            .copied()
-            .unwrap_or(raw.len());
+        let end = event_starts.get(i + 1).copied().unwrap_or(raw.len());
         let chunk = raw[start..end].trim();
         if let Some(g) = parse_one_game_chunk(chunk) {
             games.push(g);

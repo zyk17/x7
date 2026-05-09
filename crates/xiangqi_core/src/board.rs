@@ -139,9 +139,17 @@ pub fn between_bb(a: Square, b: Square) -> Bitboard {
 
     if ok_rook {
         let d = if rank_of(a) == rank_of(b) {
-            if file_of(b) as i32 > file_of(a) as i32 { EAST } else { WEST }
+            if file_of(b) as i32 > file_of(a) as i32 {
+                EAST
+            } else {
+                WEST
+            }
         } else if file_of(a) == file_of(b) {
-            if rank_of(b) as i32 > rank_of(a) as i32 { NORTH } else { SOUTH }
+            if rank_of(b) as i32 > rank_of(a) as i32 {
+                NORTH
+            } else {
+                SOUTH
+            }
         } else {
             0
         };
@@ -202,11 +210,17 @@ pub fn rook_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
         let mut s = sq as i32;
         loop {
             s += dir;
-            if s < 0 || s >= SQUARE_NB as i32 { break; }
+            if s < 0 || s >= SQUARE_NB as i32 {
+                break;
+            }
             let cur: Square = unsafe { std::mem::transmute(s as u8) };
-            if !is_valid_step(unsafe { std::mem::transmute((s - dir) as u8) }, cur) { break; }
+            if !is_valid_step(unsafe { std::mem::transmute((s - dir) as u8) }, cur) {
+                break;
+            }
             att |= square_bb(cur);
-            if occupied & square_bb(cur) != 0 { break; }
+            if occupied & square_bb(cur) != 0 {
+                break;
+            }
         }
     }
     att
@@ -225,9 +239,13 @@ pub fn cannon_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
         let mut s = sq as i32;
         loop {
             s += dir;
-            if s < 0 || s >= SQUARE_NB as i32 { break; }
+            if s < 0 || s >= SQUARE_NB as i32 {
+                break;
+            }
             let cur: Square = unsafe { std::mem::transmute(s as u8) };
-            if !is_valid_step(unsafe { std::mem::transmute((s - dir) as u8) }, cur) { break; }
+            if !is_valid_step(unsafe { std::mem::transmute((s - dir) as u8) }, cur) {
+                break;
+            }
 
             if occupied & square_bb(cur) != 0 {
                 if !hurdle {
@@ -249,9 +267,13 @@ pub fn knight_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let mut att = 0u128;
     for &dir in &KNIGHT_DIRS {
         let to_val = sq as i32 + dir;
-        if to_val < 0 || to_val >= SQUARE_NB as i32 { continue; }
+        if to_val < 0 || to_val >= SQUARE_NB as i32 {
+            continue;
+        }
         let to: Square = unsafe { std::mem::transmute(to_val as u8) };
-        if sq_distance(sq, to) > 2 { continue; }
+        if sq_distance(sq, to) > 2 {
+            continue;
+        }
         let block = knight_block_square(sq, dir as i8);
         if block & occupied == 0 {
             att |= square_bb(to);
@@ -280,9 +302,13 @@ pub fn bishop_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
 
     for &dir in &BISHOP_DIRS {
         let to_val = sq as i32 + dir;
-        if to_val < 0 || to_val >= SQUARE_NB as i32 { continue; }
+        if to_val < 0 || to_val >= SQUARE_NB as i32 {
+            continue;
+        }
         let to: Square = unsafe { std::mem::transmute(to_val as u8) };
-        if sq_distance(sq, to) > 2 { continue; }
+        if sq_distance(sq, to) > 2 {
+            continue;
+        }
         let block = knight_block_square(sq, dir as i8);
         if block & occupied == 0 {
             att |= square_bb(to);
@@ -301,7 +327,9 @@ pub fn king_attacks(sq: Square) -> Bitboard {
     let mut att = 0u128;
     for &step in &[NORTH, SOUTH, EAST, WEST] {
         let to_val = sq as i32 + step;
-        if to_val < 0 || to_val >= SQUARE_NB as i32 { continue; }
+        if to_val < 0 || to_val >= SQUARE_NB as i32 {
+            continue;
+        }
         let to: Square = unsafe { std::mem::transmute(to_val as u8) };
         if is_valid_step(sq, to) && is_in_palace(to) {
             att |= square_bb(to);
@@ -315,7 +343,9 @@ pub fn advisor_attacks(sq: Square) -> Bitboard {
     let mut att = 0u128;
     for &step in &[NORTH_EAST, SOUTH_EAST, SOUTH_WEST, NORTH_WEST] {
         let to_val = sq as i32 + step;
-        if to_val < 0 || to_val >= SQUARE_NB as i32 { continue; }
+        if to_val < 0 || to_val >= SQUARE_NB as i32 {
+            continue;
+        }
         let to: Square = unsafe { std::mem::transmute(to_val as u8) };
         if is_valid_step(sq, to) && is_in_palace(to) {
             att |= square_bb(to);
@@ -384,10 +414,20 @@ impl Zobrist {
         let mut psq = [[0u64; SQUARE_NB]; PIECE_NB];
         // Only iterate over valid piece values (skip NO_PIECE=0 and the gap at 8)
         let valid_pieces: [Piece; 14] = [
-            Piece::W_ROOK, Piece::W_ADVISOR, Piece::W_CANNON,
-            Piece::W_PAWN, Piece::W_KNIGHT, Piece::W_BISHOP, Piece::W_KING,
-            Piece::B_ROOK, Piece::B_ADVISOR, Piece::B_CANNON,
-            Piece::B_PAWN, Piece::B_KNIGHT, Piece::B_BISHOP, Piece::B_KING,
+            Piece::W_ROOK,
+            Piece::W_ADVISOR,
+            Piece::W_CANNON,
+            Piece::W_PAWN,
+            Piece::W_KNIGHT,
+            Piece::W_BISHOP,
+            Piece::W_KING,
+            Piece::B_ROOK,
+            Piece::B_ADVISOR,
+            Piece::B_CANNON,
+            Piece::B_PAWN,
+            Piece::B_KNIGHT,
+            Piece::B_BISHOP,
+            Piece::B_KING,
         ];
         for &pc in &valid_pieces {
             let pc_val = pc.0 as usize;
@@ -697,9 +737,8 @@ impl Position {
         let occupied = self.occupancy();
 
         // Hollow cannon detection
-        self.state.need_full_check =
-            self.checkers() != 0
-                || (rook_attacks(self.king_square(us), 0) & self.pieces_c_pt(them, PieceType::Cannon) != 0);
+        self.state.need_full_check = self.checkers() != 0
+            || (rook_attacks(self.king_square(us), 0) & self.pieces_c_pt(them, PieceType::Cannon) != 0);
 
         // Check squares: from opponent king's perspective, where would each piece type give check?
         self.state.check_squares[PieceType::Pawn as usize] = {
@@ -750,8 +789,7 @@ impl Position {
         self.state.check_squares[PieceType::Bishop as usize] = 0;
 
         // Hollow cannon discovery squares
-        let hollow = self.state.check_squares[PieceType::Rook as usize]
-            & self.pieces_c_pt(us, PieceType::Cannon);
+        let hollow = self.state.check_squares[PieceType::Rook as usize] & self.pieces_c_pt(us, PieceType::Cannon);
         if hollow != 0 {
             let mut h = hollow;
             let mut discover = 0u128;
@@ -781,7 +819,10 @@ impl Position {
         let snipers = {
             let rook_att = rook_attacks(ksq, 0);
             let knight_att = knight_attacks(ksq, 0);
-            (rook_att & (self.piece_type_bb(PieceType::Rook) | self.piece_type_bb(PieceType::Cannon) | self.piece_type_bb(PieceType::King)))
+            (rook_att
+                & (self.piece_type_bb(PieceType::Rook)
+                    | self.piece_type_bb(PieceType::Cannon)
+                    | self.piece_type_bb(PieceType::King)))
                 | (knight_att & self.piece_type_bb(PieceType::Knight))
         } & self.color_bb(them);
 
@@ -863,9 +904,7 @@ impl Position {
 
         // Direct check
         if pt == PieceType::Cannon {
-            if self.state.check_squares[PieceType::Rook as usize] & square_bb(from) != 0
-                && aligned(from, to, ksq)
-            {
+            if self.state.check_squares[PieceType::Rook as usize] & square_bb(from) != 0 && aligned(from, to, ksq) {
                 if self.piece_on(to) != Piece::NO_PIECE {
                     // Capture: check if to is between the cannon and king
                     let ray = between_bb(ksq, from);
@@ -903,8 +942,10 @@ impl Position {
 
         assert!(pc != Piece::NO_PIECE);
         assert!(color_of(pc) == us);
-        assert!(captured == Piece::NO_PIECE || type_of(captured) != PieceType::King,
-            "Cannot capture the king!");
+        assert!(
+            captured == Piece::NO_PIECE || type_of(captured) != PieceType::King,
+            "Cannot capture the king!"
+        );
 
         // ── Snapshot old state values before modifying self.state ──
         let old_st = self.state.clone();
@@ -961,8 +1002,7 @@ impl Position {
         self.move_piece(from, to);
 
         // ── Update Zobrist keys ──
-        self.state.key ^= self.zobrist.psq[pc.0 as usize][from as usize]
-            ^ self.zobrist.psq[pc.0 as usize][to as usize];
+        self.state.key ^= self.zobrist.psq[pc.0 as usize][from as usize] ^ self.zobrist.psq[pc.0 as usize][to as usize];
         if captured != Piece::NO_PIECE {
             self.state.key ^= self.zobrist.psq[captured.0 as usize][to as usize];
         }
@@ -971,33 +1011,27 @@ impl Position {
         // Update pawn/minor/non-pawn keys
         if type_of(pc) == PieceType::Pawn {
             self.state.pawn_key ^=
-                self.zobrist.psq[pc.0 as usize][from as usize]
-                ^ self.zobrist.psq[pc.0 as usize][to as usize];
+                self.zobrist.psq[pc.0 as usize][from as usize] ^ self.zobrist.psq[pc.0 as usize][to as usize];
             if captured != Piece::NO_PIECE && type_of(captured) == PieceType::Pawn {
                 self.state.pawn_key ^= self.zobrist.psq[captured.0 as usize][to as usize];
             }
         } else {
             self.state.non_pawn_key[us as usize] ^=
-                self.zobrist.psq[pc.0 as usize][from as usize]
-                ^ self.zobrist.psq[pc.0 as usize][to as usize];
+                self.zobrist.psq[pc.0 as usize][from as usize] ^ self.zobrist.psq[pc.0 as usize][to as usize];
             if type_of(pc) as u8 & 1 != 0 && type_of(pc) != PieceType::Rook {
                 self.state.minor_piece_key ^=
-                    self.zobrist.psq[pc.0 as usize][from as usize]
-                    ^ self.zobrist.psq[pc.0 as usize][to as usize];
+                    self.zobrist.psq[pc.0 as usize][from as usize] ^ self.zobrist.psq[pc.0 as usize][to as usize];
             }
         }
         if captured != Piece::NO_PIECE {
             if type_of(captured) == PieceType::Pawn {
                 self.state.pawn_key ^= self.zobrist.psq[captured.0 as usize][to as usize];
             } else {
-                self.state.non_pawn_key[them as usize] ^=
-                    self.zobrist.psq[captured.0 as usize][to as usize];
+                self.state.non_pawn_key[them as usize] ^= self.zobrist.psq[captured.0 as usize][to as usize];
                 if type_of(captured) as u8 & 1 != 0 {
-                    self.state.major_material[them as usize] -=
-                        PIECE_VALUE[captured.0 as usize];
+                    self.state.major_material[them as usize] -= PIECE_VALUE[captured.0 as usize];
                     if type_of(captured) != PieceType::Rook {
-                        self.state.minor_piece_key ^=
-                            self.zobrist.psq[captured.0 as usize][to as usize];
+                        self.state.minor_piece_key ^= self.zobrist.psq[captured.0 as usize][to as usize];
                     }
                 }
             }
@@ -1054,7 +1088,9 @@ impl Position {
     }
 
     pub fn move_piece(&mut self, from: Square, to: Square) {
-        if from == to { return; }  // No-op, or error
+        if from == to {
+            return;
+        } // No-op, or error
         let pc = self.board[from as usize];
         self.board[from as usize] = Piece::NO_PIECE;
         self.board[to as usize] = pc;
@@ -1090,10 +1126,9 @@ impl Position {
                         return Err(format!("Invalid FEN: unknown piece '{}'", ch));
                     }
                     let pc: Piece = unsafe { std::mem::transmute(idx as u8) };
-                    let sq = make_square(
-                        unsafe { std::mem::transmute(file as u8) },
-                        unsafe { std::mem::transmute(rank as u8) },
-                    );
+                    let sq = make_square(unsafe { std::mem::transmute(file as u8) }, unsafe {
+                        std::mem::transmute(rank as u8)
+                    });
                     self.put_piece(pc, sq);
                     file += 1;
                 } else {

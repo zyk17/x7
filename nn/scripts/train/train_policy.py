@@ -35,6 +35,7 @@ from nn.model import (
     PolicyResNet,
     aux_heads_sigmoid_mse,
     policy_cross_entropy,
+    value_head_tanh_mse,
 )
 from nn.xrsh_io import xrsh_dir_is_complete
 
@@ -43,12 +44,18 @@ _LABEL_SMOOTHING = 0.08
 _WARMUP_EPOCHS = 1
 _MIN_LR = 1e-5
 _AUX_LOSS_WEIGHT = 0.1
-_AUX_HEAD_PREFIXES = ("fc_attack.", "fc_danger.", "fc_tactical.")
+_VALUE_LOSS_WEIGHT = 0.5
+_OPTIONAL_HEAD_PREFIXES = (
+    "fc_attack.",
+    "fc_danger.",
+    "fc_tactical.",
+    "fc_value.",
+)
 
 
-def _missing_keys_are_aux_only(missing_keys: list[str]) -> bool:
+def _missing_keys_are_optional_heads_only(missing_keys: list[str]) -> bool:
     return all(
-        any(k.startswith(p) for p in _AUX_HEAD_PREFIXES) for k in missing_keys
+        any(k.startswith(p) for p in _OPTIONAL_HEAD_PREFIXES) for k in missing_keys
     )
 
 
@@ -61,9 +68,11 @@ def _load_policy_state_dict(model: PolicyResNet, raw: dict[str, object]) -> None
         if not model.aux_heads:
             raise
         inc = model.load_state_dict(raw, strict=False)
-        if inc.missing_keys and not _missing_keys_are_aux_only(list(inc.missing_keys)):
+        if inc.missing_keys and not _missing_keys_are_optional_heads_only(
+            list(inc.missing_keys)
+        ):
             raise RuntimeError(
-                "checkpoint 与当前模型结构不兼容（缺失键不仅是 fc_attack/fc_danger/fc_tactical）："
+                "checkpoint 与当前模型结构不兼容（缺失键不仅是可选头 fc_* / fc_value）："
                 f" {list(inc.missing_keys)}"
             ) from None
         if inc.missing_keys:
@@ -75,7 +84,21 @@ def _load_policy_state_dict(model: PolicyResNet, raw: dict[str, object]) -> None
             print(f"checkpoint 非严格加载：忽略未知键: {list(inc.unexpected_keys)}")
 
 
-def unpack_train_batch(batch: tuple[Any, ...], *, aux_heads: bool) -> dict[str, Any]:
+def unpack_train_batch(
+    batch: tuple[Any, ...], *, aux_heads: bool, value_head: bool
+) -> dict[str, Any]:
+    if aux_heads and value_head:
+        b, m, t, w, ta, td, tt, tv = batch
+        return {
+            "boards": b,
+            "masks": m,
+            "targets": t,
+            "weights": w,
+            "t_atk": ta,
+            "t_dan": td,
+            "t_tac": tt,
+            "t_val": tv,
+        }
     if aux_heads:
         b, m, t, w, ta, td, tt = batch
         return {
@@ -91,7 +114,23 @@ def unpack_train_batch(batch: tuple[Any, ...], *, aux_heads: bool) -> dict[str, 
     return {"boards": b, "masks": m, "targets": t, "weights": w}
 
 
-def unpack_val_batch(batch: tuple[Any, ...], *, aux_heads: bool) -> dict[str, Any]:
+def unpack_val_batch(
+    batch: tuple[Any, ...], *, aux_heads: bool, value_head: bool
+) -> dict[str, Any]:
+    if aux_heads and value_head:
+        b, m, t, w, ta, td, tt, tv, pl, sid = batch
+        return {
+            "boards": b,
+            "masks": m,
+            "targets": t,
+            "weights": w,
+            "t_atk": ta,
+            "t_dan": td,
+            "t_tac": tt,
+            "t_val": tv,
+            "plies": pl,
+            "src_ids": sid,
+        }
     if aux_heads:
         b, m, t, w, ta, td, tt, pl, sid = batch
         return {
@@ -231,6 +270,17 @@ def main() -> None:
         default=_AUX_LOSS_WEIGHT,
         help="辅助头 MSE 相对 policy CE 的权重",
     )
+    ap.add_argument(
+        "--value-head",
+        action="store_true",
+        help="训练 value 头（tanh 后 ∈[-1,1]，监督为 2*attack-1；需开启辅助头）",
+    )
+    ap.add_argument(
+        "--value-loss-weight",
+        type=float,
+        default=_VALUE_LOSS_WEIGHT,
+        help="value MSE 相对 policy CE 的权重",
+    )
     ap.add_argument("--device", default="cuda")
     ap.add_argument(
         "--num-workers",
@@ -239,6 +289,11 @@ def main() -> None:
         help="DataLoader worker 数；遇 Windows 多进程问题可改为 0",
     )
     args = ap.parse_args()
+
+    if args.value_head and args.no_aux_heads:
+        raise SystemExit(
+            "--value-head 与辅助头共用数据路径（attack 伪标），不能与 --no-aux-heads 同时使用"
+        )
 
     random.seed(_TRAIN_SEED)
     torch.manual_seed(_TRAIN_SEED)
@@ -266,12 +321,14 @@ def main() -> None:
         raise FileNotFoundError(f"--val-xrsh-dir 不完整: {args.val_xrsh_dir}")
 
     aux_heads = not bool(args.no_aux_heads)
+    value_head = bool(args.value_head)
 
     train_ds = PolicyXrshDataset(
         args.train_xrsh_dir,
         move_to_idx,
         for_training=True,
         with_aux_labels=aux_heads,
+        with_value_labels=value_head,
     )
     val_ds = PolicyXrshDataset(
         args.val_xrsh_dir,
@@ -279,6 +336,7 @@ def main() -> None:
         for_training=False,
         with_row_meta=True,
         with_aux_labels=aux_heads,
+        with_value_labels=value_head,
     )
 
     print(f"train rows={len(train_ds)} val rows={len(val_ds)} vocab={n_moves}")
@@ -297,6 +355,11 @@ def main() -> None:
         )
     else:
         print("aux heads: 关闭（仅 policy）")
+    if value_head:
+        print(
+            f"value head: tanh MSE vs 2*attack-1 | "
+            f"value_loss_weight={float(args.value_loss_weight)}"
+        )
 
     nw = args.num_workers
     pm = device.type == "cuda"
@@ -337,6 +400,7 @@ def main() -> None:
         num_blocks=args.blocks,
         num_moves=n_moves,
         aux_heads=aux_heads,
+        value_head=value_head,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"parameters={n_params:,} (~{n_params * 4 / 1e6:.2f} MiB fp32 权重)")
@@ -350,6 +414,13 @@ def main() -> None:
         _assert_ckpt_compatible(
             ckpt, moves=moves, n_moves=n_moves, width=args.width, blocks=args.blocks
         )
+        ck_vh = bool(ckpt.get("value_head", False))
+        if ck_vh and not value_head:
+            raise SystemExit(
+                "checkpoint 含 value 头，续训请加上 --value-head（与保存结构一致）"
+            )
+        if not ck_vh and value_head:
+            print("提示: checkpoint 无 value 头，fc_value 将随机初始化")
         _load_policy_state_dict(model, ckpt["model"])
         start_epoch = int(ckpt.get("completed_epochs", 0))
         print(
@@ -393,7 +464,9 @@ def main() -> None:
         total = 0.0
         w_sum = 0.0
         for batch in tqdm(train_loader, desc=f"epoch {epoch+1}/{end_epoch} train"):
-            bt = unpack_train_batch(batch, aux_heads=aux_heads)
+            bt = unpack_train_batch(
+                batch, aux_heads=aux_heads, value_head=value_head
+            )
             boards = bt["boards"].to(device, non_blocking=pm)
             masks = bt["masks"].to(device, non_blocking=pm)
             targets = bt["targets"].to(device, non_blocking=pm)
@@ -402,16 +475,26 @@ def main() -> None:
                 t_atk = bt["t_atk"].to(device, non_blocking=pm)
                 t_dan = bt["t_dan"].to(device, non_blocking=pm)
                 t_tac = bt["t_tac"].to(device, non_blocking=pm)
+            if value_head:
+                t_val = bt["t_val"].to(device, non_blocking=pm)
             out = model(boards)
-            if aux_heads:
+            if aux_heads and value_head:
+                logits, p_atk, p_dan, p_tac, p_val = out
+            elif aux_heads:
                 logits, p_atk, p_dan, p_tac = out
-                loss_p = policy_cross_entropy(
-                    logits,
-                    targets,
-                    masks,
-                    label_smoothing=_LABEL_SMOOTHING,
-                    sample_weight=weights,
-                )
+            elif value_head:
+                logits, p_val = out
+            else:
+                logits = out
+            loss_p = policy_cross_entropy(
+                logits,
+                targets,
+                masks,
+                label_smoothing=_LABEL_SMOOTHING,
+                sample_weight=weights,
+            )
+            loss = loss_p
+            if aux_heads:
                 loss_a = aux_heads_sigmoid_mse(
                     p_atk,
                     p_dan,
@@ -421,16 +504,12 @@ def main() -> None:
                     t_tac,
                     sample_weight=weights,
                 )
-                loss = loss_p + float(args.aux_loss_weight) * loss_a
-            else:
-                logits = out
-                loss = policy_cross_entropy(
-                    logits,
-                    targets,
-                    masks,
-                    label_smoothing=_LABEL_SMOOTHING,
-                    sample_weight=weights,
+                loss = loss + float(args.aux_loss_weight) * loss_a
+            if value_head:
+                loss_v = value_head_tanh_mse(
+                    p_val, t_val, sample_weight=weights
                 )
+                loss = loss + float(args.value_loss_weight) * loss_v
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -445,10 +524,13 @@ def main() -> None:
         vcount = 0
         correct = 0
         v_aux = 0.0
+        v_val = 0.0
         val_metrics = ValMetricsState()
         with torch.no_grad():
             for batch in val_loader:
-                bv = unpack_val_batch(batch, aux_heads=aux_heads)
+                bv = unpack_val_batch(
+                    batch, aux_heads=aux_heads, value_head=value_head
+                )
                 boards = bv["boards"].to(device, non_blocking=pm)
                 masks = bv["masks"].to(device, non_blocking=pm)
                 targets = bv["targets"].to(device, non_blocking=pm)
@@ -459,9 +541,18 @@ def main() -> None:
                     t_atk = bv["t_atk"].to(device, non_blocking=pm)
                     t_dan = bv["t_dan"].to(device, non_blocking=pm)
                     t_tac = bv["t_tac"].to(device, non_blocking=pm)
+                if value_head:
+                    t_val = bv["t_val"].to(device, non_blocking=pm)
                 out = model(boards)
-                if aux_heads:
+                if aux_heads and value_head:
+                    logits, p_atk, p_dan, p_tac, p_val = out
+                elif aux_heads:
                     logits, p_atk, p_dan, p_tac = out
+                elif value_head:
+                    logits, p_val = out
+                else:
+                    logits = out
+                if aux_heads:
                     v_aux += (
                         aux_heads_sigmoid_mse(
                             p_atk,
@@ -474,8 +565,13 @@ def main() -> None:
                         ).item()
                         * boards.size(0)
                     )
-                else:
-                    logits = out
+                if value_head:
+                    v_val += (
+                        value_head_tanh_mse(
+                            p_val, t_val, sample_weight=wvb
+                        ).item()
+                        * boards.size(0)
+                    )
                 loss = policy_cross_entropy(
                     logits,
                     targets,
@@ -491,7 +587,9 @@ def main() -> None:
         val_mean = vloss / max(1, vcount)
         aux_tail = ""
         if aux_heads and vcount > 0:
-            aux_tail = f" | val_aux_mse {v_aux / vcount:.4f}"
+            aux_tail += f" | val_aux_mse {v_aux / vcount:.4f}"
+        if value_head and vcount > 0:
+            aux_tail += f" | val_value_mse {v_val / vcount:.4f}"
         print(
             f"val loss {val_mean:.4f} acc {correct / max(1, vcount):.4f}{aux_tail}"
         )
@@ -511,7 +609,9 @@ def main() -> None:
             "n_moves": n_moves,
             "moves": moves,
             "aux_heads": aux_heads,
+            "value_head": value_head,
             "aux_loss_weight": float(args.aux_loss_weight),
+            "value_loss_weight": float(args.value_loss_weight),
             "completed_epochs": epoch + 1,
             "lr_schedule_epochs": lr_schedule_epochs,
             "optimizer": opt.state_dict(),

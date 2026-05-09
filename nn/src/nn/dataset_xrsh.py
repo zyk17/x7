@@ -53,6 +53,7 @@ class PolicyXrshDataset(Dataset):
         for_training: bool = False,
         with_row_meta: bool = False,
         with_aux_labels: bool = False,
+        with_value_labels: bool = False,
     ) -> None:
         self.root = Path(xrsh_dir)
         if not xrsh_dir_is_complete(self.root):
@@ -69,6 +70,7 @@ class PolicyXrshDataset(Dataset):
         self.for_training = for_training
         self.with_row_meta = with_row_meta
         self.with_aux_labels = bool(with_aux_labels)
+        self.with_value_labels = bool(with_value_labels)
         self.aug_mirror_p = _TRAIN_MIRROR_PROB if for_training else 0.0
 
         self._idx_to_move: list[str] = [""] * self.vocab_size
@@ -132,7 +134,8 @@ class PolicyXrshDataset(Dataset):
         ]
 
         atk0, dan0, tac0 = (0.5, 0.5, 0.5)
-        if self.with_aux_labels:
+        need_aux_like = self.with_aux_labels or self.with_value_labels
+        if need_aux_like:
             if (
                 "aux_attack" in row
                 and "aux_danger" in row
@@ -148,6 +151,7 @@ class PolicyXrshDataset(Dataset):
                     uci_prefix=pfx0,
                     legal_uci=legal_uci0,
                 )
+        v0 = float(2.0 * atk0 - 1.0) if self.with_value_labels else 0.0
 
         w0 = 1.0
         if self.position_weight_by_fen is not None:
@@ -177,7 +181,7 @@ class PolicyXrshDataset(Dataset):
                         if not mask_m[ti_m]:
                             use_mirror = False
                         else:
-                            if self.with_aux_labels:
+                            if need_aux_like:
                                 # 水平镜像不改变物质差、合法着数与「合法着吃子占比」启发 → 与分片内 Rust 标量一致。
                                 # 仅在无预计算（旧 v1）时回退 pyffish。
                                 if (
@@ -200,6 +204,7 @@ class PolicyXrshDataset(Dataset):
                                     )
                             else:
                                 atk_m, dan_m, tac_m = (atk0, dan0, tac0)
+                            v_m = float(2.0 * atk_m - 1.0) if self.with_value_labels else 0.0
                             out = (
                                 board_m,
                                 mask_m,
@@ -213,6 +218,8 @@ class PolicyXrshDataset(Dataset):
                                     torch.tensor(dan_m, dtype=torch.float32),
                                     torch.tensor(tac_m, dtype=torch.float32),
                                 )
+                            if self.with_value_labels:
+                                out = (*out, torch.tensor(v_m, dtype=torch.float32))
                             if self.with_row_meta:
                                 return (
                                     *out,
@@ -236,6 +243,8 @@ class PolicyXrshDataset(Dataset):
                 torch.tensor(dan0, dtype=torch.float32),
                 torch.tensor(tac0, dtype=torch.float32),
             )
+        if self.with_value_labels:
+            out = (*out, torch.tensor(v0, dtype=torch.float32))
         if self.with_row_meta:
             return (
                 *out,

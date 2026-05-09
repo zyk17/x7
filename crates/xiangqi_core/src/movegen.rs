@@ -188,15 +188,17 @@ fn generate_evasions(pos: &Position, list: &mut [ExtMove]) -> usize {
         } else {
             let att = piece_attacks(piece_pt, from, occupied, us);
             let cap = att & square_bb(checksq);
-            let blk = att & between & if piece_pt == PieceType::Pawn {
-                // Pawn can only advance to block, not capture sideways unless aligned
-                !occupied
-            } else if piece_pt == PieceType::Bishop || piece_pt == PieceType::Knight {
-                // Lame leapers can block
-                !occupied
-            } else {
-                !occupied
-            };
+            let blk = att
+                & between
+                & if piece_pt == PieceType::Pawn {
+                    // Pawn can only advance to block, not capture sideways unless aligned
+                    !occupied
+                } else if piece_pt == PieceType::Bishop || piece_pt == PieceType::Knight {
+                    // Lame leapers can block
+                    !occupied
+                } else {
+                    !occupied
+                };
             // For simplicity, only capture or block the checking piece
             cap | blk
         };
@@ -357,8 +359,8 @@ fn generate_legal(pos: &Position, list: &mut [ExtMove]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::misc::PRNG;
     use crate::board::Zobrist;
+    use crate::misc::PRNG;
 
     fn init_zobrist() -> &'static Zobrist {
         Box::leak(Box::new(Zobrist::init(&mut PRNG::new(1070372))))
@@ -368,10 +370,14 @@ mod tests {
     fn test_initial_position_moves() {
         let zobrist = init_zobrist();
         let mut pos = Position::new(zobrist);
-        pos.set_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1").unwrap();
+        pos.set_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1")
+            .unwrap();
 
         let mut list = vec![
-            ExtMove { mv: Move::none(), value: 0 };
+            ExtMove {
+                mv: Move::none(),
+                value: 0
+            };
             256
         ];
         let count = generate_legal(&pos, &mut list);
@@ -393,10 +399,14 @@ mod tests {
     fn test_captures_and_quiets() {
         let zobrist = init_zobrist();
         let mut pos = Position::new(zobrist);
-        pos.set_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1").unwrap();
+        pos.set_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1")
+            .unwrap();
 
         let mut list = vec![
-            ExtMove { mv: Move::none(), value: 0 };
+            ExtMove {
+                mv: Move::none(),
+                value: 0
+            };
             256
         ];
 

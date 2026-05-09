@@ -18,7 +18,7 @@ train = [
   "torch>=2.0",
   "onnx>=1.16",
 ]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "onnx>=1.16"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

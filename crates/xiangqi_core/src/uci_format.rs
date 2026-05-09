@@ -3,8 +3,7 @@
 use crate::board::Position;
 use crate::types::*;
 
-pub const START_FEN: &str =
-    "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1";
+pub const START_FEN: &str = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1";
 
 /// 转为 pyffish 半串：纵坐标为 **1～10**（对应内部条纹 0～9）。
 pub fn square_to_algebraic(s: Square) -> String {
@@ -13,11 +12,7 @@ pub fn square_to_algebraic(s: Square) -> String {
 }
 
 pub fn move_to_uci(m: Move) -> String {
-    format!(
-        "{}{}",
-        square_to_algebraic(m.from_sq()),
-        square_to_algebraic(m.to_sq())
-    )
+    format!("{}{}", square_to_algebraic(m.from_sq()), square_to_algebraic(m.to_sq()))
 }
 
 /// 从 pyffish 风格 UCI 串解析着法（**不** 校验局面）；纵坐标为 **1～10**（盘面条纹为 值−1）。
@@ -50,10 +45,9 @@ fn parse_half_pyffish(b: &[u8]) -> Option<(Square, usize)> {
     }
     let rank_u8 = (num - 1) as u8;
     let file_u8 = f - b'a';
-    let sq = make_square(
-        unsafe { std::mem::transmute(file_u8) },
-        unsafe { std::mem::transmute(rank_u8) },
-    );
+    let sq = make_square(unsafe { std::mem::transmute(file_u8) }, unsafe {
+        std::mem::transmute(rank_u8)
+    });
     Some((sq, j))
 }
 

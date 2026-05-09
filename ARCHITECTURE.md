@@ -12,7 +12,7 @@
 |------|------|
 | 身份 | **人类知识引导的深度搜索**：以大师棋谱为先验、**语义引导的选择性搜索**；中局战术深度优先，非纯「大宽树硬算」 |
 | 搜索骨架 | **Alpha-Beta**（非 MCTS） |
-| 网络 | 小 **ResNet**；输入 **`15×10×9`**；**当前** 单 **policy**；**路线** 上为 shared trunk + **policy / attack / danger / tactical**（及可选 **phase**） |
+| 网络 | 小 **ResNet**；输入 **`15×10×9`**；训练默认可含 **policy + attack / danger / tactical** 辅助头；导出 ONNX 见下文契约（可选仅 **`logits`**） |
 | 数据 | 人类特级大师棋谱，**不自对弈** 为主；划分须按整局 **`game_id`** |
 | 搜索侧 | **Policy 排序** → Top-k 选择性搜索 → 由多头语义驱动 **动态宽度与 extension**；**NN 与 Search 解耦**（ONNX / CPU / CUDA / 未来 NPU） |
 
@@ -107,9 +107,9 @@
 |--------|------|------|------|
 | **`xiangqi_core`** | `crates/xiangqi_core` | 库 | 类型、规则、合法着（实现自 **pikafish-rust** 迁入，见 crate 内 `README.md`）；搜索与工具共用 |
 | **`xiangqi_dataset`** | `crates/xiangqi_dataset` | **维护者** | 数据集生成、标注、语料工具 CLI（**不** 随引擎分发） |
-| **`engin`** | `crates/engin` | **终端用户** | **UCI 引擎**：搜索 + `xiangqi_core` + NN（ONNX） |
+| **`engin`** | `crates/engin` | **终端用户** | **UCI（stdin/stdout）** + `xiangqi_core` + **`ort`**；**`setoption`**：`PolicyFile` / `VocabFile` / `Hash` / `Threads` / `MultiPV` / **`Clear Hash`**；**`go`** 支持 `infinite`+`stop`（后台线程）；无搜索树时 `bestmove` 由 policy（若已加载且词表维匹配）或合法着首项给出 |
 
-规则逻辑始终集中在 **`xiangqi_core`**；`engin` 与 `xiangqi_dataset` 均只依赖该库（引擎侧后续可增加 ONNX 等依赖）。
+规则逻辑始终在 **`xiangqi_core`**；`engin` 另依赖 **`ort`/`ndarray`** 做推理；`xiangqi_dataset` 仅依赖核心库。
 
 ## 里程碑（执行顺序）
 

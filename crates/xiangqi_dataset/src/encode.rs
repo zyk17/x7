@@ -1,17 +1,13 @@
 //! 从对局或 JSONL 行编码为 [`shard::EncodedRow`]（用 `xiangqi_core` 生成合法着下标）。
 
-use crate::iccs::iccs_move_to_pyffish;
-use crate::pgn::{
-    movetext_iccs_pairs, movetext_uci_tokens, pgn_format, ParsedGame,
-};
 use crate::aux_labels::pseudo_aux_labels;
+use crate::iccs::iccs_move_to_pyffish;
+use crate::pgn::{movetext_iccs_pairs, movetext_uci_tokens, pgn_format, ParsedGame};
 use crate::shard::{EncodedGame, EncodedRow};
 use anyhow::Result;
 use std::collections::HashMap;
 
-use xiangqi_core::{
-    legal_moves_uci, parse_pyffish_uci, Position, START_FEN,
-};
+use xiangqi_core::{legal_moves_uci, parse_pyffish_uci, Position, START_FEN};
 
 /// 棋谱头中的起始 FEN；缺省为 [`START_FEN`]。
 pub fn starting_fen(game: &ParsedGame) -> Result<String> {
@@ -41,14 +37,7 @@ pub fn moves_for_game(game: &ParsedGame) -> Result<(Vec<String>, String)> {
 
     let uci_toks = movetext_uci_tokens(text);
     if !uci_toks.is_empty() {
-        return Ok((
-            uci_toks,
-            if fmt.is_empty() {
-                "UCI".into()
-            } else {
-                fmt
-            },
-        ));
+        return Ok((uci_toks, if fmt.is_empty() { "UCI".into() } else { fmt }));
     }
 
     if !iccs_pairs.is_empty() {
@@ -63,11 +52,7 @@ pub fn moves_for_game(game: &ParsedGame) -> Result<(Vec<String>, String)> {
 }
 
 /// 一局 → 编码样本（跳过无法映射或非法的尾段，与 Python 类似）。
-pub fn encode_game(
-    game: &ParsedGame,
-    game_id: &str,
-    vocab: &HashMap<String, i32>,
-) -> Result<Option<EncodedGame>> {
+pub fn encode_game(game: &ParsedGame, game_id: &str, vocab: &HashMap<String, i32>) -> Result<Option<EncodedGame>> {
     let (py_moves, _fmt) = moves_for_game(game)?;
     if py_moves.is_empty() {
         return Ok(None);

@@ -18,9 +18,7 @@ use std::path::Path;
 /// `--jobs 0` → 使用机器默认并行度；否则至少 1 个工作线程。
 fn build_rayon_pool(jobs: usize) -> Result<(ThreadPool, usize)> {
     let n = if jobs == 0 {
-        std::thread::available_parallelism()
-            .map(|x| x.get())
-            .unwrap_or(1)
+        std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1)
     } else {
         jobs.max(1)
     };
@@ -54,8 +52,7 @@ pub fn run_jsonl_shards(
     );
 
     let (vocab, vocab_hash) = load_vocab(vocab_path)?;
-    let raw = fs::read_to_string(jsonl_path)
-        .with_context(|| format!("读取 {}", jsonl_path.display()))?;
+    let raw = fs::read_to_string(jsonl_path).with_context(|| format!("读取 {}", jsonl_path.display()))?;
     let lines: Vec<String> = raw.lines().map(|s| s.to_string()).collect();
     eprintln!("  非空行数: {}，开始 Rayon 编码 …", lines.len());
 
@@ -118,12 +115,8 @@ pub fn run_pgn_shards(
     max_games: usize,
 ) -> Result<usize> {
     let (vocab, vocab_hash) = load_vocab(vocab_path)?;
-    let stem = pgn_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("pgn");
-    let raw = fs::read_to_string(pgn_path)
-        .with_context(|| format!("读取 {}", pgn_path.display()))?;
+    let stem = pgn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("pgn");
+    let raw = fs::read_to_string(pgn_path).with_context(|| format!("读取 {}", pgn_path.display()))?;
     let mut games = read_pgn_games(&raw);
     if max_games > 0 {
         games.truncate(max_games);
@@ -143,13 +136,7 @@ pub fn run_pgn_shards(
     });
     sort_games_for_deterministic_shards(&mut encoded);
 
-    write_shards_to_dir(
-        out_dir,
-        &vocab_hash,
-        &encoded,
-        games_per_shard,
-        &format!("pgn:{stem}"),
-    )
+    write_shards_to_dir(out_dir, &vocab_hash, &encoded, games_per_shard, &format!("pgn:{stem}"))
 }
 
 /// 写入 `shard_*.xrsh` 与 `pack_meta.json`，返回 **分片文件个数**。

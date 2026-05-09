@@ -5,9 +5,7 @@ use std::fs;
 use tempfile::tempdir;
 
 use xiangqi_core::{legal_moves_uci, Position, START_FEN};
-use xiangqi_dataset::{
-    load_vocab_json_str, read_shard_header, run_jsonl_shards, vocab_sha256_hex,
-};
+use xiangqi_dataset::{load_vocab_json_str, read_shard_header, run_jsonl_shards, vocab_sha256_hex};
 
 #[test]
 fn smoke_jsonl_generates_one_shard() {

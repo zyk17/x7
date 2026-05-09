@@ -14,9 +14,7 @@ pub fn iccs_half_to_pyffish(half: &str) -> Result<String> {
         bail!("非法 ICCS 半格: {half:?}");
     }
     let num_str = std::str::from_utf8(&b[1..]).map_err(|_| anyhow!("ICCS 非 UTF-8"))?;
-    let r: i32 = num_str
-        .parse()
-        .map_err(|_| anyhow!("非法 ICCS 条纹数字: {half:?}"))?;
+    let r: i32 = num_str.parse().map_err(|_| anyhow!("非法 ICCS 条纹数字: {half:?}"))?;
     Ok(format!("{}{}", f as char, r + 1))
 }
 

@@ -1,9 +1,7 @@
 //! 与 `nn/src/nn/aux_pseudo_labels.py` 对齐的伪标签，仅用 `xiangqi_core`（无 pyffish）。
 
-use xiangqi_core::{
-    generate, Color, ExtMove, GenType, Move, Piece, Position,
-};
 use xiangqi_core::types::MAX_MOVES;
+use xiangqi_core::{generate, Color, ExtMove, GenType, Move, Piece, Position};
 
 fn material_red_black(board_field: &str) -> (f32, f32) {
     let mut red = 0.0_f32;
@@ -44,9 +42,8 @@ pub fn pseudo_aux_labels(pos: &Position) -> (f32, f32, f32) {
     }
 
     let mut caps = 0_usize;
-    for i in 0..n {
-        let mv = list[i].mv;
-        let pc = pos.piece_on(mv.to_sq());
+    for em in list.iter().take(n) {
+        let pc = pos.piece_on(em.mv.to_sq());
         if pc != Piece::NO_PIECE {
             caps += 1;
         }
@@ -55,11 +52,7 @@ pub fn pseudo_aux_labels(pos: &Position) -> (f32, f32, f32) {
 
     let stm_w = pos.side_to_move == Color::White;
     let (red, black) = material_red_black(board_field);
-    let adv = if stm_w {
-        red - black
-    } else {
-        black - red
-    };
+    let adv = if stm_w { red - black } else { black - red };
 
     let attack = 0.5 * (1.0 + (adv / 12.0).tanh());
 
@@ -75,13 +68,28 @@ pub fn pseudo_aux_labels(pos: &Position) -> (f32, f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xiangqi_core::START_FEN;
+    use xiangqi_core::Color;
     use xiangqi_core::Position;
+    use xiangqi_core::START_FEN;
 
     #[test]
     fn start_position_attack_near_half() {
         let pos = Position::from_fen(START_FEN).unwrap();
         let (a, _d, _t) = pseudo_aux_labels(&pos);
         assert!((a - 0.5).abs() < 0.02, "a={a}");
+    }
+
+    /// 黑方物质明显落后时，`attack`（实为行棋方子力差经 tanh）应显著低于 0.5。
+    #[test]
+    fn user_fen_black_down_material_attack_below_half() {
+        let fen = "3Rka3/9/1cR6/p7p/1r7/6P2/4P3P/2N1C1N2/4A4/4KAB2 b - - 0 1";
+        let pos = Position::from_fen(fen).unwrap();
+        assert_eq!(pos.side_to_move, Color::Black);
+        let (a, d, t) = pseudo_aux_labels(&pos);
+        // 典型输出约 attack≈0.047 danger≈0.956 tactical≈0.5（黑方大亏、高危险、半数合法着为吃子）
+        assert!(
+            a < 0.45,
+            "黑方落后时 attack 应 <0.5，便于与「均势≈0.5」区分；got attack={a} danger={d} tactical={t}"
+        );
     }
 }
