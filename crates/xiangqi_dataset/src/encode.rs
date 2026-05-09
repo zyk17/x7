@@ -4,6 +4,7 @@ use crate::iccs::iccs_move_to_pyffish;
 use crate::pgn::{
     movetext_iccs_pairs, movetext_uci_tokens, pgn_format, ParsedGame,
 };
+use crate::aux_labels::pseudo_aux_labels;
 use crate::shard::{EncodedGame, EncodedRow};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -98,6 +99,8 @@ pub fn encode_game(
             break;
         }
 
+        let (aux_attack, aux_danger, aux_tactical) = pseudo_aux_labels(&pos);
+
         rows.push(EncodedRow {
             fen: pos.fen(),
             root_fen: root_fen.clone(),
@@ -105,6 +108,9 @@ pub fn encode_game(
             target_idx,
             legal_idx,
             ply: ply as u16,
+            aux_attack,
+            aux_danger,
+            aux_tactical,
         });
 
         let Some(mv) = parse_pyffish_uci(py_uci) else {
@@ -180,6 +186,8 @@ pub fn encode_jsonl_line(line: &str, vocab: &HashMap<String, i32>) -> Result<Opt
         legal_idx.push(j);
     }
 
+    let (aux_attack, aux_danger, aux_tactical) = pseudo_aux_labels(&pos);
+
     Ok(Some(EncodedRow {
         fen,
         root_fen,
@@ -187,5 +195,8 @@ pub fn encode_jsonl_line(line: &str, vocab: &HashMap<String, i32>) -> Result<Opt
         target_idx,
         legal_idx,
         ply,
+        aux_attack,
+        aux_danger,
+        aux_tactical,
     }))
 }

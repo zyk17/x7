@@ -44,10 +44,20 @@ pub fn run_jsonl_shards(
     jobs: usize,
     games_per_shard: usize,
 ) -> Result<usize> {
+    eprintln!("jsonl-shards: 读取 {} ...", jsonl_path.display());
+    let byte_len = fs::metadata(jsonl_path)
+        .with_context(|| format!("stat {}", jsonl_path.display()))?
+        .len();
+    eprintln!(
+        "  文件约 {:.2} GiB，将整文件载入内存后按行并行编码（超大文件请先切片或保证内存）",
+        byte_len as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+
     let (vocab, vocab_hash) = load_vocab(vocab_path)?;
     let raw = fs::read_to_string(jsonl_path)
         .with_context(|| format!("读取 {}", jsonl_path.display()))?;
     let lines: Vec<String> = raw.lines().map(|s| s.to_string()).collect();
+    eprintln!("  非空行数: {}，开始 Rayon 编码 …", lines.len());
 
     let (pool, n_threads) = build_rayon_pool(jobs)?;
     let min_len = if lines.is_empty() {
@@ -70,6 +80,8 @@ pub fn run_jsonl_shards(
             .collect()
     });
 
+    eprintln!("  编码完成，有效样本 {} 条（按 game_id 聚合）…", rows.len());
+
     let mut by_game: HashMap<String, Vec<(u16, EncodedRow)>> = HashMap::new();
     for (gid, ply, row) in rows {
         by_game.entry(gid).or_default().push((ply, row));
@@ -83,6 +95,8 @@ pub fn run_jsonl_shards(
         });
     }
     sort_games_for_deterministic_shards(&mut encoded);
+
+    eprintln!("  聚合局数: {}，写入分片 …", encoded.len());
 
     let stem = jsonl_path.file_stem().and_then(|s| s.to_str()).unwrap_or("jsonl");
     write_shards_to_dir(

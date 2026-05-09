@@ -1,6 +1,6 @@
 # xiangqi_dataset
 
-维护者工具：**PGN / JSONL → 二进制分片**（格式 **XRSH** v1，扩展名 **`.xrsh`**）。**PGN** 按局并行；**JSONL** 按行并行（Rayon，`--jobs`，`0` = 本机并行度）。
+维护者工具：**PGN / JSONL → 二进制分片**（格式 **XRSH v2**（`pack_meta.format: xrsh_v2`），扩展名 **`.xrsh`**）。**PGN** 按局并行；**JSONL** 按行并行（Rayon，`--jobs`，`0` = 本机并行度）。编码时为每样本写入 **`xiangqi_core`** 预计算的 **attack/danger/tactical** 三 float（与 `nn.aux_pseudo_labels` 对齐）。
 
 ## 依赖
 
@@ -20,11 +20,11 @@ cargo run -p xiangqi_dataset -- jsonl-shards --jsonl data/train.jsonl --vocab da
 
 说明：**整文件会先读入内存**后再并行处理单行；若单行数极大导致内存吃紧，可先在外部按字节切成多个 JSONL 分批运行。
 
-输出：`shard_00000.xrsh`、…、`pack_meta.json`（`format: xrsh_v1`，含 `vocab_sha256`，与 Python `policy_pack` 指纹算法一致）。
+输出：`shard_00000.xrsh`、…、`pack_meta.json`（`format: xrsh_v2`，含 `vocab_sha256`，与 Python `policy_pack` 指纹算法一致）。
 
 ## 格式说明
 
-见仓库根目录 **`ARCHITECTURE.md`**（数据管线 / **`xrsh_v1`**）。Python 训练侧使用 **`nn.dataset_xrsh.PolicyXrshDataset`**（`train_policy.py --train-xrsh-dir`）。
+见仓库根目录 **`ARCHITECTURE.md`**（数据管线 / **XRSH v1↔v2**）。Python 训练侧使用 **`nn.dataset_xrsh.PolicyXrshDataset`**（`train_policy.py --train-xrsh-dir`）。
 
 ## 测试
 

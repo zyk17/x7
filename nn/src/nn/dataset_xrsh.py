@@ -58,7 +58,7 @@ class PolicyXrshDataset(Dataset):
         if not xrsh_dir_is_complete(self.root):
             raise FileNotFoundError(f"XRSH 目录不完整: {self.root}")
         meta = load_pack_meta(self.root)
-        if meta.get("format") not in ("xrsh_v1",):
+        if meta.get("format") not in ("xrsh_v1", "xrsh_v2"):
             raise ValueError(
                 f"非本仓库 XRSH 元数据 format={meta.get('format')!r}"
             )
@@ -133,12 +133,21 @@ class PolicyXrshDataset(Dataset):
 
         atk0, dan0, tac0 = (0.5, 0.5, 0.5)
         if self.with_aux_labels:
-            atk0, dan0, tac0 = pseudo_aux_labels_from_sample(
-                fen0,
-                root_fen=root0,
-                uci_prefix=pfx0,
-                legal_uci=legal_uci0,
-            )
+            if (
+                "aux_attack" in row
+                and "aux_danger" in row
+                and "aux_tactical" in row
+            ):
+                atk0 = float(row["aux_attack"])
+                dan0 = float(row["aux_danger"])
+                tac0 = float(row["aux_tactical"])
+            else:
+                atk0, dan0, tac0 = pseudo_aux_labels_from_sample(
+                    fen0,
+                    root_fen=root0,
+                    uci_prefix=pfx0,
+                    legal_uci=legal_uci0,
+                )
 
         w0 = 1.0
         if self.position_weight_by_fen is not None:
@@ -169,15 +178,26 @@ class PolicyXrshDataset(Dataset):
                             use_mirror = False
                         else:
                             if self.with_aux_labels:
-                                root_m = mirror_fen(root0)
-                                pfx_m = mirror_uci_prefix(pfx0)
-                                mir_uci = [self._idx_to_move[int(j)] for j in mir_ids]
-                                atk_m, dan_m, tac_m = pseudo_aux_labels_from_sample(
-                                    fen_m,
-                                    root_fen=root_m,
-                                    uci_prefix=pfx_m,
-                                    legal_uci=mir_uci,
-                                )
+                                # 水平镜像不改变物质差、合法着数与「合法着吃子占比」启发 → 与分片内 Rust 标量一致。
+                                # 仅在无预计算（旧 v1）时回退 pyffish。
+                                if (
+                                    "aux_attack" in row
+                                    and "aux_danger" in row
+                                    and "aux_tactical" in row
+                                ):
+                                    atk_m, dan_m, tac_m = atk0, dan0, tac0
+                                else:
+                                    root_m = mirror_fen(root0)
+                                    pfx_m = mirror_uci_prefix(pfx0)
+                                    mir_uci = [
+                                        self._idx_to_move[int(j)] for j in mir_ids
+                                    ]
+                                    atk_m, dan_m, tac_m = pseudo_aux_labels_from_sample(
+                                        fen_m,
+                                        root_fen=root_m,
+                                        uci_prefix=pfx_m,
+                                        legal_uci=mir_uci,
+                                    )
                             else:
                                 atk_m, dan_m, tac_m = (atk0, dan0, tac0)
                             out = (

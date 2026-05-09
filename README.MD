@@ -11,7 +11,7 @@
 | **`crates/xiangqi_dataset`** | Rust **可执行文件**：**维护者专用**——二进制 dataset、并行标注、语料工具（不随引擎分发给终端用户） |
 | **`nn/`** | Python：数据管线、ResNet policy 训练、ONNX 导出（`torch` 为可选 `[train]`） |
 
-**产品边界、方法论、分层与路线图** 见 **`ARCHITECTURE.md`**。
+**产品边界、方法论、分层与路线图** 见 **`ARCHITECTURE.md`**。中期研发目标见 **`工程目标.md`**。
 
 ## 环境
 
@@ -37,14 +37,15 @@ cargo run -p engin              # 用户侧 UCI 引擎（当前占位）
 cargo run -p xiangqi_dataset    # 训练侧数据集/标注 CLI（当前占位）
 ```
 
-**下一里程碑**：在 `xiangqi_core` 中实现 **象棋规则与合法着**（数据工具与引擎共用）。参考：`c:\projects\pikafish-rust`（`src/board.rs`、`src/movegen.rs`）。
+**当前优先**：见根目录 **`TODO.md`**「推进顺序」。规则实现已在 **`xiangqi_core`**（合法着、perft）；下一步重点是 **与 pyffish / Pikafish 行为对拍**，再放心大规模造数；棋谱规则边界可参考本地 **`c:\projects\Pikafish`**、结构对齐 **`c:\projects\pikafish-rust`**（不纳入本仓库）。
 
 ## 文档索引
 
 | 文件 | 内容 |
 |------|------|
 | `ARCHITECTURE.md` | 产品与方法边界、crate 划分、数据格式、里程碑摘要 |
-| `MILESTONES.md` | P0–P3 里程碑定义与依赖顺序 |
+| `MILESTONES.md` | P0–P7 里程碑定义与依赖顺序 |
 | `TODO.md` | 分阶段执行清单（勾选推进） |
+| `工程目标.md` | P3 之后的中期工程目标：value、搜索控制头、蒸馏、动态搜索 |
 | `crates/xiangqi_dataset/README.md` | `pgn-shards` / `jsonl-shards` 与 **XRSH**（`.xrsh`）格式 |
 | `agents.md` | 给自动化助手 / Agent 的仓库约定 |

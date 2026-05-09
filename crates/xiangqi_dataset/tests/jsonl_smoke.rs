@@ -45,7 +45,7 @@ fn smoke_jsonl_generates_one_shard() {
     assert!(shard.is_file(), "缺少 shard 文件");
 
     let (ver, file_hash, n_games) = read_shard_header(&shard).expect("header");
-    assert_eq!(ver, 1);
+    assert_eq!(ver, 2);
     assert_eq!(n_games, 1);
 
     let vocab_txt = fs::read_to_string(&vocab_path).expect("read vocab");

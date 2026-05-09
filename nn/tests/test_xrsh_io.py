@@ -1,4 +1,4 @@
-"""XRSH v1 二进制解析与 Dataset 冒烟。"""
+"""XRSH 二进制解析与 Dataset 冒烟（v1 / v2）。"""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from nn.dataset_xrsh import PolicyXrshDataset
 from nn.policy_pack import vocab_fingerprint_ordered_moves
 from nn.xrsh_io import HEADER_SIZE, parse_shard_bytes
 
+import struct
+
 
 def _write_str_u16(s: str) -> bytes:
     b = s.encode("utf-8")
@@ -32,11 +34,13 @@ def _write_prefix_list(pfx: list[str]) -> bytes:
     return out
 
 
-def _minimal_shard_bytes(*, vocab_hash32: bytes, games_body: bytes) -> bytes:
+def _minimal_shard_bytes(
+    *, vocab_hash32: bytes, games_body: bytes, file_version: int = 1
+) -> bytes:
     assert len(vocab_hash32) == 32
     header = (
         b"XRSH"
-        + (1).to_bytes(4, "little")
+        + int(file_version).to_bytes(4, "little")
         + vocab_hash32
         + (1).to_bytes(4, "little")
         + bytes(20)
@@ -72,6 +76,32 @@ def test_parse_xrsh_single_game_row():
     assert r["legal_idx"] == [0]
     assert r["target_idx"] == 0
     assert r["ply"] == 5
+
+
+def test_parse_xrsh_v2_aux_floats():
+    moves_v = ["m0"]
+    vh = bytes.fromhex(vocab_fingerprint_ordered_moves(moves_v))
+    body = (
+        _write_str_u16("game_b")
+        + (1).to_bytes(4, "little")
+        + _write_str_u16(START_FEN)
+        + _write_str_u16(START_FEN)
+        + _write_prefix_list([])
+        + (0).to_bytes(4, "little", signed=True)
+        + (1).to_bytes(2, "little")
+        + (0).to_bytes(4, "little", signed=True)
+        + (1).to_bytes(2, "little")
+        + struct.pack("<fff", 0.25, 0.75, 0.33)
+    )
+    blob = _minimal_shard_bytes(
+        vocab_hash32=vh, games_body=body, file_version=2
+    )
+    rows, _ = parse_shard_bytes(blob)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["aux_attack"] == pytest.approx(0.25)
+    assert r["aux_danger"] == pytest.approx(0.75)
+    assert r["aux_tactical"] == pytest.approx(0.33)
 
 
 def test_policy_xrsh_dataset_smoke(tmp_path: Path) -> None:

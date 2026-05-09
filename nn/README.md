@@ -14,7 +14,7 @@ pip install -e ".[train]"   # PyTorch 训练与 ONNX 导出
 
 核心运行时：`pyffish`（规则与合法着）、`tqdm`。训练额外需要 `torch`。
 
-**训练数据**：仅支持 **XRSH**（Rust `xiangqi_dataset` 生成的 `shard_*.xrsh` + `pack_meta.json`）。
+**训练数据**：仅支持 **XRSH**（Rust `xiangqi_dataset` 生成的 `shard_*.xrsh` + `pack_meta.json`）。**`xrsh_v2`** 在分片内带 **attack/danger/tactical** 三 float（`xiangqi_core` 预计算）；**`xrsh_v1`** 仍可读。多头训练时 v2 样本 **不再** 在 `__getitem__` 为辅助头调用 pyffish。
 
 ---
 
@@ -81,8 +81,8 @@ Rust 子命令与字段说明见 **`crates/xiangqi_dataset/README.md`**。
 
 ```bash
 cd nn
-python scripts/train/train_policy.py --train-xrsh-dir data/xrsh_train --val-xrsh-dir data/xrsh_val --vocab data/move_vocab.json --out data/checkpoints/policy.pt --device cuda --epochs 30
-python scripts/export/export_onnx.py --checkpoint data/checkpoints/policy.pt --out data/policy.onnx
+python scripts/train/train_policy.py --train-xrsh-dir ../data/xrsh_train --val-xrsh-dir ../data/xrsh_val --vocab ../data/move_vocab.json --out ../data/checkpoints/policy.pt --device cuda --epochs 30
+python scripts/export/export_onnx.py --checkpoint ../data/checkpoints/policy.pt --out ../data/policy.onnx
 ```
 
 静态 **batch=1**，输入 `board`：`float32[1,15,10,9]`。默认训练带 **多头**，ONNX 输出 **`logits`**（`float32[1,V]`）及 **`attack` / `danger` / `tactical`**（各 `float32[1]`，**导出图中已为 sigmoid 概率**）；仅单 policy 时加训练参数 `--no-aux-heads`，导出则仅 `logits`。
@@ -97,8 +97,8 @@ python scripts/export/export_onnx.py --checkpoint data/checkpoints/policy.pt --o
 cargo run -p xiangqi_dataset -- jsonl-shards --jsonl nn/data/smock_train.jsonl --vocab nn/data/smock_vocab.json --out-dir nn/data/smock_xrsh_train --jobs 0
 cargo run -p xiangqi_dataset -- jsonl-shards --jsonl nn/data/smock_val.jsonl --vocab nn/data/smock_vocab.json --out-dir nn/data/smock_xrsh_val --jobs 0
 cd nn
-python scripts/train/train_policy.py --train-xrsh-dir data/smock_xrsh_train --val-xrsh-dir data/smock_xrsh_val --vocab data/smock_vocab.json --out data/checkpoints/smock_policy.pt --width 64 --blocks 4 --batch-size 256 --epochs 2 --device cpu
-python scripts/export/export_onnx.py --checkpoint data/checkpoints/smock_policy.pt --out data/smock_policy.onnx
+python scripts/train/train_policy.py --train-xrsh-dir ../data/smock_xrsh_train --val-xrsh-dir ../data/smock_xrsh_val --vocab ../data/smock_vocab.json --out ../data/checkpoints/smock_policy.pt --width 64 --blocks 4 --batch-size 256 --epochs 2 --device cpu
+python scripts/export/export_onnx.py --checkpoint ../data/checkpoints/smock_policy.pt --out ../data/smock_policy.onnx
 ```
 
 （路径可按实际数据位置调整；试跑建议 `--epochs 2`、`--device cpu` 等。）
@@ -115,3 +115,13 @@ pytest
 ```
 
 未安装 `torch` 时会跳过 `tests/test_nn_smoke.py`。
+
+### xiangqi_core ↔ pyffish 合法 UCI 对拍
+
+依赖：`pyffish`（随 `pip install -e .`）、系统 **`cargo`**。在 **`nn/`** 下：
+
+```bash
+python scripts/parity/pyffish_xiangqi_core_parity.py -v
+```
+
+或仅跑该项：`pytest tests/test_pyffish_xiangqi_core_parity.py`。Rust 侧二进制说明见 **`crates/xiangqi_core/README.md`**。

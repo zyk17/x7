@@ -1,6 +1,7 @@
-//! 训练侧数据：PGN / JSONL → 二进制分片（**XRSH** v1，`.xrsh`）。
+//! 训练侧数据：PGN / JSONL → 二进制分片（**XRSH** v2，`.xrsh`；兼容读取旧 v1 由 Python 侧实现）。
 //! PGN 按局并行；JSONL **按行并行**（Rayon，`pipeline::run_jsonl_shards`）。
 
+pub mod aux_labels;
 pub mod encode;
 pub mod iccs;
 pub mod pgn;

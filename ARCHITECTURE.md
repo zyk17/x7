@@ -88,10 +88,10 @@
 ## 数据管线（现状）
 
 - **训练用数据**：**XRSH** 分片（`shard_*.xrsh` + `pack_meta.json`），由 Rust **`xiangqi_dataset`** 从 PGN 或 JSONL 生成。中间 **JSONL** 仍可用于 `build_vocab.py` 与 `jsonl-shards` 输入，但 **`train_policy` 不再直接读 JSONL / mmap 索引 / policy npy 包**。
-- **二进制分片（Rust，`xiangqi_dataset`）**：**XRSH**（Xiangqi Review Shard）v1，文件 **`shard_*.xrsh`**（魔数 `XRSH`，勿与市面 `.xqb` 棋谱混淆）  
+- **二进制分片（Rust，`xiangqi_dataset`）**：**XRSH**（Xiangqi Review Shard），文件 **`shard_*.xrsh`**（魔数 `XRSH`）。**当前写入 `xrsh_v2`**（文件头版本 2）：在 v1 字段基础上每样本追加 **`aux_attack` / `aux_danger` / `aux_tactical`**（`float32×3`，由 **`xiangqi_core`** 预计算，与 `nn.aux_pseudo_labels` 公式一致）。**v1 分片仍可读**（Python `xrsh_io` 兼容文件版本 1）。  
   - 子命令 **`pgn-shards`**：读 PGN / `.pgns`，按局 **Rayon 并行** 编码；**`jsonl-shards`**：读已有 JSONL。  
-  - 每样本含：`fen`、`root_fen`、`uci_prefix`、**词表下标**的合法着列表、`target`、`ply`；`pack_meta.json` 含 **`format: xrsh_v1`**、**`vocab_sha256`**（与 Python `vocab_fingerprint_ordered_moves` 一致）。  
-  - 细节与 CLI 见 **`crates/xiangqi_dataset/README.md`**。Python 训练仅 **`nn.dataset_xrsh.PolicyXrshDataset`**（`train_policy.py --train-xrsh-dir`）。
+  - 每样本至少含：`fen`、`root_fen`、`uci_prefix`、**词表下标**的合法着列表、`target`、`ply`；v2 含上述三辅助标量；`pack_meta.json` 含 **`format`**（`xrsh_v2`）、**`vocab_sha256`**。  
+  - 细节与 CLI 见 **`crates/xiangqi_dataset/README.md`**。Python 训练仅 **`nn.dataset_xrsh.PolicyXrshDataset`**（`train_policy.py --train-xrsh-dir`）；若样本含辅助字段则 **训练步不再对辅助头调 pyffish**。
 
 ## 模型与 ONNX（Python）
 
@@ -99,7 +99,7 @@
 - **输出**：
   - **仅 policy**：`logits`，`float32[1,V]`；推理时对非法位掩码后再 softmax。
   - **多头（`aux_heads`，默认训练开启）**：在上述基础上追加 **`attack`、`danger`、`tactical`**，均为 **`float32[1]`**。**ONNX 图中**三辅助输出已含 **sigmoid**（见 `export_onnx.py` 的 `PolicyOnnxExport`），数值约在 `[0,1]`；训练仍对原始 logit 做 sigmoid 后与伪标签对齐。
-  - 伪标签见 `nn/src/nn/aux_pseudo_labels.py`：须传入 XRSH 中的 **`root_fen` / `uci_prefix`**，且机动与吃子比例默认基于 **Rust 物化的合法 UCI 表**（与 policy mask 同源）；物质项仍读当前 `fen`。规则权威长期迁往 Rust 预计算见里程碑。
+  - **XRSH v2** 已含 Rust 预计算伪标签；读 **v1** 或缺失字段时回退 `nn/src/nn/aux_pseudo_labels.py`（pyffish）。物质项与机动均应与 **`xiangqi_core`** 一致后再依赖纯 Rust 路径。
 
 ## Rust Crate 划分
 

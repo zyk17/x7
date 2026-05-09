@@ -1,11 +1,13 @@
-"""读取 Rust ``xiangqi_dataset`` 写入的 XRSH v1 分片（``shard_*.xrsh``）。
+"""读取 Rust ``xiangqi_dataset`` 写入的 XRSH 分片（``shard_*.xrsh``）。
 
 二进制布局须与 ``crates/xiangqi_dataset/src/shard.rs`` 一致。
+支持 **文件版本 1**（无辅助伪标签）与 **版本 2**（每样本末尾 3×float32）。
 """
 
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +41,10 @@ def parse_shard_bytes(buf: bytes) -> tuple[list[dict[str, Any]], bytes]:
     if buf[0:4] != MAGIC:
         raise ValueError("魔数非 XRSH（非本仓库 review shard 格式）")
     file_ver = int.from_bytes(buf[4:8], "little")
-    if file_ver != 1:
-        raise ValueError(f"不支持的 XRSH 文件版本: {file_ver}（仅支持 1）")
+    if file_ver not in (1, 2):
+        raise ValueError(
+            f"不支持的 XRSH 文件版本: {file_ver}（支持 1 无辅助标签、2 含 aux）"
+        )
     vocab_hash = bytes(buf[8:40])
     n_games = int.from_bytes(buf[40:44], "little")
     off = HEADER_SIZE
@@ -64,17 +68,24 @@ def parse_shard_bytes(buf: bytes) -> tuple[list[dict[str, Any]], bytes]:
                 legal.append(j)
             ply = int.from_bytes(buf[off : off + 2], "little")
             off += 2
-            all_samples.append(
-                {
-                    "game_id": gid,
-                    "fen": fen,
-                    "root_fen": _root_fen,
-                    "uci_prefix": _prefix,
-                    "legal_idx": legal,
-                    "target_idx": target_idx,
-                    "ply": ply,
-                }
-            )
+            sample: dict[str, Any] = {
+                "game_id": gid,
+                "fen": fen,
+                "root_fen": _root_fen,
+                "uci_prefix": _prefix,
+                "legal_idx": legal,
+                "target_idx": target_idx,
+                "ply": ply,
+            }
+            if file_ver >= 2:
+                if off + 12 > len(buf):
+                    raise ValueError("XRSH v2 样本缺少 aux 12 字节")
+                atk, dan, tac = struct.unpack_from("<fff", buf, off)
+                off += 12
+                sample["aux_attack"] = atk
+                sample["aux_danger"] = dan
+                sample["aux_tactical"] = tac
+            all_samples.append(sample)
     if off != len(buf):
         raise ValueError(f"XRSH 尾部长度不匹配: 解析到 {off} 总长 {len(buf)}")
     return all_samples, vocab_hash

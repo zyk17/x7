@@ -6,7 +6,11 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
-pub const FORMAT_NAME: &str = "xrsh_v1";
+/// 当前写入格式：`pack_meta.json` 的 `format` 字段。
+pub const FORMAT_NAME: &str = "xrsh_v2";
+
+/// 分片文件头内的二进制版本号（与 `pack_meta.format_version` 一致）。
+pub const SHARD_FILE_VERSION: u32 = 2;
 
 /// 单样本（一行训练数据）。
 #[derive(Debug, Clone)]
@@ -17,6 +21,10 @@ pub struct EncodedRow {
     pub target_idx: i32,
     pub legal_idx: Vec<i32>,
     pub ply: u16,
+    /// 由 `xiangqi_core` 预计算，与 `nn.aux_pseudo_labels` 数值对齐。
+    pub aux_attack: f32,
+    pub aux_danger: f32,
+    pub aux_tactical: f32,
 }
 
 /// 一局内的所有样本。
@@ -60,9 +68,9 @@ pub fn write_shard(path: &Path, vocab_hash: &[u8; 32], games: &[EncodedGame]) ->
     let f = File::create(path).with_context(|| path.display().to_string())?;
     let mut w = BufWriter::new(f);
 
-    // 头 64 字节（魔数 `"XRSH"`，勿与市面 `.xqb` 棋谱混淆）
+    // 头 64 字节（魔数 `"XRSH"`）
     w.write_all(b"XRSH")?;
-    w.write_all(&1u32.to_le_bytes())?;
+    w.write_all(&SHARD_FILE_VERSION.to_le_bytes())?;
     w.write_all(vocab_hash)?;
     w.write_all(&(games.len() as u32).to_le_bytes())?;
     w.write_all(&[0u8; 20])?; // 保留（共 64 字节头）
@@ -86,6 +94,9 @@ pub fn write_shard(path: &Path, vocab_hash: &[u8; 32], games: &[EncodedGame]) ->
                 w.write_all(&idx.to_le_bytes())?;
             }
             w.write_all(&r.ply.to_le_bytes())?;
+            w.write_all(&r.aux_attack.to_le_bytes())?;
+            w.write_all(&r.aux_danger.to_le_bytes())?;
+            w.write_all(&r.aux_tactical.to_le_bytes())?;
         }
     }
     w.flush()?;
@@ -102,7 +113,7 @@ pub fn write_pack_meta(
     let hex: String = vocab_hash.iter().map(|b| format!("{b:02x}")).collect();
     let meta = serde_json::json!({
         "format": FORMAT_NAME,
-        "format_version": 1,
+        "format_version": SHARD_FILE_VERSION,
         "vocab_sha256": hex,
         "shard_count": shard_count,
         "source": source_note,

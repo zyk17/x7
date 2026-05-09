@@ -1,6 +1,6 @@
-# 里程碑（P0–P3）
+# 里程碑（P0–P7）
 
-与 **`ARCHITECTURE.md`** 中的产品与分层说明配套；**执行勾选**见根目录 **`TODO.md`**。
+与 **`ARCHITECTURE.md`** 中的产品与分层说明配套；中期目标见根目录 **`工程目标.md`**；**执行勾选**与**近期推荐顺序**见根目录 **`TODO.md`**（文首「推进顺序」表）。
 
 | 阶段 | 目标 | 主要交付 / Crate |
 |------|------|------------------|
@@ -8,6 +8,10 @@
 | **P1** | **数据管线**：PGN / JSONL → **二进制 shards**（**XRSH** `.xrsh`），**按局并行** | `crates/xiangqi_dataset`：**`xrsh_v1`**、`pack_meta.json`（`vocab_sha256`）；CLI 见 crate `README.md`；Python 读取见 **`nn.dataset_xrsh`** |
 | **P2** | **Python 训练**接入二进制数据包 + **多头网络** | `nn/`：`Dataset`/loader、损失与 ONNX 契约扩展（policy + 辅助头）；标签管线与 P1 输出衔接 |
 | **P3** | **引擎**：搜索 + UCI | `crates/engin`：**Alpha-Beta**、**TT**、**move ordering**、**UCI 协议**；挂接 `xiangqi_core` + ONNX |
+| **P4** | **Value Head**：补齐局面真值估计 | `nn/`：value head；`xiangqi_dataset`：value 标签；`engin`：value 消费接口 |
+| **P5** | **Search-aware heads**：让头部直接服务搜索 | `nn/`：danger / volatility / forcing / mobility_tension；`xiangqi_dataset`：Rust 统一标注 |
+| **P6** | **Search distillation**：学习搜索注意力 | 数据/训练：visit count、search distribution 蒸馏 |
+| **P7** | **Dynamic search**：模型驱动搜索调度 | `crates/engin`：根据多头信号控制 extension / pruning / LMR / top-k |
 
 ## 依赖顺序
 
@@ -18,6 +22,15 @@ P0 (core) ───────────────────→ P3 (engin
 ```
 
 P3 可与 P2 **部分并行**（规则与 MoveGen 来自 P0），但 **实用引擎**通常需 **policy ONNX**（P2 导出）后再深度联调。
+
+P4–P7 依赖顺序：
+
+```text
+P2 + P3 → P4
+P4 → P5
+P3 + P5 → P6
+P4 + P5 + P6 → P7
+```
 
 ## 参考实现（本地）
 
