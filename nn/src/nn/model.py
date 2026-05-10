@@ -37,10 +37,14 @@ class PolicyResNet(nn.Module):
         *,
         aux_heads: bool = False,
         value_head: bool = False,
+        aux_head_hidden_dim: int = 0,
+        value_head_hidden_dim: int = 0,
     ) -> None:
         super().__init__()
         self.aux_heads = bool(aux_heads)
         self.value_head = bool(value_head)
+        self.aux_head_hidden_dim = int(max(0, aux_head_hidden_dim))
+        self.value_head_hidden_dim = int(max(0, value_head_hidden_dim))
         self.stem = nn.Sequential(
             nn.Conv2d(in_planes, width, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(width),
@@ -50,11 +54,29 @@ class PolicyResNet(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(width, num_moves)
         if self.aux_heads:
-            self.fc_attack = nn.Linear(width, 1)
-            self.fc_danger = nn.Linear(width, 1)
-            self.fc_tactical = nn.Linear(width, 1)
+            self.fc_attack = self._make_scalar_head(
+                width, self.aux_head_hidden_dim
+            )
+            self.fc_danger = self._make_scalar_head(
+                width, self.aux_head_hidden_dim
+            )
+            self.fc_tactical = self._make_scalar_head(
+                width, self.aux_head_hidden_dim
+            )
         if self.value_head:
-            self.fc_value = nn.Linear(width, 1)
+            self.fc_value = self._make_scalar_head(
+                width, self.value_head_hidden_dim
+            )
+
+    @staticmethod
+    def _make_scalar_head(in_dim: int, hidden_dim: int) -> nn.Module:
+        if hidden_dim <= 0:
+            return nn.Linear(in_dim, 1)
+        return nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         h = self.blocks(self.stem(x))
@@ -139,7 +161,7 @@ def aux_heads_sigmoid_mse(
     sample_weight: torch.Tensor | None = None,
     reduction: str = "mean",
 ) -> torch.Tensor:
-    """辅助头：sigmoid 后与 [0,1] 伪标签做逐元素 MSE。"""
+    """辅助头：sigmoid 后与 [0,1] 伪标签做逐元素 MSE（遗留；主训练见 ``aux_heads_sigmoid_bce``）。"""
     if reduction not in ("mean", "none"):
         raise ValueError("reduction 须为 mean 或 none")
     pa = torch.sigmoid(pred_attack)
@@ -159,25 +181,82 @@ def aux_heads_sigmoid_mse(
     return err
 
 
-def value_head_tanh_mse(
-    pred_value: torch.Tensor,
-    tgt_value: torch.Tensor,
+def aux_heads_sigmoid_bce(
+    pred_attack: torch.Tensor,
+    pred_danger: torch.Tensor,
+    pred_tactical: torch.Tensor,
+    tgt_attack: torch.Tensor,
+    tgt_danger: torch.Tensor,
+    tgt_tactical: torch.Tensor,
     *,
+    attack_scale: float = 1.0,
+    pos_weight_attack: float = 1.0,
+    pos_weight_danger: float = 1.0,
+    pos_weight_tactical: float = 1.0,
     sample_weight: torch.Tensor | None = None,
     reduction: str = "mean",
 ) -> torch.Tensor:
-    """``tanh(logit)`` 与 [-1,1] 目标（如 2*attack-1）的 MSE。"""
+    """辅助头：``BCEWithLogits``，目标为 [0,1] 事件型伪标签；``attack_scale`` 可压低 attack 项权重。"""
     if reduction not in ("mean", "none"):
         raise ValueError("reduction 须为 mean 或 none")
-    pv = torch.tanh(pred_value)
-    err = (pv - tgt_value) ** 2
+
+    def _weighted_bce(
+        pred: torch.Tensor,
+        tgt: torch.Tensor,
+        *,
+        pos_weight: float,
+    ) -> torch.Tensor:
+        pw = torch.as_tensor(
+            float(max(pos_weight, 1e-6)),
+            device=pred.device,
+            dtype=pred.dtype,
+        )
+        return F.binary_cross_entropy_with_logits(
+            pred, tgt, reduction="none", pos_weight=pw
+        )
+
+    eps = 1e-6
+    ta = tgt_attack.clamp(eps, 1.0 - eps)
+    td = tgt_danger.clamp(eps, 1.0 - eps)
+    tt = tgt_tactical.clamp(eps, 1.0 - eps)
+    la = _weighted_bce(pred_attack, ta, pos_weight=pos_weight_attack)
+    ld = _weighted_bce(pred_danger, td, pos_weight=pos_weight_danger)
+    lt = _weighted_bce(pred_tactical, tt, pos_weight=pos_weight_tactical)
+    denom = 2.0 + float(attack_scale)
+    err = (float(attack_scale) * la + ld + lt) / denom
     if sample_weight is not None:
-        if sample_weight.shape != pred_value.shape:
-            raise ValueError("sample_weight 形状须与 pred_value 一致 [B]")
+        if sample_weight.shape != pred_attack.shape:
+            raise ValueError("sample_weight 形状须与 pred_* 一致 [B]")
         err = err * sample_weight
         if reduction == "mean":
             return err.sum() / sample_weight.sum().clamp(min=1e-8)
         return err
     if reduction == "mean":
         return err.mean()
+    return err
+
+
+def value_head_tanh_mse(
+    pred_value: torch.Tensor,
+    tgt_value: torch.Tensor,
+    *,
+    target_weight_alpha: float = 0.0,
+    sample_weight: torch.Tensor | None = None,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """``tanh(logit)`` 与 [-1,1] 目标（结局监督 value）的 MSE。"""
+    if reduction not in ("mean", "none"):
+        raise ValueError("reduction 须为 mean 或 none")
+    pv = torch.tanh(pred_value)
+    err = (pv - tgt_value) ** 2
+    weight = torch.ones_like(err)
+    if target_weight_alpha != 0.0:
+        weight = weight * (1.0 + float(target_weight_alpha) * tgt_value.abs())
+    if sample_weight is not None:
+        if sample_weight.shape != pred_value.shape:
+            raise ValueError("sample_weight 形状须与 pred_value 一致 [B]")
+        weight = weight * sample_weight
+    err = err * weight
+    if reduction == "mean":
+        return err.sum() / weight.sum().clamp(min=1e-8)
     return err

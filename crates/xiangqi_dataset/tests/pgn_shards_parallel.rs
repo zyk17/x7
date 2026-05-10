@@ -1,13 +1,12 @@
-//! JSONL：`jobs=1` 与多线程下分片输出字节一致（写出前按 `game_id` 排序）。
+//! PGN：`jobs=1` 与多线程下分片输出字节一致（写出前按 `game_id` 排序）。
 
-use serde_json::json;
 use std::fs;
 use std::path::Path;
 
 use tempfile::tempdir;
 
 use xiangqi_core::{legal_moves_uci, Position, START_FEN};
-use xiangqi_dataset::run_jsonl_shards;
+use xiangqi_dataset::{collect_vocab_moves_from_pgn, run_pgn_shards, write_vocab_json};
 
 fn list_shard_files(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut v: Vec<_> = fs::read_dir(dir)
@@ -26,44 +25,26 @@ fn list_shard_files(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
-fn jsonl_jobs_serial_equals_parallel_shards() {
+fn pgn_jobs_serial_equals_parallel_shards() {
     let dir = tempdir().expect("tempdir");
     let pos = Position::from_fen(START_FEN).expect("startpos");
-    let mut vmoves = legal_moves_uci(&pos);
-    vmoves.sort();
-    let first = vmoves[0].clone();
+    let mut legals = legal_moves_uci(&pos);
+    legals.sort();
+    let first = legals[0].clone();
 
+    let pgn_body =
+        format!("[Event \"a\"]\n\n1. {first}\n\n[Event \"b\"]\n\n1. {first}\n\n[Event \"c\"]\n\n1. {first}\n");
+    let pgn_path = dir.path().join("many.pgn");
+    fs::write(&pgn_path, &pgn_body).expect("pgn");
+
+    let moves = collect_vocab_moves_from_pgn(&pgn_body, 0).expect("vocab");
     let vocab_path = dir.path().join("vocab.json");
-    fs::write(
-        &vocab_path,
-        serde_json::to_string(&json!({ "moves": vmoves })).expect("json"),
-    )
-    .expect("write vocab");
-
-    let line = |game_id: &str| {
-        serde_json::to_string(&json!({
-            "fen": pos.fen(),
-            "root_fen": START_FEN,
-            "uci_prefix": [],
-            "human_move_pyffish": first,
-            "ply": 0,
-            "game_id": game_id,
-        }))
-        .expect("line")
-    };
-
-    // 文件中局顺序故意打乱；排序后应为 game_a, game_m, game_z
-    let jl = dir.path().join("many.jsonl");
-    fs::write(
-        &jl,
-        format!("{}\n{}\n{}\n", line("game_z"), line("game_a"), line("game_m")),
-    )
-    .expect("jsonl");
+    write_vocab_json(&vocab_path, &moves).expect("write vocab");
 
     let out1 = dir.path().join("out_j1");
     let out8 = dir.path().join("out_j8");
-    let n1 = run_jsonl_shards(&jl, &vocab_path, &out1, 1, 500).expect("run 1");
-    let n8 = run_jsonl_shards(&jl, &vocab_path, &out8, 8, 500).expect("run 8");
+    let n1 = run_pgn_shards(&pgn_path, &vocab_path, &out1, 1, 500, 0).expect("run 1");
+    let n8 = run_pgn_shards(&pgn_path, &vocab_path, &out8, 8, 500, 0).expect("run 8");
     assert_eq!(n1, n8);
     assert_eq!(n1, 1, "3 局 games_per_shard=500 → 1 个 shard");
 

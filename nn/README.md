@@ -14,25 +14,24 @@ pip install -e ".[train]"   # PyTorch 训练与 ONNX 导出
 
 核心运行时：`pyffish`（规则与合法着）、`tqdm`。训练额外需要 `torch`。
 
-**训练数据**：仅支持 **XRSH**（Rust `xiangqi_dataset` 生成的 `shard_*.xrsh` + `pack_meta.json`）。**`xrsh_v2`** 在分片内带 **attack/danger/tactical** 三 float（`xiangqi_core` 预计算）；**`xrsh_v1`** 仍可读。多头训练时 v2 样本 **不再** 在 `__getitem__` 为辅助头调用 pyffish。
+**训练数据**：仅支持 **XRSH v3**（Rust `xiangqi_dataset` 生成的 `shard_*.xrsh` + `pack_meta.json`）。`xrsh_v3` 包含 **辅助头三标量 + 对局结果 + 总步数**（供 **value 头**，见 `nn.dataset_xrsh`）；训练步不再为辅助头调用 pyffish。
 
 ---
 
 ## 数据集创建与使用流程（总览）
 
-整体分为两段：**先用 Rust 产出 XRSH**，**再用 Python 训练 / 导出 ONNX**。词表必须由 **`scripts/vocab/build_vocab.py`** 从 JSONL 汇总得到；**XRSH 与训练必须使用同一份 `move_vocab.json`**（`pack_meta.json` 里的 `vocab_sha256` 会校验）。
+整体分为两段：**先用 Rust 生成固定 canonical 词表与 XRSH**，**再用 Python 训练 / 导出 ONNX**。词表主线由 **`vocab-enum`** 直接确定性生成；**XRSH 与训练必须使用与分片一致的 `move_vocab.json`**（`pack_meta.json` 里的 `vocab_sha256` 会校验）。不再把“从 PGN 扫词表”作为常规流程。
 
 ```mermaid
 flowchart LR
   subgraph create["① 创建数据集 XRSH"]
-    J[JSONL 语料]
-    V["build_vocab.py → move_vocab.json"]
-    R["xiangqi_dataset:\npgn-shards / jsonl-shards"]
+    P[PGN 语料]
+    V["vocab-enum\ncanonical move_vocab.json"]
+    R["xiangqi_dataset:\npgn-shards"]
     X["XRSH 目录\npack_meta + shard_*.xrsh"]
-    J --> V
+    P --> V
     V --> R
-    J --> R
-    P[PGN 语料] --> R
+    P --> R
     R --> X
   end
   subgraph use["② 使用"]
@@ -46,33 +45,26 @@ flowchart LR
 
 | 阶段 | 谁做 | 输入 | 输出 |
 |------|------|------|------|
-| 词表 | Python `scripts/vocab/build_vocab.py` | 一条或多条 JSONL（扫描 `human_move_pyffish`） | `move_vocab.json` |
-| 分片 | Rust `cargo run -p xiangqi_dataset -- …` | 同上词表 + PGN **或** JSONL | 每个语料一个目录：`pack_meta.json`、`shard_*.xrsh` |
-| 训练 | Python `scripts/train/train_policy.py` | 训练/验证 **XRSH 目录** + **同一词表** | `policy.pt` |
+| 词表 | Rust `vocab-enum` | 无（规则几何直接枚举） | `move_vocab.json` |
+| 分片 | Rust `cargo run -p xiangqi_dataset -- pgn-shards …` | 词表 + PGN | 每个语料一个目录：`pack_meta.json`、`shard_*.xrsh` |
+| 训练 | Python `scripts/train/train_policy.py`（**默认含 value 头**，`--no-value-head` 可关） | 训练/验证 **XRSH v3** + **同一词表** | `policy.pt` |
 | 部署（可选） | `scripts/export/export_onnx.py` | checkpoint | `.onnx` |
 
-**划分 train / val 的推荐方式**：按**不同语料文件**分别生成 XRSH（例如 dpxq → `xrsh_train`，WXF → `xrsh_val`），而不是在同一大 JSONL 里按局随机切分。
+**划分 train / val 的推荐方式**：按**不同 PGN 文件**分别生成 XRSH（例如 dpxq → `xrsh_train`，WXF → `xrsh_val`）。
 
 ### 词表 → XRSH（命令）
 
-**1. 词表**（在 `nn/` 下执行；可指定多个 `--jsonl` 覆盖 train∪val 出现过的走法）：
+**1. 词表**（**仓库根目录**；固定 canonical 词表）：
 
 ```bash
-python scripts/vocab/build_vocab.py --jsonl data/train.jsonl --jsonl data/val.jsonl --out data/move_vocab.json
+cargo run --release -p xiangqi_dataset -- vocab-enum --out data/move_vocab.json
 ```
 
-**2a. PGN → XRSH**（在**仓库根目录**执行，每个 PGN 输出到独立目录）：
+**2. PGN → XRSH**（在**仓库根目录**执行，每个 PGN 输出到独立目录）：
 
 ```bash
-cargo run -p xiangqi_dataset -- pgn-shards --pgn pgns/dpxq-99813games.pgns --vocab data/move_vocab.json --out-dir data/xrsh_train --jobs 0 --games-per-shard 500
-cargo run -p xiangqi_dataset -- pgn-shards --pgn pgns/WXF-41743games.pgns --vocab data/move_vocab.json --out-dir data/xrsh_val --jobs 0 --games-per-shard 500
-```
-
-**2b. 已有 JSONL → XRSH**（仍在仓库根目录）：
-
-```bash
-cargo run -p xiangqi_dataset -- jsonl-shards --jsonl data/train.jsonl --vocab data/move_vocab.json --out-dir data/xrsh_train --jobs 0
-cargo run -p xiangqi_dataset -- jsonl-shards --jsonl data/val.jsonl --vocab data/move_vocab.json --out-dir data/xrsh_val --jobs 0
+cargo run --release -p xiangqi_dataset -- pgn-shards --pgn pgns/dpxq-99813games.pgns --vocab data/move_vocab.json --out-dir data/xrsh_train --jobs 0 --games-per-shard 500
+cargo run --release -p xiangqi_dataset -- pgn-shards --pgn pgns/WXF-41743games.pgns --vocab data/move_vocab.json --out-dir data/xrsh_val --jobs 0 --games-per-shard 500
 ```
 
 Rust 子命令与字段说明见 **`crates/xiangqi_dataset/README.md`**。
@@ -91,17 +83,17 @@ python scripts/export/export_onnx.py --checkpoint ..\data\checkpoints\policy.bes
 
 ### 小规模试跑（smock）
 
-已有 `data/smock_train.jsonl`、`data/smock_val.jsonl` 与 `data/smock_vocab.json` 时，先在**仓库根目录**生成 XRSH，再进入 `nn/` 训练：
+自备极小 **PGN**（一至数局 UCI 或 ICCS 记谱）。在**仓库根目录**：
 
 ```bash
-cargo run -p xiangqi_dataset -- jsonl-shards --jsonl nn/data/smock_train.jsonl --vocab nn/data/smock_vocab.json --out-dir nn/data/smock_xrsh_train --jobs 0
-cargo run -p xiangqi_dataset -- jsonl-shards --jsonl nn/data/smock_val.jsonl --vocab nn/data/smock_vocab.json --out-dir nn/data/smock_xrsh_val --jobs 0
+cargo run --release -p xiangqi_dataset -- vocab-enum --out data/smock_vocab.json
+cargo run --release -p xiangqi_dataset -- pgn-shards --pgn data/smock.pgn --vocab data/smock_vocab.json --out-dir data/smock_xrsh --jobs 0
 cd nn
-python scripts/train/train_policy.py --train-xrsh-dir ../data/smock_xrsh_train --val-xrsh-dir ../data/smock_xrsh_val --vocab ../data/smock_vocab.json --out ../data/checkpoints/smock_policy.pt --width 64 --blocks 4 --batch-size 256 --epochs 2 --device cpu
+python scripts/train/train_policy.py --train-xrsh-dir ../data/smock_xrsh --val-xrsh-dir ../data/smock_xrsh --vocab ../data/smock_vocab.json --out ../data/checkpoints/smock_policy.pt --width 64 --blocks 4 --batch-size 256 --epochs 2 --device cpu
 python scripts/export/export_onnx.py --checkpoint ../data/checkpoints/smock_policy.pt --out ../data/smock_policy.onnx
 ```
 
-（路径可按实际数据位置调整；试跑建议 `--epochs 2`、`--device cpu` 等。）
+（`smock.pgn` 须含 **`[Result "..."]`**，否则默认开的 value 头会报错；也可临时加 **`--no-value-head`**。试跑建议 `--epochs 2`、`--device cpu`。）
 
 默认 `--device cuda`；仅 CPU 时可显式 `--device cpu`。
 

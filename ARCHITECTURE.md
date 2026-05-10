@@ -55,8 +55,9 @@
 
 - **来源**：特级大师棋谱（ICCS / PGN）；人类 **不自对弈** 生成主标签。
 - **样本**：`position → move`；划分必须 **按整局 `game_id`**，禁止局面级随机切分导致泄漏。
-- **坐标字符串**：棋谱侧 ICCS → **pyffish 风格 UCI 字符串**（与皮卡鱼 / 77 象棋纵坐标 1～10 一致）；ICCS 解析在 **`crates/xiangqi_dataset/src/iccs.rs`**。
-- **合法着（主路径）**：**XRSH** 由 Rust **`xiangqi_dataset`** 使用 **`xiangqi_core`** 枚举并写入每样本 **合法着词表下标**；`train_policy` / **`PolicyXrshDataset`** 仅消费掩码与下标，**不在训练热路径上再用 pyffish 枚举全谱合法着**（当前默认 **`xrsh_v2`**）。**pyffish（Python `board`）** 用于 **对拍/冒烟**、水平镜像与 **`nn.aux_pseudo_labels`** 在 **旧 v1 分片或缺失辅助字段** 时的 **回退**，而非主数据契约的规则源。
+- **坐标字符串**：棋谱侧 ICCS → **引擎着法 UCI**（`a0`～`i9`，纵坐标 **0～9**，与皮卡鱼等一致）；ICCS 解析在 **`crates/xiangqi_dataset/src/iccs.rs`**。XRSH 中人类着法以 **词表下标** 与 **合法着下标列表** 存储；着法串与 `xiangqi_core::legal_moves_uci` 一致；**`parse_move_uci`** 解析单条着法串。
+- **合法着（主路径）**：**XRSH** 由 Rust **`xiangqi_dataset`** 使用 **`xiangqi_core`** 枚举并写入每样本 **合法着词表下标**；`train_policy` / **`PolicyXrshDataset`** 仅消费掩码与下标，**不在训练热路径上再用 pyffish 枚举全谱合法着**。当前训练主线固定为 **`xrsh_v3`**；**pyffish（Python `board`）** 仅用于 **对拍/冒烟** 与少量工具脚本边界适配，不再承担旧分片回退。
+- **四头语义（与 `temp.md` 一致）**：**danger**（被将、低机动、物质压力、王侧暴露）、**tactical**（吃子/将军着占比 + 被将加成）、**attack**（对敌王威胁、过河兵、深入对方半场）由 **`xiangqi_dataset::aux_labels`** 预计算；**value** 为结局监督 × **progress^γ**（`train_policy --value-progress-gamma`，默认 1.5），与三 aux 解耦。训练时辅助头默认 **BCEWithLogits**，**attack** 项可用 **`--aux-attack-scale`** 弱权重。
 
 ### 路线摘要（实现以代码与本文件里程碑为准）
 
@@ -92,7 +93,7 @@
 ## 仓库定位（Monorepo）
 
 1. **`xiangqi_core`（Rust 库）**：规则、局面表示、合法着；**所有** 可执行体与 Python 训练栈**共用**。
-2. **`nn`（Python）**：PGN → JSONL → 索引 / policy pack；**ResNet** 训练与 **ONNX** 契约。
+2. **`nn`（Python）**：**XRSH** 上 **ResNet** 训练与 **ONNX** 契约（语料物化由 Rust **`xiangqi_dataset`**：`vocab-enum → move_vocab.json`，`PGN → shards`）。
 3. **`engin`（Rust 二进制）**：**分发给终端用户** 的 **UCI 引擎**——搜索 + `xiangqi_core` + 神经网络（ONNX）推理；**不包含** 数据标注/数据集工具。
 4. **`xiangqi_dataset`（Rust 二进制）**：**维护者/训练侧** 专用——二进制 dataset 生成、按局并行、规则侧标注等；**不** 与「用户引擎」同一发布物。
 
@@ -129,14 +130,14 @@
 | 增强 | `augment_mirror.py` | 水平镜像 |
 | 神经网络 | `nn/` | `fen_tensor`、`model`、`dataset_xrsh`、`policy_pack`（词表指纹）、`xrsh_io` 等 |
 
-脚本：`nn/scripts/vocab/build_vocab.py`；`nn/scripts/train/train_policy.py`（**仅 XRSH**）、`export/export_onnx.py`。
+脚本：`nn/scripts/train/train_policy.py`（**仅 XRSH**）、`export/export_onnx.py`。
 
 ## 数据管线（现状）
 
-- **训练用数据**：**XRSH** 分片（`shard_*.xrsh` + `pack_meta.json`），由 Rust **`xiangqi_dataset`** 从 PGN 或 JSONL 生成。中间 **JSONL** 仍可用于 `build_vocab.py` 与 `jsonl-shards` 输入，但 **`train_policy` 不再直接读 JSONL / mmap 索引 / policy npy 包**。
-- **二进制分片（Rust，`xiangqi_dataset`）**：**XRSH**（Xiangqi Review Shard），文件 **`shard_*.xrsh`**（魔数 `XRSH`）。**当前写入 `xrsh_v2`**（文件头版本 2）：在 v1 字段基础上每样本追加 **`aux_attack` / `aux_danger` / `aux_tactical`**（`float32×3`，由 **`xiangqi_core`** 预计算，与 `nn.aux_pseudo_labels` 公式一致）。**v1 分片仍可读**（Python `xrsh_io` 兼容文件版本 1）。  
-  - 子命令 **`pgn-shards`**：读 PGN / `.pgns`，按局 **Rayon 并行** 编码；**`jsonl-shards`**：读已有 JSONL。  
-  - 每样本至少含：`fen`、`root_fen`、`uci_prefix`、**词表下标**的合法着列表、`target`、`ply`；v2 含上述三辅助标量；`pack_meta.json` 含 **`format`**（`xrsh_v2`）、**`vocab_sha256`**。  
+- **训练用数据**：**XRSH** 分片（`shard_*.xrsh` + `pack_meta.json`），由 Rust **`xiangqi_dataset`** 从 **PGN** 生成（**`vocab-enum`** 生成固定 canonical 词表，**`pgn-shards`** 写分片）。**`train_policy` 仅读 XRSH**，不读中间 JSONL / mmap 索引 / policy npy 包。
+- **二进制分片（Rust，`xiangqi_dataset`）**：**XRSH**（Xiangqi Review Shard），文件 **`shard_*.xrsh`**（魔数 `XRSH`）。**当前写入 `xrsh_v3`**（文件头版本 3）：在 v2 的 **`aux_*` 三 float** 之后追加 **`game_result_red`（i8）** 与 **`ply_total`（u16）**（来自 PGN `[Result]` 与总局数）。**v1/v2 分片仍可读**（Python `xrsh_io`）。  
+- 子命令 **`vocab-enum`**：按象棋几何规则直接枚举固定 **canonical `move_vocab.json`**；**`pgn-shards`**：读 PGN / `.pgns`，按局 **Rayon 并行** 编码。**`vocab-from-pgn`** 仅保留作调试/覆盖校验入口，不属于主线契约。
+  - `pack_meta.json` 含 **`format`**（`xrsh_v3`）、**`vocab_sha256`**。**`train_policy` 默认训练 value 头**（`--no-value-head` 可关），须 v3 且 PGN **`[Result "1-0"]` / `[Result "0-1"]` / `[Result "1/2-1/2"]`** 可解析；`*` 或未标注视为未知（`game_result_red=2`，Dataset 会报错，除非 `--no-value-head`）。  
   - 细节与 CLI 见 **`crates/xiangqi_dataset/README.md`**。Python 训练仅 **`nn.dataset_xrsh.PolicyXrshDataset`**（`train_policy.py --train-xrsh-dir`）；若样本含辅助字段则 **训练步不再对辅助头调 pyffish**。
 
 ## 模型与 ONNX（Python）

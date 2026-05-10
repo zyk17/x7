@@ -1,6 +1,6 @@
 # xiangqi_core
 
-象棋 **规则、位棋盘、合法着生成**（UCI 字符串，与 pyffish / Pikafish 坐标一致）。
+象棋 **规则、位棋盘、合法着生成**（着法 UCI：`a0`～`i9`，与皮卡鱼等引擎一致）。
 
 ## 来源与许可说明
 
@@ -9,7 +9,8 @@
 ## API 摘要
 
 - `Position::from_fen(&str)` / `set_fen`：局面
-- `legal_moves_uci(&Position) -> Vec<String>`：合法着 UCI 串；**纵坐标为 1～10**（与 pyffish 一致，非 ICCS 的 0～9）
+- `legal_moves_uci(&Position) -> Vec<String>`：合法着 UCI 串；**纵坐标为 0～9**（`a0`～`i9`）
+- `parse_move_uci(s: &str) -> Option<Move>`：解析着法串（不校验合法）；`uci_to_move` 需局面
 - `movegen::generate(..., GenType::Legal, ...)`：内部 `Move` 枚举
 - `uci_format::START_FEN`：起始 FEN
 

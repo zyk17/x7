@@ -5,7 +5,7 @@
 | 阶段 | 目标 | 主要交付 / Crate |
 |------|------|------------------|
 | **P0** | **完整象棋规则 + 合法 UCI**，与 **pikafish-rust / Pikafish** 语义对齐 | `crates/xiangqi_core`：已从 pikafish-rust 迁入 `types`/`board`/`movegen`/`misc`；`legal_moves_uci`、perft 测试；可选：与 pyffish 抽样对拍 |
-| **P1** | **数据管线**：PGN / JSONL → **二进制 shards**（**XRSH** `.xrsh`），**按局并行** | `crates/xiangqi_dataset`：**`xrsh_v1`/v2**、`pack_meta.json`（`vocab_sha256`）；CLI 见 crate `README.md`；Python 读取见 **`nn.dataset_xrsh`** |
+| **P1** | **数据管线**：**canonical 词表 + PGN → 二进制 shards**（**XRSH v3** `.xrsh`），**按局并行** | `crates/xiangqi_dataset`：**`vocab-enum`**、**`pgn-shards`**；`pack_meta.json`（`format=xrsh_v3`、`vocab_sha256`）；Python 读取见 **`nn.dataset_xrsh`** |
 | **P2** | **Python 训练**接入二进制数据包 + **多头网络**（人类棋谱 policy + 语义辅助头） | `nn/`：`Dataset`/loader、损失与 ONNX 契约扩展（policy + 辅助头）；标签管线与 P1 输出衔接 |
 | **P3** | **引擎**：**搜索承担战术深度**；UCI 闭环 | `crates/engin`：**Alpha-Beta**、**TT**、**move ordering**、**UCI 协议**；挂接 `xiangqi_core` + ONNX（policy/语义先验，非单独扛「引擎真理」） |
 | **P4** | **人类局面感 Value（可选）**：服务剪枝与志向，**非**引擎静态评估的全量替代 | `nn/`：value head 契约；标签侧重 **人类局面理解**（或文档约定的伪标/Teacher，见 TODO）；`engin`：可选消费接口 |

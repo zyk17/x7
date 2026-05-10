@@ -1,10 +1,9 @@
 # 测试夹具说明
 
-- **`jsonl_smoke.rs`** 冒烟测试在运行时生成：
-  - 临时目录中的 **move_vocab.json**（内容为起始局面全部合法 UCI，已排序）；
-  - 单行 **JSONL**（与训练管线 JSONL 字段一致，见根目录 **`ARCHITECTURE.md`**）。
-- 无需提交大块棋谱；若要手工跑 CLI，可先在同一目录写好 `vocab.json` 与 `*.jsonl`，再：
+- **`pgn_xrsh_smoke.rs`**：运行时构造极小 **PGN**（两回合合法 UCI），再 **`collect_vocab_moves_from_pgn`** → **`run_pgn_shards`**，校验分片头与 `pack_meta`。
+- 无需提交大块棋谱。手工跑 CLI 时在**仓库根**执行，例如：
 
 ```bash
-cargo run -p xiangqi_dataset -- jsonl-shards --jsonl train.jsonl --vocab move_vocab.json --out-dir out_xrsh
+cargo run --release -p xiangqi_dataset -- vocab-enum --out data/move_vocab.json
+cargo run --release -p xiangqi_dataset -- pgn-shards --pgn data/foo.pgn --vocab data/move_vocab.json --out-dir data/xrsh_out --jobs 0
 ```

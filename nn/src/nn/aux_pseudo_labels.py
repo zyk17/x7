@@ -1,4 +1,7 @@
-"""训练侧伪标签：由 FEN + pyffish 生成的 attack / danger / tactical 标量（无人工标注）。"""
+"""训练侧伪标签：与 ``crates/xiangqi_dataset/src/aux_labels.rs`` 语义对齐（FEN + pyffish 回退路径）。
+
+主数据应由 Rust 预计算写入 XRSH；本模块仅在缺 aux 字段时调用。
+"""
 
 from __future__ import annotations
 
@@ -28,6 +31,9 @@ _PIECE_MATERIAL: dict[str, float] = {
     "k": 0.0,
 }
 
+_CORE_MOVE = re.compile(r"^([a-i])([0-9])([a-i])([0-9])([a-z])?$")
+_PYFFISH_MOVE = re.compile(r"^([a-i])(10|[1-9])([a-i])(10|[1-9])([a-z])?$")
+
 # 全局计数：pyffish is_capture 失败 → FEN 回退 → 仍失败 的次数；供 DataLoader 侧诊断
 _pyffish_capture_fallback_count = 0
 _pyffish_capture_total_calls = 0
@@ -37,8 +43,23 @@ def pyffish_capture_diag() -> tuple[int, int]:
     return _pyffish_capture_fallback_count, _pyffish_capture_total_calls
 
 
+def core_uci_to_pyffish(uci: str) -> str:
+    m = _CORE_MOVE.match(uci.strip().lower())
+    if not m:
+        raise ValueError(f"非标准 UCI: {uci!r}")
+
+    def enc_rank(r: int) -> str:
+        return "10" if r == 9 else str(r + 1)
+
+    r1 = int(m.group(2))
+    r2 = int(m.group(4))
+    s = f"{m.group(1)}{enc_rank(r1)}{m.group(3)}{enc_rank(r2)}"
+    if m.group(5):
+        s += m.group(5)
+    return s
+
+
 def _material_red_black(board_field: str) -> tuple[float, float]:
-    """FEN 棋盘段：红方（大写）与黑方（小写）子力分值和（不含将/帅）。"""
     red = 0.0
     black = 0.0
     for ch in board_field:
@@ -53,7 +74,6 @@ def _material_red_black(board_field: str) -> tuple[float, float]:
 
 
 def _fen_board_to_flat(fen_board: str) -> list[str]:
-    """将 FEN 棋盘字段展开为逐格列表（行主序，rank 9 → rank 0，col a → i）。"""
     ranks = fen_board.split("/")
     if len(ranks) != 10:
         raise ValueError(f"期望 10 行棋盘，得到 {len(ranks)}")
@@ -69,21 +89,27 @@ def _fen_board_to_flat(fen_board: str) -> list[str]:
     return cells
 
 
+def _rank_from_cell_index(i: int) -> int:
+    """纵坐标 0..9，与 xiangqi_core 一致（0=红方底线）。"""
+    return 9 - (i // 9)
+
+
+def _cheb_cell(i: int, j: int) -> int:
+    return max(abs(i // 9 - j // 9), abs(i % 9 - j % 9))
+
+
 def _uci_dest_fen_index(uci: str) -> int | None:
-    """将 pyffish UCI（如 ``b2b6``）的目的格转为 0..89 的 FEN 棋盘索引，失败返回 None。"""
-    m = re.fullmatch(r"([a-i])(\d+)([a-i])(\d+)", uci.lower())
+    m = re.fullmatch(r"([a-i])([0-9])([a-i])([0-9])([a-z])?", uci.strip().lower())
     if not m:
         return None
     file = ord(m.group(3)) - ord("a")
-    pyr = int(m.group(4))  # pyffish rank 1..10
-    if pyr < 1 or pyr > 10:
+    fen_rank = int(m.group(4))
+    if fen_rank > 9 or not (0 <= file <= 8):
         return None
-    fen_rank = pyr - 1  # FEN rank 0..9（0=底）
-    return (9 - fen_rank) * 9 + file  # row-major: rank 9 在最前
+    return (9 - fen_rank) * 9 + file
 
 
 def _fen_dest_piece(fen: str, uci: str) -> str | None:
-    """从当前 fen 读取 uci 目标格的棋子符号；失败返回 None。"""
     idx = _uci_dest_fen_index(uci)
     if idx is None:
         return None
@@ -99,15 +125,15 @@ def _fen_dest_piece(fen: str, uci: str) -> str | None:
     return cells[idx]
 
 
-def _is_capture_safe(fen: str, base: str, prefix: list[str], uci: str) -> bool:
+def _is_capture_safe(fen: str, base: str, prefix_pf: list[str], uci: str) -> bool:
     global _pyffish_capture_fallback_count, _pyffish_capture_total_calls
     _pyffish_capture_total_calls += 1
+    u_pf = core_uci_to_pyffish(uci)
     try:
-        return bool(sf.is_capture(VARIANT, base, prefix, uci))
+        return bool(sf.is_capture(VARIANT, base, prefix_pf, u_pf))
     except (ValueError, SystemError, RuntimeError):
         pass
 
-    # pyffish 失败：回退到 FEN 检查（目标格是否有对方棋子）
     ch = _fen_dest_piece(fen, uci)
     if ch is not None and ch not in (".", ""):
         stm = fen.split()[1] if len(fen.split()) > 1 else "w"
@@ -121,6 +147,103 @@ def _is_capture_safe(fen: str, base: str, prefix: list[str], uci: str) -> bool:
     return False
 
 
+def _in_check_sf(base: str, prefix_pf: list[str]) -> bool:
+    try:
+        return bool(sf.gives_check(VARIANT, base, prefix_pf))
+    except (ValueError, SystemError, RuntimeError):
+        return False
+
+
+def _gives_check_move(base: str, prefix_pf: list[str], uci: str) -> bool:
+    u_pf = core_uci_to_pyffish(uci)
+    try:
+        return bool(sf.gives_check(VARIANT, base, prefix_pf, u_pf))
+    except (ValueError, SystemError, RuntimeError):
+        return False
+
+
+def pyffish_uci_to_core(uci: str) -> str:
+    m = _PYFFISH_MOVE.match(uci.strip().lower())
+    if not m:
+        return uci
+
+    def dec_rank(rs: str) -> int:
+        return 10 if rs == "10" else int(rs)
+
+    r1 = dec_rank(m.group(2)) - 1
+    r2 = dec_rank(m.group(4)) - 1
+    core = f"{m.group(1)}{r1}{m.group(3)}{r2}"
+    if m.group(5):
+        core += m.group(5)
+    return core
+
+
+def _king_exposure_proxy(cells: list[str], *, stm_white: bool) -> float:
+    our_k, enemy_k = ("K", "k") if stm_white else ("k", "K")
+    try:
+        i_our = cells.index(our_k)
+    except ValueError:
+        return 0.0
+    n_enemy_near = 0
+    for i, ch in enumerate(cells):
+        if ch in (".", ""):
+            continue
+        enemy = ch.islower() if stm_white else ch.isupper()
+        if not enemy or ch in ("K", "k"):
+            continue
+        if _cheb_cell(i, i_our) <= 2:
+            n_enemy_near += 1
+    return min(1.0, n_enemy_near / 6.0)
+
+
+def _attack_pressure_proxy(cells: list[str], *, stm_white: bool) -> tuple[float, float, float]:
+    """(威胁老将邻域, 过河兵比例, 深入对方半场子力) 均 ∈ [0,1]。"""
+    our_k, enemy_k = ("K", "k") if stm_white else ("k", "K")
+    try:
+        i_ek = cells.index(enemy_k)
+    except ValueError:
+        return 0.0, 0.0, 0.0
+
+    threat = 0
+    for i, ch in enumerate(cells):
+        if ch in (".", ""):
+            continue
+        ours = ch.isupper() if stm_white else ch.islower()
+        if not ours or ch in ("K", "k"):
+            continue
+        if _cheb_cell(i, i_ek) <= 2:
+            threat += 1
+    threat_k = min(1.0, threat / 8.0)
+
+    pawns = 0
+    crossed = 0
+    for i, ch in enumerate(cells):
+        if stm_white and ch == "P":
+            pawns += 1
+            if _rank_from_cell_index(i) >= 5:
+                crossed += 1
+        if not stm_white and ch == "p":
+            pawns += 1
+            if _rank_from_cell_index(i) <= 4:
+                crossed += 1
+    crossed_ratio = 0.0 if pawns == 0 else crossed / float(pawns)
+
+    deep = 0
+    for i, ch in enumerate(cells):
+        if ch in (".", ""):
+            continue
+        ours = ch.isupper() if stm_white else ch.islower()
+        if not ours or ch in ("K", "k"):
+            continue
+        r = _rank_from_cell_index(i)
+        on_enemy = r >= 5 if stm_white else r <= 4
+        if on_enemy:
+            deep += 1
+    half_norm = min(1.0, deep / 12.0)
+
+    return threat_k, crossed_ratio, half_norm
+
+
 def pseudo_aux_labels_from_sample(
     fen: str,
     *,
@@ -129,51 +252,72 @@ def pseudo_aux_labels_from_sample(
     legal_uci: Sequence[str] | None = None,
 ) -> tuple[float, float, float]:
     """
-    返回三维伪标签，取值约在 [0, 1]，可与 sigmoid 回归头配合。
+    返回 attack / danger / tactical，与 Rust ``pseudo_aux_labels`` 同语义（本实现为几何+pyffish 近似）。
 
-    - **base / prefix**：须与分片编码时一致（``pyffish.legal_moves(VARIANT, root_fen, uci_prefix)``），
-      以计入长将 / 重复等路径依赖约束；若缺省则退化为 ``root_fen=fen``、空 prefix（与旧行为一致）。
-    - **legal_uci**：若提供，**机动性 / 吃子比例** 仅在该集合上统计（与 XRSH 物化的 ``legal_idx`` 一致，
-      减少与 policy mask 的合法集分裂；仍用 pyffish 判定各着是否吃子）。
-
-    物质项 **attack** 仍从当前局面 ``fen`` 的棋盘段读取（与行内 ``fen`` 一致）。
-
-    注意：policy 目标来自 **Rust** 合法集，本函数在吃子判定时仍调 **pyffish**；若两引擎规则有差异，
-    可能仍有静默不一致，长期应用 ``xiangqi_core`` 在数据侧预计算伪标签以统一规则源（见 ARCHITECTURE）。
+    - **legal_uci**：若提供，统计仅在该集合上（与 XRSH ``legal_idx`` 一致）。
     """
     base = root_fen if root_fen else fen
     prefix = list(uci_prefix or [])
+    prefix_pf = [core_uci_to_pyffish(m) for m in prefix]
 
     if legal_uci is not None:
         moves = list(legal_uci)
     else:
-        moves = list(sf.legal_moves(VARIANT, base, prefix))
+        moves = [pyffish_uci_to_core(m) for m in sf.legal_moves(VARIANT, base, prefix_pf)]
 
     n = len(moves)
     if n < 1:
         return 0.5, 1.0, 0.0
 
-    caps = sum(1 for u in moves if _is_capture_safe(fen, base, prefix, u))
-    tactical = caps / float(n)
+    caps = sum(1 for u in moves if _is_capture_safe(fen, base, prefix_pf, u))
+    checks = sum(1 for u in moves if _gives_check_move(base, prefix_pf, u))
+    capture_ratio = caps / float(n)
+    check_ratio = checks / float(n)
+    in_check_bonus = 1.0 if _in_check_sf(base, prefix_pf) else 0.0
+    tactical = min(
+        1.0,
+        max(0.0, 0.5 * capture_ratio + 0.3 * check_ratio + 0.2 * in_check_bonus),
+    )
 
     parts = fen.split()
     stm = parts[1] if len(parts) > 1 else "w"
+    stm_white = stm == "w"
     red, black = _material_red_black(parts[0])
-    if stm == "w":
-        adv = red - black
-    else:
-        adv = black - red
+    adv = red - black if stm_white else black - red
 
-    attack = 0.5 * (1.0 + math.tanh(adv / 12.0))
-
+    danger_check = 1.0 if in_check_bonus else 0.0
     mob_norm = min(1.0, n / 48.0)
-    danger_from_moves = 1.0 - mob_norm
-    mat_stress = 0.5 * (1.0 + math.tanh(-adv / 12.0))
-    danger = max(0.0, min(1.0, 0.55 * danger_from_moves + 0.45 * mat_stress))
+    low_mobility = 1.0 - mob_norm
+    material_stress = max(0.0, min(1.0, 0.5 * (1.0 + math.tanh(-adv / 12.0))))
+
+    try:
+        cells = _fen_board_to_flat(parts[0])
+        king_exposure = _king_exposure_proxy(cells, stm_white=stm_white)
+        threat_k, crossed_ratio, half_norm = _attack_pressure_proxy(
+            cells, stm_white=stm_white
+        )
+    except ValueError:
+        king_exposure = 0.0
+        threat_k, crossed_ratio, half_norm = 0.0, 0.0, 0.0
+
+    danger = max(
+        0.0,
+        min(
+            1.0,
+            0.35 * danger_check
+            + 0.30 * low_mobility
+            + 0.20 * material_stress
+            + 0.15 * king_exposure,
+        ),
+    )
+
+    attack = max(
+        0.0,
+        min(1.0, 0.45 * threat_k + 0.35 * crossed_ratio + 0.20 * half_norm),
+    )
 
     return attack, danger, tactical
 
 
 def pseudo_aux_labels_from_fen(fen: str) -> tuple[float, float, float]:
-    """兼容旧调用：无根局面、无走子历史、不绑定 Rust 合法表。"""
     return pseudo_aux_labels_from_sample(fen)

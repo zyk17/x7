@@ -1,4 +1,4 @@
-"""水平镜像：棋盘 + pyffish 四字母 UCI（仅交换纵线 a↔i …），不改变先后手语义。"""
+"""水平镜像：棋盘 + 四字符着法 UCI（仅交换纵线 a↔i …），不改变先后手语义。"""
 
 from __future__ import annotations
 
@@ -6,20 +6,20 @@ _FILES = "abcdefghi"
 _FILE_TR = str.maketrans(_FILES, "ihgfedcba")
 
 
-def mirror_pyffish_file(ch: str) -> str:
+def mirror_uci_file(ch: str) -> str:
     if ch not in _FILES:
         raise ValueError(f"非纵线字符: {ch!r}")
     return ch.translate(_FILE_TR)
 
 
-def mirror_pyffish_uci(u: str) -> str:
-    """四字母 UCI，例如 c4c5 → g4g5（仅镜像 file）。"""
+def mirror_move_uci(u: str) -> str:
+    """四字符 UCI 着法，例如 c4c5 → g4g5（仅镜像纵线）。"""
     if len(u) != 4:
         raise ValueError(f"期望 4 字符着法，得到 {len(u)}: {u!r}")
     return (
-        mirror_pyffish_file(u[0])
+        mirror_uci_file(u[0])
         + u[1]
-        + mirror_pyffish_file(u[2])
+        + mirror_uci_file(u[2])
         + u[3]
     )
 
@@ -76,4 +76,4 @@ def mirror_fen(fen: str) -> str:
 
 
 def mirror_uci_prefix(prefix: list[str]) -> list[str]:
-    return [mirror_pyffish_uci(m) for m in prefix]
+    return [mirror_move_uci(m) for m in prefix]

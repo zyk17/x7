@@ -562,10 +562,10 @@ mod tests {
     #[test]
     fn split_fen_moves() {
         let (fen, m) =
-            split_fen_and_moves("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b - - 0 1 moves b7b6")
+            split_fen_and_moves("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b - - 0 1 moves b6b5")
                 .unwrap();
         assert!(fen.contains("b -"));
-        assert_eq!(m.as_deref(), Some("b7b6"));
+        assert_eq!(m.as_deref(), Some("b6b5"));
     }
 
     #[test]

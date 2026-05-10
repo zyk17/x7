@@ -1,4 +1,4 @@
-//! `move_vocab.json`：`{ "moves": [ "a0a1", ... ], "size": N }`（与 `build_vocab.py` 一致）。
+//! `move_vocab.json`：`{ "moves": [ "a0a1", ... ], "size": N }`（与 `xiangqi_dataset vocab-enum` 生成格式一致）。
 
 use std::collections::HashMap;
 use std::path::Path;

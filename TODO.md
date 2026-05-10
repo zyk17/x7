@@ -43,7 +43,7 @@
 - [x] 局面表示：`from_fen` / `set_fen`；perft + do/undo 回归
 - [x] 各子力走法与阻挡、将/帅照面、过河等（移植自 pikafish-rust）
 - [x] 将军 / 应将 / 合法性过滤（`GenType::Legal` + `Position::legal`）
-- [x] **合法着 UCI**：`legal_moves_uci`、`parse_pyffish_uci`（纵坐标 **1～10**，与 pyffish 字符串一致）
+- [x] **合法着 UCI**：`legal_moves_uci`、`parse_move_uci`（纵坐标 **0～9**，与 Pikafish 等引擎 UCI 一致）
 - [x] **一致性测试（门禁）**：`nn/scripts/parity/pyffish_xiangqi_core_parity.py` + `pytest tests/test_pyffish_xiangqi_core_parity.py`（须 `pyffish` + `cargo`）；`xiangqi_core` 二进制 `legal_moves_dump`；种子含 **根 FEN + 非空 `uci_prefix`**；可选扩展：与 **Pikafish** 边界用例对照（外部仓库 `c:\projects\Pikafish`，本仓仅文档引用）
 - [x] 文档：`crates/xiangqi_core/README.md`（来源、API、测试）
 
@@ -53,13 +53,13 @@
 
 **当前阶段：MVP 已可用；下一步是「规则单一来源」增强**
 
-- [x] 输入：**PGN**（ICCS / UCI，Rust `encode`）+ **`jsonl-shards`** 读 JSONL
-- [x] 输出：**XRSH**（`shard_NNNNN.xrsh`，魔数 `XRSH`）+ `pack_meta.json`；**当前默认 `xrsh_v2`**
-- [x] `vocab_sha256` 与 Python 词表指纹一致；`pack_meta.format` 为 **`xrsh_v2`**（旧 v1 包仍兼容）
-- [x] CLI：`pgn-shards` / `jsonl-shards`，`--jobs`、`--games-per-shard`
+- [x] 输入：**PGN**（ICCS / UCI，Rust `encode`）；**`vocab-enum`** 生成固定 canonical 词表
+- [x] 输出：**XRSH**（`shard_NNNNN.xrsh`，魔数 `XRSH`）+ `pack_meta.json`；**当前默认 `xrsh_v3`**
+- [x] `vocab_sha256` 与 Python 词表指纹一致；`pack_meta.format` 为 **`xrsh_v3`**
+- [x] CLI：`vocab-enum` / `pgn-shards`，`--jobs`、`--games-per-shard`
 - [x] Python **`PolicyXrshDataset`**（`nn.dataset_xrsh`，`--train-xrsh-dir`）
-- [x] Rust：单元测试（`iccs` / `pgn` / `vocab`）、集成冒烟 `tests/jsonl_smoke.rs`（JSONL → XRSH + `read_shard_header` + `pack_meta`）
-- [x] **XRSH v2**：编码行走 **`xiangqi_core`** 预计算 **attack/danger/tactical** 写入分片（`pack_meta.format: xrsh_v2`，文件头版本 2）；Python **`xrsh_io` / `PolicyXrshDataset`** 优先读入；缺字段或旧 **v1** 分片回退 pyffish（`aux_pseudo_labels`）
+- [x] Rust：单元测试（`iccs` / `pgn` / `vocab`）、集成冒烟 `tests/pgn_xrsh_smoke.rs`（PGN → XRSH + `read_shard_header` + `pack_meta`）
+- [x] **XRSH v3**：三辅助 float + **`game_result_red` / `ply_total`**（`pack_meta.format: xrsh_v3`，文件头版本 3）；Python **`xrsh_io` / `PolicyXrshDataset`** 读入；**value 头**用终局标签（非 `2*attack-1`）
 
 ---
 
@@ -72,7 +72,7 @@
 - [x] 损失与权重；验证指标（`--aux-loss-weight`、`val_aux_mse`）
 - [x] **ONNX 导出**（`export_onnx.py`：logits + 可选三头，图中 sigmoid）
 - [x] 训练路径 **XRSH only**
-- [x] **惯例**：**`xrsh_v2`** + 多头训练 → 辅助标签来自 Rust，与 policy 同源；仅持有旧 **v1** 分片或想排除辅助头噪声时用 **`--no-aux-heads`**
+- [x] **惯例**：**`xrsh_v3`** + 多头训练 → 辅助标签来自 Rust；**`train_policy` 默认开 value 头**（棋谱须含 `[Result]`；**`--no-value-head`** 关闭）；旧 **v1/v2** 或想排除辅助头噪声时用 **`--no-aux-heads`**
 
 ---
 
@@ -123,5 +123,5 @@
 ## 已完成（归档区）
 
 - **2026-05**：P0 主体 — 自 pikafish-rust 并入 `types` / `misc` / `board` / `movegen`；`Position::from_fen`、`global_zobrist`、`legal_moves_uci`；`tests/perft.rs`（depth 1–3 = 44 / 1926 / 80069）。
-- **2026-05**：P1 MVP — `xiangqi_dataset`：`pgn-shards` / `jsonl-shards`，XRSH（`.xrsh`），`pack_meta.json`；`uci_format` 与 pyffish 纵坐标 1～10 对齐。
+- **2026-05**：P1 MVP — `xiangqi_dataset`：`vocab-enum` / `pgn-shards`，XRSH（`.xrsh`），`pack_meta.json`；`uci_format` 与 Pikafish UCI（纵坐标 0～9）对齐。
 - **2026-05**：P2 — `PolicyResNet` 可选多头；`aux_pseudo_labels` + `root_fen`/`uci_prefix`/合法 UCI 表；ONNX 多输出；训练 `unpack_*_batch`。

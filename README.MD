@@ -46,7 +46,7 @@
 
 ## Python 训练栈（`nn/`）
 
-**词表（`build_vocab`）→ Rust 生成 XRSH → `train_policy` / ONNX** 的完整步骤见 **`nn/README.md`** 中「数据集创建与使用流程」。
+**固定 canonical `move_vocab.json` → Rust 生成 XRSH → `train_policy` / ONNX** 的完整步骤见 **`nn/README.md`** 中「数据集创建与使用流程」。
 
 ```bash
 cd nn
@@ -63,7 +63,7 @@ cargo run -p engin                   # **UCI**：自 stdin 读协议（GUI 对�
 cargo run -p engin -- --onnx-smoke   # 加载 data/policy.onnx 对起始局面推理（路径见 --help）
 cargo run -p engin -- --bench --depth 4   # P3 基准：NDJSON（资源路径同上）；`--nn-leaf off|main|all`、`--no-nn-leaf`、`--nn-eval-budget N`、`--no-policy-ordering`、`--require-onnx`
 cargo run -p engin -- --value-probe --depth 4   # 小评测：`nn-leaf off` vs `main`，Markdown 表（见 `docs/value-probe.md`）
-cargo run -p xiangqi_dataset -- <子命令> …   # 维护者：**PGN/JSONL → XRSH**（`pgn-shards` / `jsonl-shards`，见 `crates/xiangqi_dataset/README.md`）
+cargo run -p xiangqi_dataset -- <子命令> …   # 维护者：**canonical 词表 + PGN → XRSH**（主线：`vocab-enum` / `pgn-shards`，见 `crates/xiangqi_dataset/README.md`）
 ```
 
 （`cargo run` 传给**二进制**的参数必须写在 **`--` 之后**；若写 `cargo run --onnx-smoke` 会被当成 Cargo 自己的选项而报错。）
@@ -79,6 +79,6 @@ cargo run -p xiangqi_dataset -- <子命令> …   # 维护者：**PGN/JSONL → 
 | `TODO.md` | 阶段索引与近期主线 |
 | `工程目标.md` | P3 之后的中期工程目标：value、搜索控制头、蒸馏、动态搜索 |
 | `NEXT_STEPS.md` | 接下来 2～6 周的实际执行计划：P3 做实、benchmark、ablation、head 收益归因 |
-| `crates/xiangqi_dataset/README.md` | `pgn-shards` / `jsonl-shards` 与 **XRSH**（`.xrsh`）格式 |
+| `crates/xiangqi_dataset/README.md` | `vocab-enum` / `pgn-shards` 与 **XRSH**（`.xrsh`）格式 |
 | `agents.md` | 给自动化助手 / Agent 的仓库约定 |
 | `docs/design-summary.md` | 人类认知驱动搜索、能力边界与 Elo 声明的 **归档摘要**（非数据契约） |

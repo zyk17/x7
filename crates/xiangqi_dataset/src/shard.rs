@@ -7,10 +7,10 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 /// 当前写入格式：`pack_meta.json` 的 `format` 字段。
-pub const FORMAT_NAME: &str = "xrsh_v2";
+pub const FORMAT_NAME: &str = "xrsh_v3";
 
 /// 分片文件头内的二进制版本号（与 `pack_meta.format_version` 一致）。
-pub const SHARD_FILE_VERSION: u32 = 2;
+pub const SHARD_FILE_VERSION: u32 = 3;
 
 /// 单样本（一行训练数据）。
 #[derive(Debug, Clone)]
@@ -25,6 +25,10 @@ pub struct EncodedRow {
     pub aux_attack: f32,
     pub aux_danger: f32,
     pub aux_tactical: f32,
+    /// PGN `[Result]` 红方视角：`1` 红胜、`-1` 黑胜、`0` 和、`2` 未知（`*` 或未标注）。
+    pub game_result_red: i8,
+    /// 本局总着数（与 `uci_moves.len()` 一致），用于 value 时间折扣等。
+    pub ply_total: u16,
 }
 
 /// 一局内的所有样本。
@@ -97,6 +101,8 @@ pub fn write_shard(path: &Path, vocab_hash: &[u8; 32], games: &[EncodedGame]) ->
             w.write_all(&r.aux_attack.to_le_bytes())?;
             w.write_all(&r.aux_danger.to_le_bytes())?;
             w.write_all(&r.aux_tactical.to_le_bytes())?;
+            w.write_all(&r.game_result_red.to_le_bytes())?;
+            w.write_all(&r.ply_total.to_le_bytes())?;
         }
     }
     w.flush()?;

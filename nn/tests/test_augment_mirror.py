@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from augment_mirror import (
     mirror_board_fen_field,
     mirror_fen,
-    mirror_pyffish_uci,
+    mirror_move_uci,
 )
 from constants import START_FEN
 from nn.fen_tensor import fen_to_planes
@@ -19,8 +19,8 @@ from nn.fen_tensor import fen_to_planes
 
 def test_mirror_uci_involution():
     u = "c4c5"
-    assert mirror_pyffish_uci(mirror_pyffish_uci(u)) == u
-    assert mirror_pyffish_uci(u) == "g4g5"
+    assert mirror_move_uci(mirror_move_uci(u)) == u
+    assert mirror_move_uci(u) == "g4g5"
 
 
 def test_mirror_fen_involution():

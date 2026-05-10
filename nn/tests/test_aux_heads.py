@@ -19,7 +19,8 @@ from nn.model import PolicyResNet, aux_heads_sigmoid_mse
 def test_pseudo_aux_labels_range_and_start():
     a, d, t = pseudo_aux_labels_from_fen(START_FEN)
     assert 0.0 <= a <= 1.0 and 0.0 <= d <= 1.0 and 0.0 <= t <= 1.0
-    assert abs(a - 0.5) < 0.01
+    # 开局无过河兵、对敌王无直接威胁 → attack 接近 0（与 Rust aux_labels 语义一致）
+    assert a < 0.15
 
 
 def test_pseudo_aux_with_prefix_matches_empty_start():

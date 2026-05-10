@@ -1,9 +1,9 @@
-//! ICCS 纵线记谱 → pyffish UCI（历史 Python 实现已移除；单源为本模块）。
+//! ICCS 纵线记谱 → 引擎 UCI（Pikafish：`a0`～`i9`；单源为本模块）。
 
 use anyhow::{anyhow, bail, Result};
 
-/// 单格 ICCS（如 `C3`、`a0`）→ pyffish 半串（纵坐标为条纹+1，如 `c4`、`a1`）。
-pub fn iccs_half_to_pyffish(half: &str) -> Result<String> {
+/// 单格 ICCS（如 `C3`、`a0`）→ UCI 半串（`[a-i][0-9]`，纵坐标等于盘面条纹）。
+pub fn iccs_half_to_uci(half: &str) -> Result<String> {
     let s = half.trim();
     let b = s.as_bytes();
     if b.len() < 2 {
@@ -15,11 +15,14 @@ pub fn iccs_half_to_pyffish(half: &str) -> Result<String> {
     }
     let num_str = std::str::from_utf8(&b[1..]).map_err(|_| anyhow!("ICCS 非 UTF-8"))?;
     let r: i32 = num_str.parse().map_err(|_| anyhow!("非法 ICCS 条纹数字: {half:?}"))?;
-    Ok(format!("{}{}", f as char, r + 1))
+    if !(0..=9).contains(&r) {
+        bail!("ICCS 纵坐标越界（须 0～9）: {half:?}");
+    }
+    Ok(format!("{}{}", f as char, r))
 }
 
-/// `C3-C4` / `c3c4` → pyffish UCI。
-pub fn iccs_move_to_pyffish(mv: &str) -> Result<String> {
+/// `C3-C4` / `c3c4` → 着法 UCI（四字符，纵坐标 0～9）。
+pub fn iccs_move_to_uci(mv: &str) -> Result<String> {
     let t = mv.trim().replace(' ', "");
     let (a, b) = if let Some((x, y)) = t.split_once('-') {
         (x, y)
@@ -40,7 +43,7 @@ pub fn iccs_move_to_pyffish(mv: &str) -> Result<String> {
         }
         (&t[..split], &t[split..])
     };
-    Ok(iccs_half_to_pyffish(a)? + &iccs_half_to_pyffish(b)?)
+    Ok(iccs_half_to_uci(a)? + &iccs_half_to_uci(b)?)
 }
 
 #[cfg(test)]
@@ -48,12 +51,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn iccs_pair_to_pyffish() {
-        assert_eq!(iccs_move_to_pyffish("c3-c4").unwrap(), "c4c5");
+    fn iccs_pair_to_uci() {
+        assert_eq!(iccs_move_to_uci("c3-c4").unwrap(), "c3c4");
     }
 
     #[test]
     fn iccs_compact() {
-        assert_eq!(iccs_move_to_pyffish("c3c4").unwrap(), "c4c5");
+        assert_eq!(iccs_move_to_uci("c3c4").unwrap(), "c3c4");
     }
 }

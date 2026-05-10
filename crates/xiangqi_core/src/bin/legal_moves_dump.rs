@@ -1,4 +1,4 @@
-//! 将当前局面的合法 UCI（与 pyffish 一致：纵坐标 1～10）排序后逐行打印，供 Python 与 pyffish 对拍。
+//! 将当前局面的合法 UCI（Pikafish：`a0`～`i9`）排序后逐行打印，便于与 Pikafish / 其他引擎对拍。
 //!
 //! 用法：`cargo run -p xiangqi_core --bin legal_moves_dump -- [--fen FEN] [--prefix "uci1 uci2 ..."]`
 //! 或：`--stdin` 读取一行：`FEN<TAB>前缀`（前缀可为空）。
@@ -12,7 +12,7 @@ use xiangqi_core::{legal_moves_uci, uci_to_move, Position, START_FEN};
 fn usage() -> ! {
     eprintln!(
         "用法: legal_moves_dump [--fen FEN] [--prefix \"m1 m2 ...\"] [--stdin]\n\
-         默认 FEN 为起始局面；前缀为从该根局面依次执行的 pyffish UCI（空格分隔）。\n\
+         默认 FEN 为起始局面；前缀为从该根局面依次执行的 Pikafish UCI（空格分隔）。\n\
          --stdin：从标准输入读一行 `FEN\\t前缀`。"
     );
     process::exit(2);

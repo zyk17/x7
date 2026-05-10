@@ -2,7 +2,7 @@
 name = "xiangqi_dataset"
 version = "0.1.0"
 edition.workspace = true
-description = "Maintainer CLI: PGN/JSONL → binary shards, parallel by game."
+description = "Maintainer CLI: PGN → vocab + binary XRSH shards, parallel by game."
 publish = false
 
 [dependencies]

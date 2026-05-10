@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "xiangqi-review-nn"
 version = "0.2.0"
-description = "Chinese chess human policy model (JSONL → ResNet → ONNX)"
+description = "Chinese chess human policy model (XRSH → ResNet → ONNX)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -38,7 +38,7 @@
 
 - ONNX 输入输出
 - policy pack 格式
-- JSONL 字段
+- XRSH / `pack_meta` 等数据契约字段
 - Rust 二进制 dataset 头格式
 
 必须同步：

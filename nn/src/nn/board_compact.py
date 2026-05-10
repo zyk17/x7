@@ -57,3 +57,20 @@ def compact_board_to_planes(board90: np.ndarray, stm: np.uint8 | int) -> np.ndar
 
 def compact_board_to_torch_planes(board90: np.ndarray, stm: np.uint8 | int) -> torch.Tensor:
     return torch.from_numpy(compact_board_to_planes(board90, stm))
+
+
+def compact_boards_to_torch_planes(
+    boards90: np.ndarray, stms: np.ndarray | list[int]
+) -> torch.Tensor:
+    """批量 ``uint8[N,90]`` + ``stm[N]`` → ``float32[N,15,10,9]``。"""
+    b = np.asarray(boards90, dtype=np.uint8).reshape(-1, 90)
+    stm_arr = np.asarray(stms, dtype=np.uint8).reshape(-1)
+    n = b.shape[0]
+    planes = np.zeros((n, 15, 10, 9), dtype=np.float32)
+    nz_batch, nz_pos = np.nonzero(b)
+    vals = b[nz_batch, nz_pos].astype(np.int64) - 1
+    rows = nz_pos // 9
+    cols = nz_pos % 9
+    planes[nz_batch, vals, rows, cols] = 1.0
+    planes[:, 14, :, :] = stm_arr[:, None, None].astype(np.float32)
+    return torch.from_numpy(planes)

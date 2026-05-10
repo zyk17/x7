@@ -208,6 +208,7 @@ fn move_order_key(pos: &Position, m: Move, tt_mv: Option<Move>, killers: &[Move;
     0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn order_ext_moves_idx(
     n: usize,
     ext_buf: &[ExtMove],
@@ -285,22 +286,22 @@ fn quiescence(pos: &mut Position, ply: usize, qs_ply: u32, mut alpha: i32, beta:
         if qs_n == 0 {
             return terminal_mate_or_draw_score(pos);
         }
-        for i in 0..qs_n {
-            ext_buf[i].value = mvv_lva(pos, ext_buf[i].mv);
+        for ext in ext_buf.iter_mut().take(qs_n) {
+            ext.value = mvv_lva(pos, ext.mv);
         }
         ext_buf[..qs_n].sort_unstable_by_key(|e| std::cmp::Reverse(e.value));
         qs_use_ext = true;
     } else {
         let cap_n = generate(pos, GenType::Captures, &mut ext_buf);
-        for i in 0..cap_n {
-            let m = ext_buf[i].mv;
+        for ext in ext_buf.iter().take(cap_n) {
+            let m = ext.mv;
             if pos.legal(m) {
                 cap_moves[qs_n] = m;
                 qs_n += 1;
             }
         }
         if qs_n > 0 {
-            cap_moves[..qs_n].sort_unstable_by(|a, b| mvv_lva(pos, *b).cmp(&mvv_lva(pos, *a)));
+            cap_moves[..qs_n].sort_unstable_by_key(|b| std::cmp::Reverse(mvv_lva(pos, *b)));
         } else {
             let n_full = generate(pos, GenType::Legal, &mut ext_buf);
             if n_full == 0 {
