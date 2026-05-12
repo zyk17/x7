@@ -1,13 +1,13 @@
-//! UCI 坐标与着法串（**Pikafish / Stockfish 族象棋 UCI**：`a0`～`i9`，纵坐标 **0～9** 对应内部 `rank_of` 0～9）。
+//! UCI 坐标与着法串（**常见皮卡鱼族象棋 UCI**：`a0`～`i9`，纵坐标 **0～9** 对应内部 `rank_of` 0～9）。
 //!
-//! 说明：旧版曾使用纵坐标 **1～10**（与部分 Python `pyffish` 字符串习惯一致），与 **Pikafish 引擎 UCI 不兼容**；现已统一为 0～9。
+//! 说明：旧版曾使用纵坐标 **1～10**（与部分 Python `pyffish` 字符串习惯一致），与 **常见引擎 UCI（0～9）** 不兼容；现已统一为 0～9。
 
 use crate::board::Position;
 use crate::types::*;
 
 pub const START_FEN: &str = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1";
 
-/// 转为 UCI 半串：`[a-i][0-9]`，与 Pikafish 一致。
+/// 转为 UCI 半串：`[a-i][0-9]`（与常见皮卡鱼族引擎一致）。
 pub fn square_to_algebraic(s: Square) -> String {
     let f = (file_of(s) as u8 + b'a') as char;
     let r = rank_of(s) as u32;
@@ -34,7 +34,7 @@ pub fn write_move_uci_bytes(m: Move, buf: &mut [u8; 8]) -> usize {
     n0 + n1
 }
 
-/// 从 **着法 UCI 串**（如 `a0a1`）解析 [`Move`]，**不** 校验是否合法；纵坐标 **0～9**（与 Pikafish 等引擎 UCI 一致）。
+/// 从 **着法 UCI 串**（如 `a0a1`）解析 [`Move`]，**不** 校验是否合法；纵坐标 **0～9**（与常见引擎 UCI 一致）。
 pub fn parse_move_uci(s: &str) -> Option<Move> {
     let s = s.trim().to_ascii_lowercase();
     let b = s.as_bytes();
@@ -76,7 +76,7 @@ fn parse_two_square_uci_move(b: &[u8]) -> Option<(Square, Square, usize)> {
     Some((from, to, j1 + j2))
 }
 
-/// 若 `from` 上为当前行棋方棋子则解析为 [`Move`]（Pikafish 坐标 `a0`～`i9`）。
+/// 若 `from` 上为当前行棋方棋子则解析为 [`Move`]（坐标 `a0`～`i9`）。
 pub fn uci_to_move(pos: &Position, s: &str) -> Option<Move> {
     let m = parse_move_uci(s)?;
     let from = m.from_sq();

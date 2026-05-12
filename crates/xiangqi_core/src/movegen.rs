@@ -6,7 +6,7 @@
 use crate::board::*;
 use crate::types::*;
 
-/// The type of moves to generate.
+/// 要生成的着法类型。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GenType {
     Captures,
@@ -16,18 +16,17 @@ pub enum GenType {
     Legal,
 }
 
-/// Maximum number of moves in a position (empirically, never exceeds 128).
+/// 单局面着法数上限（经验上不超过 128）。
 pub const MAX_MOVES: usize = 128;
 
-/// A move with an associated score (for move ordering).
+/// 带着法分值的扩展着法（用于排序）。
 #[derive(Clone, Copy, Debug)]
 pub struct ExtMove {
     pub mv: Move,
     pub value: i32,
 }
 
-/// Generate moves of the given type for the position into `list`.
-/// Returns the number of moves generated.
+/// 向 `list` 生成指定类型的着法，返回生成数量。
 pub fn generate(pos: &Position, gen_type: GenType, list: &mut [ExtMove]) -> usize {
     match gen_type {
         GenType::Captures => generate_captures(pos, list),
@@ -38,7 +37,7 @@ pub fn generate(pos: &Position, gen_type: GenType, list: &mut [ExtMove]) -> usiz
     }
 }
 
-/// Generate all pseudo-legal moves, return count.
+/// 生成全部伪合法着，返回数量。
 fn generate_pseudo_legal(pos: &Position, list: &mut [ExtMove]) -> usize {
     let us = pos.side_to_move;
     let _them = !us;
@@ -54,7 +53,7 @@ fn generate_pseudo_legal(pos: &Position, list: &mut [ExtMove]) -> usize {
 
         let attacks = piece_attacks(pt, from, pos.occupancy(), us);
 
-        // Filter out squares occupied by own pieces
+        // 排除己方占据格
         let targets = attacks & !pos.color_bb(us);
 
         let mut t = targets;
@@ -74,7 +73,7 @@ fn generate_pseudo_legal(pos: &Position, list: &mut [ExtMove]) -> usize {
     count
 }
 
-/// Generate all pseudo-legal captures.
+/// 生成全部伪合法吃子。
 fn generate_captures(pos: &Position, list: &mut [ExtMove]) -> usize {
     let us = pos.side_to_move;
     let them = !us;
@@ -113,7 +112,7 @@ fn generate_captures(pos: &Position, list: &mut [ExtMove]) -> usize {
     count
 }
 
-/// Generate all pseudo-legal non-captures (quiets).
+/// 生成全部伪合法非吃子（安静着）。
 fn generate_quiets(pos: &Position, list: &mut [ExtMove]) -> usize {
     let us = pos.side_to_move;
     let our_pieces = pos.color_bb(us);
@@ -128,7 +127,7 @@ fn generate_quiets(pos: &Position, list: &mut [ExtMove]) -> usize {
         let pt = type_of(pc);
 
         let attacks = if pt == PieceType::Cannon {
-            // Cannon quiets: rook-style sliding to empty squares
+            // 炮的安静着：车式滑向空格
             rook_attacks(from, occupied) & !occupied
         } else {
             piece_attacks(pt, from, occupied, us) & !occupied
@@ -151,14 +150,14 @@ fn generate_quiets(pos: &Position, list: &mut [ExtMove]) -> usize {
     count
 }
 
-/// Generate check evasions. Only the moves that get out of check are generated.
+/// 生成应将着：仅包含能解除将军的着法。
 fn generate_evasions(pos: &Position, list: &mut [ExtMove]) -> usize {
     let us = pos.side_to_move;
     let _them = !us;
     let ksq = pos.king_square(us);
     let checkers = pos.checkers();
 
-    // If double check, only king moves can save
+    // 双将时仅将/帅可走
     if more_than_one(checkers) {
         return generate_king_evasions(pos, list, ksq);
     }
@@ -167,10 +166,10 @@ fn generate_evasions(pos: &Position, list: &mut [ExtMove]) -> usize {
     let checksq: Square = unsafe { std::mem::transmute(checkers.trailing_zeros() as u8) };
     let pt = type_of(pos.piece_on(checksq));
 
-    // Target squares: between king and checker (excluding own pieces) — these are blocking squares
+    // 目标格：王与将军子之间（去掉己方占据）——垫将格
     let between = between_bb(ksq, checksq) & !pos.color_bb(us);
 
-    // Non-king pieces can block or capture the checker
+    // 非将子可垫将或吃去将军子
     let our_pieces = pos.color_bb(us) & !square_bb(ksq);
     let occupied = pos.occupancy();
     let mut bb = our_pieces;
@@ -180,7 +179,7 @@ fn generate_evasions(pos: &Position, list: &mut [ExtMove]) -> usize {
         let pc = pos.piece_on(from);
         let piece_pt = type_of(pc);
 
-        // Targets for this piece: between squares + the checker itself (capture)
+        // 该子目标：中间格 + 将军子所在格（吃）
         let targets = if piece_pt == PieceType::Cannon {
             let cap_targets = cannon_attacks(from, occupied) & square_bb(checksq);
             let quiet_targets = rook_attacks(from, occupied) & between & !occupied;
@@ -191,15 +190,15 @@ fn generate_evasions(pos: &Position, list: &mut [ExtMove]) -> usize {
             let blk = att
                 & between
                 & if piece_pt == PieceType::Pawn {
-                    // Pawn can only advance to block, not capture sideways unless aligned
+                    // 兵垫将仅能向前，除非吃子与将军子共线才可横吃
                     !occupied
                 } else if piece_pt == PieceType::Bishop || piece_pt == PieceType::Knight {
-                    // Lame leapers can block
+                    // 马、象可垫到空格
                     !occupied
                 } else {
                     !occupied
                 };
-            // For simplicity, only capture or block the checking piece
+            // 简化：仅吃子或垫向将军子
             cap | blk
         };
 
@@ -219,20 +218,20 @@ fn generate_evasions(pos: &Position, list: &mut [ExtMove]) -> usize {
         }
     }
 
-    // King evasions
+    // 将/帅应将
     count += generate_king_evasions_with_check(pos, list, ksq, checksq, pt, count);
 
-    // Cannon hurdle evasion: if the checker is a cannon, we can move the hurdle piece
+    // 炮架移动：若将军子为炮，可移动炮架子解将
     if pt == PieceType::Cannon {
         let hurdle_bb = between_bb(ksq, checksq) & pos.color_bb(us);
         if hurdle_bb != 0 {
             let hurdle_sq: Square = unsafe { std::mem::transmute(hurdle_bb.trailing_zeros() as u8) };
             let hurdle_pt = type_of(pos.piece_on(hurdle_sq));
             let hurdle_attacks = piece_attacks(hurdle_pt, hurdle_sq, occupied, us);
-            // Hurdle can move to any non-king-attacked square except along the cannon line
+            // 炮架可走至任意不受王攻击的格，但不能沿炮线走入「炮盯王」线
             let line_to_checker = between_bb(checksq, hurdle_sq);
             let targets = hurdle_attacks & !line_to_checker & !pos.color_bb(us);
-            // But can also capture the cannon if possible
+            // 若可吃炮则亦可
             let cannon_cap = hurdle_attacks & square_bb(checksq);
             let all_targets = targets | cannon_cap;
 
@@ -256,7 +255,7 @@ fn generate_evasions(pos: &Position, list: &mut [ExtMove]) -> usize {
     count
 }
 
-/// Generate king moves to escape check. Simple version.
+/// 将/帅简单应将（仅看目标格是否受攻）。
 fn generate_king_evasions(pos: &Position, list: &mut [ExtMove], ksq: Square) -> usize {
     let us = pos.side_to_move;
     let them = !us;
@@ -268,7 +267,7 @@ fn generate_king_evasions(pos: &Position, list: &mut [ExtMove], ksq: Square) -> 
     while t != 0 {
         let to: Square = unsafe { std::mem::transmute(t.trailing_zeros() as u8) };
         t &= t - 1;
-        // Check if destination is not attacked
+        // 目标格须不受对方攻击
         let after_occupied = (occupied ^ square_bb(ksq)) | square_bb(to);
         if pos.checkers_to(them, to) & after_occupied == 0 {
             if count < list.len() {
@@ -283,8 +282,7 @@ fn generate_king_evasions(pos: &Position, list: &mut [ExtMove], ksq: Square) -> 
     count
 }
 
-/// King evasions that also consider slider checkers (cannons/rooks).
-/// King cannot move along the check line.
+/// 将/帅应将：考虑车/炮等滑子将军线，**不可沿将军线走入仍被将军的格**。
 fn generate_king_evasions_with_check(
     pos: &Position,
     list: &mut [ExtMove],
@@ -298,7 +296,7 @@ fn generate_king_evasions_with_check(
     let occupied = pos.occupancy();
     let mut attacks = king_attacks(ksq) & !pos.color_bb(us);
 
-    // Remove squares on the line of a sliding checker
+    // 滑子将军时去掉王与将军子射线上的格
     if checker_pt == PieceType::Rook || checker_pt == PieceType::Cannon {
         let line = {
             let mut bb = 0u128;
@@ -332,7 +330,7 @@ fn generate_king_evasions_with_check(
     count
 }
 
-/// Generate all legal moves.
+/// 生成全部合法着。
 fn generate_legal(pos: &Position, list: &mut [ExtMove]) -> usize {
     let pseudo_count = if pos.checkers() != 0 {
         generate_evasions(pos, list)
@@ -340,12 +338,12 @@ fn generate_legal(pos: &Position, list: &mut [ExtMove]) -> usize {
         generate_pseudo_legal(pos, list)
     };
 
-    // Filter out illegal moves
+    // 过滤非法着
     let mut legal_count = 0;
     for i in 0..pseudo_count {
         let mv = list[i].mv;
         if !mv.is_ok() {
-            // Skip invalid moves — they come from generate_pseudo_legal internal bug
+            // 跳过无效着（不应由伪合法生成产生）
             continue;
         }
         if pos.legal(mv) {
@@ -381,14 +379,14 @@ mod tests {
             256
         ];
         let count = generate_legal(&pos, &mut list);
-        assert!(count > 0, "Starting position should have legal moves");
-        assert!(count <= 128, "Starting position should not exceed 128 moves");
+        assert!(count > 0, "起始局面应有合法着");
+        assert!(count <= 128, "起始局面着法数不应超过 128");
 
-        // Verify all generated moves are legal
+        // 校验生成的着法全部合法
         for i in 0..count {
             assert!(
                 pos.legal(list[i].mv),
-                "Move {:?}->{:?} should be legal",
+                "着法 {:?}->{:?} 应合法",
                 list[i].mv.from_sq(),
                 list[i].mv.to_sq()
             );
@@ -414,9 +412,8 @@ mod tests {
         let quiet_count = generate_quiets(&pos, &mut list);
         let _total = generate_pseudo_legal(&pos, &mut list);
 
-        // In starting position, cannons can capture via own pawn as hurdle.
-        // B2 cannon captures B6 (black pawn), H2 captures H6 (black pawn) = 2 captures.
-        assert_eq!(cap_count, 2, "Starting position should have 2 cannon captures");
-        assert!(quiet_count > 0, "Starting position should have quiet moves");
+        // 起始局面炮可隔己方兵吃对方兵：B 线、H 线各一吃，共 2 个吃子。
+        assert_eq!(cap_count, 2, "起始局面应有 2 个炮吃");
+        assert!(quiet_count > 0, "起始局面应有安静着");
     }
 }

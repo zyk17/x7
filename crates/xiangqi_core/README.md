@@ -1,10 +1,6 @@
 # xiangqi_core
 
-象棋 **规则、位棋盘、合法着生成**（着法 UCI：`a0`～`i9`，与皮卡鱼等引擎一致）。
-
-## 来源与许可说明
-
-`src/types.rs`、`src/misc.rs`、`src/board.rs`、`src/movegen.rs` 自本地 **pikafish-rust**（Pikafish 的 Rust 移植）拷贝，并增加全局 Zobrist、`Position::from_fen` / `new_with_global_zobrist`、`legal_moves_uci` 等库 API。上游 Pikafish 通常为 **GPL-3.0**；若发布衍生作品，请自行核对与仓库根目录许可证字段是否一致。
+中国象棋 **规则、位棋盘表示、合法着生成** 的 Rust 库。着法 UCI 串为 `a0`～`i9` 形式，与常见皮卡鱼族引擎的坐标约定一致，便于对拍与联调。
 
 ## API 摘要
 
@@ -20,7 +16,7 @@
 cargo test -p xiangqi_core
 ```
 
-含 perft(1–3) 与 do/undo，与 pikafish-rust 测试数值对齐。
+含 perft(1–3) 与走子/撤销回归；数值可与参考实现对照，用于防止无意回归。
 
 ## 与 pyffish 合法集对拍
 

@@ -1,185 +1,183 @@
-主要是分析, policy 和辅助头的训练情况:
+我已经把代码直接改了，改动很小，但足够支撑你现在要做的低成本筛选实验。
 
-(.venv) PS C:\projects\77xiangqi_engine\nn> python scripts/train/train_policy.py --train-dir ../data/xrsh_train --val-dir ../data/xrsh_val --vocab ../data/move_vocab.json --out ../data/checkpoints/policy_v3.pt --batch-size 512 --epochs 40 --val-every 5 --device cuda
-torch 2.11.0+cu128 | cuda.is_available=True | device=cuda (NVIDIA GeForce RTX 5070 Ti)
-train rows=3945784 val rows=1722978 vocab=2238
-train eager cache: hit
-value filtering: 已自动跳过未知结局样本 (train=0, val=938)
-train data: XRSH（Rust .xrsh；合法着已物化为下标；v3 含结局字段供 value）
-dataset mode: train=eager | val=lazy
-val data: XRSH（与 train 同 major 版本即可）
-train recipe: game-batch | mirror_p=0.5 | fen weight 1/sqrt(count) | label_smooth=0.08 | lr warmup=1ep + cosine→1e-05
-aux heads: BCE | attack_scale=0.25 | aux_loss_weight=0.2
-aux target stats: attack μ=0.0240 σ=0.0547 | danger μ=0.1626 σ=0.0710 | tactical μ=0.0333 σ=0.0469
-aux loss shaping: pos_weight(atk/dan/tac)=(6.37/2.27/5.38) | const-baseline≈0.2749
-value head: 默认开启 | tanh MSE vs 结局×progress^1.50 | value_loss_weight=0.5 | target_weight_alpha=1.50
-value target stats: μ=0.0012 σ=0.2546 | mean|v|=0.1415 | zero-baseline-mse≈0.0648
-警告: Windows 上 train_num_workers>0 会对大 XRSH Dataset 走 spawn 多进程复制；若首个 batch 长时间卡在 0/xxxx，建议先降 train worker 或改 lazy
-DataLoader train batches/epoch≈7707 train_num_workers=8 val_num_workers=0 pin_memory=True
-amp: off | val_every=5
-parameters=2,670,146 (~10.68 MiB fp32 权重)
-续训: 已加载 ..\data\checkpoints\policy_v3.pt | 已完成 epoch 计数=20 | 本次将再训练 40 个 epoch（至 epoch 60）
-提示: 续训已按总 epoch 重建 scheduler，避免原余弦周期在到达最小 lr 后回升
-epoch 21/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [04:13<00:00, 30.35it/s]
-train loss 2.4241 lr=2.32e-04
-skip val: epoch 21/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 22/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:56<00:00, 32.55it/s]
-train loss 2.4143 lr=2.25e-04
-skip val: epoch 22/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 23/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.69it/s]
-train loss 2.3899 lr=2.18e-04
-skip val: epoch 23/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 24/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:56<00:00, 32.65it/s]
-train loss 2.3651 lr=2.11e-04
-skip val: epoch 24/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 25/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.79it/s]
-train loss 2.3412 lr=2.04e-04
-val loss 1.7540 acc 0.4899 | val_aux_bce 0.5769 | atk 0.1657 | dan 0.4872 | tac 0.2092 | val_value_mse 0.0598
-val human_NLL mean=1.7540 std=1.4094 | entropy(nat) mean=1.9615 | top1=0.4899 top3=0.7361 top5=0.8254
-val by ply bin:
-  ply0-19 n=827851 NLL=1.2677+-1.1849 H=1.6255 top1=0.6025 top3=0.8658
-  ply20-39 n=533700 NLL=2.0359+-1.4703 H=2.1602 top1=0.4322 top3=0.6663
-  ply40-59 n=249371 NLL=2.4252+-1.4110 H=2.4245 top1=0.3285 top3=0.5551
-  ply60+ n=112056 NLL=2.5106+-1.3209 H=2.4670 top1=0.2913 top3=0.5138
-val by pgn_source:
-   n=1722978 NLL=1.7540+-1.4094 H=1.9615 top1=0.4899 top3=0.7361
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 26/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:56<00:00, 32.65it/s]
-train loss 2.3174 lr=1.97e-04
-skip val: epoch 26/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 27/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.76it/s]
-train loss 2.2945 lr=1.89e-04
-skip val: epoch 27/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 28/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.72it/s]
-train loss 2.2716 lr=1.82e-04
-skip val: epoch 28/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 29/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.68it/s]
-train loss 2.2499 lr=1.74e-04
-skip val: epoch 29/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 30/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.79it/s]
-train loss 2.2285 lr=1.67e-04
-val loss 1.6891 acc 0.5198 | val_aux_bce 0.5766 | atk 0.1703 | dan 0.4824 | tac 0.2119 | val_value_mse 0.0596
-val human_NLL mean=1.6891 std=1.4696 | entropy(nat) mean=1.8254 | top1=0.5198 top3=0.7529 top5=0.8362
-val by ply bin:
-  ply0-19 n=827851 NLL=1.2095+-1.2359 H=1.4883 top1=0.6387 top3=0.8775
-  ply20-39 n=533700 NLL=1.9578+-1.5424 H=2.0172 top1=0.4586 top3=0.6877
-  ply40-59 n=249371 NLL=2.3610+-1.4988 H=2.2934 top1=0.3506 top3=0.5771
-  ply60+ n=112056 NLL=2.4565+-1.3993 H=2.3614 top1=0.3102 top3=0.5341
-val by pgn_source:
-   n=1722978 NLL=1.6891+-1.4696 H=1.8254 top1=0.5198 top3=0.7529
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-best checkpoint -> ..\data\checkpoints\policy_v3.best.pt (val_loss=1.6891 epoch=30/60)
+这次加了 4 个能力：
 
-(.venv) PS C:\projects\77xiangqi_engine\nn> python scripts/train/train_policy.py --train-dir ../data/xrsh_train --val-dir ../data/xrsh_val --vocab ../data/move_vocab.json --out ../data/checkpoints/policy_v3.pt --batch-size 512 --epochs 40 --val-every 5 --device cuda
-torch 2.11.0+cu128 | cuda.is_available=True | device=cuda (NVIDIA GeForce RTX 5070 Ti)
-train rows=3945784 val rows=1722978 vocab=2238
-train eager cache: hit
-value filtering: 已自动跳过未知结局样本 (train=0, val=938)
-train data: XRSH（Rust .xrsh；合法着已物化为下标；v3 含结局字段供 value）
-dataset mode: train=eager | val=lazy
-val data: XRSH（与 train 同 major 版本即可）
-train recipe: game-batch | mirror_p=0.5 | fen weight 1/sqrt(count) | label_smooth=0.08 | lr warmup=1ep + cosine→1e-05
-aux heads: BCE | attack_scale=0.25 | aux_loss_weight=0.2
-aux target stats: attack μ=0.0240 σ=0.0547 | danger μ=0.1626 σ=0.0710 | tactical μ=0.0333 σ=0.0469
-aux loss shaping: pos_weight(atk/dan/tac)=(6.37/2.27/5.38) | const-baseline≈0.2749
-value head: 默认开启 | tanh MSE vs 结局×progress^1.50 | value_loss_weight=0.5 | target_weight_alpha=1.50
-value target stats: μ=0.0012 σ=0.2546 | mean|v|=0.1415 | zero-baseline-mse≈0.0648
-警告: Windows 上 train_num_workers>0 会对大 XRSH Dataset 走 spawn 多进程复制；若首个 batch 长时间卡在 0/xxxx，建议先降 train worker 或改 lazy
-DataLoader train batches/epoch≈7707 train_num_workers=8 val_num_workers=0 pin_memory=True
-amp: off | val_every=5
-parameters=2,670,146 (~10.68 MiB fp32 权重)
-续训: 已加载 ..\data\checkpoints\policy_v3.pt | 已完成 epoch 计数=20 | 本次将再训练 40 个 epoch（至 epoch 60）
-提示: 续训已按总 epoch 重建 scheduler，避免原余弦周期在到达最小 lr 后回升
-epoch 21/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [04:13<00:00, 30.35it/s]
-train loss 2.4241 lr=2.32e-04
-skip val: epoch 21/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 22/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:56<00:00, 32.55it/s]
-train loss 2.4143 lr=2.25e-04
-skip val: epoch 22/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 23/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.69it/s]
-train loss 2.3899 lr=2.18e-04
-skip val: epoch 23/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 24/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:56<00:00, 32.65it/s]
-train loss 2.3651 lr=2.11e-04
-skip val: epoch 24/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 25/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.79it/s]
-train loss 2.3412 lr=2.04e-04
-val loss 1.7540 acc 0.4899 | val_aux_bce 0.5769 | atk 0.1657 | dan 0.4872 | tac 0.2092 | val_value_mse 0.0598
-val human_NLL mean=1.7540 std=1.4094 | entropy(nat) mean=1.9615 | top1=0.4899 top3=0.7361 top5=0.8254
-val by ply bin:
-  ply0-19 n=827851 NLL=1.2677+-1.1849 H=1.6255 top1=0.6025 top3=0.8658
-  ply20-39 n=533700 NLL=2.0359+-1.4703 H=2.1602 top1=0.4322 top3=0.6663
-  ply40-59 n=249371 NLL=2.4252+-1.4110 H=2.4245 top1=0.3285 top3=0.5551
-  ply60+ n=112056 NLL=2.5106+-1.3209 H=2.4670 top1=0.2913 top3=0.5138
-val by pgn_source:
-   n=1722978 NLL=1.7540+-1.4094 H=1.9615 top1=0.4899 top3=0.7361
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 26/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:56<00:00, 32.65it/s]
-train loss 2.3174 lr=1.97e-04
-skip val: epoch 26/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 27/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.76it/s]
-train loss 2.2945 lr=1.89e-04
-skip val: epoch 27/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 28/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.72it/s]
-train loss 2.2716 lr=1.82e-04
-skip val: epoch 28/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 29/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.68it/s]
-train loss 2.2499 lr=1.74e-04
-skip val: epoch 29/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 30/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [03:55<00:00, 32.79it/s]
-train loss 2.2285 lr=1.67e-04
-val loss 1.6891 acc 0.5198 | val_aux_bce 0.5766 | atk 0.1703 | dan 0.4824 | tac 0.2119 | val_value_mse 0.0596
-val human_NLL mean=1.6891 std=1.4696 | entropy(nat) mean=1.8254 | top1=0.5198 top3=0.7529 top5=0.8362
-val by ply bin:
-  ply0-19 n=827851 NLL=1.2095+-1.2359 H=1.4883 top1=0.6387 top3=0.8775
-  ply20-39 n=533700 NLL=1.9578+-1.5424 H=2.0172 top1=0.4586 top3=0.6877
-  ply40-59 n=249371 NLL=2.3610+-1.4988 H=2.2934 top1=0.3506 top3=0.5771
-  ply60+ n=112056 NLL=2.4565+-1.3993 H=2.3614 top1=0.3102 top3=0.5341
-val by pgn_source:
-   n=1722978 NLL=1.6891+-1.4696 H=1.8254 top1=0.5198 top3=0.7529
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-best checkpoint -> ..\data\checkpoints\policy_v3.best.pt (val_loss=1.6891 epoch=30/60)
-epoch 31/60 train:  24%|█████████████████▍                                                       | 1847/7707 [00:57<02:58, 32.88it/s]epoch 31/60 train:  24%|█████████████████▌                                                       | 1851/7707 [00:57<03:00, 32.51it/epoch 31/60 train:  24%|█████████████████▌                                                       | 1855/7707 [00:57<03:00, 32.47it/sepoch 31/60 train:  24%|█████████████████▌                                                       | 1859/7707 [00:57<02:59, 32.51it/sepoch 31/60 train:  24%|█████████████████▋                                                       | 1863/7707 [00:57<02:59, 32.54it/sepochepoch 31/6epochepoch 31/60 traepoch 31/60 traepoch 31/60 traepochepoch 31/6epoch 31/60 train:  epoch 31/60 train: 100%|█████████████████████████████████████████████████████████████████████████| 7707/7707 [04:16<00:00, 30.10it/s]
-train loss 2.2069 lr=1.59e-04
-skip val: epoch 31/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 32/60 train: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 7707/7707 [04:34<00:00, 28.07it/s]
-train loss 2.1859 lr=1.51e-04
-skip val: epoch 32/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 33/60 train: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 7707/7707 [04:35<00:00, 27.93it/s]
-train loss 2.1660 lr=1.43e-04
-skip val: epoch 33/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 34/60 train: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 7707/7707 [04:42<00:00, 27.31it/s]
-train loss 2.1460 lr=1.36e-04
-skip val: epoch 34/60（--val-every=5）
-checkpoint -> ..\data\checkpoints\policy_v3.pt
-epoch 35/60 train: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 7707/7707 [04:36<00:00, 27.83it/s]
-train loss 2.1260 lr=1.28e-04
-val loss 1.6603 acc 0.5325 | val_aux_bce 0.5772 | atk 0.1839 | dan 0.4883 | tac 0.2257 | val_value_mse 0.0594
-val human_NLL mean=1.6603 std=1.4791 | entropy(nat) mean=1.8123 | top1=0.5325 top3=0.7630 top5=0.8425
-val by ply bin:
-  ply0-19 n=827851 NLL=1.1911+-1.2192 H=1.5079 top1=0.6462 top3=0.8841
-  ply20-39 n=533700 NLL=1.9186+-1.5726 H=1.9761 top1=0.4763 top3=0.6997
-  ply40-59 n=249371 NLL=2.3224+-1.5402 H=2.2485 top1=0.3679 top3=0.5921
-  ply60+ n=112056 NLL=2.4223+-1.4485 H=2.3110 top1=0.3269 top3=0.5500
-val by pgn_source:
-   n=1722978 NLL=1.6603+-1.4791 H=1.8123 top1=0.5325 top3=0.7630
-checkpoint -> ..\data\checkpoints\policy_v3.pt
+- 可以冻结 trunk：`--freeze-trunk`
+- 可以冻结 policy head：`--freeze-policy-head`
+- 可以把 aux/value 头从单层线性改成小 MLP：
+  - `--aux-head-hidden-dim`
+  - `--value-head-hidden-dim`
+- 可以按头分别设权重：
+  - `--attack-loss-weight`
+  - `--danger-loss-weight`
+  - `--tactical-loss-weight`
+  - `--value-loss-weight` 仍保留
+
+相关文件是：
+
+- [nn/scripts/train/train_policy.py](/C:/projects/77xiangqi_engine/nn/scripts/train/train_policy.py)
+- [nn/src/nn/model.py](/C:/projects/77xiangqi_engine/nn/src/nn/model.py)
+
+我已经验证过：
+
+- `--help` 正常
+- `frozen trunk + frozen policy + 单训 danger + aux MLP` 的 dry run 正常
+- 现有 `tests/test_aux_heads.py` 通过
+
+---
+
+**你现在可以直接跑的实验**
+
+我建议你不要撒太大网，先做 3 组，每组都只跑 `5 epoch`，并且 `val_every=1`。
+
+## 1. `danger` 读出实验
+目标：验证 policy trunk 里是否已经有“危险感”表征。
+
+命令建议：
+
+```powershell
+python scripts/train/train_policy.py `
+  --train-dir ../data/xrsh_train `
+  --val-dir ../data/xrsh_val `
+  --vocab ../data/move_vocab.json `
+  --out ../data/checkpoints/exp_danger_probe.pt `
+  --batch-size 512 `
+  --epochs 5 `
+  --val-every 1 `
+  --device cuda `
+  --freeze-trunk `
+  --freeze-policy-head `
+  --attack-loss-weight 0 `
+  --danger-loss-weight 0.2 `
+  --tactical-loss-weight 0 `
+  --value-loss-weight 0 `
+  --aux-head-hidden-dim 64 `
+  --lr 5e-4
+```
+
+关注点：
+
+- `dan` 是否明显优于你现在联合训练时的水平
+- `atk/tac/value` 不重要，因为这轮本来就不训
+- `policy` 指标可以忽略，不是这轮目标
+
+成功标准：
+- `dan` 明显下降
+- 并且 5 epoch 内下降趋势稳定
+
+---
+
+## 2. `value` 读出实验
+目标：验证 trunk 里是否已经有结果趋势表征。
+
+命令建议：
+
+```powershell
+python scripts/train/train_policy.py `
+  --train-dir ../data/xrsh_train `
+  --val-dir ../data/xrsh_val `
+  --vocab ../data/move_vocab.json `
+  --out ../data/checkpoints/exp_value_probe.pt `
+  --batch-size 512 `
+  --epochs 5 `
+  --val-every 1 `
+  --device cuda `
+  --freeze-trunk `
+  --freeze-policy-head `
+  --no-aux-heads `
+  --value-loss-weight 0.5 `
+  --value-head-hidden-dim 64 `
+  --lr 5e-4
+```
+
+关注点：
+
+- `val_value_mse` 是否稳定低于零基线 `0.0648`
+- 是否能明显好过你现在联合训练里的 `0.0594~0.0598`
+
+成功标准：
+- 快速掉到比当前联合训练更低
+- 至少稳定优于 `0.0594`
+
+---
+
+## 3. `danger + value` 联合读出实验
+目标：看这两个最有希望服务复盘的头，能否一起从固定 trunk 中读出来。
+
+命令建议：
+
+```powershell
+python scripts/train/train_policy.py `
+  --train-dir ../data/xrsh_train `
+  --val-dir ../data/xrsh_val `
+  --vocab ../data/move_vocab.json `
+  --out ../data/checkpoints/exp_danger_value_probe.pt `
+  --batch-size 512 `
+  --epochs 5 `
+  --val-every 1 `
+  --device cuda `
+  --freeze-trunk `
+  --freeze-policy-head `
+  --attack-loss-weight 0 `
+  --danger-loss-weight 0.2 `
+  --tactical-loss-weight 0 `
+  --value-loss-weight 0.5 `
+  --aux-head-hidden-dim 64 `
+  --value-head-hidden-dim 64 `
+  --lr 5e-4
+```
+
+关注点：
+
+- `dan`
+- `val_value_mse`
+
+成功标准：
+- 两个都比当前联合训练更好
+- 没有明显互相拖累
+
+---
+
+**你现在最该盯的不是总 `val loss`**
+在这些 probe 实验里，重点不是 policy CE 了，而是：
+
+- `dan`
+- `val_value_mse`
+
+如果你后面要测 `attack/tactical`，再看：
+
+- `atk`
+- `tac`
+
+但短期复盘系统目标下，我建议先别把资源砸在 `attack/tactical` 上。
+
+---
+
+**我对结果的解读标准**
+
+如果 `danger` frozen probe 很快变好：
+- 说明 trunk 里已经有危险语义
+- 当前问题主要在 head capacity 或多任务干扰
+
+如果 `value` frozen probe 很快变好：
+- 说明 trunk 已经有结果趋势信息
+- 当前联合训练方式在压制 value 读出
+
+如果 `danger/value` frozen probe 都没明显变好：
+- 说明问题更偏标签定义或 trunk 本身没学到
+- 这时才值得回头继续改 loss
+
+---
+
+**你当前最值得优先跑的顺序**
+
+1. `danger` probe
+2. `value` probe
+3. `danger + value` probe
+
+跑完这 3 个，你就能知道下一步是：
+
+- 走“冻结 trunk + 单独小 head”路线
+- 还是继续改联合训练 loss
+
+如果你愿意，等你跑完这 3 组，把日志贴给我，我可以继续帮你把结果整理成一张对比表，并直接给出下一步该不该动 `attack/tactical`。

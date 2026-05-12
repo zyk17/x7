@@ -1,4 +1,4 @@
-//! Perft 与 do/undo 回归（与 pikafish-rust 测试一致）。
+//! Perft 与走子/撤销回归（数值可与参考实现对拍）。
 
 use xiangqi_core::movegen::{generate, ExtMove, GenType};
 use xiangqi_core::types::*;

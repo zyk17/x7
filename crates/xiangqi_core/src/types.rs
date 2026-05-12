@@ -1,4 +1,4 @@
-//! 象棋引擎核心类型（源自 Pikafish / pikafish-rust）。
+//! 象棋引擎核心类型（实现曾参考公开引擎常见编码；本模块为独立整理）。
 //!
 //! 定义格子、棋子、着法、位棋盘、分值等。棋盘为 **9 列 × 10 行**（90 格），
 //! 下标 0（A0）～89（I9）；纵线 A～I，横线 0～9。含走子生成用的特殊子力类型（`KNIGHT_TO`、`PAWN_TO`）。
@@ -101,7 +101,7 @@ pub const fn mated_in(ply: i32) -> Value {
     -VALUE_MATE + ply
 }
 
-// Piece material values
+// 子力物质价值（用于搜索评估常量）
 pub const ROOK_VALUE: Value = 1305;
 pub const ADVISOR_VALUE: Value = 219;
 pub const CANNON_VALUE: Value = 773;
@@ -109,7 +109,7 @@ pub const PAWN_VALUE: Value = 144;
 pub const KNIGHT_VALUE: Value = 720;
 pub const BISHOP_VALUE: Value = 187;
 
-// ── 搜索深度 ─────────────────────────────────────────────────────────────────
+// 搜索深度相关类型
 
 pub type Depth = i32;
 
@@ -119,7 +119,7 @@ pub const DEPTH_ENTRY_OFFSET: Depth = -3;
 
 // ── 格子 ─────────────────────────────────────────────────────────────────────
 
-/// Squares on the 9×10 xiangqi board, indexed row-major from A0 to I9.
+/// 9×10 棋盘格子，自 A0 起行主序编号至 I9。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 #[allow(non_camel_case_types)]
@@ -218,8 +218,7 @@ pub enum Square {
 
 pub const SQUARE_ZERO: usize = 0;
 pub const SQUARE_NB: usize = 90;
-// SQ_NONE is used as a sentinel value. We represent it as Option<Square>::None
-// in Rust. For compatibility with C++ code that needs a numeric sentinel, use:
+// `SQ_NONE` 作哨兵；Rust 中更常用 `Option<Square>`。若需与旧 C++ 风格数值哨兵兼容，用：
 pub const SQ_NONE_IDX: u8 = 90;
 
 impl Square {
@@ -295,8 +294,7 @@ impl Rank {
 
 // ── 方向 ───────────────────────────────────────────────────────────────────────
 
-/// Board offsets for xiangqi. The board is stored in row-major order with
-/// 9 files per rank, so NORTH = +9, EAST = +1.
+/// 棋盘方向步长：行主序 9 列/行，故 `North = +9`，`East = +1`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
 pub enum Direction {
@@ -328,14 +326,14 @@ pub const fn make_square(f: File, r: Rank) -> Square {
     unsafe { std::mem::transmute((r as u8) * FILE_NB as u8 + (f as u8)) }
 }
 
-/// Mirror rank: A0 ↔ A9
+/// 纵坐标镜像：A0 ↔ A9
 pub const fn flip_rank(s: Square) -> Square {
     make_square(file_of(s), unsafe {
         std::mem::transmute(RANK_NB as u8 - 1 - rank_of(s) as u8)
     })
 }
 
-/// Mirror file: A0 ↔ I0
+/// 横坐标镜像：A0 ↔ I0
 pub const fn flip_file(s: Square) -> Square {
     make_square(
         unsafe { std::mem::transmute(FILE_NB as u8 - 1 - file_of(s) as u8) },
@@ -356,8 +354,8 @@ pub enum PieceType {
     Knight,
     Bishop,
     King,
-    KnightTo, // special: "by knight" direction for path checking
-    PawnTo,   // special: "pawn attack to" direction
+    KnightTo, // 特殊：路径检测用「马踏」方向
+    PawnTo,   // 特殊：兵卒攻击指向
 }
 
 pub const PIECE_TYPE_NB: usize = 8;
@@ -365,10 +363,10 @@ pub const ALL_PIECES: PieceType = unsafe { std::mem::transmute(0u8) }; // 0, use
 
 // ── 棋子（含颜色）────────────────────────────────────────────────────────────
 
-/// Piece is a newtype around u8, matching the C++ encoding:
-/// bits 0-2: piece type (0-7), bit 3: color (0=WHITE, 1=BLACK).
-/// Values 0 = NO_PIECE, 8 = unused gap.
-/// This approach lets us use pieces as array indices freely.
+/// 棋子：`u8` 新类型包装，与常见引擎内部编码一致：
+/// 低 3 位为子力类型（0～7），第 4 位为颜色（0=白，1=黑）。
+/// `0` 表示无子；`8` 为保留间隔。
+/// 便于将棋子值直接用作数组下标。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct Piece(pub u8);
@@ -382,7 +380,7 @@ impl Piece {
     pub const W_KNIGHT: Piece = Piece(5);
     pub const W_BISHOP: Piece = Piece(6);
     pub const W_KING: Piece = Piece(7);
-    // gap at 8
+    // 编码在 8 处留空
     pub const B_ROOK: Piece = Piece(9);
     pub const B_ADVISOR: Piece = Piece(10);
     pub const B_CANNON: Piece = Piece(11);
@@ -430,13 +428,13 @@ pub const fn type_of(pc: Piece) -> PieceType {
 }
 
 pub const fn color_of(pc: Piece) -> Color {
-    // SAFETY: bit 3 is either 0 (WHITE) or 1 (BLACK)
+    // SAFETY：第 4 位仅为 0（白）或 1（黑）
     unsafe { std::mem::transmute(pc.0 >> 3) }
 }
 
 impl std::ops::Not for Piece {
     type Output = Piece;
-    /// Swap piece color: B_ROOK ↔ W_ROOK, etc.
+    /// 交换棋子颜色：如 `B_ROOK` ↔ `W_ROOK`。
     fn not(self) -> Piece {
         Piece(self.0 ^ 8)
     }
@@ -444,11 +442,11 @@ impl std::ops::Not for Piece {
 
 // ── 着法编码 ───────────────────────────────────────────────────────────────────
 
-/// A 16-bit move encoding:
-/// - bits 0-6:  destination square (0..89)
-/// - bits 7-13: origin square (0..89)
+/// 16 位着法编码：
+/// - 位 0～6：目标格（0..89）
+/// - 位 7～13：起始格（0..89）
 ///
-/// Special values: Move::none() = 0, Move::null() = 129.
+/// 特殊值：`Move::none() = 0`，`Move::null() = 129`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Move(u16);
 

@@ -78,8 +78,6 @@ def _load_policy_state_dict(model: PolicyResNet, raw: dict[str, object]) -> None
         model.load_state_dict(raw, strict=True)
         return
     except RuntimeError:
-        if not model.aux_heads:
-            raise
         inc = model.load_state_dict(raw, strict=False)
         if inc.missing_keys and not _missing_keys_are_optional_heads_only(
             list(inc.missing_keys)
@@ -87,6 +85,13 @@ def _load_policy_state_dict(model: PolicyResNet, raw: dict[str, object]) -> None
             raise RuntimeError(
                 "checkpoint 与当前模型结构不兼容（缺失键不仅是可选头 fc_* / fc_value）："
                 f" {list(inc.missing_keys)}"
+            ) from None
+        if inc.unexpected_keys and not _missing_keys_are_optional_heads_only(
+            list(inc.unexpected_keys)
+        ):
+            raise RuntimeError(
+                "checkpoint 与当前模型结构不兼容（未知键不仅是可选头 fc_* / fc_value）："
+                f" {list(inc.unexpected_keys)}"
             ) from None
         if inc.missing_keys:
             print(
@@ -128,6 +133,15 @@ def unpack_train_batch(
             "t_dan": td,
             "t_tac": tt,
         }
+    if value_head:
+        b, m, t, w, tv = batch
+        return {
+            "boards": b,
+            "masks": m,
+            "targets": t,
+            "weights": w,
+            "t_val": tv,
+        }
     b, m, t, w = batch
     return {"boards": b, "masks": m, "targets": t, "weights": w}
 
@@ -159,6 +173,17 @@ def unpack_val_batch(
             "t_atk": ta,
             "t_dan": td,
             "t_tac": tt,
+            "plies": pl,
+            "src_ids": sid,
+        }
+    if value_head:
+        b, m, t, w, tv, pl, sid = batch
+        return {
+            "boards": b,
+            "masks": m,
+            "targets": t,
+            "weights": w,
+            "t_val": tv,
             "plies": pl,
             "src_ids": sid,
         }
@@ -482,6 +507,11 @@ def main() -> None:
         action="store_true",
         help="冻结 policy fc；常与 --freeze-trunk 搭配，只训练辅助头 / value 头",
     )
+    ap.add_argument(
+        "--freeze-value-head",
+        action="store_true",
+        help="冻结 value 头；供后续在固定 policy+value 后单独训练其它语义头",
+    )
     ap.add_argument("--device", default="cuda")
     ap.add_argument(
         "--dataset-mode",
@@ -780,6 +810,8 @@ def main() -> None:
         _set_requires_grad(model.blocks, False)
     if args.freeze_policy_head:
         _set_requires_grad(model.fc, False)
+    if args.freeze_value_head and hasattr(model, "fc_value"):
+        _set_requires_grad(model.fc_value, False)
     n_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
@@ -822,8 +854,16 @@ def main() -> None:
     opt = AdamW(trainable_parameters, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = _lr_scheduler(opt, epochs=max(1, lr_schedule_epochs))
     if resume and ckpt is not None:
+        optimizer_state_loaded = False
         if "optimizer" in ckpt:
-            opt.load_state_dict(ckpt["optimizer"])
+            try:
+                opt.load_state_dict(ckpt["optimizer"])
+                optimizer_state_loaded = True
+            except ValueError:
+                print(
+                    "提示: checkpoint 的 optimizer 参数组与当前实验不一致 "
+                    "（常见于 freeze / head 结构变化）；已忽略旧 optimizer，改用当前实验新建状态"
+                )
         else:
             print(
                 "提示: checkpoint 无 optimizer 状态，已新建 AdamW（学习率从命令行初值开始）"
@@ -834,9 +874,14 @@ def main() -> None:
             total_epochs=lr_schedule_epochs,
             completed_epochs=start_epoch,
         )
-        print(
-            "提示: 续训已按总 epoch 重建 scheduler，避免原余弦周期在到达最小 lr 后回升"
-        )
+        if optimizer_state_loaded:
+            print(
+                "提示: 续训已按总 epoch 重建 scheduler，避免原余弦周期在到达最小 lr 后回升"
+            )
+        else:
+            print(
+                "提示: 已基于当前实验参数重建 optimizer/scheduler；模型权重保留，优化器状态从头开始"
+            )
 
     best_val_loss = float("inf")
     best_epoch = 0
@@ -1051,6 +1096,7 @@ def main() -> None:
             "value_head_hidden_dim": int(args.value_head_hidden_dim),
             "freeze_trunk": bool(args.freeze_trunk),
             "freeze_policy_head": bool(args.freeze_policy_head),
+            "freeze_value_head": bool(args.freeze_value_head),
             "completed_epochs": epoch + 1,
             "lr_schedule_epochs": lr_schedule_epochs,
             "optimizer": opt.state_dict(),
