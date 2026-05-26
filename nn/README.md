@@ -2,7 +2,7 @@
 
 仓库根目录 **`README.MD`** 描述 Monorepo 全貌；本节为 **`nn/`** 的安装与命令。
 
-训练栈服务于 **人类认知驱动的搜索**：**policy / 语义头** 学大师棋谱与人类局面特征，用于引擎侧 **剪枝与排序先验**；**不是**以「复刻外部引擎静态评估」为默认目标。完整边界与契约见根目录 **`ARCHITECTURE.md`**。
+训练栈服务于 **人类认知驱动的搜索**：**policy / 语义头** 学大师棋谱与人类局面特征；但当前短期主产品是**复盘系统**，不是先追求搜索集成。完整边界与契约见根目录 **`ARCHITECTURE.md`**。
 
 ## 依赖
 
@@ -15,6 +15,17 @@ pip install -e ".[train]"   # PyTorch 训练与 ONNX 导出
 核心运行时：`pyffish`（规则与合法着）、`tqdm`。训练额外需要 `torch`。
 
 **训练数据**：仅支持 **XRSH v3**（Rust `xiangqi_dataset` 生成的 `shard_*.xrsh` + `pack_meta.json`）。`xrsh_v3` 包含 **辅助头三标量 + 对局结果 + 总步数**（供 **value 头**，见 `nn.dataset_xrsh`）；训练步不再为辅助头调用 pyffish。
+
+## 当前训练主线
+
+当前不建议长期同时共训所有头。推荐顺序是：
+
+1. 先做大一轮 `policy + trunk`
+2. 等 trunk 接近平台
+3. 冻结 trunk，单独训练 `value`
+4. 冻结 trunk，单独训练 `danger`
+5. 冻结 trunk，单独训练 `attack`
+6. `tactical` 作为第二波增强头，暂不属于复盘 MVP
 
 ---
 
@@ -77,7 +88,7 @@ python scripts/train/train_policy.py --train-xrsh-dir ../data/xrsh_train --val-x
 python scripts/export/export_onnx.py --checkpoint ..\data\checkpoints\policy.best.pt --out ../data/policy.onnx
 ```
 
-静态 **batch=1**，输入 `board`：`float32[1,15,10,9]`。默认训练带 **多头**，ONNX 输出 **`logits`**（`float32[1,V]`）及 **`attack` / `danger` / `tactical`**（各 `float32[1]`，**导出图中已为 sigmoid 概率**）；仅单 policy 时加训练参数 `--no-aux-heads`，导出则仅 `logits`。
+静态 **batch=1**，输入 `board`：`float32[1,15,10,9]`。默认训练可带 **多头**，ONNX 输出 **`logits`**（`float32[1,V]`）及 **`attack` / `danger` / `tactical`**（各 `float32[1]`，**导出图中已为 sigmoid 概率**）；若 checkpoint 含 value 头，也可导出 value。复盘阶段并不要求一次性把所有头都训到最好，更推荐基于强 trunk 分头读出。
 
 ---
 

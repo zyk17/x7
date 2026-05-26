@@ -9,7 +9,11 @@
    - Rust / Python 分层
    - 数据与 ONNX 契约
    - 双主线：复盘系统（短期）+ 搜索引擎（长期）
-2. **`.cursorrules`**
+2. **`docs/review-system.md`**
+   - 复盘 MVP
+   - 真理引擎与滑动窗口的角色
+   - 当前训练顺序
+3. **`.cursorrules`**
    - 沟通语言
    - 文档同步规则
    - 当前执行主线
@@ -19,10 +23,12 @@
 - 本项目走 **人类认知驱动的搜索**，不是“把网络做成引擎静态评估的唯一真理”。
 - **短期主产品**是复盘系统：模型输出需要**可解释**。
 - **长期路线**是搜索引擎：搜索负责验证这些语义是否真的有用。
-- 当前主线不是继续加 head，而是：
-  - 做实 `P3 engin`
-  - 建 benchmark / ablation
-  - 评估现有 `attack / danger / tactical / value`
+- 当前复盘 MVP 目标是：**`policy + value + danger + attack`**。
+- 复盘系统允许结合：**真理引擎** 与 **滑动窗口前后文**。
+- 当前主线不是继续加 head，也不是优先把所有 head 接进搜索，而是：
+  - 先做强 `policy + trunk`
+  - 再冻结 trunk 分别训练 `value / danger / attack`
+  - 把这些输出整合进复盘系统
 
 ## 目录约定
 
@@ -51,12 +57,14 @@
 
 - 产品定位
 - 双主线表述
+- 复盘 MVP
 - 里程碑顺序
 - 近期执行主线
 
 必须同步：
 
 - `ARCHITECTURE.md`
+- `docs/review-system.md`
 - `工程目标.md`
 - `NEXT_STEPS.md`
 - `TODO.md`
@@ -66,37 +74,10 @@
 ## 实现优先级
 
 1. **象棋规则与合法着（Rust）**
-   - 参考 `pikafish-rust` 的 `board.rs`、`movegen.rs`
-   - 保持与 Pikafish 语义一致
 2. **数据生成 / 标注加速（Rust）**
-   - 多线程按 `game_id` 分片
-   - 输出 XRSH，避免训练热路径重新判规则
-3. **Python**
-   - 保留训练、评估、导出
-   - 避免在热路径重复实现规则
-4. **引擎消费**
-   - 先接最小消费链路，再谈复杂 head 和动态搜索
-
-## 测试
-
-- Python：`cd nn && .venv\Scripts\python.exe -m pytest`
-- Rust：`cargo test -p xiangqi_core`
-- Rust：`cargo test -p engin`
-- Rust：`cargo test -p xiangqi_dataset`
-
-说明：
-
-- 无 `torch` 时，Python NN smoke 可跳过
-- `engin` 若存在 `data/policy.onnx`，会跑 ONNX 推理相关冒烟
-
-## Rust 格式与静态检查
-
-提交或合并前建议在仓库根目录执行：
-
-- `cargo fmt --all`
-- `cargo clippy --workspace --all-targets`
-
-Python 侧无强制格式化命令；如需格式整理，保持现有风格即可。
+3. **Python 训练与复盘语义头**
+4. **复盘系统消费链路**
+5. **搜索消费**
 
 ## 勿做
 

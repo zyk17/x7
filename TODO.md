@@ -11,10 +11,11 @@
 
 ## 产品与方法论（全员对齐）
 
-- **定位**：**人类认知驱动的搜索**——模型主要学习 **人类棋谱与局面语义**（policy、危险、先手权等），用于 **候选空间与剪枝先验**；**不是**「堆一个大网络替代 Pikafish 式静态评估」。
-- **双主线**：**短期主产品**是复盘系统，模型输出需要**可解释**；**长期路线**是搜索引擎，搜索负责验证这些语义是否真的有用。
-- **分工**：**机器话 / 战术穷尽 / 物质与深度验证** → **`engin` 搜索 + `xiangqi_core`**；**人类风格与大局观** → **`nn/` 小网络 + ONNX**。
-- **文档**：原则性表述以 **`ARCHITECTURE.md`**、根目录 **`README.MD`**、**`.cursorrules`**、**`agents.md`** 为准。
+- **定位**：**人类认知驱动的搜索**，但短期先落到**复盘系统**
+- **双主线**：短期主产品是复盘系统；长期路线是搜索引擎
+- **复盘 MVP**：`policy + value + danger + attack`
+- **复盘系统允许结合**：真理引擎、滑动窗口前后文
+- **分工**：机器侧战术与验证 → `engin` / `xiangqi_core`；人类风格与局面语义 → `nn/`
 
 ---
 
@@ -22,106 +23,81 @@
 
 当前只做三件事：
 
-1. 做实 `P3 engin`
-2. 建 benchmark / ablation
-3. 对现有 heads 做“复盘解释价值 + 搜索收益”双重归因
-
-详细拆解见 `NEXT_STEPS.md`。
+1. 持续做强 `policy + trunk`
+2. 将复盘 MVP 收敛为 `policy + value + danger + attack`
+3. 用真理引擎 + 滑动窗口上下文把这些输出组织成可解释复盘
 
 执行方式：
 
-- 写代码时：优先做 `engin`、benchmark、ablation、最小消费链路
-- 不写代码时：优先跑训练对比矩阵，判断 `attack / danger / tactical / value` 的保留价值
+- 写代码时：优先做复盘消费链路、冻结 trunk 后的单头训练能力、真理引擎/滑动窗口整合
+- 不写代码时：优先跑 trunk 训练与 `value / danger / attack` 单头实验
 
 ---
 
-## P0 — `xiangqi_core`：规则 + 合法 UCI（对齐 pikafish-rust / Pikafish）
+## P0 — `xiangqi_core`：规则 + 合法 UCI
 
-**当前阶段：实现已落地，「可对拍验证」是门禁**
-
-- [x] 对照 `pikafish-rust` 划定模块边界：`types` / `misc` / `board` / `movegen`
-- [x] 局面表示：`from_fen` / `set_fen`；perft + do/undo 回归
-- [x] 各子力走法与阻挡、将/帅照面、过河等（移植自 pikafish-rust）
-- [x] 将军 / 应将 / 合法性过滤（`GenType::Legal` + `Position::legal`）
-- [x] **合法着 UCI**：`legal_moves_uci`、`parse_move_uci`（纵坐标 **0～9**，与 Pikafish 等引擎 UCI 一致）
-- [x] **一致性测试（门禁）**：`nn/scripts/parity/pyffish_xiangqi_core_parity.py` + `pytest tests/test_pyffish_xiangqi_core_parity.py`（须 `pyffish` + `cargo`）；`xiangqi_core` 二进制 `legal_moves_dump`；种子含 **根 FEN + 非空 `uci_prefix`**；可选扩展：与 **Pikafish** 边界用例对照（外部仓库 `c:\projects\Pikafish`，本仓仅文档引用）
-- [x] 文档：`crates/xiangqi_core/README.md`（来源、API、测试）
+- [x] 对照 `pikafish-rust` 划定模块边界
+- [x] 局面表示、perft、do/undo 回归
+- [x] 合法着 UCI：`legal_moves_uci`、`parse_move_uci`
+- [x] 与 `pyffish` / Pikafish 基本对拍工具
 
 ---
 
-## P1 — `xiangqi_dataset`：PGN → 二进制 shards（按局并行）
+## P1 — `xiangqi_dataset`：PGN → XRSH
 
-**当前阶段：MVP 已可用；下一步是「规则单一来源」增强**
-
-- [x] 输入：**PGN**（ICCS / UCI，Rust `encode`）；**`vocab-enum`** 生成固定 canonical 词表
-- [x] 输出：**XRSH**（`shard_NNNNN.xrsh`，魔数 `XRSH`）+ `pack_meta.json`；**当前默认 `xrsh_v3`**
-- [x] `vocab_sha256` 与 Python 词表指纹一致；`pack_meta.format` 为 **`xrsh_v3`**
-- [x] CLI：`vocab-enum` / `pgn-shards`，`--jobs`、`--games-per-shard`
-- [x] Python **`PolicyXrshDataset`**（`nn.dataset_xrsh`，`--train-xrsh-dir`）
-- [x] Rust：单元测试（`iccs` / `pgn` / `vocab`）、集成冒烟 `tests/pgn_xrsh_smoke.rs`（PGN → XRSH + `read_shard_header` + `pack_meta`）
-- [x] **XRSH v3**：三辅助 float + **`game_result_red` / `ply_total`**（`pack_meta.format: xrsh_v3`，文件头版本 3）；Python **`xrsh_io` / `PolicyXrshDataset`** 读入；**value 头**用终局标签（非 `2*attack-1`）
+- [x] `vocab-enum` 固定 canonical 词表
+- [x] `pgn-shards` 生成 XRSH
+- [x] XRSH v3 包含 `aux_* + game_result_red + ply_total`
+- [x] Python `PolicyXrshDataset` 仅读 XRSH
 
 ---
 
-## P2 — `nn/`：二进制训练包 + 多头网络
+## P2 — `nn/`：训练与 ONNX
 
-**当前阶段：XRSH + 训练 + 多头 + ONNX 已打通；与 P1「Rust 预计算标签」衔接前注意双源风险**
-
-- [x] `Dataset` / DataLoader 读取 P1 **XRSH**（`.xrsh`）
-- [x] 模型：shared trunk + **policy** + **attack / danger / tactical**（定义见 ARCHITECTURE / `aux_pseudo_labels.py`）
-- [x] 损失与权重；验证指标（`--aux-loss-weight`、`val_aux_mse`）
-- [x] **ONNX 导出**（`export_onnx.py`：logits + 可选三头，图中 sigmoid）
-- [x] 训练路径 **XRSH only**
-- [x] **惯例**：**`xrsh_v3`** + 多头训练 → 辅助标签来自 Rust；**`train_policy` 默认开 value 头**（棋谱须含 `[Result]`；**`--no-value-head`** 关闭）；旧 **v1/v2** 或想排除辅助头噪声时用 **`--no-aux-heads`**
+- [x] XRSH only 训练路径
+- [x] shared trunk + policy + aux 头
+- [x] value 头训练支持
+- [x] ONNX 导出
+- [x] 冻结训练基础能力：`freeze-trunk` / `freeze-policy-head` / `freeze-value-head`
 
 ---
 
 ## P3 — `engin`：搜索 + UCI
 
-- [x] UCI 最小闭环：`uci`（含 **id**、**option**、**uciok**）/ `isready` / `ucinewgame` / **`setoption`**（含 **Clear Hash** 按钮项）/ `position startpos|fen …` + `moves` / `go`（`depth` `movetime` `infinite` `ponder` `nodes`）/ `stop` / `ponderhit` / `quit`；**无参数启动 `engin` 即 UCI（stdin/stdout）**
-- [x] **Alpha-Beta** + **静止搜索**（吃子延伸；被将军时全应将）+ **置换表 TT**
-- [x] **迭代加深**（`go` / `go depth`）；**movetime** / **nodes** 在搜索内检查（不再先睡眠再搜）；**infinite** 配合 **stop** 与节点内轮询
-- [x] **Move ordering**：TT + MVV-LVA + 杀手 + 根 policy logit；静止阶段仅 MVV-LVA（不吃 ONNX）
-- [x] ONNX Runtime 加载 P2 导出模型 + **单次局面推理**：`engin::PolicyOnnx`（输入名 `board`，输出 `logits` + 可选 `attack`/`danger`/`tactical`）；`cargo run -p engin -- --onnx-smoke [PATH]`；`cargo test -p engin` 在存在 `data/policy.onnx` 时起推理冒烟
-- [x] 与 `xiangqi_core` 走子、合法性、终局判定联调（`crates/engin/tests/p3_integration.rs` + `parse_position_uci`）
-- [x] 建立固定 FEN benchmark 集与统一输出格式（`engin::benchmark`、`engin --bench [--depth N]`，NDJSON）
-- [x] 建立搜索侧消融：`setoption name UsePolicyOrdering` / `UseNNLeaf`（**attack/danger/tactical** 当前不进入搜索树，无独立开关；见 `NEXT_STEPS`）
-- [x] **ONNX 契约回归**：`nn/tests/test_policy_onnx_contract.py` 校验 `data/policy.onnx` 的 I/O 名与形状（与 `export_onnx.py` 一致；**`data/` 被 gitignore**，本地放入导出文件后跑 `pytest` 即执行）
-
----
-
-## P4 — Value Head
-
-- [ ] 仅保留“最小 value head”路线
-- [ ] 明确 value 契约、标签来源、训练指标，优先服务“人类局面感”解释
-- [ ] 只先接入 `engin` 的最小消费点
-- [ ] 以 benchmark 收益决定是否继续扩大作用范围
-
----
-
-## P5 — Search-aware Heads
-
-- [ ] 先比较现有 `attack / danger / tactical / value` 的真实收益
-- [ ] 只保留有复盘解释价值或 benchmark 收益的 head
-- [ ] 在完成收益归因前，不新增 `forcing / volatility / mobility_tension`
-- [ ] 暂不做 `style / sacrifice / initiative / psychological`
-
----
-
-## P6 / P7 — 后续阶段
-
-- [ ] `P6`：搜索注意力蒸馏
-- [ ] `P7`：动态搜索
+- [x] UCI 最小闭环
+- [x] Alpha-Beta + qsearch + TT + ordering
+- [x] benchmark / ablation 基础设施
+- [x] ONNX 推理接线
+- [ ] 维持为可用实验平台
 
 说明：
 
-- 这两项在完成 `P3` 做实、benchmark、head 收益归因之前不进入近期主线
-- 详细任务以后续版本 `NEXT_STEPS.md` 为准
+- `engin` 仍然重要
+- 但不是当前最急主线
 
 ---
 
-## 已完成（归档区）
+## P4 — 复盘 MVP 头
 
-- **2026-05**：P0 主体 — 自 pikafish-rust 并入 `types` / `misc` / `board` / `movegen`；`Position::from_fen`、`global_zobrist`、`legal_moves_uci`；`tests/perft.rs`（depth 1–3 = 44 / 1926 / 80069）。
-- **2026-05**：P1 MVP — `xiangqi_dataset`：`vocab-enum` / `pgn-shards`，XRSH（`.xrsh`），`pack_meta.json`；`uci_format` 与 Pikafish UCI（纵坐标 0～9）对齐。
-- **2026-05**：P2 — `PolicyResNet` 可选多头；`aux_pseudo_labels` + `root_fen`/`uci_prefix`/合法 UCI 表；ONNX 多输出；训练 `unpack_*_batch`。
+- [ ] 先做大一轮 `policy + trunk`
+- [ ] trunk 接近平台后，冻结 trunk 单独训练 `value`
+- [ ] 再冻结 trunk 单独训练 `danger`
+- [ ] 再冻结 trunk 单独训练 `attack`
+- [ ] `tactical` 暂列第二波增强头
+
+---
+
+## P5 — 复盘编排层
+
+- [ ] 固定候选着、趋势、风险、攻势的输出契约
+- [ ] 将模型头、真理引擎、滑动窗口整合成完整复盘输出
+- [ ] 形成小规模人工样例集，验证解释是否像人会说的话
+
+---
+
+## P6 / P7 — 长期搜索线
+
+- [ ] 将已验证有效的 head 逐步接入搜索
+- [ ] 做搜索收益 benchmark
+- [ ] 只保留对搜索真正有收益的头
+- [ ] 后续再考虑蒸馏与动态搜索

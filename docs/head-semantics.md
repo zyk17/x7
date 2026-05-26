@@ -9,6 +9,15 @@
 
 它们的目标不是替代传统引擎的单一静态评估，而是为**复盘解释**与后续**搜索调度**提供可解释的局面语义。临时讨论以 `temp.md` 为主；本文件用于长期保留这些头的正式定义与理解方式。
 
+当前复盘 MVP 的优先级是：
+
+- `policy`
+- `value`
+- `danger`
+- `attack`
+
+`tactical` 仍保留语义定义，但暂时不属于最小复盘系统阻塞项。
+
 相关实现：
 
 - Rust 标签生成：[crates/xiangqi_dataset/src/aux_labels.rs](/C:/projects/77xiangqi_engine/crates/xiangqi_dataset/src/aux_labels.rs)
@@ -21,6 +30,7 @@
 - `attack / danger / tactical` 是**复盘语义头**，用于描述人类能理解的局面状态。
 - `value` 也不是传统引擎式“静态分数真值”，而是**结果导向的趋势监督**。
 - 它们的职责是补充 `policy`，不是和 `policy` 争夺主任务地位。
+- 复盘系统最终可以将这些头与**真理引擎**、**滑动窗口前后文**一起使用；单头输出不是完整产品。
 
 一句话理解：
 

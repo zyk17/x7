@@ -1,6 +1,8 @@
 # Value 小评测集（`--value-probe`）
 
-用于对照 **`NNLeafMode::Off`** 与 **`MainLeafOnly`** 在同一组固定 FEN 上的 `bestmove`，判断叶子 value 是否值得留在搜索主线（见仓库任务 3）。
+用于对照 **`NNLeafMode::Off`** 与 **`MainLeafOnly`** 在同一组固定 FEN 上的 `bestmove`，判断叶子 value 是否值得留在搜索主线。
+
+注意：当前短期主产品是**复盘系统**。因此 `value-probe` 属于**长期搜索验证工具**，不是近期主阻塞项。
 
 ## 运行
 

@@ -1,11 +1,12 @@
 # ONNX Leaf Value 实现方案
 
-本文件只定义一条近期实现路线：
+本文件只定义一条**长期引擎侧**实现路线：
 
 **保留 ONNX 推理，但收紧 `nn-leaf` 的调用范围与调用成本。**
 
 适用前提：
 
+- 当前复盘 MVP 已不再以搜索接线为第一优先级
 - 当前 `engin` 已有 `--bench`
 - `UsePolicyOrdering` / `UseNNLeaf` 已可消融
 - bench 已确认主要瓶颈在 `nn-leaf`
