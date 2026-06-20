@@ -37,7 +37,7 @@ fn smoke_pgn_generates_one_shard() {
     assert!(shard.is_file(), "缺少 shard 文件");
 
     let (ver, file_hash, n_games) = read_shard_header(&shard).expect("header");
-    assert_eq!(ver, 3);
+    assert_eq!(ver, 5);
     assert_eq!(n_games, 1);
 
     let vocab_txt = fs::read_to_string(&vocab_path).expect("read vocab");
@@ -47,5 +47,5 @@ fn smoke_pgn_generates_one_shard() {
     let meta = fs::read_to_string(out.join("pack_meta.json")).expect("pack_meta");
     let hex = vocab_sha256_hex(&exp_hash);
     assert!(meta.contains(&hex), "pack_meta 应含完整 vocab_sha256");
-    assert!(meta.contains("xrsh_v3"), "pack_meta 应为 xrsh_v3");
+    assert!(meta.contains("xrsh_v5"), "pack_meta 应为 xrsh_v5");
 }

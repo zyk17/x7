@@ -22,9 +22,7 @@ pub mod uci_format;
 pub use board::{global_zobrist, Position, UndoFrame, Zobrist};
 pub use movegen::{generate, ExtMove, GenType};
 pub use types::{Color, File, Key, Move, Piece, PieceType, Rank, Square, Value, MAX_MOVES as TYPES_MAX_MOVES};
-pub use uci_format::{
-    move_to_uci, parse_move_uci, square_to_algebraic, uci_to_move, write_move_uci_bytes, START_FEN,
-};
+pub use uci_format::{move_to_uci, parse_move_uci, square_to_algebraic, uci_to_move, write_move_uci_bytes, START_FEN};
 
 /// **合法着** UCI 字符串列表（`a0`～`i9`，与常见皮卡鱼族引擎约定一致；已过滤将帅照面等）。
 pub fn legal_moves_uci(pos: &Position) -> Vec<String> {

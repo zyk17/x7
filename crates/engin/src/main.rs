@@ -1,4 +1,4 @@
-//! 用户侧引擎：默认 **UCI（stdin/stdout）**；`--onnx-smoke` 为 ONNX 冒烟；`--bench` 为 P3 搜索基准（NDJSON）。
+//! 用户侧引擎：默认 UCI；`--onnx-smoke` 为 ONNX 冒烟；`--bench` 为 MCTS 基准。
 
 use std::collections::HashMap;
 use std::env;
@@ -10,12 +10,11 @@ use std::sync::{Arc, Mutex};
 use xiangqi_core::{legal_moves_uci, Position};
 
 use engin::benchmark::{
-    default_benchmark_fen_strings, resolve_data_file, write_benchmark_ndjson, BenchJsonMeta,
-    BenchSessionParams,
+    default_benchmark_fen_strings, resolve_data_file, write_benchmark_ndjson, BenchJsonMeta, BenchSessionParams,
 };
-use engin::value_probe::{markdown_table_off_vs_main, ValueProbeTableArgs};
+use engin::mcts::{MctsBudget, MctsConfig};
 use engin::vocab::{load_move_vocab, load_move_vocab_ordered};
-use engin::{run_uci_stdio, PolicyOnnx, NNLeafMode, SearchAblation, START_FEN};
+use engin::{run_uci_stdio, PolicyOnnx, START_FEN};
 
 fn default_policy_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/policy.onnx")
@@ -28,54 +27,58 @@ fn default_vocab_path() -> PathBuf {
 fn print_usage() {
     eprintln!(
         "用法:\n  engin                         UCI 模式（stdin/stdout）\n  \
-         engin --onnx-smoke [ONNX] [FEN] [VOCAB]  冒烟；缺省 ONNX=data/policy.onnx、FEN=起始局面；VOCAB 缺省且存在 data/move_vocab.json 则自动加载\n  \
-         engin --bench [选项]            P3 基准：NDJSON；默认 **吞吐基线**（nn-leaf off、无 policy 排序、hash 16）；可加 `--policy-ordering` / `--nn-leaf main` 等覆盖\n  \
-         engin --value-probe [选项]     小评测集：`nn-leaf off` vs `main`，输出 Markdown 表（见 docs/value-probe.md）\n  \
-         --bench / --value-probe 共用: --depth N  --nodes N  --onnx  --vocab  --data-dir  --hash  --require-onnx  --policy-ordering  --no-policy-ordering  --nn-eval-budget N  --nn-leaf …  --no-nn-leaf\n  \
-         伪标签真值: cargo test -p xiangqi_dataset user_fen_black_down_material_attack_below_half"
+         engin --onnx-smoke [ONNX] [FEN] [VOCAB]  冒烟；缺省 ONNX=data/policy.onnx、FEN=起始局面\n  \
+         engin --bench [选项]            MCTS 基准（NDJSON）\n  \
+         --bench 选项: --visits N  --nodes N  --movetime MS  --cpuct F  --onnx PATH  --vocab PATH  --data-dir PATH  --require-onnx"
     );
 }
 
 #[derive(Debug)]
 struct BenchCli {
-    depth: u32,
-    max_nodes: Option<u64>,
+    budget: MctsBudget,
+    config: MctsConfig,
     onnx: Option<PathBuf>,
     vocab: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     require_onnx: bool,
-    ablation: SearchAblation,
-    hash_mb: usize,
-    nn_eval_budget: u64,
-    policy_ordering_explicit: bool,
-    nn_leaf_explicit: bool,
 }
 
 fn parse_bench_cli(rest: &[String]) -> BenchCli {
-    let mut depth = 4u32;
-    let mut max_nodes: Option<u64> = None;
+    let mut budget = MctsBudget {
+        max_visits: Some(256),
+        max_nodes: None,
+        deadline: None,
+        stop: None,
+    };
+    let mut config = MctsConfig::default();
     let mut onnx: Option<PathBuf> = None;
     let mut vocab: Option<PathBuf> = None;
     let mut data_dir: Option<PathBuf> = None;
     let mut require_onnx = false;
-    let mut no_policy_ordering = false;
-    let mut policy_ordering_explicit = false;
-    let mut nn_leaf_mode: Option<NNLeafMode> = None;
-    let mut nn_leaf_explicit = false;
-    let mut hash_mb = 16usize;
-    let mut nn_eval_budget = 0u64;
     let mut i = 0usize;
     while i < rest.len() {
         match rest[i].as_str() {
-            "--depth" if i + 1 < rest.len() => {
+            "--visits" if i + 1 < rest.len() => {
                 if let Ok(n) = rest[i + 1].parse::<u32>() {
-                    depth = n.clamp(1, 64);
+                    budget.max_visits = Some(n.max(1));
                 }
                 i += 2;
             }
             "--nodes" if i + 1 < rest.len() => {
+                if let Ok(n) = rest[i + 1].parse::<u32>() {
+                    budget.max_nodes = Some(n.max(1));
+                }
+                i += 2;
+            }
+            "--movetime" if i + 1 < rest.len() => {
                 if let Ok(n) = rest[i + 1].parse::<u64>() {
-                    max_nodes = (n > 0).then_some(n);
+                    budget = MctsBudget::from_movetime_ms(n.max(1));
+                }
+                i += 2;
+            }
+            "--cpuct" if i + 1 < rest.len() => {
+                if let Ok(n) = rest[i + 1].parse::<f32>() {
+                    config.cpuct = n.clamp(0.01, 100.0);
                 }
                 i += 2;
             }
@@ -95,42 +98,6 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
                 require_onnx = true;
                 i += 1;
             }
-            "--policy-ordering" => {
-                no_policy_ordering = false;
-                policy_ordering_explicit = true;
-                i += 1;
-            }
-            "--no-policy-ordering" => {
-                no_policy_ordering = true;
-                policy_ordering_explicit = true;
-                i += 1;
-            }
-            "--no-nn-leaf" => {
-                nn_leaf_mode = Some(NNLeafMode::Off);
-                nn_leaf_explicit = true;
-                i += 1;
-            }
-            "--nn-leaf" if i + 1 < rest.len() => {
-                if let Some(m) = NNLeafMode::parse_uci(&rest[i + 1]) {
-                    nn_leaf_mode = Some(m);
-                    nn_leaf_explicit = true;
-                } else {
-                    eprintln!("--nn-leaf: 无效值 {:?}，应为 off|main|all", rest[i + 1]);
-                }
-                i += 2;
-            }
-            "--nn-eval-budget" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<u64>() {
-                    nn_eval_budget = n;
-                }
-                i += 2;
-            }
-            "--hash" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<usize>() {
-                    hash_mb = n.max(1);
-                }
-                i += 2;
-            }
             other => {
                 eprintln!("--bench: 忽略未知参数 {other}");
                 i += 1;
@@ -138,30 +105,12 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
         }
     }
     BenchCli {
-        depth,
-        max_nodes,
+        budget,
+        config,
         onnx,
         vocab,
         data_dir,
         require_onnx,
-        ablation: SearchAblation {
-            policy_ordering: !no_policy_ordering,
-            nn_leaf_mode: nn_leaf_mode.unwrap_or(NNLeafMode::MainLeafOnly),
-        },
-        hash_mb,
-        nn_eval_budget,
-        policy_ordering_explicit,
-        nn_leaf_explicit,
-    }
-}
-
-/// `--bench` 默认对齐单线程 NPS 基线：无 NN 叶值、无 policy 排序（除非显式传参）。
-fn apply_bench_throughput_defaults(cli: &mut BenchCli) {
-    if !cli.policy_ordering_explicit {
-        cli.ablation.policy_ordering = false;
-    }
-    if !cli.nn_leaf_explicit {
-        cli.ablation.nn_leaf_mode = NNLeafMode::Off;
     }
 }
 
@@ -192,8 +141,7 @@ fn resolve_bench_onnx_vocab(cli: &BenchCli) -> (Option<PathBuf>, Option<PathBuf>
 }
 
 fn run_bench_cli(rest: &[String]) -> io::Result<()> {
-    let mut cli = parse_bench_cli(rest);
-    apply_bench_throughput_defaults(&mut cli);
+    let cli = parse_bench_cli(rest);
     let (onnx_path, vocab_path) = resolve_bench_onnx_vocab(&cli);
 
     if let Some(ref p) = cli.onnx {
@@ -202,9 +150,8 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
             process::exit(1);
         }
     }
-
     if cli.require_onnx && onnx_path.is_none() {
-        eprintln!("--bench: 未找到 policy.onnx（请放入 ./data/、设置 ENGIN_DATA_DIR，或使用 --onnx）");
+        eprintln!("--bench: 未找到 policy.onnx");
         process::exit(1);
     }
 
@@ -218,8 +165,8 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
                 *policy.lock().unwrap() = Some(net);
                 meta.policy_session_loaded = true;
             }
-            Err(e) => {
-                eprintln!("--bench: 加载 ONNX 失败: {e}");
+            Err(err) => {
+                eprintln!("--bench: 加载 ONNX 失败: {err}");
                 if cli.require_onnx {
                     process::exit(1);
                 }
@@ -227,83 +174,29 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
         }
     }
 
-    let (vocab, vocab_size) = if let Some(ref vp) = vocab_path {
+    let vocab = if let Some(ref vp) = vocab_path {
         meta.vocab_path = Some(vp.display().to_string());
-        load_move_vocab(vp).unwrap_or_else(|e| {
-            eprintln!("--bench: 词表加载失败: {e}");
+        let (vocab, size) = load_move_vocab(vp).unwrap_or_else(|err| {
+            eprintln!("--bench: 词表加载失败: {err}");
             (HashMap::new(), 0)
-        })
+        });
+        meta.vocab_entries = size;
+        vocab
     } else {
-        (HashMap::new(), 0)
+        HashMap::new()
     };
-    meta.vocab_entries = vocab_size;
 
     let session = BenchSessionParams {
-        max_depth: cli.depth,
-        max_nodes: cli.max_nodes,
+        budget: cli.budget,
+        config: cli.config,
         policy: &policy,
         vocab: &vocab,
-        vocab_size,
-        ablation: cli.ablation,
-        hash_mb: cli.hash_mb,
-        nn_eval_budget: cli.nn_eval_budget,
         meta: &meta,
     };
+
     let stdout = io::stdout();
     let mut out = stdout.lock();
     write_benchmark_ndjson(&mut out, default_benchmark_fen_strings(), &session)
-}
-
-fn run_value_probe_cli(rest: &[String]) {
-    let cli = parse_bench_cli(rest);
-    let (onnx_path, vocab_path) = resolve_bench_onnx_vocab(&cli);
-
-    let Some(ref op) = onnx_path else {
-        eprintln!(
-            "--value-probe: 必须能找到并加载 policy.onnx（请放入 ./data/、设置 ENGIN_DATA_DIR、--data-dir 或 --onnx）"
-        );
-        process::exit(1);
-    };
-    if !op.is_file() {
-        eprintln!("--value-probe: ONNX 路径无效: {}", op.display());
-        process::exit(1);
-    }
-
-    let policy = Arc::new(Mutex::new(None));
-    match PolicyOnnx::from_file(op) {
-        Ok(net) => *policy.lock().unwrap() = Some(net),
-        Err(e) => {
-            eprintln!("--value-probe: 加载 ONNX 失败: {e}");
-            process::exit(1);
-        }
-    }
-
-    let (vocab, vocab_size) = if let Some(ref vp) = vocab_path {
-        load_move_vocab(vp).unwrap_or_else(|e| {
-            eprintln!("--value-probe: 词表加载失败: {e}");
-            (HashMap::new(), 0)
-        })
-    } else {
-        (HashMap::new(), 0)
-    };
-
-    let table_args = ValueProbeTableArgs {
-        depth: cli.depth,
-        hash_mb: cli.hash_mb,
-        policy_ordering: cli.ablation.policy_ordering,
-        nn_eval_budget: cli.nn_eval_budget,
-        onnx_path: op.as_path(),
-        policy: &policy,
-        vocab: &vocab,
-        vocab_size,
-    };
-    match markdown_table_off_vs_main(&table_args) {
-        Ok(md) => print!("{md}"),
-        Err(e) => {
-            eprintln!("--value-probe: {e}");
-            process::exit(1);
-        }
-    }
 }
 
 fn legal_top_lines(logits: &[f32], vocab: &[String], fen: &str, k: usize) -> Result<String, String> {
@@ -325,7 +218,6 @@ fn legal_top_lines(logits: &[f32], vocab: &[String], fen: &str, k: usize) -> Res
         .join(" | "))
 }
 
-/// 解析 `--onnx-smoke` 后的参数：若首参为已有文件则视为 ONNX，否则视为 FEN。
 fn parse_onnx_smoke_args(rest: &[String]) -> (PathBuf, String, Option<PathBuf>) {
     match rest {
         [] => (default_policy_path(), START_FEN.to_string(), None),
@@ -378,12 +270,6 @@ fn main() {
         return;
     }
 
-    if first == "--value-probe" {
-        let rest: Vec<String> = args.collect();
-        run_value_probe_cli(&rest);
-        return;
-    }
-
     if first == "--onnx-smoke" {
         let rest: Vec<String> = args.collect();
         let (onnx_path, fen, vocab_arg) = parse_onnx_smoke_args(&rest);
@@ -394,7 +280,6 @@ fn main() {
 
         if !onnx_path.is_file() {
             eprintln!("找不到 ONNX 文件: {}", onnx_path.display());
-            eprintln!("请先导出 policy.onnx 到仓库根目录 data/，或把 .onnx 路径作为首参。");
             process::exit(1);
         }
         let mut net = match PolicyOnnx::from_file(&onnx_path) {
@@ -404,8 +289,7 @@ fn main() {
                 process::exit(1);
             }
         };
-        let fen = fen.as_str();
-        let out = match net.eval_fen(fen) {
+        let out = match net.eval_fen(&fen) {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("推理失败: {e}");
@@ -428,34 +312,16 @@ fn main() {
                         );
                     } else {
                         println!("vocab: {}", vp.display());
-                        match legal_top_lines(&out.logits, &vocab, fen, 8) {
-                            Ok(s) => {
-                                println!("policy_legal_top8: {s}");
-                            }
+                        match legal_top_lines(&out.logits, &vocab, &fen, 8) {
+                            Ok(s) => println!("policy_legal_top8: {s}"),
                             Err(e) => eprintln!("policy_legal_top8: (skip) {e}"),
                         }
                     }
                 }
                 Err(e) => eprintln!("词表加载失败: {e}"),
             }
-        } else {
-            eprintln!("未找到词表；下列为全词表 logit 最高的下标（常含非法着，仅调试用）。");
-            let mut top: Vec<(usize, f32)> = out.logits.iter().copied().enumerate().collect();
-            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let s: Vec<String> = top
-                .iter()
-                .take(5)
-                .map(|(i, v)| format!("idx={i} logit={v:.6}"))
-                .collect();
-            println!("policy_raw_top5_no_vocab: {}", s.join(" | "));
         }
 
-        print!("aux(onnx): ");
-        if let (Some(a), Some(d), Some(t)) = (out.attack, out.danger, out.tactical) {
-            println!("attack={a:.6} danger={d:.6} tactical={t:.6}");
-        } else {
-            println!("{:?}", (out.attack, out.danger, out.tactical));
-        }
         print!("value(onnx): ");
         if let Some(v) = out.value {
             println!("{v:.6}");

@@ -9,7 +9,6 @@ description = "Chinese chess human policy model (XRSH → ResNet → ONNX)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "pyffish>=0.0.86",
   "tqdm>=4.65",
 ]
 

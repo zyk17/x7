@@ -5,10 +5,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use xiangqi_dataset::{
-    collect_vocab_moves_from_pgn_with_jobs,
-    enumerate_canonical_vocab_moves,
-    run_pgn_shards,
-    write_vocab_json,
+    collect_vocab_moves_from_pgn_with_jobs, enumerate_canonical_vocab_moves, export_search_label_shard_from_pgn,
+    run_pgn_shards, write_vocab_json, SearchLabelExportConfig,
 };
 
 #[derive(Parser)]
@@ -55,6 +53,27 @@ enum Cmd {
         #[arg(long, default_value_t = 0usize)]
         max_games: usize,
     },
+    /// 从 PGN 对人类局面跑 MCTS，导出带搜索标注的 XRSH
+    SearchLabelPgn {
+        #[arg(long, required = true)]
+        pgn: PathBuf,
+        #[arg(long, required = true)]
+        vocab: PathBuf,
+        #[arg(long, required = true)]
+        out_dir: PathBuf,
+        #[arg(long)]
+        onnx: Option<PathBuf>,
+        #[arg(long, default_value_t = 256u32)]
+        visits: u32,
+        #[arg(long, default_value_t = 1.25f32)]
+        cpuct: f32,
+        #[arg(long, default_value_t = 0usize)]
+        max_games: usize,
+        #[arg(long, default_value_t = 0usize)]
+        max_rows_per_game: usize,
+        #[arg(long)]
+        round: Option<u32>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -86,6 +105,32 @@ fn main() -> Result<()> {
         } => {
             let n = run_pgn_shards(&pgn, &vocab, &out_dir, jobs, games_per_shard, max_games)?;
             eprintln!("写入 {n} 个分片 -> {}", out_dir.display());
+        }
+        Cmd::SearchLabelPgn {
+            pgn,
+            vocab,
+            out_dir,
+            onnx,
+            visits,
+            cpuct,
+            max_games,
+            max_rows_per_game,
+            round,
+        } => {
+            let n = export_search_label_shard_from_pgn(
+                &pgn,
+                &vocab,
+                &out_dir,
+                onnx.as_deref(),
+                &SearchLabelExportConfig {
+                    max_visits: visits,
+                    max_games,
+                    max_rows_per_game,
+                    cpuct,
+                },
+            )?;
+            let _ = round;
+            eprintln!("写入 {n} 条搜索标注 XRSH -> {}", out_dir.display());
         }
     }
     Ok(())

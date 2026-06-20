@@ -8,80 +8,62 @@ torch = pytest.importorskip("torch")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "train"))
 
-from train_policy import unpack_train_batch, unpack_val_batch
-from train_policy import _set_requires_grad
+from train_policy import _set_requires_grad, unpack_train_batch, unpack_val_batch
 from nn.model import PolicyResNet
 
 
-def test_unpack_train_batch_all_modes():
+def test_unpack_train_batch_modes():
     b = torch.zeros(2, 15, 10, 9)
     m = torch.zeros(2, 8, dtype=torch.bool)
     t = torch.zeros(2, dtype=torch.long)
     w = torch.ones(2)
-    ta = torch.zeros(2)
-    td = torch.zeros(2)
-    tt = torch.zeros(2)
     tv = torch.zeros(2)
+    vp = torch.zeros(2, 8)
+    sq = torch.zeros(2)
+    sv = torch.zeros(2, dtype=torch.long)
 
-    out = unpack_train_batch((b, m, t, w), aux_heads=False, value_head=False)
+    out = unpack_train_batch((b, m, t, w), value_head=False, search_policy_head=False)
     assert set(out.keys()) == {"boards", "masks", "targets", "weights"}
 
-    out = unpack_train_batch((b, m, t, w, tv), aux_heads=False, value_head=True)
+    out = unpack_train_batch((b, m, t, w, tv), value_head=True, search_policy_head=False)
     assert set(out.keys()) == {"boards", "masks", "targets", "weights", "t_val"}
 
-    out = unpack_train_batch(
-        (b, m, t, w, ta, td, tt), aux_heads=True, value_head=False
-    )
+    out = unpack_train_batch((b, m, t, w, vp, sq, sv), value_head=False, search_policy_head=True)
     assert set(out.keys()) == {
         "boards",
         "masks",
         "targets",
         "weights",
-        "t_atk",
-        "t_dan",
-        "t_tac",
+        "visit_target",
     }
 
-    out = unpack_train_batch(
-        (b, m, t, w, ta, td, tt, tv), aux_heads=True, value_head=True
-    )
+    out = unpack_train_batch((b, m, t, w, tv, vp, sq, sv), value_head=True, search_policy_head=True)
     assert set(out.keys()) == {
         "boards",
         "masks",
         "targets",
         "weights",
-        "t_atk",
-        "t_dan",
-        "t_tac",
         "t_val",
+        "visit_target",
     }
 
 
-def test_unpack_val_batch_all_modes():
+def test_unpack_val_batch_modes():
     b = torch.zeros(2, 15, 10, 9)
     m = torch.zeros(2, 8, dtype=torch.bool)
     t = torch.zeros(2, dtype=torch.long)
     w = torch.ones(2)
-    ta = torch.zeros(2)
-    td = torch.zeros(2)
-    tt = torch.zeros(2)
     tv = torch.zeros(2)
+    vp = torch.zeros(2, 8)
+    sq = torch.zeros(2)
+    sv = torch.zeros(2, dtype=torch.long)
     pl = torch.zeros(2, dtype=torch.long)
     sid = torch.zeros(2, dtype=torch.long)
 
-    out = unpack_val_batch((b, m, t, w, pl, sid), aux_heads=False, value_head=False)
-    assert set(out.keys()) == {
-        "boards",
-        "masks",
-        "targets",
-        "weights",
-        "plies",
-        "src_ids",
-    }
+    out = unpack_val_batch((b, m, t, w, pl, sid), value_head=False, search_policy_head=False)
+    assert set(out.keys()) == {"boards", "masks", "targets", "weights", "plies", "src_ids"}
 
-    out = unpack_val_batch(
-        (b, m, t, w, tv, pl, sid), aux_heads=False, value_head=True
-    )
+    out = unpack_val_batch((b, m, t, w, tv, pl, sid), value_head=True, search_policy_head=False)
     assert set(out.keys()) == {
         "boards",
         "masks",
@@ -92,35 +74,25 @@ def test_unpack_val_batch_all_modes():
         "src_ids",
     }
 
-    out = unpack_val_batch(
-        (b, m, t, w, ta, td, tt, pl, sid), aux_heads=True, value_head=False
-    )
+    out = unpack_val_batch((b, m, t, w, vp, sq, sv, pl, sid), value_head=False, search_policy_head=True)
     assert set(out.keys()) == {
         "boards",
         "masks",
         "targets",
         "weights",
-        "t_atk",
-        "t_dan",
-        "t_tac",
+        "visit_target",
         "plies",
         "src_ids",
     }
 
-    out = unpack_val_batch(
-        (b, m, t, w, ta, td, tt, tv, pl, sid),
-        aux_heads=True,
-        value_head=True,
-    )
+    out = unpack_val_batch((b, m, t, w, tv, vp, sq, sv, pl, sid), value_head=True, search_policy_head=True)
     assert set(out.keys()) == {
         "boards",
         "masks",
         "targets",
         "weights",
-        "t_atk",
-        "t_dan",
-        "t_tac",
         "t_val",
+        "visit_target",
         "plies",
         "src_ids",
     }
@@ -131,7 +103,6 @@ def test_set_requires_grad_can_freeze_value_head_only():
         width=32,
         num_blocks=2,
         num_moves=16,
-        aux_heads=False,
         value_head=True,
         value_head_hidden_dim=16,
     )

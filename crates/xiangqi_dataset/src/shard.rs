@@ -1,4 +1,4 @@
-//! 二进制分片 **XRSH**（Xiangqi Review Shard）v1：按局聚合，便于按 `game_id` 并行生成。
+//! 二进制分片 **XRSH**（Xiangqi Review Shard）：按局聚合，便于按 `game_id` 并行生成。
 //! 扩展名 `.xrsh`，与市面其它 `.xqb` 棋谱格式区分。
 
 use anyhow::{bail, Context, Result};
@@ -7,10 +7,10 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 /// 当前写入格式：`pack_meta.json` 的 `format` 字段。
-pub const FORMAT_NAME: &str = "xrsh_v3";
+pub const FORMAT_NAME: &str = "xrsh_v5";
 
 /// 分片文件头内的二进制版本号（与 `pack_meta.format_version` 一致）。
-pub const SHARD_FILE_VERSION: u32 = 3;
+pub const SHARD_FILE_VERSION: u32 = 5;
 
 /// 单样本（一行训练数据）。
 #[derive(Debug, Clone)]
@@ -21,14 +21,16 @@ pub struct EncodedRow {
     pub target_idx: i32,
     pub legal_idx: Vec<i32>,
     pub ply: u16,
-    /// 由 `xiangqi_core` 预计算，与 `nn.aux_pseudo_labels` 数值对齐。
-    pub aux_attack: f32,
-    pub aux_danger: f32,
-    pub aux_tactical: f32,
     /// PGN `[Result]` 红方视角：`1` 红胜、`-1` 黑胜、`0` 和、`2` 未知（`*` 或未标注）。
     pub game_result_red: i8,
     /// 本局总着数（与 `uci_moves.len()` 一致），用于 value 时间折扣等。
     pub ply_total: u16,
+    /// 根节点搜索 Q；`0` 且 `search_visits==0` 表示该行未带搜索标注。
+    pub search_q: f32,
+    /// 根节点总 visits。
+    pub search_visits: u32,
+    /// 与 `legal_idx` 对齐的根 visit 统计。
+    pub search_counts: Vec<u16>,
 }
 
 /// 一局内的所有样本。
@@ -98,11 +100,16 @@ pub fn write_shard(path: &Path, vocab_hash: &[u8; 32], games: &[EncodedGame]) ->
                 w.write_all(&idx.to_le_bytes())?;
             }
             w.write_all(&r.ply.to_le_bytes())?;
-            w.write_all(&r.aux_attack.to_le_bytes())?;
-            w.write_all(&r.aux_danger.to_le_bytes())?;
-            w.write_all(&r.aux_tactical.to_le_bytes())?;
             w.write_all(&r.game_result_red.to_le_bytes())?;
             w.write_all(&r.ply_total.to_le_bytes())?;
+            w.write_all(&r.search_q.to_le_bytes())?;
+            w.write_all(&r.search_visits.to_le_bytes())?;
+            if r.search_counts.len() != r.legal_idx.len() {
+                bail!("search_counts 与 legal_idx 长度不一致");
+            }
+            for &count in &r.search_counts {
+                w.write_all(&count.to_le_bytes())?;
+            }
         }
     }
     w.flush()?;

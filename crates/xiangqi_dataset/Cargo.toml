@@ -6,6 +6,7 @@ description = "Maintainer CLI: PGN → vocab + binary XRSH shards, parallel by g
 publish = false
 
 [dependencies]
+engin = { path = "../engin" }
 xiangqi_core = { path = "../xiangqi_core" }
 clap = { version = "4", features = ["derive"] }
 rayon = "1.10"

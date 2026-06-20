@@ -85,11 +85,7 @@ pub(crate) fn position_to_planes(pos: &Position) -> Result<Array4<f32>, String> 
         let ri = 9usize.saturating_sub(r);
         planes[[0, c, ri, fi]] = 1.0;
     }
-    let stm_fill = if pos.side_to_move == Color::White {
-        1.0
-    } else {
-        0.0
-    };
+    let stm_fill = if pos.side_to_move == Color::White { 1.0 } else { 0.0 };
     planes.slice_mut(s![0, 14, .., ..]).fill(stm_fill);
     Ok(planes)
 }

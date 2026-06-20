@@ -149,16 +149,7 @@ fn enumerate_rook_like(seen: &mut BTreeSet<String>) {
 }
 
 fn enumerate_horse(seen: &mut BTreeSet<String>) {
-    const DELTAS: &[(i32, i32)] = &[
-        (1, 2),
-        (2, 1),
-        (2, -1),
-        (1, -2),
-        (-1, -2),
-        (-2, -1),
-        (-2, 1),
-        (-1, 2),
-    ];
+    const DELTAS: &[(i32, i32)] = &[(1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)];
     for ff in 0..=8 {
         for fr in 0..=9 {
             for &(df, dr) in DELTAS {

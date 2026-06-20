@@ -1,6 +1,5 @@
 //! 从 **PGN 对局**编码为 [`shard::EncodedRow`]（`xiangqi_core` 生成合法着下标）。
 
-use crate::aux_labels::pseudo_aux_labels;
 use crate::iccs::iccs_move_to_uci;
 use crate::pgn::{movetext_iccs_pairs, movetext_uci_tokens, pgn_format, ParsedGame};
 use crate::shard::{EncodedGame, EncodedRow};
@@ -104,8 +103,7 @@ pub fn encode_game(game: &ParsedGame, game_id: &str, vocab: &HashMap<String, i32
             break;
         }
 
-        let (aux_attack, aux_danger, aux_tactical) = pseudo_aux_labels(&pos);
-
+        let search_counts = vec![0; legal_idx.len()];
         rows.push(EncodedRow {
             fen: pos.fen(),
             root_fen: root_fen.clone(),
@@ -113,11 +111,11 @@ pub fn encode_game(game: &ParsedGame, game_id: &str, vocab: &HashMap<String, i32
             target_idx,
             legal_idx,
             ply: ply as u16,
-            aux_attack,
-            aux_danger,
-            aux_tactical,
             game_result_red: result_r,
             ply_total,
+            search_q: 0.0,
+            search_visits: 0,
+            search_counts,
         });
 
         let Some(mv) = parse_move_uci(uci_tok) else {

@@ -1,88 +1,60 @@
-# 仓库 Agent 指南
+# AGENTS
 
-面向在本仓库内工作的自动化助手 / CI Agent。
+面向在本仓库内工作的自动化助手。
 
-## 必读
+## 1. 开始前先读
 
-1. **`ARCHITECTURE.md`**
-   - 产品边界
-   - Rust / Python 分层
-   - 数据与 ONNX 契约
-   - 双主线：复盘系统（短期）+ 搜索引擎（长期）
-2. **`docs/review-system.md`**
-   - 复盘 MVP
-   - 真理引擎与滑动窗口的角色
-   - 当前训练顺序
-3. **`.cursorrules`**
-   - 沟通语言
-   - 文档同步规则
-   - 当前执行主线
+1. `README.MD`
+2. `ARCHITECTURE.md`
+3. `AGENTS.md`
+4. `NextStep.md`
+5. `TODO.md`
+6. `temp.md`
 
-## 当前共识
+## 2. 当前项目共识
 
-- 本项目走 **人类认知驱动的搜索**，不是“把网络做成引擎静态评估的唯一真理”。
-- **短期主产品**是复盘系统：模型输出需要**可解释**。
-- **长期路线**是搜索引擎：搜索负责验证这些语义是否真的有用。
-- 当前复盘 MVP 目标是：**`policy + value + danger + attack`**。
-- 复盘系统允许结合：**真理引擎** 与 **滑动窗口前后文**。
-- 当前主线不是继续加 head，也不是优先把所有 head 接进搜索，而是：
-  - 先做强 `policy + trunk`
-  - 再冻结 trunk 分别训练 `value / danger / attack`
-  - 把这些输出整合进复盘系统
+- 这是新项目，不背历史方案包袱
+- 搜索主路线只有 **MCTS**
+- 网络只保留 **policy + value**
+- `value` 主监督优先是 **search_q**
+- 自对弈只做小批量、分轮次、受控混合
+- 正式训练格式只保留 **XRSH v5**
 
-## 目录约定
+## 3. 当前代码边界
 
-- **Python 包**：在 `nn/` 下开发与安装；虚拟环境放在 `nn/.venv`（或用户自定，勿提交 venv）。
-- **Rust workspace**：仓库根 `Cargo.toml`。
-- **规则库**：`crates/xiangqi_core`
-- **用户 UCI 引擎**：`crates/engin`
-- **维护者数据工具**：`crates/xiangqi_dataset`
+- `crates/xiangqi_core`：规则核心
+- `crates/engin`：MCTS、ONNX、UCI
+- `crates/xiangqi_dataset`：词表、PGN、XRSH、搜索标注
+- `nn/`：policy/value 训练与导出
 
-## 修改契约时
+不要再往仓库里放：
 
-若变更以下任一内容：
+- Alpha-Beta 主线代码
+- 复盘语义头代码
+- 多套正式数据格式
+- 为“未来社区平台”提前做的大抽象
 
-- ONNX 输入输出
-- policy pack 格式
-- XRSH / `pack_meta` 等数据契约字段
-- Rust 二进制 dataset 头格式
+## 4. 代码规范
 
-必须同步：
+- 优先复用，不重复造轮子
+- 优先简洁、直接、可读
+- 这是高频系统，但前期先保可读性
+- 性能优化应在清晰实现上定点推进
+- 避免重复分配、重复推理、重复序列化
+- Python 只做训练，不搬规则热路径
 
-- `ARCHITECTURE.md`
-- 根目录 `README.MD`
-- `nn/README.md`（若命令或训练入口受影响）
+## 5. 文档规则
 
-若变更以下任一内容：
+稳定文档只保留：
 
-- 产品定位
-- 双主线表述
-- 复盘 MVP
-- 里程碑顺序
-- 近期执行主线
-
-必须同步：
-
-- `ARCHITECTURE.md`
-- `docs/review-system.md`
-- `工程目标.md`
-- `NEXT_STEPS.md`
-- `TODO.md`
 - `README.MD`
-- `.cursorrules`
+- `ARCHITECTURE.md`
+- `AGENTS.md`
 
-## 实现优先级
+临时文档只保留：
 
-1. **象棋规则与合法着（Rust）**
-2. **数据生成 / 标注加速（Rust）**
-3. **Python 训练与复盘语义头**
-4. **复盘系统消费链路**
-5. **搜索消费**
+- `NextStep.md`
+- `TODO.md`
+- `temp.md`
 
-## 勿做
-
-- 未被任务要求时，不做无关大重构
-- 不将训练代码与搜索引擎绑死在同一进程
-- 不把数据标注、二进制 dataset 生成塞进 `engin`
-- 不默认把“更像 Pikafish 静态评估”当成唯一优化方向
-- 在现有 head 未完成收益归因前，不新增 `style / sacrifice / initiative / psychological`
+`docs/` 先不承担正式文档角色。

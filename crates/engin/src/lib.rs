@@ -1,26 +1,28 @@
-//! 用户侧引擎：规则核心 + ONNX 策略/价值推理 + **Alpha-Beta**（置换表、杀手着法、MVV-LVA、根着 policy 排序）。
+//! 用户侧引擎基础设施。
 //!
-//! 数据标注与 XRSH 生成见 **`xiangqi_dataset`**，不在本 crate。
+//! 当前 crate 只保留 MCTS 主线所需能力：
+//!
+//! - MCTS 搜索骨架
+//! - ONNX policy/value 消费
+//! - UCI 对弈入口
+//! - 基准与最小调试工具
 
 use std::io;
 
 pub mod benchmark;
 pub mod eval;
 pub mod fen_tensor;
+pub mod mcts;
 pub mod policy_onnx;
-pub mod search;
-pub mod tt;
 pub mod uci;
-pub mod value_probe;
 pub mod vocab;
 
 pub use benchmark::{default_benchmark_fen_strings, resolve_data_file, BenchJsonMeta, BenchSessionParams};
-pub use value_probe::{
-    markdown_table_off_vs_main, ValueProbeCase, ValueProbeTableArgs, VALUE_PROBE_CASES,
+pub use eval::{material_stm, terminal_score};
+pub use mcts::{
+    EdgeStats, MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsNode, MctsNodeId, MctsSearchResult, MctsTree,
+    OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput,
 };
-pub use eval::{NNLeafMode, NnEvalSession, NnEvalSite};
-pub use search::{root_search_iterative, RootSearchShared, RootSearchResult, SearchAblation, SearchLimits};
-pub use tt::TranspositionTable;
 pub use uci::parse_position_uci;
 
 pub use policy_onnx::{PolicyOnnx, PolicyOutputs};

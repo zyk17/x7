@@ -1,4 +1,4 @@
-//! ONNX Runtime 加载 `policy.onnx`（`board` → `logits` + 可选 `attack` / `danger` / `tactical`）。
+//! ONNX Runtime 加载 `policy.onnx`（`board` → `logits` + 可选 `value`）。
 
 use std::path::Path;
 
@@ -11,9 +11,6 @@ use ort::Error;
 #[derive(Debug, Clone)]
 pub struct PolicyOutputs {
     pub logits: Vec<f32>,
-    pub attack: Option<f32>,
-    pub danger: Option<f32>,
-    pub tactical: Option<f32>,
     /// 局面价值，ONNX 图中一般为 **tanh**，约 **[-1,1]**（与 `export_onnx.py` 一致）。
     pub value: Option<f32>,
 }
@@ -70,9 +67,6 @@ impl PolicyOnnx {
 
         Ok(PolicyOutputs {
             logits,
-            attack: f1("attack")?,
-            danger: f1("danger")?,
-            tactical: f1("tactical")?,
             value: f1("value")?,
         })
     }
@@ -104,8 +98,5 @@ mod tests {
         let mut p = PolicyOnnx::from_file(&path).expect("load onnx");
         let out = p.eval_fen(crate::START_FEN).expect("infer");
         assert!(!out.logits.is_empty());
-        assert!(out.attack.is_some());
-        assert!(out.danger.is_some());
-        assert!(out.tactical.is_some());
     }
 }

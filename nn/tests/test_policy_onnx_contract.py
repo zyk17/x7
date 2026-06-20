@@ -17,8 +17,7 @@ POLICY_ONNX = REPO_ROOT / "data" / "policy.onnx"
 
 _ALLOWED_SUFFIXES = (
     (),
-    ("attack", "danger", "tactical"),
-    ("attack", "danger", "tactical", "value"),
+    ("value",),
 )
 
 
