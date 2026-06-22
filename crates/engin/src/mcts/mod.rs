@@ -9,7 +9,7 @@ mod policy_value;
 mod tree;
 
 pub use config::{MctsBudget, MctsConfig};
-pub use engine::{MctsEngine, MctsMoveStat, MctsSearchResult};
+pub use engine::{MctsEngine, MctsMoveStat, MctsSearchProgress, MctsSearchResult};
 pub use node::{EdgeStats, MctsNode, MctsNodeId};
-pub use policy_value::{OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput};
+pub use policy_value::{OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput, SharedPolicy};
 pub use tree::MctsTree;

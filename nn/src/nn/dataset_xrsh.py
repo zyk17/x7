@@ -16,21 +16,35 @@ import torch
 from torch.utils.data import Dataset
 
 from augment_mirror import mirror_fen, mirror_move_uci
-from nn.board_compact import compact_board_to_torch_planes, fen_to_compact_board
+from nn.board_compact import fen_to_compact_board, mirror_compact_board
 from nn.policy_pack import assert_vocab_matches_pack
+from nn.dataset_batch import (
+    SAMPLE_BOARD90,
+    SAMPLE_LEGAL_IDX,
+    SAMPLE_PLY,
+    SAMPLE_SEARCH_COUNTS,
+    SAMPLE_SEARCH_VISITS,
+    SAMPLE_SRC_ID,
+    SAMPLE_STM,
+    SAMPLE_T_VAL,
+    SAMPLE_TARGET,
+    SAMPLE_VOCAB_SIZE,
+    SAMPLE_WEIGHT,
+)
 from nn.xrsh_io import (
     XrshRowRef,
+    assert_shard_binary_v5,
     fen_key64,
     load_pack_meta,
     read_row_train_at,
-    read_shard_file,
     scan_shard_file,
+    scan_shard_train_rows,
     xrsh_dir_is_complete,
 )
 
 _TRAIN_MIRROR_PROB = 0.5
 _SHARD_CACHE_LIMIT = 2
-_EAGER_CACHE_VERSION = 4
+_EAGER_CACHE_VERSION = 5
 
 
 @lru_cache(maxsize=32768)
@@ -90,6 +104,8 @@ class PolicyXrshDataset(Dataset):
             raise ValueError(f"未知 storage_mode: {storage_mode!r}")
         self.aug_mirror_p = _TRAIN_MIRROR_PROB if self.for_training else 0.0
         self._shard_paths = sorted(self.root.glob("shard_*.xrsh"))
+        for sp in self._shard_paths:
+            assert_shard_binary_v5(sp)
         self._shard_cache: OrderedDict[int, tuple[object, mmap.mmap]] = OrderedDict()
         self._pack_meta_path = self.root / "pack_meta.json"
         self.cache_used = False
@@ -150,7 +166,7 @@ class PolicyXrshDataset(Dataset):
         return "|".join(parts)
 
     def _eager_cache_path(self) -> Path:
-        return self.root / ".cache" / "policy_xrsh_eager_v4.npz"
+        return self.root / ".cache" / f"policy_xrsh_eager_v{_EAGER_CACHE_VERSION}.npz"
 
     def _load_eager_rows(self) -> None:
         compact_boards: list[np.ndarray] = []
@@ -165,39 +181,35 @@ class PolicyXrshDataset(Dataset):
         search_flat: list[int] = []
         row_group_ids: list[int] = []
         ref_hash: bytes | None = None
-        game_group = 0
+        next_game_group = 0
 
         for sp in self._shard_paths:
-            rows, vocab_hash = read_shard_file(sp)
+            rows, vocab_hash, next_game_group = scan_shard_train_rows(
+                sp,
+                start_game_group=next_game_group,
+            )
             if ref_hash is None:
                 ref_hash = vocab_hash
             elif vocab_hash != ref_hash:
                 raise ValueError(f"分片词表哈希不一致: {sp}")
-            gid_to_group: dict[str, int] = {}
             for row in rows:
-                gid = str(row.get("game_id", ""))
-                grp = gid_to_group.get(gid)
-                if grp is None:
-                    grp = game_group
-                    gid_to_group[gid] = grp
-                    game_group += 1
-                fen = str(row["fen"])
+                fen = row.fen
                 b90, stm = fen_to_compact_board(fen)
                 compact_boards.append(np.asarray(b90, dtype=np.uint8))
                 stms.append(int(stm))
-                targets.append(int(row["target_idx"]))
-                plies.append(int(row.get("ply", 0) or 0))
-                search_qs.append(float(row.get("search_q", 0.0) or 0.0))
-                search_visits.append(int(row.get("search_visits", 0) or 0))
+                targets.append(int(row.target_idx))
+                plies.append(int(row.ply))
+                search_qs.append(float(row.search_q))
+                search_visits.append(int(row.search_visits))
                 fen_keys.append(fen_key64(fen))
-                idxs = [int(x) for x in row["legal_idx"]]
-                counts = [int(x) for x in row.get("search_counts", [])]
+                idxs = row.legal_idx
+                counts = row.search_counts
                 if counts and len(counts) != len(idxs):
                     raise ValueError("search_counts 与 legal_idx 长度不一致")
                 legal_flat.extend(idxs)
                 search_flat.extend(counts or [0] * len(idxs))
                 legal_offsets.append(len(legal_flat))
-                row_group_ids.append(grp)
+                row_group_ids.append(int(row.game_group))
 
         self.eager_compact_boards = (
             np.stack(compact_boards, axis=0)
@@ -335,7 +347,39 @@ class PolicyXrshDataset(Dataset):
             old_fh.close()
         return mm
 
-    def __getitem__(self, i: int) -> tuple[torch.Tensor, ...]:
+    def _sample_dict(
+        self,
+        *,
+        board90: np.ndarray,
+        stm: int,
+        target: torch.Tensor,
+        weight: torch.Tensor,
+        sq_i: float,
+        sv_i: int,
+        idxs: np.ndarray | list[int],
+        search_counts: np.ndarray | list[int],
+        ply_i: int,
+    ) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {
+            SAMPLE_BOARD90: torch.as_tensor(board90, dtype=torch.uint8).reshape(90),
+            SAMPLE_STM: torch.tensor(int(stm), dtype=torch.uint8),
+            SAMPLE_LEGAL_IDX: torch.as_tensor(idxs, dtype=torch.long),
+            SAMPLE_VOCAB_SIZE: torch.tensor(self.vocab_size, dtype=torch.long),
+            SAMPLE_TARGET: target,
+            SAMPLE_WEIGHT: weight,
+        }
+        if self.with_search_labels:
+            out[SAMPLE_SEARCH_COUNTS] = torch.as_tensor(search_counts, dtype=torch.long)
+        if self.with_value_labels:
+            out[SAMPLE_T_VAL] = torch.tensor(sq_i, dtype=torch.float32)
+        if self.with_value_labels:
+            out[SAMPLE_SEARCH_VISITS] = torch.tensor(sv_i, dtype=torch.long)
+        if self.with_row_meta:
+            out[SAMPLE_PLY] = torch.tensor(ply_i, dtype=torch.long)
+            out[SAMPLE_SRC_ID] = torch.tensor(0, dtype=torch.long)
+        return out
+
+    def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         if self.storage_mode == "eager":
             assert self.eager_compact_boards is not None
             assert self.eager_stms is not None
@@ -357,7 +401,6 @@ class PolicyXrshDataset(Dataset):
             idxs = self.eager_legal_flat[lo:hi]
             search_counts = self.eager_search_flat[lo:hi]
             fen0 = None
-            board = compact_board_to_torch_planes(b90, stm)
         else:
             ref = self.row_refs[i]
             fen0, idxs, ti, sq_i, sv_i, search_counts = read_row_train_at(
@@ -365,34 +408,25 @@ class PolicyXrshDataset(Dataset):
                 ref.row_offset,
             )
             b90, stm = _fen_to_compact_cached(fen0)
-            board = compact_board_to_torch_planes(b90, stm)
             ply_i = int(ref.ply)
 
-        mask = torch.zeros(self.vocab_size, dtype=torch.bool)
-        for idx in idxs:
-            if 0 <= int(idx) < self.vocab_size:
-                mask[int(idx)] = True
-        if not mask.any():
+        idx_arr = np.asarray(idxs, dtype=np.int64).reshape(-1)
+        counts_arr = np.asarray(search_counts, dtype=np.int64).reshape(-1)
+        valid = (idx_arr >= 0) & (idx_arr < self.vocab_size)
+        idx_arr = idx_arr[valid]
+        counts_arr = counts_arr[valid]
+        if idx_arr.size == 0:
             raise RuntimeError(f"样本 {i} 无有效合法着下标")
         if not (0 <= ti < self.vocab_size):
             raise RuntimeError(f"样本 {i} 标签下标越界: {ti}")
-        if not mask[ti]:
+        if not np.any(idx_arr == ti):
             raise RuntimeError(f"样本 {i} 标签不在合法掩码内: ti={ti}")
-
-        visit_target: torch.Tensor | None = None
-        if self.with_search_labels:
-            visit_target = torch.zeros(self.vocab_size, dtype=torch.float32)
-            total = max(int(sum(int(x) for x in search_counts)), 1)
-            for idx, count in zip(idxs, search_counts):
-                if 0 <= int(idx) < self.vocab_size:
-                    visit_target[int(idx)] = float(count) / float(total)
 
         sample_weight = 1.0 if self.position_weights is None else self.position_weights[i]
         human_move = self._idx_to_move[ti]
 
         use_mirror = (
-            fen0 is not None
-            and not self.with_search_labels
+            not self.with_search_labels
             and self.aug_mirror_p > 0.0
             and random.random() < self.aug_mirror_p
         )
@@ -401,54 +435,105 @@ class PolicyXrshDataset(Dataset):
                 mirrored_move = mirror_move_uci(human_move)
                 mirrored_idx = self.move_to_idx.get(mirrored_move)
                 if mirrored_idx is not None:
-                    fen_m = mirror_fen(fen0)
-                    b90m, stmm = fen_to_compact_board(fen_m)
                     mirrored_legals = _mirror_legal_indices(
                         idxs,
                         self._idx_to_move,
                         self.move_to_idx,
                     )
                     if mirrored_legals:
-                        mask_m = torch.zeros(self.vocab_size, dtype=torch.bool)
-                        mask_m[torch.tensor(mirrored_legals, dtype=torch.long)] = True
-                        if mask_m[mirrored_idx]:
-                            out = (
-                                compact_board_to_torch_planes(b90m, stmm),
-                                mask_m,
-                                torch.tensor(mirrored_idx, dtype=torch.long),
-                                torch.tensor(sample_weight, dtype=torch.float32),
+                        mirrored_legals_arr = np.asarray(mirrored_legals, dtype=np.int64)
+                        if np.any(mirrored_legals_arr == mirrored_idx):
+                            if fen0 is not None:
+                                fen_m = mirror_fen(fen0)
+                                b90m, stmm = fen_to_compact_board(fen_m)
+                            else:
+                                b90m = mirror_compact_board(b90)
+                                stmm = stm
+                            return self._sample_dict(
+                                board90=b90m,
+                                stm=stmm,
+                                target=torch.tensor(mirrored_idx, dtype=torch.long),
+                                weight=torch.tensor(sample_weight, dtype=torch.float32),
+                                sq_i=sq_i,
+                                sv_i=sv_i,
+                                idxs=mirrored_legals_arr,
+                                search_counts=np.zeros_like(mirrored_legals_arr),
+                                ply_i=ply_i,
                             )
-                            if self.with_value_labels:
-                                out = (*out, torch.tensor(sq_i, dtype=torch.float32))
-                            if self.with_row_meta:
-                                out = (
-                                    *out,
-                                    torch.tensor(ply_i, dtype=torch.long),
-                                    torch.tensor(0, dtype=torch.long),
-                                )
-                            return out
             except (RuntimeError, ValueError):
                 pass
 
-        out = (
-            board,
-            mask,
-            torch.tensor(ti, dtype=torch.long),
-            torch.tensor(sample_weight, dtype=torch.float32),
+        return self._sample_dict(
+            board90=b90,
+            stm=stm,
+            target=torch.tensor(ti, dtype=torch.long),
+            weight=torch.tensor(sample_weight, dtype=torch.float32),
+            sq_i=sq_i,
+            sv_i=sv_i,
+            idxs=idx_arr,
+            search_counts=counts_arr,
+            ply_i=ply_i,
         )
-        if self.with_value_labels:
-            out = (*out, torch.tensor(sq_i, dtype=torch.float32))
-        if self.with_search_labels and visit_target is not None:
-            out = (
-                *out,
-                visit_target,
-                torch.tensor(sq_i, dtype=torch.float32),
-                torch.tensor(sv_i, dtype=torch.long),
+
+
+class MixedPolicyXrshDataset(Dataset):
+    """按权重拼接多个 XRSH 目录，用于受控混合训练。"""
+
+    def __init__(
+        self,
+        sources: list[tuple[Path | str, float]],
+        move_to_idx: dict[str, int],
+        *,
+        for_training: bool = False,
+        with_row_meta: bool = False,
+        with_value_labels: bool = False,
+        with_search_labels: bool = False,
+        storage_mode: str = "eager",
+    ) -> None:
+        if not sources:
+            raise ValueError("sources 不能为空")
+        self.parts: list[PolicyXrshDataset] = []
+        self._offsets: list[int] = [0]
+        self.mix_weights: list[float] = []
+        self.row_group_ids: list[int] = []
+        self.pgn_source_vocab: list[str] = [""]
+        group_base = 0
+        for xrsh_dir, mix_w in sources:
+            ds = PolicyXrshDataset(
+                xrsh_dir,
+                move_to_idx,
+                for_training=for_training,
+                with_row_meta=with_row_meta,
+                with_value_labels=with_value_labels,
+                with_search_labels=with_search_labels,
+                storage_mode=storage_mode,
             )
-        if self.with_row_meta:
-            out = (
-                *out,
-                torch.tensor(ply_i, dtype=torch.long),
-                torch.tensor(0, dtype=torch.long),
-            )
-        return out
+            self.parts.append(ds)
+            n = len(ds)
+            pos_w = ds.position_weights if ds.position_weights is not None else [1.0] * n
+            self.mix_weights.extend(float(mix_w) * float(w) for w in pos_w)
+            self.row_group_ids.extend(int(g) + group_base for g in ds.row_group_ids)
+            group_base = max(self.row_group_ids) + 1 if self.row_group_ids else 0
+            self._offsets.append(self._offsets[-1] + n)
+
+    def __len__(self) -> int:
+        return self._offsets[-1]
+
+    def _locate(self, index: int) -> tuple[int, int]:
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        lo, hi = 0, len(self.parts) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._offsets[mid] <= index:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo, index - self._offsets[lo]
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        part_i, local_i = self._locate(index)
+        sample = dict(self.parts[part_i][local_i])
+        if self.parts[0].for_training:
+            sample[SAMPLE_WEIGHT] = torch.tensor(self.mix_weights[index], dtype=torch.float32)
+        return sample

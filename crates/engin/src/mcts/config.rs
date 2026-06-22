@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 /// MCTS 搜索预算。
 #[derive(Clone, Debug, Default)]
 pub struct MctsBudget {
-    pub max_visits: Option<u32>,
+    pub max_playouts: Option<u32>,
     pub max_nodes: Option<u32>,
     pub deadline: Option<Instant>,
     pub stop: Option<Arc<AtomicBool>>,
@@ -14,7 +14,7 @@ pub struct MctsBudget {
 impl MctsBudget {
     pub fn from_movetime_ms(ms: u64) -> Self {
         Self {
-            max_visits: None,
+            max_playouts: None,
             max_nodes: None,
             deadline: Some(Instant::now() + Duration::from_millis(ms)),
             stop: None,

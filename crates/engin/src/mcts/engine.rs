@@ -18,7 +18,8 @@ pub struct MctsMoveStat {
 #[derive(Clone, Debug, Default)]
 pub struct MctsSearchResult {
     pub best_move: Option<Move>,
-    pub visits: u32,
+    pub playouts: u32,
+    pub root_visits: u32,
     pub nodes: usize,
     pub root_value: f32,
     pub moves: Vec<MctsMoveStat>,
@@ -27,7 +28,8 @@ pub struct MctsSearchResult {
 #[derive(Clone, Debug, Default)]
 pub struct MctsSearchProgress {
     pub best_move: Option<Move>,
-    pub visits: u32,
+    pub playouts: u32,
+    pub root_visits: u32,
     pub nodes: usize,
     pub root_value: f32,
 }
@@ -110,29 +112,26 @@ where
         }
         let root_id = self.tree.add_node(root);
 
-        let root_fen = pos.fen();
-        let mut work = Position::from_fen(&root_fen).expect("root fen should round-trip");
+        let mut work = pos.clone_for_search();
+        let mut playouts = 0u32;
         let mut next_report_at = if info_interval.is_zero() {
             None
         } else {
             Some(Instant::now() + info_interval)
         };
-        while !budget_exhausted(&budget, self.root_visits(), self.tree.len()) {
+        while !budget_exhausted(&budget, playouts, self.tree.len()) {
             self.simulate(root_id, &mut work)?;
+            playouts = playouts.saturating_add(1);
             if let Some(deadline) = next_report_at {
                 let now = Instant::now();
                 if now >= deadline {
-                    on_progress(&self.progress_from_root(root_id));
+                    on_progress(&self.progress_from_root(root_id, playouts));
                     next_report_at = Some(now + info_interval);
                 }
             }
         }
 
-        Ok(self.result_from_root(root_id))
-    }
-
-    fn root_visits(&self) -> u32 {
-        self.tree.get(super::MctsNodeId(0)).map(|node| node.visits).unwrap_or(0)
+        Ok(self.result_from_root(root_id, playouts))
     }
 
     fn simulate(&mut self, root_id: super::MctsNodeId, pos: &mut Position) -> Result<f32, E::Error> {
@@ -232,7 +231,7 @@ where
         Ok(value)
     }
 
-    fn progress_from_root(&self, root_id: super::MctsNodeId) -> MctsSearchProgress {
+    fn progress_from_root(&self, root_id: super::MctsNodeId, playouts: u32) -> MctsSearchProgress {
         let root = self.tree.get(root_id).expect("root must exist");
         let best_move = root
             .children
@@ -245,18 +244,20 @@ where
             .map(|edge| edge.mv);
         MctsSearchProgress {
             best_move,
-            visits: root.visits,
+            playouts,
+            root_visits: root.visits,
             nodes: self.tree.len(),
             root_value: root.mean_value(),
         }
     }
 
-    fn result_from_root(&self, root_id: super::MctsNodeId) -> MctsSearchResult {
+    fn result_from_root(&self, root_id: super::MctsNodeId, playouts: u32) -> MctsSearchResult {
         let root = self.tree.get(root_id).expect("root must exist");
-        let progress = self.progress_from_root(root_id);
+        let progress = self.progress_from_root(root_id, playouts);
         MctsSearchResult {
             best_move: progress.best_move,
-            visits: progress.visits,
+            playouts: progress.playouts,
+            root_visits: progress.root_visits,
             nodes: progress.nodes,
             root_value: progress.root_value,
             moves: root
@@ -273,9 +274,9 @@ where
     }
 }
 
-fn budget_exhausted(budget: &MctsBudget, root_visits: u32, nodes: usize) -> bool {
-    if let Some(target_visits) = budget.max_visits {
-        if root_visits >= target_visits.max(1) {
+fn budget_exhausted(budget: &MctsBudget, playouts: u32, nodes: usize) -> bool {
+    if let Some(target_playouts) = budget.max_playouts {
+        if playouts >= target_playouts.max(1) {
             return true;
         }
     }

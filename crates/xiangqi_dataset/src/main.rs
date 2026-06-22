@@ -63,8 +63,8 @@ enum Cmd {
         out_dir: PathBuf,
         #[arg(long)]
         onnx: Option<PathBuf>,
-        #[arg(long, default_value_t = 256u32)]
-        visits: u32,
+        #[arg(long, visible_alias = "visits", default_value_t = 256u32)]
+        playouts: u32,
         #[arg(long, default_value_t = 1.25f32)]
         cpuct: f32,
         #[arg(long, default_value_t = 0usize)]
@@ -111,7 +111,7 @@ fn main() -> Result<()> {
             vocab,
             out_dir,
             onnx,
-            visits,
+            playouts,
             cpuct,
             max_games,
             max_rows_per_game,
@@ -123,13 +123,13 @@ fn main() -> Result<()> {
                 &out_dir,
                 onnx.as_deref(),
                 &SearchLabelExportConfig {
-                    max_visits: visits,
+                    max_playouts: playouts,
                     max_games,
                     max_rows_per_game,
                     cpuct,
                 },
+                round,
             )?;
-            let _ = round;
             eprintln!("写入 {n} 条搜索标注 XRSH -> {}", out_dir.display());
         }
     }

@@ -2,10 +2,8 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
-
 use engin::benchmark::{bench_one_json, default_benchmark_fen_strings, BenchJsonMeta, BenchSessionParams};
-use engin::mcts::{MctsBudget, MctsConfig, MctsEngine, OnnxPolicyValueEval};
+use engin::mcts::{MctsBudget, MctsConfig, MctsEngine, OnnxPolicyValueEval, SharedPolicy};
 use engin::uci::parse_position_uci;
 use xiangqi_core::{legal_moves_uci, uci_to_move, Position, START_FEN};
 
@@ -27,7 +25,7 @@ fn parse_position_matches_stepwise_do_move() {
 #[test]
 fn mcts_returns_legal_bestmove_without_onnx() {
     let pos = Position::from_fen(START_FEN).unwrap();
-    let policy = Arc::new(Mutex::new(None));
+    let policy: SharedPolicy = None;
     let vocab: HashMap<String, usize> = HashMap::new();
     let mut engine = MctsEngine::new(
         MctsConfig::default(),
@@ -40,7 +38,7 @@ fn mcts_returns_legal_bestmove_without_onnx() {
         .search_root(
             &pos,
             MctsBudget {
-                max_visits: Some(64),
+                max_playouts: Some(64),
                 max_nodes: None,
                 deadline: None,
                 stop: None,
@@ -55,12 +53,12 @@ fn mcts_returns_legal_bestmove_without_onnx() {
 
 #[test]
 fn bench_json_has_expected_keys() {
-    let policy = Arc::new(Mutex::new(None));
+    let policy: SharedPolicy = None;
     let vocab: HashMap<String, usize> = HashMap::new();
     let meta = BenchJsonMeta::default();
     let session = BenchSessionParams {
         budget: MctsBudget {
-            max_visits: Some(32),
+            max_playouts: Some(32),
             max_nodes: None,
             deadline: None,
             stop: None,
@@ -74,7 +72,8 @@ fn bench_json_has_expected_keys() {
     assert!(v.get("bestmove").is_some() || v.get("error").is_some());
     assert!(v.get("bench_config").is_some());
     assert!(v.get("mcts_config").is_some());
-    assert!(v.get("visits").is_some());
+    assert!(v.get("playouts").is_some());
+    assert!(v.get("root_visits").is_some());
 }
 
 #[test]
@@ -90,11 +89,12 @@ fn default_benchmark_fens_all_parse() {
 
 #[test]
 fn uci_setoption_then_go() {
-    let input = b"uci\nisready\nsetoption name Visits value 64\nsetoption name Cpuct value 1.5\nposition startpos\ngo depth 2\nquit\n";
+    let input = b"uci\nisready\nsetoption name Visits value 64\nsetoption name Cpuct value 1.5\nposition startpos\ngo nodes 2\nquit\n";
     let mut out = Vec::new();
     engin::uci::run_uci_for_test(Cursor::new(&input[..]), &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("bestmove"));
+    assert!(s.contains("Playouts"));
     assert!(s.contains("Visits"));
     assert!(s.contains("Cpuct"));
 }

@@ -445,6 +445,7 @@ impl Zobrist {
 // StateInfo — do_move / undo_move 时压栈、弹栈的增量状态
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[derive(Clone)]
 pub struct StateInfo {
     // ── 走子时拷贝保存 ──
     pub pawn_key: Key,
@@ -511,6 +512,7 @@ pub struct UndoFrame {
 /// FEN 棋子字符表：`" RACPNBK racpnbk"`
 pub const PIECE_TO_CHAR: &str = " RACPNBK racpnbk";
 
+#[derive(Clone)]
 pub struct Position {
     /// 每格棋子；空为 `NO_PIECE`。
     pub board: [Piece; SQUARE_NB],
@@ -559,6 +561,23 @@ impl Position {
     /// 空棋盘并使用全局 Zobrist（库调用方常用）。
     pub fn new_with_global_zobrist() -> Self {
         Self::new(global_zobrist())
+    }
+
+    /// 为搜索构造当前局面快照。
+    ///
+    /// 搜索只需要当前局面真相，不需要外部对局历史，因此不复制 `undo_stack`。
+    pub fn clone_for_search(&self) -> Self {
+        Self {
+            board: self.board,
+            piece_count: self.piece_count,
+            mid_encoding: self.mid_encoding,
+            state: self.state.clone(),
+            side_to_move: self.side_to_move,
+            game_ply: self.game_ply,
+            filter: self.filter.clone(),
+            undo_stack: Vec::new(),
+            zobrist: self.zobrist,
+        }
     }
 
     /// 自 FEN 解析为新局面（使用全局 Zobrist）。

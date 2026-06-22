@@ -6,15 +6,79 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use xiangqi_core::{uci_to_move, Position, START_FEN};
 
-use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, OnnxPolicyValueEval};
+use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsSearchProgress, OnnxPolicyValueEval, SharedPolicy};
 use crate::policy_onnx::PolicyOnnx;
 
 static UCI_STDOUT_LOCK: Mutex<()> = Mutex::new(());
 const UCI_INFO_INTERVAL: Duration = Duration::from_millis(200);
+const UCI_ROOT_MOVE_TOP_K: usize = 5;
+
+fn approximate_depth(nodes: usize) -> u32 {
+    if nodes <= 1 {
+        0
+    } else {
+        (f64::ln(nodes as f64) / f64::ln(1.8)).floor().max(0.0) as u32
+    }
+}
+
+fn uci_info_line(
+    root_value: f32,
+    playouts: u32,
+    nodes: usize,
+    elapsed_ms: u64,
+    pv: Option<xiangqi_core::Move>,
+) -> String {
+    let cp = (root_value * 100.0).round() as i32;
+    let depth = approximate_depth(nodes);
+    let nps = if elapsed_ms > 0 {
+        (playouts as u128 * 1000 / u128::from(elapsed_ms)) as u64
+    } else {
+        0
+    };
+    let mut line = format!("info depth {depth} score cp {cp} nodes {nodes} nps {nps} time {elapsed_ms}");
+    if let Some(mv) = pv {
+        line.push_str(" pv ");
+        line.push_str(&xiangqi_core::move_to_uci(mv));
+    }
+    line
+}
+
+fn uci_root_moves_line(moves: &[MctsMoveStat]) -> String {
+    let mut stats = moves.to_vec();
+    stats.sort_by(|a, b| b.visits.cmp(&a.visits).then_with(|| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal)));
+    let body = stats
+        .into_iter()
+        .take(UCI_ROOT_MOVE_TOP_K)
+        .map(|s| format!("{}:{}:{:.3}", xiangqi_core::move_to_uci(s.mv), s.visits, s.q))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("info string root_moves {body}")
+}
+
+fn emit_mcts_progress(
+    output: &Arc<dyn Fn(&str) + Send + Sync>,
+    progress: &MctsSearchProgress,
+    elapsed_ms: u64,
+) {
+    output(&uci_info_line(
+        progress.root_value,
+        progress.playouts,
+        progress.nodes,
+        elapsed_ms,
+        progress.best_move,
+    ));
+    if let Some(best_move) = progress.best_move {
+        let best_uci = xiangqi_core::move_to_uci(best_move);
+        output(&format!(
+            "info string mcts playouts={} root_visits={} nodes={} root_value={:.4} bestmove={}",
+            progress.playouts, progress.root_visits, progress.nodes, progress.root_value, best_uci
+        ));
+    }
+}
 
 type EngineOutput = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
@@ -137,12 +201,12 @@ fn split_fen_and_moves(s: &str) -> Result<(&str, Option<String>), String> {
 
 struct Engine {
     pos: Position,
-    policy: Arc<Mutex<Option<PolicyOnnx>>>,
+    policy: SharedPolicy,
     policy_path: Option<PathBuf>,
     vocab_path: Option<PathBuf>,
-    vocab: HashMap<String, usize>,
+    vocab: Arc<HashMap<String, usize>>,
     config: MctsConfig,
-    default_visits: u32,
+    default_playouts: u32,
     search_stop: Option<Arc<AtomicBool>>,
     search_join: Option<JoinHandle<()>>,
     output: EngineOutput,
@@ -156,12 +220,12 @@ impl Engine {
     fn new_with_output(output: EngineOutput) -> Self {
         Self {
             pos: Position::from_fen(START_FEN).expect("startpos"),
-            policy: Arc::new(Mutex::new(None)),
+            policy: None,
             policy_path: None,
             vocab_path: None,
-            vocab: HashMap::new(),
+            vocab: Arc::new(HashMap::new()),
             config: MctsConfig::default(),
-            default_visits: 256,
+            default_playouts: 256,
             search_stop: None,
             search_join: None,
             output,
@@ -182,22 +246,22 @@ impl Engine {
     }
 
     fn reload_policy(&mut self) -> Result<(), String> {
-        let mut g = self.policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
-        *g = None;
+        self.policy = None;
         if let Some(ref p) = self.policy_path {
             if p.is_file() {
-                *g = Some(PolicyOnnx::from_file(p).map_err(|e| e.to_string())?);
+                let net = PolicyOnnx::from_file(p).map_err(|e| e.to_string())?;
+                self.policy = Some(Arc::new(Mutex::new(net)));
             }
         }
         Ok(())
     }
 
     fn reload_vocab(&mut self) -> Result<(), String> {
-        self.vocab.clear();
+        self.vocab = Arc::new(HashMap::new());
         if let Some(ref p) = self.vocab_path {
             if p.is_file() {
                 let (m, _) = crate::vocab::load_move_vocab(p)?;
-                self.vocab = m;
+                self.vocab = Arc::new(m);
             }
         }
         Ok(())
@@ -208,6 +272,7 @@ impl Engine {
         self.emit("id author github.com/77xiangqi_engine");
         self.emit("option name PolicyFile type string default <empty>");
         self.emit("option name VocabFile type string default <empty>");
+        self.emit("option name Playouts type spin default 256 min 1 max 1000000");
         self.emit("option name Visits type spin default 256 min 1 max 1000000");
         self.emit("option name Cpuct type string default 1.25");
         self.emit("uciok");
@@ -232,10 +297,10 @@ impl Engine {
                     .filter(|p| !p.as_os_str().is_empty());
                 self.reload_vocab()?;
             }
-            "Visits" => {
+            "Playouts" | "Visits" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<u32>() {
-                        self.default_visits = n.clamp(1, 1_000_000);
+                        self.default_playouts = n.clamp(1, 1_000_000);
                     }
                 }
             }
@@ -251,47 +316,53 @@ impl Engine {
         Ok(())
     }
 
-    fn budget_from_go(&self, params: &GoParams) -> MctsBudget {
+    fn budget_from_go(&self, params: &GoParams) -> Result<MctsBudget, String> {
         if let Some(ms) = params.movetime {
-            return MctsBudget::from_movetime_ms(ms);
+            return Ok(MctsBudget::from_movetime_ms(ms));
         }
 
         if let Some(nodes) = params.nodes {
-            return MctsBudget {
-                max_visits: Some(nodes.min(u64::from(u32::MAX)) as u32),
-                max_nodes: None,
+            return Ok(MctsBudget {
+                max_playouts: None,
+                max_nodes: Some(nodes.min(u64::from(u32::MAX)) as u32),
                 deadline: None,
                 stop: None,
-            };
+            });
         }
 
         if params.infinite {
-            return MctsBudget {
-                max_visits: None,
+            return Ok(MctsBudget {
+                max_playouts: None,
                 max_nodes: None,
                 deadline: None,
                 stop: None,
-            };
+            });
         }
 
-        let visits = params
-            .depth
-            .map(|depth| depth.saturating_mul(128))
-            .unwrap_or(self.default_visits)
-            .max(1);
-        MctsBudget {
-            max_visits: Some(visits),
+        if let Some(depth) = params.depth {
+            return Err(format!("go depth {depth} 暂不支持；请使用 go nodes / go movetime / go infinite"));
+        }
+
+        Ok(MctsBudget {
+            max_playouts: Some(self.default_playouts.max(1)),
             max_nodes: None,
             deadline: None,
             stop: None,
-        }
+        })
     }
 
     fn spawn_go(&mut self, params: GoParams) {
-        let fen = self.pos.fen();
-        let policy = Arc::clone(&self.policy);
-        let vocab = self.vocab.clone();
-        let mut budget = self.budget_from_go(&params);
+        let pos = self.pos.clone_for_search();
+        let policy = self.policy.clone();
+        let vocab = Arc::clone(&self.vocab);
+        let mut budget = match self.budget_from_go(&params) {
+            Ok(budget) => budget,
+            Err(err) => {
+                self.emit(&format!("info string {err}"));
+                self.emit("bestmove (none)");
+                return;
+            }
+        };
         let config = self.config;
         let stop = Arc::new(AtomicBool::new(false));
         let output = Arc::clone(&self.output);
@@ -299,11 +370,7 @@ impl Engine {
         self.search_stop = Some(stop.clone());
 
         self.search_join = Some(thread::spawn(move || {
-            let Ok(pos) = Position::from_fen(&fen) else {
-                output("bestmove (none)");
-                return;
-            };
-
+            let started_at = Instant::now();
             if stop.load(Ordering::SeqCst) {
                 output("bestmove (none)");
                 return;
@@ -318,20 +385,26 @@ impl Engine {
             );
 
             match engine.search_root_with_progress(&pos, budget, UCI_INFO_INTERVAL, |progress| {
-                if let Some(best_move) = progress.best_move {
-                    let best_uci = xiangqi_core::move_to_uci(best_move);
-                    output(&format!(
-                        "info string mcts visits={} nodes={} root_value={:.4} bestmove={}",
-                        progress.visits, progress.nodes, progress.root_value, best_uci
-                    ));
-                }
+                let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                emit_mcts_progress(&output, progress, elapsed_ms);
             }) {
                 Ok(result) => {
+                    let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    output(&uci_info_line(
+                        result.root_value,
+                        result.playouts,
+                        result.nodes,
+                        elapsed_ms,
+                        result.best_move,
+                    ));
+                    if !result.moves.is_empty() {
+                        output(&uci_root_moves_line(&result.moves));
+                    }
                     if let Some(best_move) = result.best_move {
                         let best_uci = xiangqi_core::move_to_uci(best_move);
                         output(&format!(
-                            "info string mcts visits={} nodes={} root_value={:.4}",
-                            result.visits, result.nodes, result.root_value
+                            "info string mcts playouts={} root_visits={} nodes={} root_value={:.4}",
+                            result.playouts, result.root_visits, result.nodes, result.root_value
                         ));
                         output(&format!("bestmove {best_uci}"));
                     } else {
@@ -471,9 +544,18 @@ mod tests {
     #[test]
     fn go_infinite_means_no_fixed_visit_cap() {
         let engine = Engine::new();
-        let budget = engine.budget_from_go(&parse_go("infinite"));
-        assert!(budget.max_visits.is_none());
+        let budget = engine.budget_from_go(&parse_go("infinite")).expect("budget");
+        assert!(budget.max_playouts.is_none());
+        assert!(budget.max_nodes.is_none());
         assert!(budget.deadline.is_none());
+    }
+
+    #[test]
+    fn go_nodes_maps_to_node_budget() {
+        let engine = Engine::new();
+        let budget = engine.budget_from_go(&parse_go("nodes 1234")).expect("budget");
+        assert_eq!(budget.max_nodes, Some(1234));
+        assert!(budget.max_playouts.is_none());
     }
 
     #[test]
@@ -487,14 +569,25 @@ mod tests {
 
     #[test]
     fn uci_dialog_smoke() {
-        let input = b"uci\nsetoption name Visits value 64\nisready\nposition startpos\ngo depth 1\nquit\n";
+        let input = b"uci\nsetoption name Playouts value 64\nisready\nposition startpos\ngo nodes 1\nquit\n";
         let mut out = Vec::new();
         run_uci_for_test(Cursor::new(&input[..]), &mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("uciok"));
         assert!(s.contains("readyok"));
         assert!(s.contains("bestmove"));
+        assert!(s.contains("Playouts"));
         assert!(s.contains("Visits"));
+    }
+
+    #[test]
+    fn go_depth_reports_unsupported() {
+        let input = b"uci\nposition startpos\ngo depth 2\nquit\n";
+        let mut out = Vec::new();
+        run_uci_for_test(Cursor::new(&input[..]), &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("暂不支持"));
+        assert!(s.contains("bestmove (none)"));
     }
 
     #[test]

@@ -7,6 +7,8 @@ use xiangqi_core::Position;
 
 use crate::policy_onnx::PolicyOnnx;
 
+pub type SharedPolicy = Option<Arc<Mutex<PolicyOnnx>>>;
+
 /// 评估输入。
 pub struct PolicyValueInput<'a> {
     pub position: &'a Position,
@@ -31,7 +33,7 @@ pub trait PolicyValueEval {
 
 /// 复用现有 `PolicyOnnx` 的最小 MCTS 评估桥。
 pub struct OnnxPolicyValueEval<'a> {
-    pub policy: &'a Arc<Mutex<Option<PolicyOnnx>>>,
+    pub policy: &'a SharedPolicy,
     pub vocab: &'a HashMap<String, usize>,
 }
 
@@ -39,11 +41,13 @@ impl<'a> PolicyValueEval for OnnxPolicyValueEval<'a> {
     type Error = String;
 
     fn evaluate(&mut self, input: PolicyValueInput<'_>) -> Result<PolicyValueOutput, Self::Error> {
-        let mut guard = self.policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
-        let Some(net) = guard.as_mut() else {
+        let Some(policy) = self.policy.as_ref() else {
             return Ok(uniform_output(input.legal_moves.len()));
         };
-        let out = net.eval_position(input.position).map_err(|e| e.to_string())?;
+        let out = {
+            let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
+            net.eval_position(input.position).map_err(|e| e.to_string())?
+        };
 
         let mut priors = Vec::with_capacity(input.legal_moves.len());
         let mut scratch = [0u8; 8];

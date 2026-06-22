@@ -21,7 +21,7 @@ pub use benchmark::{default_benchmark_fen_strings, resolve_data_file, BenchJsonM
 pub use eval::{material_stm, terminal_score};
 pub use mcts::{
     EdgeStats, MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsNode, MctsNodeId, MctsSearchResult, MctsTree,
-    OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput,
+    OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput, SharedPolicy,
 };
 pub use uci::parse_position_uci;
 

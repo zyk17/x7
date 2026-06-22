@@ -3,14 +3,13 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use serde_json::json;
 use xiangqi_core::{legal_moves_uci, uci_to_move, Position, START_FEN};
 
-use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, OnnxPolicyValueEval};
-use crate::policy_onnx::PolicyOnnx;
+use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, OnnxPolicyValueEval, SharedPolicy};
 
 static DEFAULT_BENCHMARK_FEN_STRINGS: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -74,7 +73,7 @@ pub struct BenchJsonMeta {
 pub struct BenchSessionParams<'a> {
     pub budget: MctsBudget,
     pub config: MctsConfig,
-    pub policy: &'a Arc<Mutex<Option<PolicyOnnx>>>,
+    pub policy: &'a SharedPolicy,
     pub vocab: &'a HashMap<String, usize>,
     pub meta: &'a BenchJsonMeta,
 }
@@ -103,7 +102,7 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
         Ok(result) => {
             let elapsed_ms = t0.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let nps = if elapsed_ms > 0 {
-                (result.visits as u128 * 1000 / u128::from(elapsed_ms)) as u64
+                (result.playouts as u128 * 1000 / u128::from(elapsed_ms)) as u64
             } else {
                 0
             };
@@ -111,21 +110,27 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                 "fen": fen,
                 "bestmove": result.best_move.map(xiangqi_core::move_to_uci),
                 "root_value": result.root_value,
-                "visits": result.visits,
+                "playouts": result.playouts,
+                "root_visits": result.root_visits,
                 "nodes": result.nodes,
                 "time_ms": elapsed_ms,
                 "nps": nps,
+                "root_moves": result.moves.iter().map(|stat: &MctsMoveStat| {
+                    json!({
+                        "move": xiangqi_core::move_to_uci(stat.mv),
+                        "visits": stat.visits,
+                        "q": stat.q,
+                        "prior": stat.prior,
+                    })
+                }).collect::<Vec<_>>(),
                 "mcts_config": {
                     "cpuct": session.config.cpuct,
                     "root_temperature": session.config.root_temperature,
                 },
                 "budget": {
-                    "max_visits": session.budget.max_visits,
+                    "max_playouts": session.budget.max_playouts,
                     "max_nodes": session.budget.max_nodes,
-                    "deadline_ms": session
-                        .budget
-                        .deadline
-                        .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_millis() as u64),
+                    "has_deadline": session.budget.deadline.is_some(),
                 },
                 "bench_config": {
                     "onnx_path": session.meta.onnx_path,

@@ -18,6 +18,16 @@
 - 自对弈只做**小批量、分轮次、受控混合**
 - 长期正式训练格式只保留 **XRSH v5**
 
+## 当前搜索语义
+
+- 搜索预算主语义是 `playouts`
+- `nodes` 表示当前树总节点数
+- `root_visits` 只作为根节点统计保留
+- UCI 主选项使用 `Playouts`
+- `Visits` 仅保留为兼容别名
+- `go depth` 当前**明确不支持**
+- `go infinite` 保留支持
+
 ## 快速结构
 
 ```text
@@ -29,7 +39,10 @@ nn/
   src/nn            Python 训练基础设施
   scripts/train     训练入口
   scripts/export    ONNX 导出
+  .venv             **训练专用虚拟环境（torch cu128）**
 ```
+
+Python 训练请在 `nn/` 下使用 **`nn/.venv`**，不要误用仓库根目录的 `.venv`（见 [nn/README.md](nn/README.md)）。
 
 ## 数据格式
 

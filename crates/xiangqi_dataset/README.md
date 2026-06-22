@@ -23,7 +23,7 @@ cargo run --release -p xiangqi_dataset -- search-label-pgn \
   --vocab data/move_vocab.json \
   --out-dir data/xrsh_search \
   --onnx data/policy.onnx \
-  --visits 256
+  --playouts 256
 ```
 
 ## XRSH v5

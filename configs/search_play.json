@@ -1,0 +1,8 @@
+{
+  "name": "search_play",
+  "description": "线上 UCI 对弈默认：较浅、低延迟",
+  "visits": 800,
+  "cpuct": 1.25,
+  "root_dirichlet_epsilon": 0.0,
+  "root_temperature": 0.0
+}

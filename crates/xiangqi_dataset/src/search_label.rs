@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-use engin::{MctsBudget, MctsConfig, MctsEngine, OnnxPolicyValueEval, PolicyOnnx};
+use engin::{MctsBudget, MctsConfig, MctsEngine, OnnxPolicyValueEval, PolicyOnnx, SharedPolicy};
 use xiangqi_core::{move_to_uci, parse_move_uci, Position};
 
 use crate::encode::{moves_for_game, starting_fen};
@@ -14,7 +14,7 @@ use crate::vocab::load_vocab;
 
 #[derive(Clone, Debug)]
 pub struct SearchLabelExportConfig {
-    pub max_visits: u32,
+    pub max_playouts: u32,
     pub max_games: usize,
     pub max_rows_per_game: usize,
     pub cpuct: f32,
@@ -23,12 +23,29 @@ pub struct SearchLabelExportConfig {
 impl Default for SearchLabelExportConfig {
     fn default() -> Self {
         Self {
-            max_visits: 256,
+            max_playouts: 256,
             max_games: 0,
             max_rows_per_game: 0,
             cpuct: 1.25,
         }
     }
+}
+
+const SEARCH_LABEL_GAMES_PER_SHARD: usize = 256;
+
+fn flush_search_label_shard(
+    out_dir: &Path,
+    vocab_hash: &[u8; 32],
+    shard_index: usize,
+    encoded_games: &mut Vec<EncodedGame>,
+) -> Result<()> {
+    if encoded_games.is_empty() {
+        return Ok(());
+    }
+    let shard_path = out_dir.join(format!("shard_{shard_index:05}.xrsh"));
+    write_shard(&shard_path, vocab_hash, encoded_games)?;
+    encoded_games.clear();
+    Ok(())
 }
 
 pub fn export_search_label_shard_from_pgn(
@@ -37,6 +54,7 @@ pub fn export_search_label_shard_from_pgn(
     out_dir: &Path,
     onnx_path: Option<&Path>,
     config: &SearchLabelExportConfig,
+    round: Option<u32>,
 ) -> Result<u64> {
     let raw = std::fs::read_to_string(pgn_path).with_context(|| format!("读取 PGN {}", pgn_path.display()))?;
     let mut games = read_pgn_games(&raw);
@@ -47,14 +65,14 @@ pub fn export_search_label_shard_from_pgn(
     let (vocab_i32, vocab_hash) = load_vocab(vocab_path)?;
     let vocab_usize: HashMap<String, usize> = vocab_i32.iter().map(|(mv, idx)| (mv.clone(), *idx as usize)).collect();
 
-    let policy = Arc::new(Mutex::new(None));
+    let mut policy: SharedPolicy = None;
     if let Some(path) = onnx_path {
         let net = PolicyOnnx::from_file(path).map_err(anyhow::Error::msg)?;
-        *policy.lock().expect("policy lock") = Some(net);
+        policy = Some(Arc::new(Mutex::new(net)));
     }
 
     let budget = MctsBudget {
-        max_visits: Some(config.max_visits.max(1)),
+        max_playouts: Some(config.max_playouts.max(1)),
         max_nodes: None,
         deadline: None,
         stop: None,
@@ -66,6 +84,9 @@ pub fn export_search_label_shard_from_pgn(
 
     let mut encoded_games = Vec::new();
     let mut total_rows = 0u64;
+    let mut shard_count = 0usize;
+
+    std::fs::create_dir_all(out_dir).with_context(|| out_dir.display().to_string())?;
 
     for (game_idx, game) in games.iter().enumerate() {
         let (uci_moves, _) = match moves_for_game(game) {
@@ -101,7 +122,7 @@ pub fn export_search_label_shard_from_pgn(
             for stat in &result.moves {
                 let uci = move_to_uci(stat.mv);
                 let Some(&idx) = vocab_i32.get(&uci) else {
-                    continue;
+                    anyhow::bail!("legal move {uci} 不在词表中；search_label 只能使用完整 canonical vocab");
                 };
                 legal_idx.push(idx);
                 search_counts.push(stat.visits.min(u16::MAX as u32) as u16);
@@ -109,17 +130,22 @@ pub fn export_search_label_shard_from_pgn(
             if legal_idx.is_empty() {
                 break;
             }
+            let Some(&target_idx) = vocab_i32.get(human_uci) else {
+                anyhow::bail!(
+                    "human move {human_uci} 不在词表中；search_label 只能使用完整 canonical vocab"
+                );
+            };
             rows.push(EncodedRow {
                 fen: pos.fen(),
                 root_fen: root_fen.clone(),
                 uci_prefix: prefix.clone(),
-                target_idx: vocab_i32.get(human_uci).copied().unwrap_or(-1),
+                target_idx,
                 legal_idx,
                 ply: ply as u16,
                 game_result_red: result_r,
                 ply_total,
                 search_q: result.root_value,
-                search_visits: result.visits,
+                search_visits: result.playouts,
                 search_counts,
             });
             total_rows += 1;
@@ -139,15 +165,26 @@ pub fn export_search_label_shard_from_pgn(
                 game_id: format!("search_game_{game_idx:08}"),
                 rows,
             });
+            if encoded_games.len() >= SEARCH_LABEL_GAMES_PER_SHARD {
+                flush_search_label_shard(out_dir, &vocab_hash, shard_count, &mut encoded_games)?;
+                shard_count += 1;
+            }
         }
     }
 
-    std::fs::create_dir_all(out_dir).with_context(|| out_dir.display().to_string())?;
-    if encoded_games.is_empty() {
-        write_pack_meta(out_dir, &vocab_hash, 0, "search_label_pgn")?;
+    let source_note = match round {
+        Some(r) => format!("search_label_pgn:round_{r}"),
+        None => "search_label_pgn".to_string(),
+    };
+    if encoded_games.is_empty() && shard_count == 0 {
+        write_pack_meta(out_dir, &vocab_hash, 0, &source_note)?;
         return Ok(0);
     }
-    write_shard(&out_dir.join("shard_00000.xrsh"), &vocab_hash, &encoded_games)?;
-    write_pack_meta(out_dir, &vocab_hash, 1, "search_label_pgn")?;
+    let has_tail_shard = !encoded_games.is_empty();
+    flush_search_label_shard(out_dir, &vocab_hash, shard_count, &mut encoded_games)?;
+    if has_tail_shard {
+        shard_count += 1;
+    }
+    write_pack_meta(out_dir, &vocab_hash, shard_count, &source_note)?;
     Ok(total_rows)
 }

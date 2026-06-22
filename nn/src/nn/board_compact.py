@@ -59,18 +59,25 @@ def compact_board_to_torch_planes(board90: np.ndarray, stm: np.uint8 | int) -> t
     return torch.from_numpy(compact_board_to_planes(board90, stm))
 
 
+def mirror_compact_board(board90: np.ndarray) -> np.ndarray:
+    """水平镜像 ``uint8[90]`` 紧凑棋盘，不改变 stm。"""
+    b = np.asarray(board90, dtype=np.uint8).reshape(10, 9)
+    return np.ascontiguousarray(b[:, ::-1].reshape(90))
+
+
 def compact_boards_to_torch_planes(
-    boards90: np.ndarray, stms: np.ndarray | list[int]
+    boards90: np.ndarray | torch.Tensor, stms: np.ndarray | list[int] | torch.Tensor
 ) -> torch.Tensor:
     """批量 ``uint8[N,90]`` + ``stm[N]`` → ``float32[N,15,10,9]``。"""
-    b = np.asarray(boards90, dtype=np.uint8).reshape(-1, 90)
-    stm_arr = np.asarray(stms, dtype=np.uint8).reshape(-1)
-    n = b.shape[0]
-    planes = np.zeros((n, 15, 10, 9), dtype=np.float32)
-    nz_batch, nz_pos = np.nonzero(b)
-    vals = b[nz_batch, nz_pos].astype(np.int64) - 1
-    rows = nz_pos // 9
-    cols = nz_pos % 9
-    planes[nz_batch, vals, rows, cols] = 1.0
-    planes[:, 14, :, :] = stm_arr[:, None, None].astype(np.float32)
-    return torch.from_numpy(planes)
+    b = torch.as_tensor(boards90, dtype=torch.uint8).reshape(-1, 90)
+    stm_t = torch.as_tensor(stms, dtype=torch.uint8).reshape(-1)
+    n = int(b.shape[0])
+    planes = torch.zeros((n, 15, 10, 9), dtype=torch.float32)
+    nz = torch.nonzero(b, as_tuple=False)
+    if nz.numel():
+        vals = b[nz[:, 0], nz[:, 1]].to(torch.long) - 1
+        rows = torch.div(nz[:, 1], 9, rounding_mode="floor")
+        cols = torch.remainder(nz[:, 1], 9)
+        planes[nz[:, 0], vals, rows, cols] = 1.0
+    planes[:, 14, :, :] = stm_t.to(torch.float32).view(n, 1, 1)
+    return planes

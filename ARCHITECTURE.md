@@ -43,11 +43,13 @@
 - selection / expansion / backup
 - policy/value ONNX 推理接入
 - UCI 入口
+- benchmark / 最小调试统计
 
 约束：
 
 - 搜索核心尽量同时服务线上走棋与离线搜索标注
 - 不承担数据集打包职责
+- 搜索预算口径统一为 `playouts / nodes / deadline`
 
 ### `crates/xiangqi_dataset`
 
@@ -128,8 +130,23 @@
 - 没有搜索标注时，`search_visits == 0`
 - `search_counts` 与 `legal_idx` 对齐
 - `search_q` 为当前行棋方视角 value 标签
+- `search_visits` 当前记录搜索 playout 数
 
-## 5. 训练主线
+## 5. 当前 UCI / Benchmark 语义
+
+- `setoption name Playouts` 是默认搜索预算入口
+- `setoption name Visits` 仅作兼容别名
+- `go nodes` 对应树总节点预算
+- `go movetime` 对应时间预算
+- `go infinite` 保留支持
+- `go depth` 目前明确不支持，不做伪兼容
+- `info` 与 benchmark 统一输出：
+  - `playouts`
+  - `root_visits`
+  - `nodes`
+  - `nps`
+
+## 6. 训练主线
 
 第一阶段只做 `policy + value + MCTS` 闭环。
 
@@ -142,7 +159,7 @@
 5. 小规模、分轮次、自对弈补冷门局面
 6. 受控混合人类数据与搜索数据继续训练
 
-## 6. 自对弈原则
+## 7. 自对弈原则
 
 自对弈不是海量主数据源，而是受控增量源。
 
@@ -154,7 +171,7 @@
 - 优先补 value 信号
 - 始终让人类数据保持锚点
 
-## 7. 稳定文档
+## 8. 稳定文档
 
 长期稳定文档只保留：
 

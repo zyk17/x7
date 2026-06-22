@@ -12,7 +12,7 @@ use xiangqi_core::{legal_moves_uci, Position};
 use engin::benchmark::{
     default_benchmark_fen_strings, resolve_data_file, write_benchmark_ndjson, BenchJsonMeta, BenchSessionParams,
 };
-use engin::mcts::{MctsBudget, MctsConfig};
+use engin::mcts::{MctsBudget, MctsConfig, SharedPolicy};
 use engin::vocab::{load_move_vocab, load_move_vocab_ordered};
 use engin::{run_uci_stdio, PolicyOnnx, START_FEN};
 
@@ -29,7 +29,7 @@ fn print_usage() {
         "用法:\n  engin                         UCI 模式（stdin/stdout）\n  \
          engin --onnx-smoke [ONNX] [FEN] [VOCAB]  冒烟；缺省 ONNX=data/policy.onnx、FEN=起始局面\n  \
          engin --bench [选项]            MCTS 基准（NDJSON）\n  \
-         --bench 选项: --visits N  --nodes N  --movetime MS  --cpuct F  --onnx PATH  --vocab PATH  --data-dir PATH  --require-onnx"
+         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --onnx PATH  --vocab PATH  --data-dir PATH  --require-onnx"
     );
 }
 
@@ -45,7 +45,7 @@ struct BenchCli {
 
 fn parse_bench_cli(rest: &[String]) -> BenchCli {
     let mut budget = MctsBudget {
-        max_visits: Some(256),
+        max_playouts: Some(256),
         max_nodes: None,
         deadline: None,
         stop: None,
@@ -58,9 +58,9 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
     let mut i = 0usize;
     while i < rest.len() {
         match rest[i].as_str() {
-            "--visits" if i + 1 < rest.len() => {
+            "--playouts" | "--visits" if i + 1 < rest.len() => {
                 if let Ok(n) = rest[i + 1].parse::<u32>() {
-                    budget.max_visits = Some(n.max(1));
+                    budget.max_playouts = Some(n.max(1));
                 }
                 i += 2;
             }
@@ -155,14 +155,14 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
         process::exit(1);
     }
 
-    let policy = Arc::new(Mutex::new(None));
+    let mut policy: SharedPolicy = None;
     let mut meta = BenchJsonMeta::default();
 
     if let Some(ref op) = onnx_path {
         meta.onnx_path = Some(op.display().to_string());
         match PolicyOnnx::from_file(op) {
             Ok(net) => {
-                *policy.lock().unwrap() = Some(net);
+                policy = Some(Arc::new(Mutex::new(net)));
                 meta.policy_session_loaded = true;
             }
             Err(err) => {

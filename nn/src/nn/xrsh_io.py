@@ -1,4 +1,4 @@
-"""读取 Rust `xiangqi_dataset` 写入的 XRSH v5 分片。"""
+"""XRSH v5 训练主线 IO（仅 v5 二进制）。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any
 
 MAGIC = b"XRSH"
 HEADER_SIZE = 64
+XRSH_V5 = 5
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,18 @@ class XrshRowRef:
     ply: int
     game_result_red: int
     ply_total: int
+
+
+@dataclass(frozen=True)
+class XrshTrainRow:
+    game_group: int
+    fen: str
+    legal_idx: list[int]
+    target_idx: int
+    ply: int
+    search_q: float
+    search_visits: int
+    search_counts: list[int]
 
 
 def read_str_u16(buf: bytes | mmap.mmap, off: int) -> tuple[str, int]:
@@ -64,14 +77,33 @@ def fen_key64(fen: str) -> int:
     )
 
 
+def shard_file_version(buf: bytes) -> int:
+    if len(buf) < 8 or buf[0:4] != MAGIC:
+        raise ValueError("魔数非 XRSH")
+    return int.from_bytes(buf[4:8], "little")
+
+
+def assert_shard_binary_v5(path: Path | str) -> None:
+    p = Path(path)
+    with open(p, "rb") as fh:
+        header = fh.read(8)
+    if len(header) < 8 or header[0:4] != MAGIC:
+        raise ValueError(f"非 XRSH 分片: {p}")
+    ver = int.from_bytes(header[4:8], "little")
+    if ver != XRSH_V5:
+        raise ValueError(
+            f"训练主线仅接受 XRSH v5 二进制分片，{p.name} 为 v{ver}；"
+            f"请先完成 migrate verify + finalize"
+        )
+
+
 def parse_shard_bytes(buf: bytes) -> tuple[list[dict[str, Any]], bytes]:
     if len(buf) < HEADER_SIZE:
         raise ValueError(f"XRSH 分片过短: {len(buf)}")
     if buf[0:4] != MAGIC:
         raise ValueError("魔数非 XRSH")
-    file_ver = int.from_bytes(buf[4:8], "little")
-    if file_ver != 5:
-        raise ValueError(f"仅支持 XRSH v5，当前文件版本: {file_ver}")
+    if shard_file_version(buf) != XRSH_V5:
+        raise ValueError(f"训练主线仅支持 XRSH v5，当前版本: {shard_file_version(buf)}")
     vocab_hash = bytes(buf[8:40])
     n_games = int.from_bytes(buf[40:44], "little")
     off = HEADER_SIZE
@@ -139,13 +171,8 @@ def scan_shard_file(
     start_game_group: int = 0,
 ) -> tuple[list[XrshRowRef], bytes, int]:
     buf = Path(path).read_bytes()
-    if len(buf) < HEADER_SIZE:
-        raise ValueError(f"XRSH 分片过短: {len(buf)}")
-    if buf[0:4] != MAGIC:
-        raise ValueError("魔数非 XRSH")
-    file_ver = int.from_bytes(buf[4:8], "little")
-    if file_ver != 5:
-        raise ValueError(f"仅支持 XRSH v5，当前文件版本: {file_ver}")
+    if shard_file_version(buf) != XRSH_V5:
+        raise ValueError(f"训练主线仅支持 XRSH v5: {Path(path).name}")
     vocab_hash = bytes(buf[8:40])
     n_games = int.from_bytes(buf[40:44], "little")
     off = HEADER_SIZE
@@ -184,6 +211,45 @@ def scan_shard_file(
     if off != len(buf):
         raise ValueError(f"XRSH 尾部长度不匹配: 扫描到 {off} 总长 {len(buf)}")
     return refs, vocab_hash, game_group
+
+
+def scan_shard_train_rows(
+    path: Path | str,
+    *,
+    start_game_group: int = 0,
+) -> tuple[list[XrshTrainRow], bytes, int]:
+    buf = Path(path).read_bytes()
+    if shard_file_version(buf) != XRSH_V5:
+        raise ValueError(f"训练主线仅支持 XRSH v5: {Path(path).name}")
+    vocab_hash = bytes(buf[8:40])
+    n_games = int.from_bytes(buf[40:44], "little")
+    off = HEADER_SIZE
+    rows: list[XrshTrainRow] = []
+    game_group = start_game_group
+    for _ in range(n_games):
+        off = _skip_str_u16(buf, off)
+        n_rows = int.from_bytes(buf[off : off + 4], "little")
+        off += 4
+        for _ in range(n_rows):
+            fen, legal_idx, target_idx, ply, search_q, search_visits, search_counts, off = (
+                _read_row_train_fields(buf, off)
+            )
+            rows.append(
+                XrshTrainRow(
+                    game_group=game_group,
+                    fen=fen,
+                    legal_idx=legal_idx,
+                    target_idx=target_idx,
+                    ply=ply,
+                    search_q=search_q,
+                    search_visits=search_visits,
+                    search_counts=search_counts,
+                )
+            )
+        game_group += 1
+    if off != len(buf):
+        raise ValueError(f"XRSH 尾部长度不匹配: 扫描到 {off} 总长 {len(buf)}")
+    return rows, vocab_hash, game_group
 
 
 def read_row_at(buf: bytes | mmap.mmap, row_offset: int) -> dict[str, Any]:
@@ -227,10 +293,10 @@ def read_row_at(buf: bytes | mmap.mmap, row_offset: int) -> dict[str, Any]:
     }
 
 
-def read_row_train_at(
+def _read_row_train_fields(
     buf: bytes | mmap.mmap,
     row_offset: int,
-) -> tuple[str, list[int], int, float, int, list[int]]:
+) -> tuple[str, list[int], int, int, float, int, list[int], int]:
     off = row_offset
     fen, off = read_str_u16(buf, off)
     off = _skip_str_u16(buf, off)
@@ -239,12 +305,15 @@ def read_row_train_at(
     off += 4
     n_leg = int.from_bytes(buf[off : off + 2], "little")
     off += 2
-    legal: list[int] = []
+    legal_idx: list[int] = []
     for _ in range(n_leg):
-        j = int.from_bytes(buf[off : off + 4], "little", signed=True)
+        legal_idx.append(int.from_bytes(buf[off : off + 4], "little", signed=True))
         off += 4
-        legal.append(j)
-    off += 2 + 3
+    ply = int.from_bytes(buf[off : off + 2], "little")
+    off += 2
+    if off + 11 + 2 * n_leg > len(buf):
+        raise ValueError("XRSH v5 样本缺少 result/search 字段")
+    off += 3
     search_q = struct.unpack_from("<f", buf, off)[0]
     off += 4
     search_visits = int.from_bytes(buf[off : off + 4], "little")
@@ -253,7 +322,33 @@ def read_row_train_at(
     for _ in range(n_leg):
         search_counts.append(int.from_bytes(buf[off : off + 2], "little"))
         off += 2
-    return fen, legal, target_idx, float(search_q), search_visits, search_counts
+    return (
+        fen,
+        legal_idx,
+        target_idx,
+        ply,
+        float(search_q),
+        search_visits,
+        search_counts,
+        off,
+    )
+
+
+def read_row_train_at(
+    buf: bytes | mmap.mmap,
+    row_offset: int,
+) -> tuple[str, list[int], int, float, int, list[int]]:
+    fen, legal_idx, target_idx, _ply, search_q, search_visits, search_counts, _off = (
+        _read_row_train_fields(buf, row_offset)
+    )
+    return (
+        fen,
+        legal_idx,
+        target_idx,
+        search_q,
+        search_visits,
+        search_counts,
+    )
 
 
 def load_pack_meta(pack_dir: Path | str) -> dict[str, Any]:
