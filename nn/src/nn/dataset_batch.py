@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 
 from nn.board_compact import compact_boards_to_torch_planes

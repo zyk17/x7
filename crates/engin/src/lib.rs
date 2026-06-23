@@ -14,6 +14,7 @@ pub mod eval;
 pub mod fen_tensor;
 pub mod mcts;
 pub mod policy_onnx;
+pub mod px0_policy;
 pub mod uci;
 pub mod vocab;
 

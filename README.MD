@@ -1,75 +1,80 @@
 # 77xiangqi_engine
 
-一个重新收敛后的象棋工程，只保留第一阶段地基：
+一个围绕 `MCTS + 小型 policy/value 网络` 的象棋工程。
 
-- `xiangqi_core`：规则、合法着、局面基础设施
-- `engin`：MCTS 搜索、ONNX policy/value 消费、UCI 入口
-- `xiangqi_dataset`：PGN -> XRSH、对人类局面做搜索标注
-- `nn/`：小型 `policy + value` 网络训练与 ONNX 导出
+当前项目已经收口到一条明确主线：
 
-当前不再保留 Alpha-Beta 路线，也不再保留 `danger / attack / tactical` 等辅助头。
+- 搜索主线只有 `MCTS`
+- 训练主线只有 `px0 / lc0` 风格外部数据
+- 网络只保留 `policy + value`
+- 当前 value 主语义改为 `WDL + qMix`
 
-## 当前共识
+## 当前真实状态
 
-- 搜索主产品路线是 **MCTS**
-- 网络只做 **policy + value**
-- `policy` 主要学大师数据
-- `value` 默认优先学 **搜索 `q`**
-- 自对弈只做**小批量、分轮次、受控混合**
-- 长期正式训练格式只保留 **XRSH v5**
+仓库当前主训练契约已经不是旧的 `15-plane human bootstrap`，而是：
 
-## 当前搜索语义
+- 输入：`124 x 10 x 9`
+- 输入格式：`px0 classical input_format=1`
+- 不含历史
+- policy 输出：`2062` 维
+- value 输出：`3-way WDL`
 
-- 搜索预算主语义是 `playouts`
-- `nodes` 表示当前树总节点数
-- `root_visits` 只作为根节点统计保留
-- UCI 主选项使用 `Playouts`
-- `Visits` 仅保留为兼容别名
-- `go depth` 当前**明确不支持**
-- `go infinite` 保留支持
+网络结构保持小，但不再过度压缩：
 
-## 快速结构
+- shared trunk：`stem + residual blocks`
+- policy head：`1x1 conv -> flatten -> linear(2062)`
+- value head：`1x1 conv -> flatten -> mlp -> wdl(3)`
 
-```text
-crates/
-  xiangqi_core      规则内核
-  engin             MCTS 引擎
-  xiangqi_dataset   数据集生产
-nn/
-  src/nn            Python 训练基础设施
-  scripts/train     训练入口
-  scripts/export    ONNX 导出
-  .venv             **训练专用虚拟环境（torch cu128）**
-```
+当前导出 / 引擎消费语义：
 
-Python 训练请在 `nn/` 下使用 **`nn/.venv`**，不要误用仓库根目录的 `.venv`（见 [nn/README.md](nn/README.md)）。
+- ONNX `value` 输出为 `WDL` 概率
+- 引擎侧统一按 `q = W - L` 消费 value
+- 当前默认 `q_ratio=1.0`，即主训练默认优先学搜索 `WDL`
 
-## 数据格式
+## 数据路线
 
-当前统一训练格式是 **XRSH v5**。单条样本只保留主线字段：
+现在的默认决策是：
 
-- `fen`
-- `target_idx`
-- `legal_idx`
-- `game_result_red`
-- `ply_total`
-- `search_q`
-- `search_visits`
-- `search_counts`
+1. 先用纯 `px0data` 跑通和迭代 baseline
+2. 不预设人类数据混入
+3. 只有当后续复盘分析或 second-stage fine-tune 明确受益时，才再引入人类数据
 
 这意味着：
 
-- 人类样本可以只带 `policy target`
-- 搜索标注样本可以额外带 `search_q + root visits`
-- 同一个格式同时服务 policy、value、MCTS 标注闭环
+- 本地 `XRSH`
+- 本地 `search-label-manifest`
+- 旧 `move_vocab` 人类 policy 路线
 
-## 最小工作流
+都不再是主线。
 
-1. 用 `xiangqi_dataset` 生成 canonical `move_vocab.json`
-2. 用 `xiangqi_dataset` 把 PGN 转成 `XRSH v5`
-3. 可选：对人类局面跑 MCTS，把搜索标注继续写回 `XRSH v5`
-4. 用 `nn/scripts/train/train_policy.py` 训练 `policy` 或 `policy + value`
-5. 用 `nn/scripts/export/export_onnx.py` 导出 `policy.onnx`
-6. 用 `engin` 直接消费 ONNX 做 MCTS 搜索
+## 当前建议的数据保留策略
 
-更详细的边界见 [ARCHITECTURE.md](/C:/projects/77xiangqi_engine/ARCHITECTURE.md)。
+仓库内建议只保留：
+
+- `data/rounds/px0_train_v1.json`
+- `data/rounds/px0_val_v1.json`
+
+其余都视为可再生临时产物：
+
+- `*.pt`
+- `*.onnx`
+- `data/xrsh_*`
+- 旧的人类 baseline 数据包
+
+如果你已经决定不再保留 XRSH 支线数据，那么这些都可以直接删除。
+
+## 目录
+
+```text
+crates/
+  xiangqi_core
+  engin
+  xiangqi_dataset
+nn/
+  src/nn
+  scripts/data
+  scripts/train
+  scripts/export
+```
+
+架构边界见 [ARCHITECTURE.md](/C:/projects/77xiangqi_engine/ARCHITECTURE.md)。

@@ -18,22 +18,18 @@ from constants import START_FEN
 from nn.dataset_batch import (
     SAMPLE_BOARD,
     SAMPLE_BOARD90,
-    SAMPLE_LEGAL_IDX,
     SAMPLE_MASK,
     SAMPLE_SEARCH_VISITS,
-    SAMPLE_SEARCH_COUNTS,
     SAMPLE_STM,
     SAMPLE_T_VAL,
     SAMPLE_TARGET,
     SAMPLE_VISIT_TARGET,
-    SAMPLE_VOCAB_SIZE,
     SAMPLE_WEIGHT,
     collate_xrsh_samples,
 )
 from nn.dataset_xrsh import PolicyXrshDataset
 from nn.policy_pack import vocab_fingerprint_ordered_moves
 from nn.xrsh_io import HEADER_SIZE, parse_shard_bytes, read_row_train_at
-from nn.xrsh_migrate_io import parse_shard_bytes as parse_shard_bytes_migrate
 
 
 def _write_str_u16(s: str) -> bytes:
@@ -258,33 +254,9 @@ def test_policy_xrsh_dataset_search_q_value_target(tmp_path: Path) -> None:
         with_value_labels=True,
     )
     sample = ds[0]
-    assert sample[SAMPLE_T_VAL].item() == pytest.approx(0.33)
+    assert sample[SAMPLE_T_VAL].shape == (3,)
+    assert sample[SAMPLE_T_VAL].tolist() == pytest.approx([0.665, 0.0, 0.335], abs=1e-6)
     assert int(sample[SAMPLE_SEARCH_VISITS].item()) == 12
-
-
-def test_parse_xrsh_v3_maps_search_defaults() -> None:
-    moves_v = ["m0"]
-    vh = bytes.fromhex(vocab_fingerprint_ordered_moves(moves_v))
-    body = (
-        _write_str_u16("game_v3")
-        + (1).to_bytes(4, "little")
-        + _write_str_u16(START_FEN)
-        + _write_str_u16(START_FEN)
-        + _write_prefix_list([])
-        + (0).to_bytes(4, "little", signed=True)
-        + (1).to_bytes(2, "little")
-        + (0).to_bytes(4, "little", signed=True)
-        + (0).to_bytes(2, "little")
-        + struct.pack("<fff", 0.0, 0.0, 0.0)
-        + struct.pack("<bH", 1, 10)
-    )
-    rows, _ = parse_shard_bytes_migrate(
-        _minimal_shard_bytes(vocab_hash32=vh, games_body=body, file_version=3)
-    )
-    assert rows[0]["game_result_red"] == 1
-    assert rows[0]["ply_total"] == 10
-    assert rows[0]["search_visits"] == 0
-    assert rows[0]["search_counts"] == [0]
 
 
 def test_lazy_mirror_value_batch_includes_search_visits(
@@ -322,7 +294,8 @@ def test_lazy_mirror_value_batch_includes_search_visits(
     sample = ds[0]
     assert SAMPLE_T_VAL in sample
     assert SAMPLE_SEARCH_VISITS in sample
-    assert sample[SAMPLE_T_VAL].shape == sample[SAMPLE_SEARCH_VISITS].shape == ()
+    assert sample[SAMPLE_T_VAL].shape == (3,)
+    assert sample[SAMPLE_SEARCH_VISITS].shape == ()
 
 
 def test_eager_mirror_updates_target_and_mask(

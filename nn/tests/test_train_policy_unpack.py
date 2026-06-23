@@ -65,7 +65,7 @@ def test_collate_xrsh_samples_value_and_search():
             SAMPLE_VOCAB_SIZE: torch.tensor(4, dtype=torch.long),
             SAMPLE_TARGET: torch.tensor(0),
             SAMPLE_WEIGHT: torch.tensor(1.0),
-            SAMPLE_T_VAL: torch.tensor(0.5),
+            SAMPLE_T_VAL: torch.tensor([0.75, 0.0, 0.25]),
             SAMPLE_SEARCH_VISITS: torch.tensor(8),
         }
     ]
@@ -100,24 +100,27 @@ def test_move_batch_to_device():
 
 def test_set_requires_grad_can_freeze_value_head_only():
     model = PolicyResNet(
+        in_planes=15,
         width=32,
         num_blocks=2,
         num_moves=16,
         value_head=True,
         value_head_hidden_dim=16,
     )
+    set_requires_grad(model.value_head_module, False)
     set_requires_grad(model.fc_value, False)
     assert all(not p.requires_grad for p in model.fc_value.parameters())
+    assert all(not p.requires_grad for p in model.value_head_module.parameters())
     assert all(p.requires_grad for p in model.fc.parameters())
 
 
 def test_compute_policy_value_loss_includes_value_term() -> None:
     logits = torch.zeros(2, 4)
-    pred_value = torch.tensor([0.1, -0.2])
+    pred_value = torch.tensor([[0.1, 0.0, -0.1], [-0.2, 0.1, 0.1]])
     targets = torch.zeros(2, dtype=torch.long)
     masks = torch.ones(2, 4, dtype=torch.bool)
     weights = torch.ones(2)
-    t_val = torch.tensor([0.5, -0.3])
+    t_val = torch.tensor([[0.75, 0.0, 0.25], [0.35, 0.10, 0.55]])
     search_visits = torch.tensor([8, 0], dtype=torch.long)
 
     policy_only = compute_policy_value_loss(

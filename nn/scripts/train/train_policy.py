@@ -12,13 +12,20 @@ from pathlib import Path
 import torch
 from torch.optim import AdamW
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "src"))
+NN_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(NN_ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nn.model import PolicyResNet
 
-from train_checkpoint import checkpoint_payload, load_resume, lr_scheduler, save_checkpoint
+from train_checkpoint import (
+    checkpoint_payload,
+    load_init_weights,
+    load_resume,
+    lr_scheduler,
+    save_checkpoint,
+)
 from train_common import (
     TRAIN_SEED,
     default_num_workers,
@@ -27,6 +34,12 @@ from train_common import (
 )
 from train_data import build_datasets, build_loaders, validate_train_args
 from train_loop import format_val_log, run_train_epoch, run_val_epoch
+
+
+def _resolve_repo_path(path: Path | None) -> Path | None:
+    if path is None or path.is_absolute():
+        return path
+    return (REPO_ROOT / path).resolve()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,7 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     loss = ap.add_argument_group("loss")
     loss.add_argument("--value-loss-weight", type=float, default=0.5)
-    loss.add_argument("--value-target-weight-alpha", type=float, default=1.0)
+    loss.add_argument(
+        "--q-ratio",
+        type=float,
+        default=1.0,
+        help="value target = q_ratio*search_wdl + (1-q_ratio)*winner_wdl；XRSH 兼容路径只使用退化 search_wdl",
+    )
     loss.add_argument(
         "--value-min-visits",
         type=int,
@@ -80,7 +98,13 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument(
         "--out",
         type=Path,
-        default=ROOT / "data" / "checkpoints" / "policy.pt",
+        default=REPO_ROOT / "data" / "checkpoints" / "policy.pt",
+    )
+    output.add_argument(
+        "--init-from",
+        type=Path,
+        default=None,
+        help="仅在 --out 不存在时使用该 checkpoint 做非严格热启动",
     )
     return ap
 
@@ -88,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    args.train_dir = _resolve_repo_path(args.train_dir)
+    args.train_mix = _resolve_repo_path(args.train_mix)
+    args.val_dir = _resolve_repo_path(args.val_dir)
+    args.vocab = _resolve_repo_path(args.vocab)
+    args.out = _resolve_repo_path(args.out)
+    args.init_from = _resolve_repo_path(args.init_from)
     validate_train_args(parser, args)
 
     random.seed(TRAIN_SEED)
@@ -115,7 +145,8 @@ def main() -> None:
     print(
         f"dataset: train={len(train_ds)} val={len(val_ds)} | "
         f"train_src={train_note} | "
-        f"value_target={'search_q' if value_head else 'off'} | "
+        f"value_target={'qmix_wdl' if value_head else 'off'} | "
+        f"q_ratio={float(args.q_ratio):.3f} | "
         f"search_policy_weight={float(args.search_policy_weight):.3f}"
     )
 
@@ -127,6 +158,7 @@ def main() -> None:
     )
 
     model = PolicyResNet(
+        in_planes=15,
         width=args.width,
         num_blocks=args.blocks,
         num_moves=n_moves,
@@ -137,8 +169,11 @@ def main() -> None:
         set_requires_grad(model.stem, False)
         set_requires_grad(model.blocks, False)
     if args.freeze_policy_head:
+        set_requires_grad(model.policy_head, False)
         set_requires_grad(model.fc, False)
     if args.freeze_value_head and hasattr(model, "fc_value"):
+        if hasattr(model, "value_head_module"):
+            set_requires_grad(model.value_head_module, False)
         set_requires_grad(model.fc_value, False)
 
     trainable_parameters = [p for p in model.parameters() if p.requires_grad]
@@ -168,6 +203,16 @@ def main() -> None:
             device=device,
         )
         lr_schedule_epochs = start_epoch + args.epochs
+    elif args.init_from is not None:
+        load_init_weights(
+            args.init_from,
+            model,
+            moves=moves,
+            n_moves=n_moves,
+            width=args.width,
+            blocks=args.blocks,
+            device=device,
+        )
 
     best_out = args.out.with_name(args.out.stem + ".best" + args.out.suffix)
     amp_enabled = bool(args.amp) and device.type == "cuda"

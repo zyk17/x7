@@ -72,7 +72,14 @@ def _mirror_legal_indices(
 
 
 class PolicyXrshDataset(Dataset):
-    """只保留 policy / search_q / search_counts 主线字段。"""
+    """XRSH v5 数据集，value 兼容路径输出退化 WDL target。"""
+
+    @staticmethod
+    def _scalar_q_to_wdl(search_q: float) -> np.ndarray:
+        q = float(max(-1.0, min(1.0, search_q)))
+        win = 0.5 * (1.0 + q)
+        loss = 0.5 * (1.0 - q)
+        return np.asarray([win, 0.0, loss], dtype=np.float32)
 
     def __init__(
         self,
@@ -371,7 +378,7 @@ class PolicyXrshDataset(Dataset):
         if self.with_search_labels:
             out[SAMPLE_SEARCH_COUNTS] = torch.as_tensor(search_counts, dtype=torch.long)
         if self.with_value_labels:
-            out[SAMPLE_T_VAL] = torch.tensor(sq_i, dtype=torch.float32)
+            out[SAMPLE_T_VAL] = torch.from_numpy(self._scalar_q_to_wdl(sq_i))
         if self.with_value_labels:
             out[SAMPLE_SEARCH_VISITS] = torch.tensor(sv_i, dtype=torch.long)
         if self.with_row_meta:

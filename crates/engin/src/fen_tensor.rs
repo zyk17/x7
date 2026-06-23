@@ -1,122 +1,119 @@
-//! FEN → CNN 输入平面，与 `nn/src/nn/fen_tensor.py` 一致：`[1, 15, 10, 9]`，NCHW，float32。
+//! Position → px0 classical 输入平面：`[1, 124, 10, 9]`，NCHW，float32。
 
 use ndarray::{s, Array4};
-use xiangqi_core::board::PIECE_TO_CHAR;
-use xiangqi_core::types::{file_of, rank_of, Color, Piece, Square};
 use xiangqi_core::Position;
+use xiangqi_core::types::{color_of, file_of, flip_rank, rank_of, type_of, Color, Piece, PieceType, Square};
+use xiangqi_core::START_FEN;
 
-/// 红方 7 类棋子通道顺序（与 Python `RED_CHARS` 一致）。
-const RED_PLANE: [char; 7] = ['R', 'N', 'B', 'A', 'K', 'C', 'P'];
-/// 黑方 7 类（与 Python `BLACK_CHARS` 一致）。
-const BLACK_PLANE: [char; 7] = ['r', 'n', 'b', 'a', 'k', 'c', 'p'];
+const PLANES_PER_BOARD: usize = 15;
+const HISTORY_PLANES: usize = 8;
+const AUX_BASE: usize = PLANES_PER_BOARD * HISTORY_PLANES;
+const TOTAL_PLANES: usize = AUX_BASE + 4;
 
-fn expand_rank(rank_str: &str) -> Result<Vec<char>, String> {
-    let mut cells = Vec::with_capacity(9);
-    for ch in rank_str.chars() {
-        if ch.is_ascii_digit() {
-            let n = ch.to_digit(10).ok_or_else(|| format!("无效 FEN 数字: {ch:?}"))? as usize;
-            cells.extend(std::iter::repeat_n('.', n));
-        } else {
-            cells.push(ch);
-        }
+fn piece_plane_offset(pt: PieceType) -> Option<usize> {
+    match pt {
+        PieceType::Rook => Some(0),
+        PieceType::Advisor => Some(1),
+        PieceType::Cannon => Some(2),
+        PieceType::Pawn => Some(3),
+        PieceType::Knight => Some(4),
+        PieceType::Bishop => Some(5),
+        PieceType::King => Some(6),
+        _ => None,
     }
-    Ok(cells)
 }
 
-fn plane_index(ch: char) -> Option<usize> {
-    RED_PLANE
-        .iter()
-        .position(|&c| c == ch)
-        .or_else(|| BLACK_PLANE.iter().position(|&c| c == ch).map(|i| i + RED_PLANE.len()))
+fn plane_row(sq: Square, black_to_move: bool) -> usize {
+    let base = 9usize.saturating_sub(rank_of(sq) as usize);
+    if black_to_move {
+        9usize.saturating_sub(base)
+    } else {
+        base
+    }
 }
 
-/// 将完整 FEN 编码为 `float32[1, 15, 10, 9]`。
-///
-/// - 通道 0–6：红方棋子；7–13：黑方；14：轮到红走为全 1，否则全 0。
-/// - `row` 0 对应 FEN 棋盘串的第一行（远离红方一侧，与训练一致）。
-pub(crate) fn fen_to_planes(fen: &str) -> Result<Array4<f32>, String> {
-    let mut parts = fen.split_whitespace();
-    let board = parts.next().ok_or_else(|| "FEN 为空".to_string())?;
-    let stm = parts.next().unwrap_or("w");
-
-    let ranks: Vec<&str> = board.split('/').collect();
-    if ranks.len() != 10 {
-        return Err(format!("期望 10 行棋盘，得到 {}: {board}", ranks.len()));
-    }
-
-    let mut planes = Array4::<f32>::zeros((1, 15, 10, 9));
-
-    for (ri, rank) in ranks.iter().enumerate() {
-        let cells = expand_rank(rank)?;
-        if cells.len() != 9 {
-            return Err(format!("行 {ri} 长度应为 9，得到 {}: {rank:?}", cells.len()));
-        }
-        for (fi, ch) in cells.iter().enumerate() {
-            if *ch == '.' {
-                continue;
-            }
-            let c = plane_index(*ch).ok_or_else(|| format!("未知棋子符号: {ch:?} in {fen}"))?;
-            planes[[0, c, ri, fi]] = 1.0;
-        }
-    }
-
-    let stm_fill = if stm == "w" { 1.0 } else { 0.0 };
-    planes.slice_mut(s![0, 14, .., ..]).fill(stm_fill);
-
-    Ok(planes)
+fn plane_file(sq: Square) -> usize {
+    file_of(sq) as usize
 }
 
-/// 由 [`Position`] 直接编码为 `float32[1, 15, 10, 9]`，避免 `FEN` 字符串分配（与 [`fen_to_planes`] 语义一致）。
-pub(crate) fn position_to_planes(pos: &Position) -> Result<Array4<f32>, String> {
-    let mut planes = Array4::<f32>::zeros((1, 15, 10, 9));
+fn is_startpos_board(pos: &Position) -> bool {
+    let start = Position::from_fen(START_FEN).expect("valid startpos");
+    pos.board == start.board
+}
+
+fn encode_history_block(planes: &mut Array4<f32>, block: usize, pos: &Position) {
+    let base = block * PLANES_PER_BOARD;
+    let black_to_move = pos.side_to_move == Color::Black;
     for sq_u in 0u8..90 {
         let sq: Square = unsafe { std::mem::transmute(sq_u) };
         let pc = pos.piece_on(sq);
         if pc == Piece::NO_PIECE {
             continue;
         }
-        let ch = PIECE_TO_CHAR.as_bytes()[pc.0 as usize] as char;
-        if ch == ' ' {
+        let Some(offset) = piece_plane_offset(type_of(pc)) else {
             continue;
-        }
-        let c = plane_index(ch).ok_or_else(|| format!("未知棋子符号: {ch:?}"))?;
-        let fi = file_of(sq) as usize;
-        let r = rank_of(sq) as usize;
-        let ri = 9usize.saturating_sub(r);
-        planes[[0, c, ri, fi]] = 1.0;
+        };
+        let ours = color_of(pc) == pos.side_to_move;
+        let plane = base + if ours { offset } else { offset + 7 };
+        let rel_sq = if black_to_move { flip_rank(sq) } else { sq };
+        let row = plane_row(rel_sq, false);
+        let col = plane_file(rel_sq);
+        planes[[0, plane, row, col]] = 1.0;
     }
-    let stm_fill = if pos.side_to_move == Color::White { 1.0 } else { 0.0 };
-    planes.slice_mut(s![0, 14, .., ..]).fill(stm_fill);
-    Ok(planes)
+}
+
+fn encode_position(pos: &Position) -> Array4<f32> {
+    let mut planes = Array4::<f32>::zeros((1, TOTAL_PLANES, 10, 9));
+    encode_history_block(&mut planes, 0, pos);
+    if !is_startpos_board(pos) {
+        for block in 1..HISTORY_PLANES {
+            encode_history_block(&mut planes, block, pos);
+        }
+    }
+
+    let stm_fill = if pos.side_to_move == Color::Black { 1.0 } else { 0.0 };
+    planes.slice_mut(s![0, AUX_BASE, .., ..]).fill(stm_fill);
+    let rule60 = pos.state.rule60.clamp(0, 119) as f32 / 119.0;
+    planes.slice_mut(s![0, AUX_BASE + 1, .., ..]).fill(rule60);
+    planes.slice_mut(s![0, AUX_BASE + 3, .., ..]).fill(1.0);
+    planes
+}
+
+pub(crate) fn fen_to_planes(fen: &str) -> Result<Array4<f32>, String> {
+    let pos = Position::from_fen(fen)?;
+    Ok(encode_position(&pos))
+}
+
+pub(crate) fn position_to_planes(pos: &Position) -> Result<Array4<f32>, String> {
+    Ok(encode_position(pos))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xiangqi_core::Position;
-    use xiangqi_core::START_FEN;
 
     #[test]
-    fn start_fen_stm_plane_red() {
+    fn start_fen_shape_and_aux_planes() {
         let t = fen_to_planes(START_FEN).unwrap();
-        assert_eq!(t.shape(), [1, 15, 10, 9]);
-        assert!((t[[0, 14, 0, 0]] - 1.0).abs() < 1e-6);
+        assert_eq!(t.shape(), [1, 124, 10, 9]);
+        assert!((t[[0, AUX_BASE, 0, 0]]).abs() < 1e-6);
+        assert!((t[[0, AUX_BASE + 3, 0, 0]] - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn start_fen_corner_rooks() {
+    fn start_fen_relative_piece_planes() {
         let t = fen_to_planes(START_FEN).unwrap();
-        // 顶行黑车 'r' → 通道 7，(0,0)
-        assert!((t[[0, 7, 0, 0]] - 1.0).abs() < 1e-6);
-        // 底行红车 'R' → 通道 0，(9,0)
         assert!((t[[0, 0, 9, 0]] - 1.0).abs() < 1e-6);
+        assert!((t[[0, 7, 0, 0]] - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn black_to_move_zero_stm_plane() {
+    fn black_to_move_mirrors_and_marks_stm() {
         let fen = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b - - 0 1";
         let t = fen_to_planes(fen).unwrap();
-        assert!((t[[0, 14, 0, 0]]).abs() < 1e-6);
+        assert!((t[[0, AUX_BASE, 0, 0]] - 1.0).abs() < 1e-6);
+        assert!((t[[0, 0, 9, 0]] - 1.0).abs() < 1e-6);
+        assert!((t[[0, 7, 0, 0]] - 1.0).abs() < 1e-6);
     }
 
     #[test]

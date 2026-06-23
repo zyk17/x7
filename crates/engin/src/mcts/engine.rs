@@ -112,7 +112,7 @@ where
         }
         let root_id = self.tree.add_node(root);
 
-        let mut work = pos.clone_for_search();
+        let mut work = pos.clone();
         let mut playouts = 0u32;
         let mut next_report_at = if info_interval.is_zero() {
             None

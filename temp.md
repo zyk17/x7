@@ -1,30 +1,212 @@
-# temp
-
-当前临时讨论点（已做阶段性默认决策，后续实验可调整）：
-
-## 1. `search_q` 口径
-
-- **默认**：根节点 `root_value` 直接作为 `search_q` 训练目标
-- **默认**：`value loss` 仅作用于 `search_visits >= 1` 的样本（人类无标注行不参与）
-- 暂不对 visits 做额外置信度加权；若后续噪声大，可在 `value_target_weight_alpha` 上试验
-
-## 2. 搜索蒸馏
-
-- **第一轮默认**：`search_policy_weight = 0`（见 `data/rounds/round_0.json`）
-- 专用 baseline 试验从 `0.2` 起（见 `nn/BASELINES.md`）
-- 混入比例通过 `train_mix.sources[].weight` 与独立 `--search-policy-weight` 控制
-
-## 3. 自对弈节奏（无 PGN 路径）
-
-- **round_0**：仅现有大师 XRSH 训 policy
-- **round_1 计划**：小批量 MCTS 自对弈 → `search_q` XRSH，再与人类数据混合训 value / 可选 policy 蒸馏
-- 停止条件见 `data/rounds/round_0.json`
-
-## 4. 搜索参数分离
-
-- 训练标注：`configs/search_train.json`（512 playouts, cpuct 1.25, 无噪声）
-- 线上对弈：`configs/search_play.json`（800 playouts, cpuct 1.25, 无噪声）
-- UCI 主预算选项：`Playouts`
-- UCI `Visits`：仅兼容别名
-- `go depth`：当前明确不支持
-- UCI `info` 与 benchmark 统一输出 `playouts / root_visits / nodes / nps`
+(.venv) PS C:\projects\77xiangqi_engine> C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
+>>   --train-list data\rounds\px0_train_v1.json `
+>>   --val-list data\rounds\px0_val_v1.json `
+>>   --out data\checkpoints\baseline_px0_wdl_v1.pt `
+>>   --width 96 `
+>>   --blocks 6 `
+>>   --batch-size 256 `
+>>   --steps 200000 `
+>>   --eval-every 1000 `
+>>   --val-batches 32 `
+>>   --num-workers 4 `
+>>   --device cuda `
+>>   --q-ratio 1.0 `
+>>   --resume
+torch 2.11.0+cu128 | cuda.is_available=True | device=cuda
+resume from data\checkpoints\baseline_px0_wdl_v1.pt | completed_steps=5000
+px0: train_files=360035 val_files=40004 batch_size=256 steps=200000 q_ratio=1.000
+step 6000/200000 train_loss=3.5444 train_policy=2.8051 train_value_ce=0.7393 train_value_q_mse=0.1272 val_loss=3.7388 val_policy=2.8617 val_value_ce=0.8772 val_value_q_mse=0.1445 lr=9.98e-04
+step 7000/200000 train_loss=3.5150 train_policy=2.6986 train_value_ce=0.8163 train_value_q_mse=0.1068 val_loss=3.6706 val_policy=2.8483 val_value_ce=0.8223 val_value_q_mse=0.1172 lr=9.97e-04
+step 8000/200000 train_loss=3.4784 train_policy=2.8903 train_value_ce=0.5881 train_value_q_mse=0.0652 val_loss=3.6441 val_policy=2.8275 val_value_ce=0.8166 val_value_q_mse=0.1132 lr=9.96e-04
+step 9000/200000 train_loss=3.2808 train_policy=3.0532 train_value_ce=0.2275 train_value_q_mse=0.0019 val_loss=3.6607 val_policy=2.8044 val_value_ce=0.8563 val_value_q_mse=0.1328 lr=9.95e-04
+step 10000/200000 train_loss=3.4699 train_policy=2.8327 train_value_ce=0.6372 train_value_q_mse=0.0633 val_loss=3.6190 val_policy=2.7935 val_value_ce=0.8255 val_value_q_mse=0.1201 lr=9.94e-04
+step 11000/200000 train_loss=3.7250 train_policy=2.9265 train_value_ce=0.7985 train_value_q_mse=0.0367 val_loss=3.5947 val_policy=2.7769 val_value_ce=0.8178 val_value_q_mse=0.1198 lr=9.93e-04
+step 12000/200000 train_loss=3.4987 train_policy=2.7710 train_value_ce=0.7277 train_value_q_mse=0.0315 val_loss=3.6055 val_policy=2.7679 val_value_ce=0.8376 val_value_q_mse=0.1211 lr=9.91e-04
+step 13000/200000 train_loss=3.1736 train_policy=2.4478 train_value_ce=0.7258 train_value_q_mse=0.1590 val_loss=3.5496 val_policy=2.7541 val_value_ce=0.7955 val_value_q_mse=0.1075 lr=9.90e-04
+step 14000/200000 train_loss=3.6234 train_policy=2.9113 train_value_ce=0.7122 train_value_q_mse=0.0306 val_loss=3.5474 val_policy=2.7435 val_value_ce=0.8040 val_value_q_mse=0.1126 lr=9.88e-04
+step 15000/200000 train_loss=3.3998 train_policy=2.5079 train_value_ce=0.8919 train_value_q_mse=0.1065 val_loss=3.5328 val_policy=2.7382 val_value_ce=0.7947 val_value_q_mse=0.1080 lr=9.86e-04
+step 16000/200000 train_loss=3.2097 train_policy=2.8029 train_value_ce=0.4068 train_value_q_mse=0.0051 val_loss=3.5235 val_policy=2.7312 val_value_ce=0.7923 val_value_q_mse=0.1048 lr=9.84e-04
+step 17000/200000 train_loss=3.4992 train_policy=2.8527 train_value_ce=0.6464 train_value_q_mse=0.0627 val_loss=3.5279 val_policy=2.7284 val_value_ce=0.7995 val_value_q_mse=0.1099 lr=9.82e-04
+step 18000/200000 train_loss=3.2715 train_policy=2.5563 train_value_ce=0.7152 train_value_q_mse=0.0519 val_loss=3.5002 val_policy=2.7171 val_value_ce=0.7831 val_value_q_mse=0.0988 lr=9.80e-04
+step 19000/200000 train_loss=4.1144 train_policy=2.8560 train_value_ce=1.2584 train_value_q_mse=0.2692 val_loss=3.5174 val_policy=2.7130 val_value_ce=0.8044 val_value_q_mse=0.1105 lr=9.78e-04
+step 20000/200000 train_loss=3.6719 train_policy=2.6273 train_value_ce=1.0446 train_value_q_mse=0.1315 val_loss=3.4925 val_policy=2.7067 val_value_ce=0.7858 val_value_q_mse=0.1030 lr=9.76e-04
+step 21000/200000 train_loss=3.4322 train_policy=2.6983 train_value_ce=0.7339 train_value_q_mse=0.0340 val_loss=3.5567 val_policy=2.7068 val_value_ce=0.8500 val_value_q_mse=0.1300 lr=9.73e-04
+step 22000/200000 train_loss=3.3764 train_policy=3.0200 train_value_ce=0.3564 train_value_q_mse=0.0035 val_loss=3.4921 val_policy=2.7004 val_value_ce=0.7917 val_value_q_mse=0.1022 lr=9.71e-04
+step 23000/200000 train_loss=3.3755 train_policy=2.5953 train_value_ce=0.7802 train_value_q_mse=0.1327 val_loss=3.4897 val_policy=2.6976 val_value_ce=0.7921 val_value_q_mse=0.1059 lr=9.68e-04
+step 24000/200000 train_loss=3.1838 train_policy=2.7214 train_value_ce=0.4623 train_value_q_mse=0.0251 val_loss=3.4809 val_policy=2.6877 val_value_ce=0.7932 val_value_q_mse=0.1028 lr=9.65e-04
+step 25000/200000 train_loss=3.7123 train_policy=2.7928 train_value_ce=0.9196 train_value_q_mse=0.1166 val_loss=3.4633 val_policy=2.6797 val_value_ce=0.7836 val_value_q_mse=0.1019 lr=9.62e-04
+step 26000/200000 train_loss=3.6826 train_policy=2.9515 train_value_ce=0.7311 train_value_q_mse=0.1014 val_loss=3.4653 val_policy=2.6801 val_value_ce=0.7853 val_value_q_mse=0.0995 lr=9.59e-04
+step 27000/200000 train_loss=3.5244 train_policy=2.7137 train_value_ce=0.8107 train_value_q_mse=0.0770 val_loss=3.4802 val_policy=2.6736 val_value_ce=0.8066 val_value_q_mse=0.1109 lr=9.56e-04
+step 28000/200000 train_loss=3.4279 train_policy=2.4639 train_value_ce=0.9640 train_value_q_mse=0.1996 val_loss=3.4670 val_policy=2.6691 val_value_ce=0.7979 val_value_q_mse=0.1115 lr=9.53e-04
+step 29000/200000 train_loss=3.4304 train_policy=2.7322 train_value_ce=0.6982 train_value_q_mse=0.1204 val_loss=3.4817 val_policy=2.6650 val_value_ce=0.8167 val_value_q_mse=0.1149 lr=9.50e-04
+step 30000/200000 train_loss=3.4406 train_policy=2.5546 train_value_ce=0.8860 train_value_q_mse=0.1480 val_loss=3.4445 val_policy=2.6597 val_value_ce=0.7848 val_value_q_mse=0.1025 lr=9.46e-04
+step 31000/200000 train_loss=3.4860 train_policy=2.6214 train_value_ce=0.8645 train_value_q_mse=0.1277 val_loss=3.4292 val_policy=2.6582 val_value_ce=0.7710 val_value_q_mse=0.0909 lr=9.42e-04
+step 32000/200000 train_loss=3.4662 train_policy=2.6866 train_value_ce=0.7796 train_value_q_mse=0.0838 val_loss=3.4292 val_policy=2.6464 val_value_ce=0.7828 val_value_q_mse=0.1007 lr=9.39e-04
+step 33000/200000 train_loss=2.9208 train_policy=2.5951 train_value_ce=0.3258 train_value_q_mse=0.0150 val_loss=3.4259 val_policy=2.6464 val_value_ce=0.7794 val_value_q_mse=0.0965 lr=9.35e-04
+step 34000/200000 train_loss=3.2595 train_policy=2.5065 train_value_ce=0.7531 train_value_q_mse=0.0373 val_loss=3.4176 val_policy=2.6432 val_value_ce=0.7744 val_value_q_mse=0.0935 lr=9.31e-04
+step 35000/200000 train_loss=3.6494 train_policy=2.6353 train_value_ce=1.0141 train_value_q_mse=0.1863 val_loss=3.4218 val_policy=2.6353 val_value_ce=0.7865 val_value_q_mse=0.0982 lr=9.27e-04
+step 36000/200000 train_loss=3.5980 train_policy=2.8740 train_value_ce=0.7240 train_value_q_mse=0.0215 val_loss=3.3972 val_policy=2.6334 val_value_ce=0.7638 val_value_q_mse=0.0905 lr=9.23e-04
+step 37000/200000 train_loss=3.5613 train_policy=2.7718 train_value_ce=0.7895 train_value_q_mse=0.0385 val_loss=3.4282 val_policy=2.6379 val_value_ce=0.7902 val_value_q_mse=0.1011 lr=9.19e-04
+step 38000/200000 train_loss=3.3677 train_policy=2.7480 train_value_ce=0.6198 train_value_q_mse=0.0285 val_loss=3.3967 val_policy=2.6262 val_value_ce=0.7704 val_value_q_mse=0.0962 lr=9.14e-04
+step 39000/200000 train_loss=3.5269 train_policy=2.6211 train_value_ce=0.9058 train_value_q_mse=0.1266 val_loss=3.4148 val_policy=2.6300 val_value_ce=0.7848 val_value_q_mse=0.0989 lr=9.10e-04
+step 40000/200000 train_loss=3.4093 train_policy=2.8031 train_value_ce=0.6062 train_value_q_mse=0.0282 val_loss=3.4415 val_policy=2.6231 val_value_ce=0.8185 val_value_q_mse=0.1114 lr=9.05e-04
+step 41000/200000 train_loss=3.2171 train_policy=2.7406 train_value_ce=0.4765 train_value_q_mse=0.0358 val_loss=3.3820 val_policy=2.6180 val_value_ce=0.7639 val_value_q_mse=0.0911 lr=9.01e-04
+step 42000/200000 train_loss=3.3242 train_policy=2.7491 train_value_ce=0.5751 train_value_q_mse=0.0326 val_loss=3.3839 val_policy=2.6214 val_value_ce=0.7626 val_value_q_mse=0.0886 lr=8.96e-04
+step 43000/200000 train_loss=3.3850 train_policy=2.8444 train_value_ce=0.5406 train_value_q_mse=0.0199 val_loss=3.3763 val_policy=2.6147 val_value_ce=0.7616 val_value_q_mse=0.0902 lr=8.91e-04
+step 44000/200000 train_loss=3.4527 train_policy=2.8388 train_value_ce=0.6139 train_value_q_mse=0.0467 val_loss=3.4168 val_policy=2.6120 val_value_ce=0.8049 val_value_q_mse=0.1088 lr=8.86e-04
+step 45000/200000 train_loss=3.0393 train_policy=2.5289 train_value_ce=0.5103 train_value_q_mse=0.0366 val_loss=3.3824 val_policy=2.6086 val_value_ce=0.7738 val_value_q_mse=0.0959 lr=8.81e-04
+step 46000/200000 train_loss=3.3934 train_policy=2.4929 train_value_ce=0.9005 train_value_q_mse=0.1558 val_loss=3.3739 val_policy=2.6007 val_value_ce=0.7732 val_value_q_mse=0.0951 lr=8.76e-04
+step 47000/200000 train_loss=3.4466 train_policy=2.6000 train_value_ce=0.8467 train_value_q_mse=0.1081 val_loss=3.4159 val_policy=2.6047 val_value_ce=0.8112 val_value_q_mse=0.1115 lr=8.71e-04
+step 48000/200000 train_loss=3.2452 train_policy=2.4868 train_value_ce=0.7585 train_value_q_mse=0.0650 val_loss=3.3705 val_policy=2.5948 val_value_ce=0.7757 val_value_q_mse=0.0924 lr=8.66e-04
+step 49000/200000 train_loss=3.2140 train_policy=2.4357 train_value_ce=0.7783 train_value_q_mse=0.0577 val_loss=3.3765 val_policy=2.5941 val_value_ce=0.7824 val_value_q_mse=0.0996 lr=8.60e-04
+step 50000/200000 train_loss=3.5116 train_policy=2.6271 train_value_ce=0.8845 train_value_q_mse=0.0538 val_loss=3.3429 val_policy=2.5921 val_value_ce=0.7508 val_value_q_mse=0.0846 lr=8.55e-04
+step 51000/200000 train_loss=3.3713 train_policy=2.3185 train_value_ce=1.0528 train_value_q_mse=0.2052 val_loss=3.3495 val_policy=2.5903 val_value_ce=0.7591 val_value_q_mse=0.0866 lr=8.49e-04
+step 52000/200000 train_loss=3.2866 train_policy=2.7628 train_value_ce=0.5238 train_value_q_mse=0.1114 val_loss=3.3491 val_policy=2.5829 val_value_ce=0.7662 val_value_q_mse=0.0895 lr=8.44e-04
+step 53000/200000 train_loss=3.4571 train_policy=2.6505 train_value_ce=0.8066 train_value_q_mse=0.0705 val_loss=3.3401 val_policy=2.5889 val_value_ce=0.7513 val_value_q_mse=0.0830 lr=8.38e-04
+step 54000/200000 train_loss=3.3951 train_policy=2.6654 train_value_ce=0.7296 train_value_q_mse=0.0751 val_loss=3.3428 val_policy=2.5825 val_value_ce=0.7603 val_value_q_mse=0.0873 lr=8.32e-04
+step 55000/200000 train_loss=3.3698 train_policy=2.5375 train_value_ce=0.8323 train_value_q_mse=0.0586 val_loss=3.3400 val_policy=2.5846 val_value_ce=0.7554 val_value_q_mse=0.0836 lr=8.26e-04
+step 56000/200000 train_loss=3.2328 train_policy=2.5096 train_value_ce=0.7232 train_value_q_mse=0.0415 val_loss=3.3301 val_policy=2.5775 val_value_ce=0.7526 val_value_q_mse=0.0835 lr=8.21e-04
+step 57000/200000 train_loss=3.2302 train_policy=2.4148 train_value_ce=0.8154 train_value_q_mse=0.0644 val_loss=3.3223 val_policy=2.5730 val_value_ce=0.7493 val_value_q_mse=0.0824 lr=8.14e-04
+step 58000/200000 train_loss=3.2769 train_policy=2.4409 train_value_ce=0.8360 train_value_q_mse=0.1258 val_loss=3.3426 val_policy=2.5764 val_value_ce=0.7663 val_value_q_mse=0.0904 lr=8.08e-04
+step 59000/200000 train_loss=2.4761 train_policy=2.3952 train_value_ce=0.0810 train_value_q_mse=0.0140 val_loss=3.3214 val_policy=2.5687 val_value_ce=0.7528 val_value_q_mse=0.0828 lr=8.02e-04
+step 60000/200000 train_loss=2.8500 train_policy=2.5077 train_value_ce=0.3423 train_value_q_mse=0.0164 val_loss=3.3266 val_policy=2.5673 val_value_ce=0.7593 val_value_q_mse=0.0873 lr=7.96e-04
+step 61000/200000 train_loss=3.2655 train_policy=2.6780 train_value_ce=0.5875 train_value_q_mse=0.0248 val_loss=3.3274 val_policy=2.5714 val_value_ce=0.7561 val_value_q_mse=0.0898 lr=7.90e-04
+step 62000/200000 train_loss=3.4091 train_policy=2.5137 train_value_ce=0.8955 train_value_q_mse=0.0807 val_loss=3.3332 val_policy=2.5668 val_value_ce=0.7664 val_value_q_mse=0.0893 lr=7.83e-04
+step 63000/200000 train_loss=3.5980 train_policy=2.6749 train_value_ce=0.9230 train_value_q_mse=0.0845 val_loss=3.3396 val_policy=2.5619 val_value_ce=0.7777 val_value_q_mse=0.0919 lr=7.77e-04
+step 64000/200000 train_loss=3.1438 train_policy=2.4287 train_value_ce=0.7151 train_value_q_mse=0.0560 val_loss=3.3034 val_policy=2.5579 val_value_ce=0.7455 val_value_q_mse=0.0802 lr=7.70e-04
+step 65000/200000 train_loss=3.2074 train_policy=2.6940 train_value_ce=0.5134 train_value_q_mse=0.0394 val_loss=3.3324 val_policy=2.5574 val_value_ce=0.7750 val_value_q_mse=0.0914 lr=7.64e-04
+step 66000/200000 train_loss=3.1733 train_policy=2.4930 train_value_ce=0.6803 train_value_q_mse=0.0351 val_loss=3.3132 val_policy=2.5577 val_value_ce=0.7555 val_value_q_mse=0.0871 lr=7.57e-04
+step 67000/200000 train_loss=3.2751 train_policy=2.4743 train_value_ce=0.8008 train_value_q_mse=0.0620 val_loss=3.3169 val_policy=2.5541 val_value_ce=0.7629 val_value_q_mse=0.0897 lr=7.50e-04
+step 68000/200000 train_loss=3.5704 train_policy=2.5056 train_value_ce=1.0649 train_value_q_mse=0.1805 val_loss=3.3092 val_policy=2.5540 val_value_ce=0.7553 val_value_q_mse=0.0858 lr=7.43e-04
+step 69000/200000 train_loss=3.0624 train_policy=2.4343 train_value_ce=0.6282 train_value_q_mse=0.0635 val_loss=3.3297 val_policy=2.5545 val_value_ce=0.7752 val_value_q_mse=0.0942 lr=7.37e-04
+step 70000/200000 train_loss=3.3534 train_policy=2.7010 train_value_ce=0.6524 train_value_q_mse=0.0622 val_loss=3.2857 val_policy=2.5466 val_value_ce=0.7390 val_value_q_mse=0.0786 lr=7.30e-04
+step 71000/200000 train_loss=3.4542 train_policy=2.7381 train_value_ce=0.7161 train_value_q_mse=0.0812 val_loss=3.3331 val_policy=2.5564 val_value_ce=0.7766 val_value_q_mse=0.0924 lr=7.23e-04
+step 72000/200000 train_loss=3.3925 train_policy=2.7364 train_value_ce=0.6561 train_value_q_mse=0.0669 val_loss=3.3153 val_policy=2.5479 val_value_ce=0.7674 val_value_q_mse=0.0905 lr=7.16e-04
+step 73000/200000 train_loss=3.3944 train_policy=2.5400 train_value_ce=0.8544 train_value_q_mse=0.0733 val_loss=3.3010 val_policy=2.5458 val_value_ce=0.7552 val_value_q_mse=0.0837 lr=7.09e-04
+step 74000/200000 train_loss=3.4790 train_policy=2.5739 train_value_ce=0.9051 train_value_q_mse=0.1930 val_loss=3.2904 val_policy=2.5419 val_value_ce=0.7485 val_value_q_mse=0.0800 lr=7.02e-04
+step 75000/200000 train_loss=3.2445 train_policy=2.5487 train_value_ce=0.6958 train_value_q_mse=0.0425 val_loss=3.3044 val_policy=2.5396 val_value_ce=0.7648 val_value_q_mse=0.0918 lr=6.94e-04
+step 76000/200000 train_loss=3.2860 train_policy=2.6726 train_value_ce=0.6134 train_value_q_mse=0.0284 val_loss=3.2912 val_policy=2.5414 val_value_ce=0.7498 val_value_q_mse=0.0841 lr=6.87e-04
+step 77000/200000 train_loss=3.2688 train_policy=2.6031 train_value_ce=0.6657 train_value_q_mse=0.0194 val_loss=3.3106 val_policy=2.5471 val_value_ce=0.7635 val_value_q_mse=0.0872 lr=6.80e-04
+step 78000/200000 train_loss=3.3358 train_policy=2.6942 train_value_ce=0.6416 train_value_q_mse=0.0516 val_loss=3.2786 val_policy=2.5362 val_value_ce=0.7424 val_value_q_mse=0.0782 lr=6.73e-04
+step 79000/200000 train_loss=3.2592 train_policy=2.4341 train_value_ce=0.8251 train_value_q_mse=0.1045 val_loss=3.2854 val_policy=2.5397 val_value_ce=0.7457 val_value_q_mse=0.0796 lr=6.65e-04
+step 80000/200000 train_loss=3.1799 train_policy=2.5319 train_value_ce=0.6480 train_value_q_mse=0.0504 val_loss=3.2867 val_policy=2.5356 val_value_ce=0.7511 val_value_q_mse=0.0813 lr=6.58e-04
+step 81000/200000 train_loss=3.3856 train_policy=2.6154 train_value_ce=0.7702 train_value_q_mse=0.0768 val_loss=3.2904 val_policy=2.5360 val_value_ce=0.7544 val_value_q_mse=0.0831 lr=6.51e-04
+step 82000/200000 train_loss=3.4092 train_policy=2.4541 train_value_ce=0.9551 train_value_q_mse=0.1603 val_loss=3.2863 val_policy=2.5298 val_value_ce=0.7565 val_value_q_mse=0.0880 lr=6.43e-04
+step 83000/200000 train_loss=3.1599 train_policy=2.7086 train_value_ce=0.4513 train_value_q_mse=0.0075 val_loss=3.2882 val_policy=2.5270 val_value_ce=0.7612 val_value_q_mse=0.0852 lr=6.36e-04
+step 84000/200000 train_loss=2.9638 train_policy=2.8074 train_value_ce=0.1564 train_value_q_mse=0.0114 val_loss=3.2839 val_policy=2.5298 val_value_ce=0.7541 val_value_q_mse=0.0836 lr=6.28e-04
+step 85000/200000 train_loss=3.4274 train_policy=2.5408 train_value_ce=0.8866 train_value_q_mse=0.1125 val_loss=3.2691 val_policy=2.5256 val_value_ce=0.7435 val_value_q_mse=0.0784 lr=6.21e-04
+step 86000/200000 train_loss=2.8753 train_policy=2.5311 train_value_ce=0.3442 train_value_q_mse=0.0240 val_loss=3.2673 val_policy=2.5257 val_value_ce=0.7416 val_value_q_mse=0.0782 lr=6.13e-04
+step 87000/200000 train_loss=3.3218 train_policy=2.5146 train_value_ce=0.8072 train_value_q_mse=0.0896 val_loss=3.2665 val_policy=2.5266 val_value_ce=0.7399 val_value_q_mse=0.0767 lr=6.05e-04
+step 88000/200000 train_loss=3.4971 train_policy=2.5043 train_value_ce=0.9927 train_value_q_mse=0.1585 val_loss=3.2649 val_policy=2.5223 val_value_ce=0.7426 val_value_q_mse=0.0771 lr=5.98e-04
+step 89000/200000 train_loss=3.3122 train_policy=2.5262 train_value_ce=0.7860 train_value_q_mse=0.1100 val_loss=3.2845 val_policy=2.5226 val_value_ce=0.7619 val_value_q_mse=0.0834 lr=5.90e-04
+step 90000/200000 train_loss=3.3475 train_policy=2.6564 train_value_ce=0.6911 train_value_q_mse=0.0215 val_loss=3.2634 val_policy=2.5208 val_value_ce=0.7426 val_value_q_mse=0.0779 lr=5.82e-04
+step 91000/200000 train_loss=3.2888 train_policy=2.6437 train_value_ce=0.6451 train_value_q_mse=0.0390 val_loss=3.2685 val_policy=2.5182 val_value_ce=0.7502 val_value_q_mse=0.0827 lr=5.75e-04
+step 92000/200000 train_loss=2.9673 train_policy=2.3588 train_value_ce=0.6085 train_value_q_mse=0.0131 val_loss=3.2583 val_policy=2.5167 val_value_ce=0.7416 val_value_q_mse=0.0788 lr=5.67e-04
+step 93000/200000 train_loss=3.3504 train_policy=2.5387 train_value_ce=0.8118 train_value_q_mse=0.0587 val_loss=3.2717 val_policy=2.5242 val_value_ce=0.7475 val_value_q_mse=0.0798 lr=5.59e-04
+step 94000/200000 train_loss=3.2508 train_policy=2.5507 train_value_ce=0.7001 train_value_q_mse=0.0536 val_loss=3.2736 val_policy=2.5197 val_value_ce=0.7538 val_value_q_mse=0.0848 lr=5.52e-04
+step 95000/200000 train_loss=3.1272 train_policy=2.5907 train_value_ce=0.5365 train_value_q_mse=0.0113 val_loss=3.2499 val_policy=2.5124 val_value_ce=0.7375 val_value_q_mse=0.0749 lr=5.44e-04
+step 96000/200000 train_loss=3.1670 train_policy=2.5704 train_value_ce=0.5966 train_value_q_mse=0.0789 val_loss=3.2517 val_policy=2.5127 val_value_ce=0.7390 val_value_q_mse=0.0761 lr=5.36e-04
+step 97000/200000 train_loss=3.3853 train_policy=2.6810 train_value_ce=0.7043 train_value_q_mse=0.0711 val_loss=3.2553 val_policy=2.5127 val_value_ce=0.7426 val_value_q_mse=0.0771 lr=5.28e-04
+step 98000/200000 train_loss=2.9493 train_policy=2.4350 train_value_ce=0.5143 train_value_q_mse=0.0144 val_loss=3.2551 val_policy=2.5100 val_value_ce=0.7450 val_value_q_mse=0.0789 lr=5.21e-04
+step 99000/200000 train_loss=3.3774 train_policy=2.6188 train_value_ce=0.7587 train_value_q_mse=0.0820 val_loss=3.2660 val_policy=2.5131 val_value_ce=0.7528 val_value_q_mse=0.0830 lr=5.13e-04
+step 100000/200000 train_loss=3.0710 train_policy=2.5301 train_value_ce=0.5409 train_value_q_mse=0.0150 val_loss=3.2532 val_policy=2.5110 val_value_ce=0.7422 val_value_q_mse=0.0778 lr=5.05e-04
+step 101000/200000 train_loss=2.8601 train_policy=2.4991 train_value_ce=0.3611 train_value_q_mse=0.0176 val_loss=3.2475 val_policy=2.5089 val_value_ce=0.7386 val_value_q_mse=0.0743 lr=4.97e-04
+step 102000/200000 train_loss=3.1410 train_policy=2.4853 train_value_ce=0.6556 train_value_q_mse=0.0444 val_loss=3.2471 val_policy=2.5075 val_value_ce=0.7396 val_value_q_mse=0.0770 lr=4.89e-04
+step 103000/200000 train_loss=3.2592 train_policy=2.5156 train_value_ce=0.7437 train_value_q_mse=0.0923 val_loss=3.2524 val_policy=2.5043 val_value_ce=0.7480 val_value_q_mse=0.0789 lr=4.82e-04
+step 104000/200000 train_loss=3.2322 train_policy=2.5214 train_value_ce=0.7109 train_value_q_mse=0.0502 val_loss=3.2527 val_policy=2.5038 val_value_ce=0.7489 val_value_q_mse=0.0810 lr=4.74e-04
+step 105000/200000 train_loss=3.2233 train_policy=2.4719 train_value_ce=0.7515 train_value_q_mse=0.1513 val_loss=3.2525 val_policy=2.5003 val_value_ce=0.7522 val_value_q_mse=0.0818 lr=4.66e-04
+step 106000/200000 train_loss=3.3265 train_policy=2.3377 train_value_ce=0.9889 train_value_q_mse=0.1036 val_loss=3.2406 val_policy=2.5002 val_value_ce=0.7404 val_value_q_mse=0.0769 lr=4.58e-04
+step 107000/200000 train_loss=2.7615 train_policy=2.1891 train_value_ce=0.5724 train_value_q_mse=0.1340 val_loss=3.2351 val_policy=2.5013 val_value_ce=0.7338 val_value_q_mse=0.0732 lr=4.51e-04
+step 108000/200000 train_loss=3.2563 train_policy=2.6079 train_value_ce=0.6484 train_value_q_mse=0.0357 val_loss=3.2499 val_policy=2.4964 val_value_ce=0.7535 val_value_q_mse=0.0821 lr=4.43e-04
+step 109000/200000 train_loss=3.3486 train_policy=2.6770 train_value_ce=0.6716 train_value_q_mse=0.0260 val_loss=3.2425 val_policy=2.5026 val_value_ce=0.7399 val_value_q_mse=0.0766 lr=4.35e-04
+step 110000/200000 train_loss=2.7717 train_policy=2.3209 train_value_ce=0.4508 train_value_q_mse=0.0287 val_loss=3.2363 val_policy=2.4978 val_value_ce=0.7385 val_value_q_mse=0.0755 lr=4.28e-04
+step 111000/200000 train_loss=2.7775 train_policy=2.4982 train_value_ce=0.2793 train_value_q_mse=0.0022 val_loss=3.2607 val_policy=2.4987 val_value_ce=0.7619 val_value_q_mse=0.0846 lr=4.20e-04
+step 112000/200000 train_loss=3.1196 train_policy=2.3259 train_value_ce=0.7937 train_value_q_mse=0.0986 val_loss=3.2370 val_policy=2.4990 val_value_ce=0.7380 val_value_q_mse=0.0740 lr=4.12e-04
+step 113000/200000 train_loss=3.2064 train_policy=2.6148 train_value_ce=0.5916 train_value_q_mse=0.0540 val_loss=3.2375 val_policy=2.4944 val_value_ce=0.7431 val_value_q_mse=0.0773 lr=4.05e-04
+step 114000/200000 train_loss=3.2311 train_policy=2.5250 train_value_ce=0.7062 train_value_q_mse=0.0395 val_loss=3.2289 val_policy=2.4942 val_value_ce=0.7347 val_value_q_mse=0.0721 lr=3.97e-04
+step 115000/200000 train_loss=3.2648 train_policy=2.6585 train_value_ce=0.6063 train_value_q_mse=0.0271 val_loss=3.2300 val_policy=2.4929 val_value_ce=0.7370 val_value_q_mse=0.0743 lr=3.89e-04
+step 116000/200000 train_loss=2.6980 train_policy=2.3331 train_value_ce=0.3649 train_value_q_mse=0.0128 val_loss=3.2325 val_policy=2.4906 val_value_ce=0.7419 val_value_q_mse=0.0783 lr=3.82e-04
+step 117000/200000 train_loss=3.0815 train_policy=2.5541 train_value_ce=0.5274 train_value_q_mse=0.0495 val_loss=3.2272 val_policy=2.4930 val_value_ce=0.7342 val_value_q_mse=0.0736 lr=3.74e-04
+step 118000/200000 train_loss=3.2213 train_policy=2.4688 train_value_ce=0.7525 train_value_q_mse=0.0449 val_loss=3.2433 val_policy=2.4944 val_value_ce=0.7489 val_value_q_mse=0.0805 lr=3.67e-04
+step 119000/200000 train_loss=3.2548 train_policy=2.5280 train_value_ce=0.7267 train_value_q_mse=0.0294 val_loss=3.2300 val_policy=2.4917 val_value_ce=0.7383 val_value_q_mse=0.0739 lr=3.59e-04
+step 120000/200000 train_loss=3.2841 train_policy=2.6649 train_value_ce=0.6192 train_value_q_mse=0.0219 val_loss=3.2213 val_policy=2.4886 val_value_ce=0.7327 val_value_q_mse=0.0718 lr=3.52e-04
+step 121000/200000 train_loss=3.3215 train_policy=2.5545 train_value_ce=0.7671 train_value_q_mse=0.0254 val_loss=3.2342 val_policy=2.4905 val_value_ce=0.7437 val_value_q_mse=0.0767 lr=3.45e-04
+step 122000/200000 train_loss=3.2785 train_policy=2.4348 train_value_ce=0.8437 train_value_q_mse=0.0725 val_loss=3.2177 val_policy=2.4862 val_value_ce=0.7315 val_value_q_mse=0.0716 lr=3.37e-04
+step 123000/200000 train_loss=3.2615 train_policy=2.5184 train_value_ce=0.7431 train_value_q_mse=0.0479 val_loss=3.2248 val_policy=2.4883 val_value_ce=0.7365 val_value_q_mse=0.0733 lr=3.30e-04
+step 124000/200000 train_loss=3.2440 train_policy=2.4832 train_value_ce=0.7609 train_value_q_mse=0.0905 val_loss=3.2320 val_policy=2.4875 val_value_ce=0.7445 val_value_q_mse=0.0771 lr=3.23e-04
+step 125000/200000 train_loss=2.9197 train_policy=2.5583 train_value_ce=0.3614 train_value_q_mse=0.0142 val_loss=3.2465 val_policy=2.4891 val_value_ce=0.7574 val_value_q_mse=0.0827 lr=3.16e-04
+step 126000/200000 train_loss=3.0852 train_policy=2.5716 train_value_ce=0.5136 train_value_q_mse=0.0192 val_loss=3.2190 val_policy=2.4881 val_value_ce=0.7309 val_value_q_mse=0.0719 lr=3.08e-04
+step 127000/200000 train_loss=3.4470 train_policy=2.6510 train_value_ce=0.7960 train_value_q_mse=0.0555 val_loss=3.2147 val_policy=2.4834 val_value_ce=0.7314 val_value_q_mse=0.0712 lr=3.01e-04
+step 128000/200000 train_loss=3.2472 train_policy=2.5470 train_value_ce=0.7002 train_value_q_mse=0.0573 val_loss=3.2205 val_policy=2.4849 val_value_ce=0.7356 val_value_q_mse=0.0722 lr=2.94e-04
+step 129000/200000 train_loss=3.2210 train_policy=2.2641 train_value_ce=0.9568 train_value_q_mse=0.1025 val_loss=3.2205 val_policy=2.4841 val_value_ce=0.7364 val_value_q_mse=0.0736 lr=2.87e-04
+step 130000/200000 train_loss=3.0559 train_policy=2.7400 train_value_ce=0.3159 train_value_q_mse=0.0086 val_loss=3.2200 val_policy=2.4841 val_value_ce=0.7359 val_value_q_mse=0.0737 lr=2.80e-04
+step 131000/200000 train_loss=3.4099 train_policy=2.6483 train_value_ce=0.7616 train_value_q_mse=0.0987 val_loss=3.2137 val_policy=2.4814 val_value_ce=0.7323 val_value_q_mse=0.0713 lr=2.73e-04
+step 132000/200000 train_loss=2.9924 train_policy=2.4211 train_value_ce=0.5713 train_value_q_mse=0.0317 val_loss=3.2123 val_policy=2.4813 val_value_ce=0.7310 val_value_q_mse=0.0728 lr=2.67e-04
+step 133000/200000 train_loss=3.1951 train_policy=2.5593 train_value_ce=0.6358 train_value_q_mse=0.0390 val_loss=3.2249 val_policy=2.4843 val_value_ce=0.7406 val_value_q_mse=0.0757 lr=2.60e-04
+step 134000/200000 train_loss=3.1755 train_policy=2.3487 train_value_ce=0.8268 train_value_q_mse=0.1056 val_loss=3.2134 val_policy=2.4799 val_value_ce=0.7336 val_value_q_mse=0.0736 lr=2.53e-04
+step 135000/200000 train_loss=3.0029 train_policy=2.1838 train_value_ce=0.8191 train_value_q_mse=0.1178 val_loss=3.2099 val_policy=2.4777 val_value_ce=0.7323 val_value_q_mse=0.0728 lr=2.46e-04
+step 136000/200000 train_loss=3.2648 train_policy=2.3644 train_value_ce=0.9005 train_value_q_mse=0.0925 val_loss=3.2030 val_policy=2.4771 val_value_ce=0.7259 val_value_q_mse=0.0694 lr=2.40e-04
+step 137000/200000 train_loss=3.2706 train_policy=2.6223 train_value_ce=0.6483 train_value_q_mse=0.0280 val_loss=3.2143 val_policy=2.4792 val_value_ce=0.7351 val_value_q_mse=0.0741 lr=2.33e-04
+step 138000/200000 train_loss=3.4209 train_policy=2.5478 train_value_ce=0.8731 train_value_q_mse=0.0800 val_loss=3.2100 val_policy=2.4762 val_value_ce=0.7338 val_value_q_mse=0.0718 lr=2.27e-04
+step 139000/200000 train_loss=2.6383 train_policy=2.2814 train_value_ce=0.3569 train_value_q_mse=0.0179 val_loss=3.2123 val_policy=2.4794 val_value_ce=0.7329 val_value_q_mse=0.0712 lr=2.20e-04
+step 140000/200000 train_loss=3.0623 train_policy=2.3465 train_value_ce=0.7159 train_value_q_mse=0.0397 val_loss=3.2030 val_policy=2.4760 val_value_ce=0.7271 val_value_q_mse=0.0697 lr=2.14e-04
+step 141000/200000 train_loss=3.2768 train_policy=2.6286 train_value_ce=0.6482 train_value_q_mse=0.0477 val_loss=3.2101 val_policy=2.4748 val_value_ce=0.7353 val_value_q_mse=0.0726 lr=2.08e-04
+step 142000/200000 train_loss=3.2278 train_policy=2.8038 train_value_ce=0.4240 train_value_q_mse=0.0464 val_loss=3.2061 val_policy=2.4748 val_value_ce=0.7313 val_value_q_mse=0.0713 lr=2.02e-04
+step 143000/200000 train_loss=3.1653 train_policy=2.5245 train_value_ce=0.6408 train_value_q_mse=0.0532 val_loss=3.2012 val_policy=2.4741 val_value_ce=0.7271 val_value_q_mse=0.0687 lr=1.96e-04
+step 144000/200000 train_loss=3.1532 train_policy=2.4185 train_value_ce=0.7347 train_value_q_mse=0.0427 val_loss=3.1992 val_policy=2.4749 val_value_ce=0.7244 val_value_q_mse=0.0680 lr=1.89e-04
+step 145000/200000 train_loss=3.4733 train_policy=2.6681 train_value_ce=0.8052 train_value_q_mse=0.1132 val_loss=3.1992 val_policy=2.4716 val_value_ce=0.7276 val_value_q_mse=0.0697 lr=1.84e-04
+step 146000/200000 train_loss=3.1798 train_policy=2.4716 train_value_ce=0.7081 train_value_q_mse=0.1033 val_loss=3.1956 val_policy=2.4707 val_value_ce=0.7249 val_value_q_mse=0.0679 lr=1.78e-04
+step 147000/200000 train_loss=3.1378 train_policy=2.7061 train_value_ce=0.4318 train_value_q_mse=0.0158 val_loss=3.1935 val_policy=2.4710 val_value_ce=0.7225 val_value_q_mse=0.0662 lr=1.72e-04
+step 148000/200000 train_loss=3.2679 train_policy=2.5056 train_value_ce=0.7623 train_value_q_mse=0.0614 val_loss=3.1993 val_policy=2.4707 val_value_ce=0.7286 val_value_q_mse=0.0695 lr=1.66e-04
+step 149000/200000 train_loss=3.1629 train_policy=2.5291 train_value_ce=0.6338 train_value_q_mse=0.0594 val_loss=3.1913 val_policy=2.4702 val_value_ce=0.7211 val_value_q_mse=0.0665 lr=1.61e-04
+step 150000/200000 train_loss=3.0354 train_policy=2.3105 train_value_ce=0.7249 train_value_q_mse=0.0609 val_loss=3.1929 val_policy=2.4697 val_value_ce=0.7232 val_value_q_mse=0.0677 lr=1.55e-04
+step 151000/200000 train_loss=3.4390 train_policy=2.5609 train_value_ce=0.8781 train_value_q_mse=0.0976 val_loss=3.2063 val_policy=2.4695 val_value_ce=0.7367 val_value_q_mse=0.0724 lr=1.50e-04
+step 152000/200000 train_loss=3.1319 train_policy=2.4327 train_value_ce=0.6991 train_value_q_mse=0.0475 val_loss=3.1906 val_policy=2.4672 val_value_ce=0.7234 val_value_q_mse=0.0674 lr=1.44e-04
+step 153000/200000 train_loss=3.4066 train_policy=2.6174 train_value_ce=0.7892 train_value_q_mse=0.0810 val_loss=3.2043 val_policy=2.4688 val_value_ce=0.7355 val_value_q_mse=0.0726 lr=1.39e-04
+step 154000/200000 train_loss=3.0941 train_policy=2.3750 train_value_ce=0.7191 train_value_q_mse=0.0559 val_loss=3.2015 val_policy=2.4716 val_value_ce=0.7300 val_value_q_mse=0.0701 lr=1.34e-04
+step 155000/200000 train_loss=3.3960 train_policy=2.6460 train_value_ce=0.7500 train_value_q_mse=0.0763 val_loss=3.1934 val_policy=2.4694 val_value_ce=0.7241 val_value_q_mse=0.0675 lr=1.29e-04
+step 156000/200000 train_loss=3.0632 train_policy=2.3426 train_value_ce=0.7205 train_value_q_mse=0.0601 val_loss=3.1951 val_policy=2.4673 val_value_ce=0.7277 val_value_q_mse=0.0692 lr=1.24e-04
+step 157000/200000 train_loss=3.1625 train_policy=2.4739 train_value_ce=0.6885 train_value_q_mse=0.0644 val_loss=3.2001 val_policy=2.4686 val_value_ce=0.7315 val_value_q_mse=0.0703 lr=1.19e-04
+step 158000/200000 train_loss=3.0276 train_policy=2.3410 train_value_ce=0.6866 train_value_q_mse=0.0456 val_loss=3.1942 val_policy=2.4664 val_value_ce=0.7277 val_value_q_mse=0.0691 lr=1.14e-04
+step 159000/200000 train_loss=3.1791 train_policy=2.6966 train_value_ce=0.4825 train_value_q_mse=0.0204 val_loss=3.1988 val_policy=2.4683 val_value_ce=0.7306 val_value_q_mse=0.0699 lr=1.09e-04
+step 160000/200000 train_loss=3.1021 train_policy=2.1612 train_value_ce=0.9409 train_value_q_mse=0.2133 val_loss=3.2042 val_policy=2.4682 val_value_ce=0.7360 val_value_q_mse=0.0714 lr=1.05e-04
+step 161000/200000 train_loss=3.1243 train_policy=2.5435 train_value_ce=0.5808 train_value_q_mse=0.0244 val_loss=3.1861 val_policy=2.4644 val_value_ce=0.7217 val_value_q_mse=0.0664 lr=1.00e-04
+step 162000/200000 train_loss=3.3631 train_policy=2.3779 train_value_ce=0.9852 train_value_q_mse=0.1064 val_loss=3.1896 val_policy=2.4647 val_value_ce=0.7248 val_value_q_mse=0.0675 lr=9.56e-05
+step 163000/200000 train_loss=3.2070 train_policy=2.5746 train_value_ce=0.6324 train_value_q_mse=0.0223 val_loss=3.1896 val_policy=2.4651 val_value_ce=0.7245 val_value_q_mse=0.0677 lr=9.13e-05
+step 164000/200000 train_loss=3.1565 train_policy=2.3198 train_value_ce=0.8367 train_value_q_mse=0.0520 val_loss=3.1850 val_policy=2.4652 val_value_ce=0.7198 val_value_q_mse=0.0658 lr=8.71e-05
+step 165000/200000 train_loss=3.1805 train_policy=2.4755 train_value_ce=0.7050 train_value_q_mse=0.0694 val_loss=3.1878 val_policy=2.4643 val_value_ce=0.7235 val_value_q_mse=0.0676 lr=8.29e-05
+step 166000/200000 train_loss=3.0964 train_policy=2.2249 train_value_ce=0.8714 train_value_q_mse=0.1294 val_loss=3.1834 val_policy=2.4629 val_value_ce=0.7205 val_value_q_mse=0.0656 lr=7.89e-05
+step 167000/200000 train_loss=3.4518 train_policy=2.6185 train_value_ce=0.8333 train_value_q_mse=0.0899 val_loss=3.1893 val_policy=2.4643 val_value_ce=0.7250 val_value_q_mse=0.0677 lr=7.50e-05
+step 168000/200000 train_loss=3.3152 train_policy=2.4526 train_value_ce=0.8625 train_value_q_mse=0.0836 val_loss=3.1888 val_policy=2.4647 val_value_ce=0.7241 val_value_q_mse=0.0673 lr=7.12e-05
+step 169000/200000 train_loss=3.1543 train_policy=2.3977 train_value_ce=0.7566 train_value_q_mse=0.0924 val_loss=3.1834 val_policy=2.4626 val_value_ce=0.7209 val_value_q_mse=0.0662 lr=6.75e-05
+step 170000/200000 train_loss=2.8426 train_policy=2.7217 train_value_ce=0.1210 train_value_q_mse=0.0009 val_loss=3.1887 val_policy=2.4639 val_value_ce=0.7248 val_value_q_mse=0.0677 lr=6.40e-05
+step 171000/200000 train_loss=3.2395 train_policy=2.7005 train_value_ce=0.5389 train_value_q_mse=0.0131 val_loss=3.1903 val_policy=2.4621 val_value_ce=0.7281 val_value_q_mse=0.0690 lr=6.05e-05
+step 172000/200000 train_loss=3.2964 train_policy=2.4446 train_value_ce=0.8518 train_value_q_mse=0.0554 val_loss=3.1852 val_policy=2.4619 val_value_ce=0.7233 val_value_q_mse=0.0672 lr=5.71e-05
+step 173000/200000 train_loss=3.3838 train_policy=2.7221 train_value_ce=0.6617 train_value_q_mse=0.0520 val_loss=3.1940 val_policy=2.4643 val_value_ce=0.7297 val_value_q_mse=0.0698 lr=5.39e-05
+step 174000/200000 train_loss=3.3122 train_policy=2.5781 train_value_ce=0.7341 train_value_q_mse=0.0839 val_loss=3.1850 val_policy=2.4615 val_value_ce=0.7235 val_value_q_mse=0.0667 lr=5.07e-05
+step 175000/200000 train_loss=3.5042 train_policy=2.5506 train_value_ce=0.9536 train_value_q_mse=0.0739 val_loss=3.1872 val_policy=2.4620 val_value_ce=0.7252 val_value_q_mse=0.0678 lr=4.77e-05
+step 176000/200000 train_loss=3.2290 train_policy=2.4247 train_value_ce=0.8043 train_value_q_mse=0.1129 val_loss=3.1796 val_policy=2.4605 val_value_ce=0.7191 val_value_q_mse=0.0655 lr=4.48e-05
+step 177000/200000 train_loss=3.2732 train_policy=2.4558 train_value_ce=0.8174 train_value_q_mse=0.0853 val_loss=3.1802 val_policy=2.4599 val_value_ce=0.7203 val_value_q_mse=0.0662 lr=4.20e-05
+step 178000/200000 train_loss=3.3033 train_policy=2.5473 train_value_ce=0.7560 train_value_q_mse=0.0426 val_loss=3.1803 val_policy=2.4606 val_value_ce=0.7197 val_value_q_mse=0.0656 lr=3.93e-05
+step 179000/200000 train_loss=3.3155 train_policy=2.5626 train_value_ce=0.7530 train_value_q_mse=0.0752 val_loss=3.1822 val_policy=2.4605 val_value_ce=0.7217 val_value_q_mse=0.0663 lr=3.67e-05
+step 180000/200000 train_loss=3.1807 train_policy=2.2795 train_value_ce=0.9012 train_value_q_mse=0.0910 val_loss=3.1837 val_policy=2.4609 val_value_ce=0.7227 val_value_q_mse=0.0667 lr=3.42e-05
+step 181000/200000 train_loss=3.2438 train_policy=2.5728 train_value_ce=0.6710 train_value_q_mse=0.0336 val_loss=3.1835 val_policy=2.4602 val_value_ce=0.7233 val_value_q_mse=0.0669 lr=3.19e-05
+step 182000/200000 train_loss=3.2447 train_policy=2.5780 train_value_ce=0.6667 train_value_q_mse=0.0278 val_loss=3.1807 val_policy=2.4600 val_value_ce=0.7207 val_value_q_mse=0.0656 lr=2.97e-05
+step 183000/200000 train_loss=3.2678 train_policy=2.6526 train_value_ce=0.6151 train_value_q_mse=0.0201 val_loss=3.1888 val_policy=2.4610 val_value_ce=0.7279 val_value_q_mse=0.0686 lr=2.75e-05
+step 184000/200000 train_loss=3.2121 train_policy=2.7153 train_value_ce=0.4968 train_value_q_mse=0.0058 val_loss=3.1864 val_policy=2.4616 val_value_ce=0.7248 val_value_q_mse=0.0677 lr=2.56e-05
+step 185000/200000 train_loss=2.7192 train_policy=2.3638 train_value_ce=0.3553 train_value_q_mse=0.0088 val_loss=3.1869 val_policy=2.4614 val_value_ce=0.7255 val_value_q_mse=0.0677 lr=2.37e-05
+step 186000/200000 train_loss=3.1171 train_policy=2.3410 train_value_ce=0.7761 train_value_q_mse=0.0486 val_loss=3.1875 val_policy=2.4599 val_value_ce=0.7276 val_value_q_mse=0.0690 lr=2.19e-05
+step 187000/200000 train_loss=3.1766 train_policy=2.4664 train_value_ce=0.7102 train_value_q_mse=0.0244 val_loss=3.1788 val_policy=2.4589 val_value_ce=0.7199 val_value_q_mse=0.0656 lr=2.03e-05
+step 188000/200000 train_loss=3.2518 train_policy=2.6021 train_value_ce=0.6497 train_value_q_mse=0.0395 val_loss=3.1843 val_policy=2.4606 val_value_ce=0.7237 val_value_q_mse=0.0676 lr=1.88e-05
+step 189000/200000 train_loss=3.0834 train_policy=2.4932 train_value_ce=0.5902 train_value_q_mse=0.0419 val_loss=3.1871 val_policy=2.4603 val_value_ce=0.7268 val_value_q_mse=0.0686 lr=1.74e-05
+step 190000/200000 train_loss=3.1266 train_policy=2.3711 train_value_ce=0.7555 train_value_q_mse=0.0729 val_loss=3.1830 val_policy=2.4603 val_value_ce=0.7227 val_value_q_mse=0.0664 lr=1.61e-05
+step 191000/200000 train_loss=3.3988 train_policy=2.7258 train_value_ce=0.6731 train_value_q_mse=0.0345 val_loss=3.1838 val_policy=2.4598 val_value_ce=0.7240 val_value_q_mse=0.0672 lr=1.49e-05
+step 192000/200000 train_loss=3.2237 train_policy=2.5554 train_value_ce=0.6683 train_value_q_mse=0.0246 val_loss=3.1805 val_policy=2.4590 val_value_ce=0.7215 val_value_q_mse=0.0660 lr=1.39e-05
+step 193000/200000 train_loss=3.3638 train_policy=2.5606 train_value_ce=0.8031 train_value_q_mse=0.0484 val_loss=3.1808 val_policy=2.4594 val_value_ce=0.7214 val_value_q_mse=0.0659 lr=1.30e-05
+step 194000/200000 train_loss=3.0250 train_policy=2.1496 train_value_ce=0.8753 train_value_q_mse=0.0713 val_loss=3.1859 val_policy=2.4603 val_value_ce=0.7255 val_value_q_mse=0.0676 lr=1.22e-05
+step 195000/200000 train_loss=3.4148 train_policy=2.6835 train_value_ce=0.7313 train_value_q_mse=0.0523 val_loss=3.1844 val_policy=2.4612 val_value_ce=0.7232 val_value_q_mse=0.0668 lr=1.15e-05
+step 196000/200000 train_loss=3.3218 train_policy=2.5936 train_value_ce=0.7281 train_value_q_mse=0.0303 val_loss=3.1801 val_policy=2.4597 val_value_ce=0.7204 val_value_q_mse=0.0653 lr=1.10e-05
+step 197000/200000 train_loss=3.0339 train_policy=2.6831 train_value_ce=0.3508 train_value_q_mse=0.0106 val_loss=3.1898 val_policy=2.4614 val_value_ce=0.7283 val_value_q_mse=0.0685 lr=1.05e-05
+step 198000/200000 train_loss=3.0836 train_policy=2.1749 train_value_ce=0.9087 train_value_q_mse=0.0860 val_loss=3.1816 val_policy=2.4595 val_value_ce=0.7221 val_value_q_mse=0.0665 lr=1.02e-05
+step 199000/200000 train_loss=3.3086 train_policy=2.5211 train_value_ce=0.7875 train_value_q_mse=0.0172 val_loss=3.1781 val_policy=2.4583 val_value_ce=0.7199 val_value_q_mse=0.0654 lr=1.01e-05
+step 200000/200000 train_loss=2.8904 train_policy=2.6754 train_value_ce=0.2150 train_value_q_mse=0.0196 val_loss=3.1829 val_policy=2.4604 val_value_ce=0.7225 val_value_q_mse=0.0667 lr=1.00e-05

@@ -4,8 +4,10 @@ use std::sync::{Arc, Mutex};
 use xiangqi_core::types::Move;
 use xiangqi_core::write_move_uci_bytes;
 use xiangqi_core::Position;
+use xiangqi_core::Color;
 
 use crate::policy_onnx::PolicyOnnx;
+use crate::px0_policy::px0_policy_index;
 
 pub type SharedPolicy = Option<Arc<Mutex<PolicyOnnx>>>;
 
@@ -20,7 +22,7 @@ pub struct PolicyValueInput<'a> {
 pub struct PolicyValueOutput {
     /// 与 `legal_moves` 对齐的先验分布。
     pub priors: Vec<f32>,
-    /// 当前行棋方视角 value，范围预期为 [-1, 1]。
+    /// 当前行棋方视角 q = w - l，范围预期为 [-1, 1]。
     pub value: f32,
 }
 
@@ -51,13 +53,16 @@ impl<'a> PolicyValueEval for OnnxPolicyValueEval<'a> {
 
         let mut priors = Vec::with_capacity(input.legal_moves.len());
         let mut scratch = [0u8; 8];
+        let black_to_move = input.position.side_to_move == Color::Black;
         for mv in input.legal_moves {
             let len = write_move_uci_bytes(*mv, &mut scratch);
             let u = std::str::from_utf8(&scratch[..len]).map_err(|e| e.to_string())?;
             let prior = self
                 .vocab
                 .get(u)
-                .and_then(|&idx| out.logits.get(idx))
+                .copied()
+                .or_else(|| px0_policy_index(*mv, black_to_move))
+                .and_then(|idx| out.logits.get(idx))
                 .copied()
                 .unwrap_or(0.0);
             priors.push(prior);
@@ -67,7 +72,10 @@ impl<'a> PolicyValueEval for OnnxPolicyValueEval<'a> {
 
         Ok(PolicyValueOutput {
             priors,
-            value: out.value.unwrap_or(0.0).clamp(-1.0, 1.0),
+            value: out
+                .wdl
+                .map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0))
+                .unwrap_or(0.0),
         })
     }
 }

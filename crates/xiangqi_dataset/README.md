@@ -1,47 +1,28 @@
 # xiangqi_dataset
 
-维护者侧数据工具，只保留第一阶段主线能力：
+这是维护者侧最小数据工具 crate。
 
-- 生成 canonical `move_vocab.json`
-- 把 PGN 转成 `XRSH v5`
-- 对人类局面跑 MCTS，并把搜索标注继续写成 `XRSH v5`
+当前定位已经降级为辅助工具，只保留：
 
-## 主要命令
+- PGN / 词表相关工具
+- XRSH 相关工具
+- 小批量本地搜索标注
 
-```bash
-cargo run --release -p xiangqi_dataset -- vocab-enum --out data/move_vocab.json
+注意：
 
-cargo run --release -p xiangqi_dataset -- pgn-shards \
-  --pgn data/corpus.pgns \
-  --vocab data/move_vocab.json \
-  --out-dir data/xrsh_train \
-  --jobs 0 \
-  --games-per-shard 500
+- 它不再承担主规模训练数据生产
+- 当前主训练数据路线已经切到 `px0 / lc0` 风格外部数据
 
-cargo run --release -p xiangqi_dataset -- search-label-pgn \
-  --pgn data/corpus.pgns \
-  --vocab data/move_vocab.json \
-  --out-dir data/xrsh_search \
-  --onnx data/policy.onnx \
-  --playouts 256
-```
+## 什么时候还会用到它
 
-## XRSH v5
+- 你要做少量规则联调
+- 你要做少量本地搜索补点
+- 你要验证旧的人类数据支线
 
-当前格式只保留主线字段：
+## 什么时候不该再用它
 
-- `target_idx`
-- `legal_idx`
-- `game_result_red`
-- `ply_total`
-- `search_q`
-- `search_visits`
-- `search_counts`
+- 你要扩主规模训练数据
+- 你要快速做 value 数据扩样本
+- 你要跑长期 baseline
 
-不再写入辅助语义头字段。
-
-## 测试
-
-```bash
-cargo test -p xiangqi_dataset
-```
+这些现在都应该回到 `px0` 主线去做。

@@ -322,9 +322,15 @@ fn main() {
             }
         }
 
-        print!("value(onnx): ");
-        if let Some(v) = out.value {
-            println!("{v:.6}");
+        print!("wdl(onnx): ");
+        if let Some(wdl) = out.wdl {
+            println!(
+                "w={:.6} d={:.6} l={:.6} q={:.6}",
+                wdl[0],
+                wdl[1],
+                wdl[2],
+                wdl[0] - wdl[2]
+            );
         } else {
             println!("None");
         }

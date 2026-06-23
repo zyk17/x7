@@ -1,30 +1,38 @@
 # ARCHITECTURE
 
-## 1. 项目边界
+## 1. 目标
 
-这是一个围绕 **MCTS + 小型 policy/value 网络** 的象棋项目。
+这是一个围绕 `MCTS + 小型 policy/value` 的象棋项目。
 
-当前只保留四块基础设施：
+当前阶段只有两个核心目标：
 
-1. 规则内核
-2. MCTS 搜索引擎
-3. 数据集生产与搜索标注
-4. policy/value 训练与导出
+1. 稳定维护一条可用的搜索与推理主链路
+2. 用 `px0` 风格数据持续训练一个小而正确的 baseline
 
-当前明确不做：
+## 2. 当前主路线
 
-- Alpha-Beta 主路线
-- 复盘语义头
-- 多格式长期并存
-- 分布式训练平台
+主路线已经固定为：
 
-## 2. 模块职责
+- 搜索：`MCTS`
+- 训练数据：`px0 / lc0` 风格外部 chunk
+- 模型：小型 shared trunk + `policy/value`
+- value 监督：`WDL + qMix`
+
+当前不再把下面这些当主线：
+
+- `XRSH` 扩样本
+- 本地大规模搜索标注
+- `15 planes + move_vocab` 的长期正式 I/O
+- Alpha-Beta 搜索
+
+## 3. 模块职责
 
 ### `crates/xiangqi_core`
 
 职责：
 
-- FEN / 局面表示
+- 局面表示
+- FEN
 - 合法着生成
 - do / undo
 - 终局判断
@@ -39,148 +47,114 @@
 
 职责：
 
-- MCTS 节点与树结构
-- selection / expansion / backup
-- policy/value ONNX 推理接入
-- UCI 入口
-- benchmark / 最小调试统计
+- MCTS 树与搜索循环
+- ONNX policy/value 推理接入
+- UCI
+- benchmark / 调试统计
 
 约束：
 
-- 搜索核心尽量同时服务线上走棋与离线搜索标注
-- 不承担数据集打包职责
-- 搜索预算口径统一为 `playouts / nodes / deadline`
+- 搜索预算口径统一成 `playouts / nodes / deadline`
+- 线上与离线尽量共用一套搜索核心
+- 不再扩 Alpha-Beta 主线
 
 ### `crates/xiangqi_dataset`
 
 职责：
 
-- PGN 解析
-- canonical 词表生成
-- PGN -> XRSH
-- 对人类局面跑 MCTS，并把搜索标签写回 XRSH
+- 最小数据辅助工具
+- 保留 PGN / XRSH / 小批量搜索标注能力
 
 约束：
 
-- 维护者工具，不塞进用户引擎进程
-- 只保留一个正式训练格式
+- 不承担主规模训练数据生产
+- 不再向“本地大规模数据平台”演化
 
 ### `nn/`
 
 职责：
 
-- `policy` 训练
-- `value` 训练
-- 搜索 visit 分布蒸馏
-- checkpoint / ONNX 导出
+- 读取 `px0 v6` chunk
+- 训练小型 `policy + value`
+- 导出 ONNX
 
 约束：
 
-- 不重新实现规则
-- 不重新实现搜索
-- 只消费物化后的样本
+- 不重写规则
+- 不重写搜索
+- 优先对齐 `px0 classical` 的数据与网络契约
 
-## 3. 当前网络设计
+## 4. 当前模型契约
 
-当前网络只做：
+### 输入
 
-- `policy logits`
-- 可选 `value logit`
+- 形状：`124 x 10 x 9`
+- 数据来源：`px0 v6`
+- 当前只支持：`classical input_format=1`
+- 不含历史
 
-结构上保持简单：
+### 输出
 
-- shared ResNet trunk
-- 全局池化
-- `fc` 输出 policy
-- 可选 `fc_value` 输出 value
+- policy：`2062` 维 logits
+- value：`3-way WDL`
 
-当前不保留：
+### 网络
 
-- `danger`
-- `attack`
-- `tactical`
-- 额外复杂 head 组合
+- shared trunk：`stem + residual blocks`
+- policy head：`1x1 conv -> flatten -> linear(2062)`
+- value head：`1x1 conv -> flatten -> mlp -> wdl(3)`
 
-## 4. 数据契约
+### value 语义
 
-当前正式格式：**XRSH v5**
+- 主训练 target：`q_ratio * search_wdl + (1 - q_ratio) * winner_wdl`
+- 当前默认：`q_ratio=1.0`
+- ONNX 导出：`value` 为 WDL 概率
+- 引擎消费：派生 `q = W - L`
 
-设计目标：
+这里的关键取舍是：
 
-- 同时容纳人类 policy 样本与搜索标注样本
-- 不引入 proto / 多平台交换层
-- 本地单机训练优先
+- 保持网络小
+- 保持实现清楚
+- 但不再用 `global average pooling -> single linear` 这种会过早抹掉空间信息的 policy 头
 
-单条样本字段：
+## 5. 数据策略
 
-- `fen`
-- `root_fen`
-- `uci_prefix`
-- `target_idx`
-- `legal_idx`
-- `ply`
-- `game_result_red`
-- `ply_total`
-- `search_q`
-- `search_visits`
-- `search_counts`
+当前默认策略：
 
-约定：
+1. 先纯 `px0`
+2. 不预设人类数据混入
+3. 后续只有在复盘解释或 second-stage fine-tune 明确有效时，再引入人类数据
 
-- 没有搜索标注时，`search_visits == 0`
-- `search_counts` 与 `legal_idx` 对齐
-- `search_q` 为当前行棋方视角 value 标签
-- `search_visits` 当前记录搜索 playout 数
+因此本地 `XRSH` 当前只剩下两种角色：
 
-## 5. 当前 UCI / Benchmark 语义
+- 调试工具
+- 可选的小支线实验
 
-- `setoption name Playouts` 是默认搜索预算入口
-- `setoption name Visits` 仅作兼容别名
-- `go nodes` 对应树总节点预算
-- `go movetime` 对应时间预算
-- `go infinite` 保留支持
-- `go depth` 目前明确不支持，不做伪兼容
-- `info` 与 benchmark 统一输出：
-  - `playouts`
-  - `root_visits`
-  - `nodes`
-  - `nps`
+如果你决定彻底不走这条支线，仓库内的 `XRSH` 数据、旧 checkpoint、旧 ONNX 都可以删除。
 
-## 6. 训练主线
+## 6. 现在真正要维护的地基
 
-第一阶段只做 `policy + value + MCTS` 闭环。
+真正需要稳定维护的只有这些：
 
-推荐顺序：
+1. `xiangqi_core` 规则正确
+2. `engin` 的 MCTS / UCI / ONNX 语义一致
+3. `px0_record.py` 和 `dataset_px0.py` 能稳定读数据
+4. `train_px0.py` 能稳定长跑、保存、恢复、导出
+5. 导出的 ONNX 契约与引擎消费侧一致
 
-1. 用大师棋谱打稳 `policy`
-2. 对人类局面跑 MCTS，得到 `search_q + visit distribution`
-3. 用 `search_q` 训练 `value`
-4. 视情况用 `search_counts` 辅助蒸馏 policy
-5. 小规模、分轮次、自对弈补冷门局面
-6. 受控混合人类数据与搜索数据继续训练
+## 7. 删除原则
 
-## 7. 自对弈原则
+仓库内可以不保留的内容：
 
-自对弈不是海量主数据源，而是受控增量源。
+- 旧 `*.pt`
+- 旧 `*.onnx`
+- `data/xrsh_*`
+- 旧人类 baseline 数据
+- 旧实验 CSV / 临时统计
 
-原则：
+仓库内建议保留的最小数据文件：
 
-- 按轮次推进
-- 每轮数据量不大
-- 优先补冷门局面
-- 优先补 value 信号
-- 始终让人类数据保持锚点
+- `data/rounds/px0_train_v1.json`
+- `data/rounds/px0_val_v1.json`
 
-## 8. 稳定文档
-
-长期稳定文档只保留：
-
-- `README.MD`
-- `ARCHITECTURE.md`
-- `AGENTS.md`
-
-临时文档只保留：
-
-- `NextStep.md`
-- `TODO.md`
-- `temp.md`
+它们只是分片清单，体积相对小，而且能直接复用你的本地 px0 数据目录。

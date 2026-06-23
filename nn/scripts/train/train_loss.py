@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from nn.model import policy_cross_entropy, soft_policy_cross_entropy, value_head_tanh_mse
+from nn.model import policy_cross_entropy, soft_policy_cross_entropy, value_wdl_cross_entropy
 
 
 def compute_policy_value_loss(
@@ -21,7 +21,6 @@ def compute_policy_value_loss(
     visit_target: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
     value_loss_weight: float = 0.5,
-    value_target_weight_alpha: float = 1.0,
     value_min_visits: int = 1,
     search_policy_weight: float = 0.0,
 ) -> torch.Tensor:
@@ -36,10 +35,9 @@ def compute_policy_value_loss(
         value_mask = search_visits >= int(value_min_visits)
         value_weights = weights * value_mask.to(weights.dtype)
         if value_weights.sum() > 0:
-            loss = loss + float(value_loss_weight) * value_head_tanh_mse(
+            loss = loss + float(value_loss_weight) * value_wdl_cross_entropy(
                 pred_value,
                 t_val,
-                target_weight_alpha=float(value_target_weight_alpha),
                 sample_weight=value_weights,
             )
     if search_policy_head and visit_target is not None:

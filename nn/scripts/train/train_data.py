@@ -13,7 +13,7 @@ from nn.dataset_batch import collate_xrsh_samples
 from nn.dataset_xrsh import MixedPolicyXrshDataset, PolicyXrshDataset
 from nn.xrsh_io import xrsh_dir_is_complete
 
-from train_common import GameGroupedBatchSampler, TRAIN_SEED, default_num_workers
+from train_common import GameGroupedBatchSampler, TRAIN_SEED
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 

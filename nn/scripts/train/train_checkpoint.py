@@ -62,6 +62,8 @@ def assert_ckpt_compatible(
         )
     if bool(ckpt.get("value_head", False)) != bool(value_head):
         raise ValueError("checkpoint value_head 配置与本次训练不一致")
+    if value_head and ckpt.get("value_head_format") not in (None, "wdl"):
+        raise ValueError("checkpoint value_head_format 与当前 WDL value 不一致")
 
 
 def load_resume(
@@ -106,6 +108,41 @@ def load_resume(
     return start_epoch, best_val_loss, best_epoch, scheduler, ckpt
 
 
+def load_init_weights(
+    init_path: Path,
+    model: torch.nn.Module,
+    *,
+    moves: list[str],
+    n_moves: int,
+    width: int,
+    blocks: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    ckpt = torch.load(init_path, map_location=device)
+    if int(ckpt.get("n_moves", -1)) != n_moves:
+        raise ValueError(
+            f"init checkpoint n_moves={ckpt.get('n_moves')} 与当前词表长度 {n_moves} 不一致"
+        )
+    if ckpt.get("moves") is not None and ckpt["moves"] != moves:
+        raise ValueError("init checkpoint 中的 moves 列表与 --vocab 不一致")
+    if int(ckpt.get("width", -1)) != width:
+        raise ValueError(
+            f"init checkpoint width={ckpt.get('width')} 与 --width={width} 不一致"
+        )
+    if int(ckpt.get("blocks", -1)) != blocks:
+        raise ValueError(
+            f"init checkpoint blocks={ckpt.get('blocks')} 与 --blocks={blocks} 不一致"
+        )
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    if unexpected:
+        raise ValueError(f"init checkpoint 含未知参数: {unexpected}")
+    print(
+        f"init from {init_path} | missing={len(missing)} "
+        f"({' '.join(missing[:4]) + (' ...' if len(missing) > 4 else '')})"
+    )
+    return ckpt
+
+
 def checkpoint_payload(
     *,
     model: torch.nn.Module,
@@ -123,15 +160,17 @@ def checkpoint_payload(
 ) -> dict[str, Any]:
     return {
         "model": model.state_dict(),
+        "in_planes": int(getattr(model, "in_planes", 15)),
         "width": args.width,
         "blocks": args.blocks,
         "n_moves": n_moves,
         "moves": moves,
         "value_head": value_head,
+        "value_head_format": "wdl" if value_head else "off",
         "value_head_hidden_dim": int(args.value_head_hidden_dim),
-        "value_target_kind": "search_q",
+        "value_target_kind": "qmix_wdl" if value_head else "off",
         "value_loss_weight": float(args.value_loss_weight),
-        "value_target_weight_alpha": float(args.value_target_weight_alpha),
+        "q_ratio": float(getattr(args, "q_ratio", 0.0)),
         "value_min_visits": int(args.value_min_visits),
         "train_mix": str(args.train_mix) if args.train_mix else None,
         "train_dir": str(args.train_dir) if args.train_dir else None,

@@ -16,25 +16,26 @@
 - 这是新项目，不背历史方案包袱
 - 搜索主路线只有 **MCTS**
 - 网络只保留 **policy + value**
-- `value` 主监督优先是 **search_q**
-- 自对弈只做小批量、分轮次、受控混合
-- 正式训练格式只保留 **XRSH v5**
-- 搜索预算主口径使用 **playouts**
-- `Visits` 只允许作为兼容别名存在
-- 不要再做假的 `go depth` 兼容
+- 主训练数据路线改为 **px0 / lc0 风格外部数据**
+- 当前正式模型契约是 **124x10x9 -> 2062 + WDL**
+- 当前 value 主监督是 **WDL + qMix**
+- 当前默认 `q_ratio=1.0`，即搜索 WDL 优先
+- 本地 `XRSH` 只保留为可选调试工具，不再视为默认支线
+- 不再把本地慢速搜索标注当主数据生产方式
+- 不再把 `15 planes + move_vocab + scalar value` 当长期正式 I/O
 
 ## 3. 当前代码边界
 
 - `crates/xiangqi_core`：规则核心
 - `crates/engin`：MCTS、ONNX、UCI
-- `crates/xiangqi_dataset`：词表、PGN、XRSH、搜索标注
-- `nn/`：policy/value 训练与导出
+- `crates/xiangqi_dataset`：最小 PGN / XRSH / 搜索标注工具
+- `nn/`：训练与导出
 
 不要再往仓库里放：
 
 - Alpha-Beta 主线代码
-- 复盘语义头代码
-- 多套正式数据格式
+- 多套正式训练格式长期并存
+- 旧 XRSH 迁移链路
 - 为“未来社区平台”提前做的大抽象
 
 ## 4. 代码规范
@@ -44,8 +45,8 @@
 - 这是高频系统，但前期先保可读性
 - 性能优化应在清晰实现上定点推进
 - 避免重复分配、重复推理、重复序列化
-- Python 只做训练，不搬规则热路径
-- 搜索/benchmark/UCI 的统计口径必须一致
+- Python 只做训练与离线数据，不搬规则热路径
+- 搜索 / benchmark / UCI 的统计口径必须一致
 
 ## 5. 文档规则
 
@@ -61,4 +62,4 @@
 - `TODO.md`
 - `temp.md`
 
-`docs/` 先不承担正式文档角色。
+`docs/` 不承担正式文档角色。

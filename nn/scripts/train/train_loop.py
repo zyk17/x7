@@ -22,7 +22,7 @@ from nn.dataset_batch import (
     move_batch_to_device,
 )
 from nn.metrics import ValMetricsState, format_val_metrics_report
-from nn.model import soft_policy_cross_entropy, value_head_tanh_mse
+from nn.model import soft_policy_cross_entropy, value_q_mse
 
 from train_common import LABEL_SMOOTHING
 from train_loss import compute_policy_value_loss
@@ -82,7 +82,6 @@ def run_train_epoch(
                 visit_target=visit_target,
                 label_smoothing=LABEL_SMOOTHING,
                 value_loss_weight=float(args.value_loss_weight),
-                value_target_weight_alpha=float(args.value_target_weight_alpha),
                 value_min_visits=int(args.value_min_visits),
                 search_policy_weight=float(args.search_policy_weight),
             )
@@ -113,7 +112,7 @@ def run_val_epoch(
     vweight_sum = 0.0
     vcount = 0
     correct = 0
-    value_mse = 0.0
+    value_q_mse_sum = 0.0
     value_eval_count = 0
     search_ce = 0.0
     val_metrics = ValMetricsState()
@@ -151,7 +150,6 @@ def run_val_epoch(
                     visit_target=visit_target,
                     label_smoothing=0.0,
                     value_loss_weight=float(args.value_loss_weight),
-                    value_target_weight_alpha=float(args.value_target_weight_alpha),
                     value_min_visits=int(args.value_min_visits),
                     search_policy_weight=float(args.search_policy_weight),
                 )
@@ -161,8 +159,8 @@ def run_val_epoch(
                         n_val = int(value_mask.sum().item())
                         masked_pred = pred_value[value_mask]
                         masked_tgt = t_val[value_mask]
-                        value_mse += (
-                            value_head_tanh_mse(
+                        value_q_mse_sum += (
+                            value_q_mse(
                                 masked_pred,
                                 masked_tgt,
                                 reduction="mean",
@@ -194,7 +192,7 @@ def run_val_epoch(
         "val_mean": val_mean,
         "acc": correct / max(1, vcount),
         "vcount": vcount,
-        "value_mse": value_mse,
+        "value_q_mse": value_q_mse_sum,
         "value_eval_count": value_eval_count,
         "search_ce": search_ce,
         "val_metrics": val_metrics,
@@ -205,10 +203,12 @@ def run_val_epoch(
 def format_val_log(result: dict[str, Any], *, value_head: bool, search_policy_head: bool) -> str:
     tail = ""
     vcount = int(result["vcount"])
-    if value_head and int(result["value_eval_count"]) > 0:
-        tail += f" | val_value_mse {result['value_mse'] / result['value_eval_count']:.4f} (n={result['value_eval_count']})"
+    value_eval_count = int(result["value_eval_count"])
+    if value_head and value_eval_count > 0:
+        value_q_mse = float(result["value_q_mse"]) / value_eval_count
+        tail += f" | val_value_q_mse {value_q_mse:.4f} (n={value_eval_count})"
     elif value_head and vcount > 0:
-        tail += " | val_value_mse n/a (无 search 标注样本)"
+        tail += " | val_value_q_mse n/a (无 search 标注样本)"
     if search_policy_head and vcount > 0:
         tail += f" | val_search_ce {result['search_ce'] / vcount:.4f}"
     return (

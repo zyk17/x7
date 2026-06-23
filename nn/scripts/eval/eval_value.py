@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""在带 search_q 的 XRSH 上评估 value 头，输出 CSV。"""
+"""在 XRSH 上评估 WDL value 头，输出 CSV。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,15 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from nn.dataset_xrsh import PolicyXrshDataset
+from nn.dataset_batch import (
+    SAMPLE_BOARD,
+    SAMPLE_SEARCH_VISITS,
+    SAMPLE_TARGET,
+    SAMPLE_T_VAL,
+    collate_xrsh_samples,
+)
 from nn.model import PolicyResNet
+from nn.model import wdl_logits_to_q
 from nn.xrsh_io import xrsh_dir_is_complete
 
 
@@ -43,6 +51,7 @@ def main() -> None:
         raise ValueError("checkpoint 未启用 value_head")
 
     model = PolicyResNet(
+        in_planes=int(ckpt.get("in_planes", 15)),
         width=int(ckpt["width"]),
         num_blocks=int(ckpt["blocks"]),
         num_moves=len(moves),
@@ -74,22 +83,35 @@ def main() -> None:
                 "target_idx",
                 "move_uci",
                 "fen",
-                "pred_value",
-                "target_value",
+                "pred_w",
+                "pred_d",
+                "pred_l",
+                "pred_q",
+                "target_w",
+                "target_d",
+                "target_l",
+                "target_q",
                 "search_visits",
-                "sqerr",
+                "q_sqerr",
             ]
         )
         with torch.no_grad():
             for i in range(n):
-                board, mask, target, _weight, t_val, search_visits = ds[i]
+                sample = ds[i]
+                batch = collate_xrsh_samples([sample])
+                board = batch[SAMPLE_BOARD]
+                target = batch[SAMPLE_TARGET][0]
+                t_val = batch[SAMPLE_T_VAL][0]
+                search_visits = batch[SAMPLE_SEARCH_VISITS][0]
                 if int(search_visits.item()) <= 0:
                     continue
-                board = board.unsqueeze(0).to(device)
+                board = board.to(device)
                 logits, pred_value = model(board)
-                pred = float(torch.tanh(pred_value[0]).item())
-                tgt = float(t_val.item())
-                err = (pred - tgt) ** 2
+                pred_probs = torch.softmax(pred_value[0], dim=0)
+                pred_q = float(wdl_logits_to_q(pred_value)[0].item())
+                tgt_probs = t_val.to(torch.float32)
+                tgt_q = float(tgt_probs[0].item() - tgt_probs[2].item())
+                err = (pred_q - tgt_q) ** 2
                 sqerr_sum += err
                 n_labeled += 1
                 ti = int(target.item())
@@ -101,15 +123,21 @@ def main() -> None:
                         ti,
                         idx_to_move.get(ti, ""),
                         "",
-                        pred,
-                        tgt,
+                        float(pred_probs[0].item()),
+                        float(pred_probs[1].item()),
+                        float(pred_probs[2].item()),
+                        pred_q,
+                        float(tgt_probs[0].item()),
+                        float(tgt_probs[1].item()),
+                        float(tgt_probs[2].item()),
+                        tgt_q,
                         int(search_visits.item()),
                         err,
                     ]
                 )
 
     mse = sqerr_sum / max(1, n_labeled)
-    print(f"labeled_rows={n_labeled} value_mse={mse:.6f} -> {args.out}")
+    print(f"labeled_rows={n_labeled} value_q_mse={mse:.6f} -> {args.out}")
 
 
 if __name__ == "__main__":

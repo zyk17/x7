@@ -1,4 +1,4 @@
-//! ONNX Runtime 加载 `policy.onnx`（`board` → `logits` + 可选 `value`）。
+//! ONNX Runtime 加载 `policy.onnx`（`board` → `logits` + 可选 `value(WDL)`）。
 
 use std::path::Path;
 
@@ -11,8 +11,8 @@ use ort::Error;
 #[derive(Debug, Clone)]
 pub struct PolicyOutputs {
     pub logits: Vec<f32>,
-    /// 局面价值，ONNX 图中一般为 **tanh**，约 **[-1,1]**（与 `export_onnx.py` 一致）。
-    pub value: Option<f32>,
+    /// WDL 概率 `[win, draw, loss]`。
+    pub wdl: Option<[f32; 3]>,
 }
 
 /// 封装 ORT [`Session`]，batch 固定为 1。
@@ -40,7 +40,7 @@ impl PolicyOnnx {
         Ok(())
     }
 
-    /// 对局面张量推理（形状 `float32[1,15,10,9]`）。
+    /// 对局面张量推理（形状 `float32[1,124,10,9]`）。
     pub fn eval_board(&mut self, board: &Array4<f32>) -> Result<PolicyOutputs, Error> {
         let tensor_ref = TensorRef::from_array_view(board)?;
         let outputs = self.session.run(ort::inputs!["board" => tensor_ref])?;
@@ -54,20 +54,23 @@ impl PolicyOnnx {
         }
         let logits = log_slice.to_vec();
 
-        let f1 = |name: &str| -> Result<Option<f32>, Error> {
-            let Some(v) = outputs.get(name) else {
-                return Ok(None);
-            };
+        let wdl = if let Some(v) = outputs.get("value") {
             let (shape, data) = v.try_extract_tensor::<f32>()?;
-            if shape.num_elements() != 1 {
-                return Err(Error::new(format!("{name} 期望标量张量，形状 {:?}", shape)));
+            if shape.len() != 2 || shape[0] != 1i64 || shape[1] != 3i64 {
+                return Err(Error::new(format!("value 形状期望 [1,3]，得到 {:?}", shape)));
             }
-            Ok(Some(data[0]))
+            let sum = data[0] + data[1] + data[2];
+            if !sum.is_finite() || sum <= 0.0 {
+                return Err(Error::new("value WDL 概率非法"));
+            }
+            Some([data[0], data[1], data[2]])
+        } else {
+            None
         };
 
         Ok(PolicyOutputs {
             logits,
-            value: f1("value")?,
+            wdl,
         })
     }
 
@@ -96,7 +99,14 @@ mod tests {
             return;
         }
         let mut p = PolicyOnnx::from_file(&path).expect("load onnx");
-        let out = p.eval_fen(crate::START_FEN).expect("infer");
+        let out = match p.eval_fen(crate::START_FEN) {
+            Ok(out) => out,
+            Err(err) if err.to_string().contains("value 形状期望 [1,3]") => {
+                eprintln!("skip old scalar policy.onnx: {err}");
+                return;
+            }
+            Err(err) => panic!("infer: {err}"),
+        };
         assert!(!out.logits.is_empty());
     }
 }

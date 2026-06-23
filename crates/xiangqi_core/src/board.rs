@@ -512,7 +512,6 @@ pub struct UndoFrame {
 /// FEN 棋子字符表：`" RACPNBK racpnbk"`
 pub const PIECE_TO_CHAR: &str = " RACPNBK racpnbk";
 
-#[derive(Clone)]
 pub struct Position {
     /// 每格棋子；空为 `NO_PIECE`。
     pub board: [Piece; SQUARE_NB],
@@ -540,6 +539,22 @@ pub struct Position {
 
     /// Zobrist 表（通常来自全局一次初始化）。
     pub zobrist: &'static Zobrist,
+}
+
+impl Clone for Position {
+    fn clone(&self) -> Self {
+        Self {
+            board: self.board,
+            piece_count: self.piece_count,
+            mid_encoding: self.mid_encoding,
+            state: self.state.clone(),
+            side_to_move: self.side_to_move,
+            game_ply: self.game_ply,
+            filter: self.filter.clone(),
+            undo_stack: self.undo_stack.clone(),
+            zobrist: self.zobrist,
+        }
+    }
 }
 
 impl Position {

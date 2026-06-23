@@ -352,7 +352,7 @@ impl Engine {
     }
 
     fn spawn_go(&mut self, params: GoParams) {
-        let pos = self.pos.clone_for_search();
+        let pos = self.pos.clone();
         let policy = self.policy.clone();
         let vocab = Arc::clone(&self.vocab);
         let mut budget = match self.budget_from_go(&params) {

@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use xiangqi_dataset::{
-    collect_vocab_moves_from_pgn_with_jobs, enumerate_canonical_vocab_moves, export_search_label_shard_from_pgn,
-    run_pgn_shards, write_vocab_json, SearchLabelExportConfig,
+    collect_vocab_moves_from_pgn_with_jobs, enumerate_canonical_vocab_moves, export_search_label_shard_from_manifest,
+    export_search_label_shard_from_pgn, run_pgn_shards, write_vocab_json, SearchLabelExportConfig,
 };
 
 #[derive(Parser)]
@@ -73,6 +73,31 @@ enum Cmd {
         max_rows_per_game: usize,
         #[arg(long)]
         round: Option<u32>,
+        /// 并行 worker 数：0 = 本机可用并行度
+        #[arg(long, default_value_t = 0usize)]
+        jobs: usize,
+    },
+    /// 从已筛好的 manifest 对局面跑 MCTS，导出带搜索标注的 XRSH
+    SearchLabelManifest {
+        #[arg(long, required = true)]
+        manifest: PathBuf,
+        #[arg(long, required = true)]
+        vocab: PathBuf,
+        #[arg(long, required = true)]
+        out_dir: PathBuf,
+        #[arg(long)]
+        onnx: Option<PathBuf>,
+        #[arg(long, visible_alias = "visits", default_value_t = 256u32)]
+        playouts: u32,
+        #[arg(long, default_value_t = 1.25f32)]
+        cpuct: f32,
+        #[arg(long, default_value_t = 0usize)]
+        max_rows: usize,
+        #[arg(long)]
+        round: Option<u32>,
+        /// 并行 worker 数：0 = 本机可用并行度
+        #[arg(long, default_value_t = 0usize)]
+        jobs: usize,
     },
 }
 
@@ -116,6 +141,7 @@ fn main() -> Result<()> {
             max_games,
             max_rows_per_game,
             round,
+            jobs,
         } => {
             let n = export_search_label_shard_from_pgn(
                 &pgn,
@@ -125,8 +151,38 @@ fn main() -> Result<()> {
                 &SearchLabelExportConfig {
                     max_playouts: playouts,
                     max_games,
+                    max_rows: 0,
                     max_rows_per_game,
                     cpuct,
+                    jobs,
+                },
+                round,
+            )?;
+            eprintln!("写入 {n} 条搜索标注 XRSH -> {}", out_dir.display());
+        }
+        Cmd::SearchLabelManifest {
+            manifest,
+            vocab,
+            out_dir,
+            onnx,
+            playouts,
+            cpuct,
+            max_rows,
+            round,
+            jobs,
+        } => {
+            let n = export_search_label_shard_from_manifest(
+                &manifest,
+                &vocab,
+                &out_dir,
+                onnx.as_deref(),
+                &SearchLabelExportConfig {
+                    max_playouts: playouts,
+                    max_games: 0,
+                    max_rows,
+                    max_rows_per_game: 0,
+                    cpuct,
+                    jobs,
                 },
                 round,
             )?;
