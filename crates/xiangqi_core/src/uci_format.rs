@@ -76,14 +76,14 @@ fn parse_two_square_uci_move(b: &[u8]) -> Option<(Square, Square, usize)> {
     Some((from, to, j1 + j2))
 }
 
-/// 若 `from` 上为当前行棋方棋子则解析为 [`Move`]（坐标 `a0`～`i9`）。
+/// 在给定局面上解析并校验**合法着**（坐标 `a0`～`i9`）。
 pub fn uci_to_move(pos: &Position, s: &str) -> Option<Move> {
     let m = parse_move_uci(s)?;
     let from = m.from_sq();
     if pos.piece_on(from) == Piece::NO_PIECE || color_of(pos.piece_on(from)) != pos.side_to_move {
         return None;
     }
-    Some(m)
+    pos.legal(m).then_some(m)
 }
 
 #[cfg(test)]
@@ -111,5 +111,11 @@ mod tests {
         let u = crate::legal_moves_uci(&pos).into_iter().next().expect("legal");
         let mv = parse_move_uci(&u).expect("parse");
         assert!(pos.piece_on(mv.from_sq()) != Piece::NO_PIECE);
+    }
+
+    #[test]
+    fn uci_to_move_rejects_illegal_move_in_check() {
+        let pos = Position::from_fen("k3r4/9/9/9/9/9/9/9/9/3AK4 w - - 0 1").unwrap();
+        assert!(uci_to_move(&pos, "d0d1").is_none());
     }
 }

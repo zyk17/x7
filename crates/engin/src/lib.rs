@@ -12,19 +12,20 @@ use std::io;
 pub mod benchmark;
 pub mod eval;
 pub mod fen_tensor;
+pub mod history;
 pub mod mcts;
 pub mod policy_onnx;
 pub mod px0_policy;
 pub mod uci;
-pub mod vocab;
 
 pub use benchmark::{default_benchmark_fen_strings, resolve_data_file, BenchJsonMeta, BenchSessionParams};
 pub use eval::{material_stm, terminal_score};
+pub use history::{PositionHistory, PX0_HISTORY_LEN};
 pub use mcts::{
     EdgeStats, MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsNode, MctsNodeId, MctsSearchResult, MctsTree,
     OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput, SharedPolicy,
 };
-pub use uci::parse_position_uci;
+pub use uci::{parse_position_history_uci, parse_position_uci};
 
 pub use policy_onnx::{PolicyOnnx, PolicyOutputs};
 pub use xiangqi_core::START_FEN;

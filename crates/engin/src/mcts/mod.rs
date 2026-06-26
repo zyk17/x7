@@ -11,5 +11,7 @@ mod tree;
 pub use config::{MctsBudget, MctsConfig};
 pub use engine::{MctsEngine, MctsMoveStat, MctsSearchProgress, MctsSearchResult};
 pub use node::{EdgeStats, MctsNode, MctsNodeId};
-pub use policy_value::{OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput, SharedPolicy};
+pub use policy_value::{
+    OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput, PolicyValueTask, SharedPolicy,
+};
 pub use tree::MctsTree;

@@ -43,6 +43,11 @@ fn px0_index_table() -> &'static [i16; 128 * 128] {
     })
 }
 
+fn px0_moves() -> &'static [&'static str] {
+    static MOVES: OnceLock<Vec<&'static str>> = OnceLock::new();
+    MOVES.get_or_init(|| PX0_POLICY_MOVES.lines().collect()).as_slice()
+}
+
 pub fn px0_policy_index(mv: Move, black_to_move: bool) -> Option<usize> {
     let mapped = if black_to_move {
         Move::make(flip_rank(mv.from_sq()), flip_rank(mv.to_sq()))
@@ -51,4 +56,17 @@ pub fn px0_policy_index(mv: Move, black_to_move: bool) -> Option<usize> {
     };
     let idx = px0_index_table()[packed_idx(mapped)];
     (idx >= 0).then_some(idx as usize)
+}
+
+pub fn px0_policy_move(index: usize, black_to_move: bool) -> Option<Move> {
+    let uci = *px0_moves().get(index)?;
+    let bytes = uci.as_bytes();
+    let from = parse_square(&bytes[0..2])?;
+    let to = parse_square(&bytes[2..4])?;
+    let mapped = if black_to_move {
+        Move::make(flip_rank(from), flip_rank(to))
+    } else {
+        Move::make(from, to)
+    };
+    Some(mapped)
 }

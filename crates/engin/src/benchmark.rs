@@ -1,6 +1,5 @@
 //! 固定局面 MCTS 基准，输出 NDJSON。
 
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -9,6 +8,7 @@ use std::time::Instant;
 use serde_json::json;
 use xiangqi_core::{legal_moves_uci, uci_to_move, Position, START_FEN};
 
+use crate::history::PositionHistory;
 use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, OnnxPolicyValueEval, SharedPolicy};
 
 static DEFAULT_BENCHMARK_FEN_STRINGS: OnceLock<Vec<String>> = OnceLock::new();
@@ -65,23 +65,20 @@ pub fn resolve_data_file(rel: impl AsRef<Path>) -> Option<PathBuf> {
 #[derive(Debug, Clone, Default)]
 pub struct BenchJsonMeta {
     pub onnx_path: Option<String>,
-    pub vocab_path: Option<String>,
     pub policy_session_loaded: bool,
-    pub vocab_entries: usize,
 }
 
 pub struct BenchSessionParams<'a> {
     pub budget: MctsBudget,
     pub config: MctsConfig,
     pub policy: &'a SharedPolicy,
-    pub vocab: &'a HashMap<String, usize>,
     pub meta: &'a BenchJsonMeta,
 }
 
 pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json::Value {
     let t0 = Instant::now();
-    let pos = match Position::from_fen(fen) {
-        Ok(pos) => pos,
+    let history = match PositionHistory::from_fen(fen) {
+        Ok(history) => history,
         Err(err) => {
             return json!({
                 "fen": fen,
@@ -90,15 +87,9 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
         }
     };
 
-    let mut engine = MctsEngine::new(
-        session.config,
-        OnnxPolicyValueEval {
-            policy: session.policy,
-            vocab: session.vocab,
-        },
-    );
+    let mut engine = MctsEngine::new(session.config, OnnxPolicyValueEval::new(session.policy.clone()));
 
-    match engine.search_root(&pos, session.budget.clone()) {
+    match engine.search_root_history(&history, session.budget.clone()) {
         Ok(result) => {
             let elapsed_ms = t0.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let nps = if elapsed_ms > 0 {
@@ -113,6 +104,8 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                 "playouts": result.playouts,
                 "root_visits": result.root_visits,
                 "nodes": result.nodes,
+                "depth": result.depth,
+                "seldepth": result.seldepth,
                 "time_ms": elapsed_ms,
                 "nps": nps,
                 "root_moves": result.moves.iter().map(|stat: &MctsMoveStat| {
@@ -125,6 +118,11 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                 }).collect::<Vec<_>>(),
                 "mcts_config": {
                     "cpuct": session.config.cpuct,
+                    "cpuct_root": session.config.cpuct_root,
+                    "cpuct_base": session.config.cpuct_base,
+                    "cpuct_factor": session.config.cpuct_factor,
+                    "fpu_reduction": session.config.fpu_reduction,
+                    "fpu_reduction_root": session.config.fpu_reduction_root,
                     "root_temperature": session.config.root_temperature,
                 },
                 "budget": {
@@ -134,9 +132,7 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                 },
                 "bench_config": {
                     "onnx_path": session.meta.onnx_path,
-                    "vocab_path": session.meta.vocab_path,
                     "policy_session_loaded": session.meta.policy_session_loaded,
-                    "vocab_entries": session.meta.vocab_entries,
                 },
             })
         }

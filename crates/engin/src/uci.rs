@@ -1,6 +1,5 @@
 //! 中国象棋 UCI 子集：`uci` / `isready` / `setoption` / `position` / `go` / `stop` / `quit`。
 
-use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,66 +9,75 @@ use std::time::{Duration, Instant};
 
 use xiangqi_core::{uci_to_move, Position, START_FEN};
 
-use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsSearchProgress, OnnxPolicyValueEval, SharedPolicy};
+use crate::history::PositionHistory;
+use crate::mcts::{
+    MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsSearchProgress, OnnxPolicyValueEval, SharedPolicy,
+};
 use crate::policy_onnx::PolicyOnnx;
 
 static UCI_STDOUT_LOCK: Mutex<()> = Mutex::new(());
 const UCI_INFO_INTERVAL: Duration = Duration::from_millis(200);
 const UCI_ROOT_MOVE_TOP_K: usize = 5;
 
-fn approximate_depth(nodes: usize) -> u32 {
-    if nodes <= 1 {
-        0
-    } else {
-        (f64::ln(nodes as f64) / f64::ln(1.8)).floor().max(0.0) as u32
-    }
+fn q_to_cp(q: f32) -> i32 {
+    let wl = q.clamp(-0.999, 0.999) as f64;
+    (90.0 * (1.5637541897 * wl).tan()).round() as i32
 }
 
 fn uci_info_line(
     root_value: f32,
+    depth: u32,
+    seldepth: u32,
     playouts: u32,
     nodes: usize,
     elapsed_ms: u64,
-    pv: Option<xiangqi_core::Move>,
+    pv: &[xiangqi_core::Move],
 ) -> String {
-    let cp = (root_value * 100.0).round() as i32;
-    let depth = approximate_depth(nodes);
+    let cp = q_to_cp(root_value);
     let nps = if elapsed_ms > 0 {
         (playouts as u128 * 1000 / u128::from(elapsed_ms)) as u64
     } else {
         0
     };
-    let mut line = format!("info depth {depth} score cp {cp} nodes {nodes} nps {nps} time {elapsed_ms}");
-    if let Some(mv) = pv {
+    let mut line =
+        format!("info depth {depth} seldepth {seldepth} score cp {cp} nodes {nodes} nps {nps} time {elapsed_ms}");
+    if !pv.is_empty() {
         line.push_str(" pv ");
-        line.push_str(&xiangqi_core::move_to_uci(mv));
+        line.push_str(
+            &pv.iter()
+                .map(|mv| xiangqi_core::move_to_uci(*mv))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     line
 }
 
 fn uci_root_moves_line(moves: &[MctsMoveStat]) -> String {
     let mut stats = moves.to_vec();
-    stats.sort_by(|a, b| b.visits.cmp(&a.visits).then_with(|| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal)));
+    stats.sort_by(|a, b| {
+        b.visits
+            .cmp(&a.visits)
+            .then_with(|| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal))
+    });
     let body = stats
         .into_iter()
         .take(UCI_ROOT_MOVE_TOP_K)
         .map(|s| format!("{}:{}:{:.3}", xiangqi_core::move_to_uci(s.mv), s.visits, s.q))
         .collect::<Vec<_>>()
         .join(",");
-    format!("info string root_moves {body}")
+    format!("info string root_moves_top{UCI_ROOT_MOVE_TOP_K} {body}")
 }
 
-fn emit_mcts_progress(
-    output: &Arc<dyn Fn(&str) + Send + Sync>,
-    progress: &MctsSearchProgress,
-    elapsed_ms: u64,
-) {
+fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsSearchProgress, elapsed_ms: u64) {
     output(&uci_info_line(
         progress.root_value,
+        progress.depth,
+        progress.seldepth,
         progress.playouts,
         progress.nodes,
         elapsed_ms,
-        progress.best_move,
+        &progress.pv,
     ));
     if let Some(best_move) = progress.best_move {
         let best_uci = xiangqi_core::move_to_uci(best_move);
@@ -81,6 +89,7 @@ fn emit_mcts_progress(
 }
 
 type EngineOutput = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+type SharedSearchEngine = Arc<Mutex<MctsEngine<OnnxPolicyValueEval>>>;
 
 fn uci_out_line(line: &str) {
     let _g = UCI_STDOUT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -134,23 +143,30 @@ fn parse_setoption(line: &str) -> Option<(String, Option<String>)> {
 }
 
 pub fn parse_position_uci(line: &str) -> Result<Position, String> {
-    parse_position(line)
+    Ok(parse_position_history(line)?.current().clone_for_search())
 }
 
-fn parse_position(line: &str) -> Result<Position, String> {
+pub fn parse_position_history_uci(line: &str) -> Result<PositionHistory, String> {
+    parse_position_history(line)
+}
+
+fn parse_position_history(line: &str) -> Result<PositionHistory, String> {
     let rest = line
         .strip_prefix("position")
         .ok_or_else(|| "internal".to_string())?
         .trim();
-    let (mut pos, moves_tail) = if let Some(tail) = rest.strip_prefix("startpos") {
+    let (mut history, moves_tail) = if let Some(tail) = rest.strip_prefix("startpos") {
         let tail = tail.trim_start();
         let moves_tail = parse_moves_suffix(tail)?;
-        (Position::from_fen(START_FEN).map_err(|e| e.to_string())?, moves_tail)
+        (
+            PositionHistory::from_position(Position::from_fen(START_FEN).map_err(|e| e.to_string())?),
+            moves_tail,
+        )
     } else if let Some(fen_part) = rest.strip_prefix("fen") {
         let fen_part = fen_part.trim();
         let (fen_str, moves_tail) = split_fen_and_moves(fen_part)?;
         (
-            Position::from_fen(fen_str.trim()).map_err(|e| e.to_string())?,
+            PositionHistory::from_position(Position::from_fen(fen_str.trim()).map_err(|e| e.to_string())?),
             moves_tail,
         )
     } else {
@@ -159,13 +175,13 @@ fn parse_position(line: &str) -> Result<Position, String> {
 
     if let Some(mvs) = moves_tail {
         for mv in mvs.split_whitespace() {
-            let Some(m) = uci_to_move(&pos, mv) else {
+            let Some(m) = uci_to_move(history.current(), mv) else {
                 return Err(format!("非法或不可执行着法: {mv}"));
             };
-            pos.do_move(m);
+            history.push_move(m);
         }
     }
-    Ok(pos)
+    Ok(history)
 }
 
 fn parse_moves_suffix(tail: &str) -> Result<Option<String>, String> {
@@ -200,12 +216,11 @@ fn split_fen_and_moves(s: &str) -> Result<(&str, Option<String>), String> {
 }
 
 struct Engine {
-    pos: Position,
+    history: PositionHistory,
     policy: SharedPolicy,
     policy_path: Option<PathBuf>,
-    vocab_path: Option<PathBuf>,
-    vocab: Arc<HashMap<String, usize>>,
     config: MctsConfig,
+    search_engine: SharedSearchEngine,
     default_playouts: u32,
     search_stop: Option<Arc<AtomicBool>>,
     search_join: Option<JoinHandle<()>>,
@@ -219,12 +234,14 @@ impl Engine {
 
     fn new_with_output(output: EngineOutput) -> Self {
         Self {
-            pos: Position::from_fen(START_FEN).expect("startpos"),
+            history: PositionHistory::new_startpos(),
             policy: None,
             policy_path: None,
-            vocab_path: None,
-            vocab: Arc::new(HashMap::new()),
             config: MctsConfig::default(),
+            search_engine: Arc::new(Mutex::new(MctsEngine::new(
+                MctsConfig::default(),
+                OnnxPolicyValueEval::new(None),
+            ))),
             default_playouts: 256,
             search_stop: None,
             search_join: None,
@@ -253,28 +270,29 @@ impl Engine {
                 self.policy = Some(Arc::new(Mutex::new(net)));
             }
         }
+        self.rebuild_search_engine();
         Ok(())
     }
 
-    fn reload_vocab(&mut self) -> Result<(), String> {
-        self.vocab = Arc::new(HashMap::new());
-        if let Some(ref p) = self.vocab_path {
-            if p.is_file() {
-                let (m, _) = crate::vocab::load_move_vocab(p)?;
-                self.vocab = Arc::new(m);
-            }
-        }
-        Ok(())
+    fn rebuild_search_engine(&mut self) {
+        self.search_engine = Arc::new(Mutex::new(MctsEngine::new(
+            self.config,
+            OnnxPolicyValueEval::new(self.policy.clone()),
+        )));
     }
 
     fn send_uci_ident(&self) {
         self.emit("id name 77xiangqi_engine");
         self.emit("id author github.com/77xiangqi_engine");
         self.emit("option name PolicyFile type string default <empty>");
-        self.emit("option name VocabFile type string default <empty>");
         self.emit("option name Playouts type spin default 256 min 1 max 1000000");
         self.emit("option name Visits type spin default 256 min 1 max 1000000");
-        self.emit("option name Cpuct type string default 1.25");
+        self.emit("option name Cpuct type string default 1.0");
+        self.emit("option name CpuctAtRoot type string default 1.745");
+        self.emit("option name CpuctBase type string default 38739");
+        self.emit("option name CpuctFactor type string default 3.894");
+        self.emit("option name FpuReduction type string default 0.22");
+        self.emit("option name FpuReductionAtRoot type string default 1.0");
         self.emit("uciok");
     }
 
@@ -290,13 +308,6 @@ impl Engine {
                     .filter(|p| !p.as_os_str().is_empty());
                 self.reload_policy()?;
             }
-            "VocabFile" => {
-                self.vocab_path = value
-                    .as_ref()
-                    .map(|s| PathBuf::from(s.trim()))
-                    .filter(|p| !p.as_os_str().is_empty());
-                self.reload_vocab()?;
-            }
             "Playouts" | "Visits" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<u32>() {
@@ -308,6 +319,47 @@ impl Engine {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<f32>() {
                         self.config.cpuct = n.clamp(0.01, 100.0);
+                        self.rebuild_search_engine();
+                    }
+                }
+            }
+            "CpuctAtRoot" => {
+                if let Some(ref v) = value {
+                    if let Ok(n) = v.trim().parse::<f32>() {
+                        self.config.cpuct_root = n.clamp(0.01, 100.0);
+                        self.rebuild_search_engine();
+                    }
+                }
+            }
+            "CpuctBase" => {
+                if let Some(ref v) = value {
+                    if let Ok(n) = v.trim().parse::<f32>() {
+                        self.config.cpuct_base = n.clamp(1.0, 1_000_000_000.0);
+                        self.rebuild_search_engine();
+                    }
+                }
+            }
+            "CpuctFactor" => {
+                if let Some(ref v) = value {
+                    if let Ok(n) = v.trim().parse::<f32>() {
+                        self.config.cpuct_factor = n.clamp(0.0, 1_000.0);
+                        self.rebuild_search_engine();
+                    }
+                }
+            }
+            "FpuReduction" => {
+                if let Some(ref v) = value {
+                    if let Ok(n) = v.trim().parse::<f32>() {
+                        self.config.fpu_reduction = n.clamp(0.0, 2.0);
+                        self.rebuild_search_engine();
+                    }
+                }
+            }
+            "FpuReductionAtRoot" => {
+                if let Some(ref v) = value {
+                    if let Ok(n) = v.trim().parse::<f32>() {
+                        self.config.fpu_reduction_root = n.clamp(0.0, 4.0);
+                        self.rebuild_search_engine();
                     }
                 }
             }
@@ -340,7 +392,9 @@ impl Engine {
         }
 
         if let Some(depth) = params.depth {
-            return Err(format!("go depth {depth} 暂不支持；请使用 go nodes / go movetime / go infinite"));
+            return Err(format!(
+                "go depth {depth} 暂不支持；请使用 go nodes / go movetime / go infinite"
+            ));
         }
 
         Ok(MctsBudget {
@@ -352,9 +406,7 @@ impl Engine {
     }
 
     fn spawn_go(&mut self, params: GoParams) {
-        let pos = self.pos.clone();
-        let policy = self.policy.clone();
-        let vocab = Arc::clone(&self.vocab);
+        let history = self.history.clone_for_search();
         let mut budget = match self.budget_from_go(&params) {
             Ok(budget) => budget,
             Err(err) => {
@@ -366,6 +418,7 @@ impl Engine {
         let config = self.config;
         let stop = Arc::new(AtomicBool::new(false));
         let output = Arc::clone(&self.output);
+        let search_engine = Arc::clone(&self.search_engine);
         budget.stop = Some(stop.clone());
         self.search_stop = Some(stop.clone());
 
@@ -376,15 +429,10 @@ impl Engine {
                 return;
             }
 
-            let mut engine = MctsEngine::new(
-                config,
-                OnnxPolicyValueEval {
-                    policy: &policy,
-                    vocab: &vocab,
-                },
-            );
+            let mut engine = search_engine.lock().unwrap_or_else(|e| e.into_inner());
+            engine.config = config;
 
-            match engine.search_root_with_progress(&pos, budget, UCI_INFO_INTERVAL, |progress| {
+            match engine.search_root_history_with_progress(&history, budget, UCI_INFO_INTERVAL, |progress| {
                 let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 emit_mcts_progress(&output, progress, elapsed_ms);
             }) {
@@ -392,10 +440,12 @@ impl Engine {
                     let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     output(&uci_info_line(
                         result.root_value,
+                        result.depth,
+                        result.seldepth,
                         result.playouts,
                         result.nodes,
                         elapsed_ms,
-                        result.best_move,
+                        &result.pv,
                     ));
                     if !result.moves.is_empty() {
                         output(&uci_root_moves_line(&result.moves));
@@ -444,8 +494,8 @@ impl Engine {
             }
             _ if line.starts_with("position") => {
                 self.stop_and_join();
-                match parse_position(line) {
-                    Ok(pos) => self.pos = pos,
+                match parse_position_history(line) {
+                    Ok(history) => self.history = history,
                     Err(err) => self.emit(&format!("info string {err}")),
                 }
             }
@@ -536,9 +586,28 @@ mod tests {
         let pos0 = Position::from_fen(START_FEN).unwrap();
         let first = legal_moves_uci(&pos0).into_iter().next().expect("mv");
         let line = format!("position startpos moves {first}");
-        let pos = parse_position(&line).expect("ok");
+        let pos = parse_position_uci(&line).expect("ok");
         let legals = legal_moves_uci(&pos);
         assert!(!legals.is_empty());
+    }
+
+    #[test]
+    fn parse_position_history_keeps_real_prefix() {
+        let pos0 = Position::from_fen(START_FEN).unwrap();
+        let first = legal_moves_uci(&pos0).into_iter().next().expect("mv");
+        let line = format!("position startpos moves {first}");
+        let history = parse_position_history_uci(&line).expect("ok");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.positions().next().expect("root").fen(), START_FEN);
+    }
+
+    #[test]
+    fn parse_position_rejects_illegal_history_move() {
+        let line = "position fen k3r4/9/9/9/9/9/9/9/9/3AK4 w - - 0 1 moves d0d1";
+        let err = parse_position_history_uci(line)
+            .err()
+            .expect("must reject illegal move");
+        assert!(err.contains("非法"));
     }
 
     #[test]

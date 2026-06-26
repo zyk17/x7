@@ -10,6 +10,7 @@ pub struct EdgeStats {
     pub mv: Move,
     pub prior: f32,
     pub visits: u32,
+    pub in_flight: u32,
     pub value_sum: f32,
     pub child: Option<MctsNodeId>,
 }
@@ -20,6 +21,7 @@ impl Default for EdgeStats {
             mv: Move::none(),
             prior: 0.0,
             visits: 0,
+            in_flight: 0,
             value_sum: 0.0,
             child: None,
         }

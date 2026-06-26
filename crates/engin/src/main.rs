@@ -1,6 +1,5 @@
 //! 用户侧引擎：默认 UCI；`--onnx-smoke` 为 ONNX 冒烟；`--bench` 为 MCTS 基准。
 
-use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,23 +12,18 @@ use engin::benchmark::{
     default_benchmark_fen_strings, resolve_data_file, write_benchmark_ndjson, BenchJsonMeta, BenchSessionParams,
 };
 use engin::mcts::{MctsBudget, MctsConfig, SharedPolicy};
-use engin::vocab::{load_move_vocab, load_move_vocab_ordered};
 use engin::{run_uci_stdio, PolicyOnnx, START_FEN};
 
 fn default_policy_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/policy.onnx")
 }
 
-fn default_vocab_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/move_vocab.json")
-}
-
 fn print_usage() {
     eprintln!(
         "用法:\n  engin                         UCI 模式（stdin/stdout）\n  \
-         engin --onnx-smoke [ONNX] [FEN] [VOCAB]  冒烟；缺省 ONNX=data/policy.onnx、FEN=起始局面\n  \
+         engin --onnx-smoke [ONNX] [FEN]  冒烟；缺省 ONNX=data/policy.onnx、FEN=起始局面\n  \
          engin --bench [选项]            MCTS 基准（NDJSON）\n  \
-         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --onnx PATH  --vocab PATH  --data-dir PATH  --require-onnx"
+         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --onnx PATH  --data-dir PATH  --require-onnx"
     );
 }
 
@@ -38,7 +32,6 @@ struct BenchCli {
     budget: MctsBudget,
     config: MctsConfig,
     onnx: Option<PathBuf>,
-    vocab: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     require_onnx: bool,
 }
@@ -52,7 +45,6 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
     };
     let mut config = MctsConfig::default();
     let mut onnx: Option<PathBuf> = None;
-    let mut vocab: Option<PathBuf> = None;
     let mut data_dir: Option<PathBuf> = None;
     let mut require_onnx = false;
     let mut i = 0usize;
@@ -86,10 +78,6 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
                 onnx = Some(PathBuf::from(&rest[i + 1]));
                 i += 2;
             }
-            "--vocab" if i + 1 < rest.len() => {
-                vocab = Some(PathBuf::from(&rest[i + 1]));
-                i += 2;
-            }
             "--data-dir" if i + 1 < rest.len() => {
                 data_dir = Some(PathBuf::from(&rest[i + 1]));
                 i += 2;
@@ -108,13 +96,12 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
         budget,
         config,
         onnx,
-        vocab,
         data_dir,
         require_onnx,
     }
 }
 
-fn resolve_bench_onnx_vocab(cli: &BenchCli) -> (Option<PathBuf>, Option<PathBuf>) {
+fn resolve_bench_onnx(cli: &BenchCli) -> Option<PathBuf> {
     let onnx = cli
         .onnx
         .clone()
@@ -125,24 +112,12 @@ fn resolve_bench_onnx_vocab(cli: &BenchCli) -> (Option<PathBuf>, Option<PathBuf>
                 .filter(|p| p.is_file())
         })
         .or_else(|| resolve_data_file("policy.onnx"));
-
-    let vocab = cli
-        .vocab
-        .clone()
-        .or_else(|| {
-            cli.data_dir
-                .as_ref()
-                .map(|d| d.join("move_vocab.json"))
-                .filter(|p| p.is_file())
-        })
-        .or_else(|| resolve_data_file("move_vocab.json"));
-
-    (onnx, vocab)
+    onnx
 }
 
 fn run_bench_cli(rest: &[String]) -> io::Result<()> {
     let cli = parse_bench_cli(rest);
-    let (onnx_path, vocab_path) = resolve_bench_onnx_vocab(&cli);
+    let onnx_path = resolve_bench_onnx(&cli);
 
     if let Some(ref p) = cli.onnx {
         if !p.is_file() {
@@ -174,23 +149,10 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
         }
     }
 
-    let vocab = if let Some(ref vp) = vocab_path {
-        meta.vocab_path = Some(vp.display().to_string());
-        let (vocab, size) = load_move_vocab(vp).unwrap_or_else(|err| {
-            eprintln!("--bench: 词表加载失败: {err}");
-            (HashMap::new(), 0)
-        });
-        meta.vocab_entries = size;
-        vocab
-    } else {
-        HashMap::new()
-    };
-
     let session = BenchSessionParams {
         budget: cli.budget,
         config: cli.config,
         policy: &policy,
-        vocab: &vocab,
         meta: &meta,
     };
 
@@ -199,11 +161,15 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
     write_benchmark_ndjson(&mut out, default_benchmark_fen_strings(), &session)
 }
 
-fn legal_top_lines(logits: &[f32], vocab: &[String], fen: &str, k: usize) -> Result<String, String> {
+fn legal_top_lines(logits: &[f32], fen: &str, k: usize) -> Result<String, String> {
     let pos = Position::from_fen(fen).map_err(|e| e.to_string())?;
+    let black_to_move = pos.side_to_move == xiangqi_core::types::Color::Black;
     let mut m: Vec<(usize, String, f32)> = Vec::new();
     for u in legal_moves_uci(&pos) {
-        let Some(idx) = vocab.iter().position(|x| x == &u) else {
+        let Some(mv) = xiangqi_core::uci_to_move(&pos, &u) else {
+            continue;
+        };
+        let Some(idx) = engin::px0_policy::px0_policy_index(mv, black_to_move) else {
             continue;
         };
         if idx < logits.len() {
@@ -218,31 +184,18 @@ fn legal_top_lines(logits: &[f32], vocab: &[String], fen: &str, k: usize) -> Res
         .join(" | "))
 }
 
-fn parse_onnx_smoke_args(rest: &[String]) -> (PathBuf, String, Option<PathBuf>) {
+fn parse_onnx_smoke_args(rest: &[String]) -> (PathBuf, String) {
     match rest {
-        [] => (default_policy_path(), START_FEN.to_string(), None),
+        [] => (default_policy_path(), START_FEN.to_string()),
         [a] => {
             if Path::new(a).is_file() {
-                (PathBuf::from(a), START_FEN.to_string(), None)
+                (PathBuf::from(a), START_FEN.to_string())
             } else {
-                (default_policy_path(), a.clone(), None)
+                (default_policy_path(), a.clone())
             }
         }
-        [a, b] => {
-            if Path::new(a).is_file() {
-                (PathBuf::from(a), b.clone(), None)
-            } else {
-                (default_policy_path(), a.clone(), Some(PathBuf::from(b)))
-            }
-        }
-        [a, b, c, ..] => {
-            if Path::new(a).is_file() {
-                let v = Path::new(c).is_file().then(|| PathBuf::from(c));
-                (PathBuf::from(a), b.clone(), v)
-            } else {
-                (default_policy_path(), a.clone(), Some(PathBuf::from(b)))
-            }
-        }
+        [a, b, ..] if Path::new(a).is_file() => (PathBuf::from(a), b.clone()),
+        [a, ..] => (default_policy_path(), a.clone()),
     }
 }
 
@@ -272,11 +225,7 @@ fn main() {
 
     if first == "--onnx-smoke" {
         let rest: Vec<String> = args.collect();
-        let (onnx_path, fen, vocab_arg) = parse_onnx_smoke_args(&rest);
-        let vocab_path = vocab_arg.or_else(|| {
-            let p = default_vocab_path();
-            p.is_file().then_some(p)
-        });
+        let (onnx_path, fen) = parse_onnx_smoke_args(&rest);
 
         if !onnx_path.is_file() {
             eprintln!("找不到 ONNX 文件: {}", onnx_path.display());
@@ -298,28 +247,13 @@ fn main() {
         };
 
         println!("model: {}", onnx_path.display());
+        println!("ep_chain: {}", net.provider_chain());
         println!("fen: {fen}");
         println!("logits_len: {}", out.logits.len());
 
-        if let Some(ref vp) = vocab_path {
-            match load_move_vocab_ordered(vp) {
-                Ok(vocab) => {
-                    if vocab.len() != out.logits.len() {
-                        eprintln!(
-                            "警告: 词表长度 {} 与 logits {} 不一致，跳过 UCI 解码",
-                            vocab.len(),
-                            out.logits.len()
-                        );
-                    } else {
-                        println!("vocab: {}", vp.display());
-                        match legal_top_lines(&out.logits, &vocab, &fen, 8) {
-                            Ok(s) => println!("policy_legal_top8: {s}"),
-                            Err(e) => eprintln!("policy_legal_top8: (skip) {e}"),
-                        }
-                    }
-                }
-                Err(e) => eprintln!("词表加载失败: {e}"),
-            }
+        match legal_top_lines(&out.logits, &fen, 8) {
+            Ok(s) => println!("policy_legal_top8: {s}"),
+            Err(e) => eprintln!("policy_legal_top8: (skip) {e}"),
         }
 
         print!("wdl(onnx): ");
