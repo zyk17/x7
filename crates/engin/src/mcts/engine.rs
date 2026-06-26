@@ -12,6 +12,7 @@ use super::{
 };
 
 const SEARCH_BATCH_SIZE: usize = 8;
+const SEARCH_COLLISION_PLAYOUT_FACTOR: usize = 4;
 
 /// MCTS 单次搜索结果。
 #[derive(Clone, Debug)]
@@ -123,8 +124,6 @@ where
 
         let root_history = history.clone_for_search();
         let mut playouts = 0u32;
-        let mut total_depth = 0u64;
-        let mut max_depth = 0usize;
         let mut next_report_at = if info_interval.is_zero() {
             None
         } else {
@@ -141,25 +140,21 @@ where
             }
 
             let iter_playouts = iteration.playouts;
-            let iter_total_depth = iteration.total_depth;
-            let iter_max_depth = iteration.max_depth;
             self.apply_iteration(iteration)?;
             debug_assert_eq!(self.total_in_flight(), 0);
 
             playouts = playouts.saturating_add(iter_playouts);
-            total_depth = total_depth.saturating_add(iter_total_depth);
-            max_depth = max_depth.max(iter_max_depth);
 
             if let Some(deadline) = next_report_at {
                 let now = Instant::now();
                 if now >= deadline {
-                    on_progress(&self.progress_from_root(root_id, playouts, total_depth, max_depth));
+                    on_progress(&self.progress_from_root(root_id, playouts));
                     next_report_at = Some(now + info_interval);
                 }
             }
         }
 
-        Ok(self.result_from_root(root_id, playouts, total_depth, max_depth))
+        Ok(self.result_from_root(root_id, playouts))
     }
 
     fn prepare_root(&mut self, history: &PositionHistory) -> Result<Option<MctsNodeId>, E::Error> {
@@ -262,8 +257,8 @@ where
     ) -> SearchIteration {
         let mut iteration = SearchIteration::default();
         let mut slots = HashMap::<PendingKey, usize>::new();
-
-        for _ in 0..batch_limit {
+        let playout_limit = batch_limit.saturating_mul(SEARCH_COLLISION_PLAYOUT_FACTOR).max(batch_limit);
+        while iteration.pending.len() < batch_limit && iteration.playouts < playout_limit as u32 {
             if budget_exhausted(
                 budget,
                 base_playouts.saturating_add(iteration.playouts),
@@ -273,8 +268,6 @@ where
             }
             let pending = self.select_pending(root_id, root_history);
             iteration.playouts = iteration.playouts.saturating_add(1);
-            iteration.total_depth = iteration.total_depth.saturating_add(pending.depth as u64);
-            iteration.max_depth = iteration.max_depth.max(pending.depth);
 
             if let Some(&slot) = slots.get(&pending.key) {
                 iteration.pending[slot].multivisit = iteration.pending[slot].multivisit.saturating_add(1);
@@ -298,7 +291,6 @@ where
         loop {
             let node = self.tree.get(node_id).expect("selected node must exist");
             if let Some(value) = node.terminal_value {
-                let depth = path.len();
                 return PendingNode {
                     key: PendingKey::ExistingLeaf(node_id),
                     path,
@@ -307,7 +299,6 @@ where
                         value,
                     },
                     multivisit: 1,
-                    depth,
                 };
             }
 
@@ -338,7 +329,6 @@ where
             let n = generate(&pos, GenType::Legal, &mut buf);
             if n == 0 {
                 let value = if pos.checkers() != 0 { -1.0 } else { 0.0 };
-                let depth = path.len();
                 return PendingNode {
                     key: PendingKey::NewEdge(parent_id, edge_idx),
                     path,
@@ -347,12 +337,10 @@ where
                         value,
                     },
                     multivisit: 1,
-                    depth,
                 };
             }
 
             let legal_moves = buf[..n].iter().map(|e| e.mv).collect::<Vec<_>>();
-            let depth = path.len();
             return PendingNode {
                 key: PendingKey::NewEdge(parent_id, edge_idx),
                 path,
@@ -364,7 +352,6 @@ where
                     },
                 },
                 multivisit: 1,
-                depth,
             };
         }
     }
@@ -481,8 +468,6 @@ where
         &self,
         root_id: MctsNodeId,
         playouts: u32,
-        total_depth: u64,
-        max_depth: usize,
     ) -> MctsSearchProgress {
         let root = self.tree.get(root_id).expect("root must exist");
         let pv = self.extract_pv(root_id);
@@ -493,25 +478,15 @@ where
             playouts,
             root_visits: root.visits,
             nodes: self.tree.len(),
-            depth: if playouts == 0 {
-                0
-            } else {
-                (total_depth / u64::from(playouts)) as u32
-            },
-            seldepth: max_depth as u32,
+            depth: self.depth_from_root(root_id),
+            seldepth: self.seldepth_from_root(root_id),
             root_value: root.mean_value(),
         }
     }
 
-    fn result_from_root(
-        &self,
-        root_id: MctsNodeId,
-        playouts: u32,
-        total_depth: u64,
-        max_depth: usize,
-    ) -> MctsSearchResult {
+    fn result_from_root(&self, root_id: MctsNodeId, playouts: u32) -> MctsSearchResult {
         let root = self.tree.get(root_id).expect("root must exist");
-        let progress = self.progress_from_root(root_id, playouts, total_depth, max_depth);
+        let progress = self.progress_from_root(root_id, playouts);
         MctsSearchResult {
             best_move: progress.best_move,
             pv: progress.pv,
@@ -569,6 +544,32 @@ where
             total = total.saturating_add(node.children.iter().map(|edge| edge.in_flight).sum::<u32>());
         }
         total
+    }
+
+    fn depth_from_root(&self, root_id: MctsNodeId) -> u32 {
+        self.extract_pv(root_id).len() as u32
+    }
+
+    fn seldepth_from_root(&self, root_id: MctsNodeId) -> u32 {
+        self.completed_depth(root_id)
+    }
+
+    fn completed_depth(&self, node_id: MctsNodeId) -> u32 {
+        let Some(node) = self.tree.get(node_id) else {
+            return 0;
+        };
+        let mut best = 0u32;
+        for edge in &node.children {
+            if edge.visits == 0 {
+                continue;
+            }
+            let depth = match edge.child {
+                Some(child_id) => 1 + self.completed_depth(child_id),
+                None => 1,
+            };
+            best = best.max(depth);
+        }
+        best
     }
 }
 
@@ -709,15 +710,12 @@ struct PendingNode {
     path: Vec<PathStep>,
     kind: PendingKind,
     multivisit: u32,
-    depth: usize,
 }
 
 #[derive(Default)]
 struct SearchIteration {
     pending: Vec<PendingNode>,
     playouts: u32,
-    total_depth: u64,
-    max_depth: usize,
 }
 
 impl SearchIteration {
@@ -818,15 +816,15 @@ mod tests {
 
         let iteration = engine.gather_iteration(root_id, &history, &MctsBudget::default(), 0, 4);
         assert_eq!(iteration.pending.len(), 1);
-        assert_eq!(iteration.pending[0].multivisit, 4);
+        assert_eq!(iteration.pending[0].multivisit, (4 * SEARCH_COLLISION_PLAYOUT_FACTOR) as u32);
 
         engine.apply_iteration(iteration).expect("apply ok");
         let root = engine.tree.get(root_id).expect("root");
         let leaf = engine.tree.get(leaf_id).expect("leaf");
-        assert_eq!(root.visits, 4);
-        assert_eq!(root.children[0].visits, 4);
+        assert_eq!(root.visits, (4 * SEARCH_COLLISION_PLAYOUT_FACTOR) as u32);
+        assert_eq!(root.children[0].visits, (4 * SEARCH_COLLISION_PLAYOUT_FACTOR) as u32);
         assert_eq!(root.children[0].in_flight, 0);
-        assert_eq!(leaf.visits, 4);
+        assert_eq!(leaf.visits, (4 * SEARCH_COLLISION_PLAYOUT_FACTOR) as u32);
     }
 
     #[test]

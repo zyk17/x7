@@ -87,7 +87,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
         let Some(policy) = self.policy.as_ref() else {
             return Ok(uniform_output(input.legal_moves.len()));
         };
-        let state_key = input.position.key();
+        let state_key = input.history.input_cache_key();
         let cached = if let Some(cached) = self.cache.get(&state_key) {
             cached.clone()
         } else {
@@ -135,7 +135,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
         let mut outputs = vec![PolicyValueOutput::default(); tasks.len()];
         let mut misses = Vec::new();
         for (idx, task) in tasks.iter().enumerate() {
-            if let Some(cached) = self.cache.get(&task.position.key()).cloned() {
+            if let Some(cached) = self.cache.get(&task.history.input_cache_key()).cloned() {
                 outputs[idx] = output_from_cached(&cached, &task.position, &task.legal_moves);
             } else {
                 misses.push(idx);
@@ -167,7 +167,8 @@ impl PolicyValueEval for OnnxPolicyValueEval {
                     .map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0))
                     .unwrap_or(0.0),
             };
-            self.cache.insert(tasks[task_idx].position.key(), cached.clone());
+            self.cache
+                .insert(tasks[task_idx].history.input_cache_key(), cached.clone());
             outputs[task_idx] = output_from_cached(&cached, &tasks[task_idx].position, &tasks[task_idx].legal_moves);
         }
 

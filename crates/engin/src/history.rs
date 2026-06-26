@@ -87,6 +87,19 @@ impl PositionHistory {
         })
     }
 
+    pub fn input_cache_key(&self) -> u64 {
+        let mut key = 0x9E37_79B9_7F4A_7C15u64
+            ^ ((self.entries.len() as u64) << 56)
+            ^ self.current().state.rule60 as u64;
+        for entry in &self.entries {
+            key = key.rotate_left(9) ^ entry.position.nn_input_key().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            if entry.repeated {
+                key ^= 0xA5A5_A5A5_A5A5_A5A5;
+            }
+        }
+        key
+    }
+
     pub fn reset_from_position(&mut self, pos: Position) {
         self.entries.clear();
         self.key_counts.clear();
@@ -216,5 +229,6 @@ mod tests {
 
         assert_eq!(a.current().fen(), b.current().fen());
         assert!(!a.same_input_window(&b));
+        assert_ne!(a.input_cache_key(), b.input_cache_key());
     }
 }
