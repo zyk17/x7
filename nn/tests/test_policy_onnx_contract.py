@@ -47,8 +47,9 @@ def test_policy_onnx_contract_matches_export_script() -> None:
     assert net_inputs[0].name == "board"
     elem, dims = _tensor_elem_type_and_shape(net_inputs[0])
     assert elem == TensorProto.FLOAT
-    assert len(dims) == 4, f"board shape expected rank-4 [1,C,10,9], got {dims}"
-    assert dims[0] == 1 and dims[2:] == [10, 9], f"board shape expected [1,C,10,9], got {dims}"
+    assert len(dims) == 4, f"board shape expected rank-4 [B,C,10,9], got {dims}"
+    assert dims[2:] == [10, 9], f"board shape expected [B,C,10,9], got {dims}"
+    assert dims[0] in (1, "batch"), f"board batch dim must be static 1 or dynamic batch, got {dims}"
     assert isinstance(dims[1], int) and dims[1] >= 1, f"board channel dim must be static positive, got {dims}"
 
     out_list = list(model.graph.output)
@@ -63,8 +64,8 @@ def test_policy_onnx_contract_matches_export_script() -> None:
     logits_info = out_list[0]
     elem, dims = _tensor_elem_type_and_shape(logits_info)
     assert elem == TensorProto.FLOAT
-    assert len(dims) == 2 and dims[0] == 1 and dims[1] not in (None, ""), (
-        f"logits expected float32[1,V] with static V, got dims={dims}"
+    assert len(dims) == 2 and dims[0] in (1, "batch") and dims[1] not in (None, ""), (
+        f"logits expected float32[B,V] with static V, got dims={dims}"
     )
     assert isinstance(dims[1], int), f"logits second dim must be static vocab size, got {dims!r}"
     assert dims[1] >= 2
@@ -74,7 +75,7 @@ def test_policy_onnx_contract_matches_export_script() -> None:
         assert elem == TensorProto.FLOAT
         if dims == [1]:
             pytest.skip("stale scalar data/policy.onnx; re-export WDL onnx via scripts/export/export_onnx.py")
-        assert dims == [1, 3], f"{o.name} expected float32[1,3] WDL probabilities, got {dims}"
+        assert dims in ([1, 3], ["batch", 3]), f"{o.name} expected float32[B,3] WDL probabilities, got {dims}"
 
 
 @pytest.mark.skipif(

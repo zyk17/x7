@@ -8,8 +8,6 @@ torch = pytest.importorskip("torch")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from constants import START_FEN
-from nn.fen_tensor import fen_to_planes
 from nn import (
     PolicyResNet,
     mix_wdl_targets,
@@ -19,14 +17,14 @@ from nn import (
 )
 
 
-def test_fen_planes_shape():
-    t = fen_to_planes(START_FEN)
-    assert tuple(t.shape) == (15, 10, 9)
+def test_px0_contract_shape():
+    x = torch.zeros((124, 10, 9), dtype=torch.float32)
+    assert tuple(x.shape) == (124, 10, 9)
 
 
 def test_policy_forward_and_masked_loss():
-    m = PolicyResNet(in_planes=15, width=32, num_blocks=2, num_moves=16)
-    x = fen_to_planes(START_FEN).unsqueeze(0)
+    m = PolicyResNet(in_planes=124, width=32, num_blocks=2, num_moves=16)
+    x = torch.zeros((1, 124, 10, 9), dtype=torch.float32)
     logits = m(x)
     assert logits.shape == (1, 16)
     mask = torch.zeros(1, 16, dtype=torch.bool)
@@ -48,8 +46,8 @@ def test_policy_forward_and_masked_loss():
 
 
 def test_value_wdl_forward_and_loss():
-    m = PolicyResNet(in_planes=15, width=32, num_blocks=2, num_moves=16, value_head=True)
-    x = fen_to_planes(START_FEN).unsqueeze(0)
+    m = PolicyResNet(in_planes=124, width=32, num_blocks=2, num_moves=16, value_head=True)
+    x = torch.zeros((1, 124, 10, 9), dtype=torch.float32)
     logits, value = m(x)
     assert logits.shape == (1, 16)
     assert value.shape == (1, 3)

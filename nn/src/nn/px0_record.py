@@ -181,7 +181,7 @@ def iter_px0_chunk_file(path: Path | str) -> Iterator[Px0Sample]:
 def expand_chunk_globs(patterns: list[str], *, max_files: int = 0) -> list[Path]:
     files: list[Path] = []
     for pattern in patterns:
-        files.extend(Path(p).resolve() for p in glob.glob(pattern))
+        files.extend(Path(p).resolve() for p in glob.glob(pattern, recursive=True))
     unique = sorted({p.resolve() for p in files if p.is_file()})
     if max_files > 0:
         return unique[:max_files]

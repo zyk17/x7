@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "xiangqi-review-nn"
 version = "0.2.0"
-description = "Chinese chess human policy model (XRSH → ResNet → ONNX)"
+description = "Chinese chess px0-style policy/value training and ONNX export"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
 train = [
   "torch>=2.0",
   "onnx>=1.16",
+  "kagglehub>=0.3",
 ]
 dev = ["pytest>=7.0", "onnx>=1.16", "ruff>=0.15"]
 

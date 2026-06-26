@@ -13,6 +13,8 @@
   解析最小 `px0 v6 classical` record
 - `src/nn/dataset_px0.py`
   流式读取 `px0` chunks
+- `src/nn/px0_kaggle.py`
+  管理 `Kaggle -> C:\work\px0data\{version}\ -> manifest`
 - `scripts/data/inspect_px0.py`
   快速检查 chunk 是否可读
 - `scripts/data/split_px0_files.py`
@@ -26,8 +28,7 @@
 
 - 默认先纯 `px0`
 - 不预设人类数据混入
-- 不把 XRSH 当主训练数据路线
 - value 主语义为 `WDL + qMix`
 - 默认 `q_ratio=1.0`，先以搜索 WDL 为主监督
-
-如果后续你彻底放弃 XRSH 支线，那么相关数据可以删掉，代码是否继续保留再单独决定。
+- 训练入口支持 `--px0-version`
+- 本地目录约定为 `C:\work\px0data\{version}\`

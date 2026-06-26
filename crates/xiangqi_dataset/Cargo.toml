@@ -2,19 +2,11 @@
 name = "xiangqi_dataset"
 version = "0.1.0"
 edition.workspace = true
-description = "Maintainer CLI: PGN → vocab + binary XRSH shards, parallel by game."
+description = "Maintainer dataset helpers: PGN parsing and future self-play preprocessing."
 publish = false
 
 [dependencies]
-engin = { path = "../engin" }
-xiangqi_core = { path = "../xiangqi_core" }
-clap = { version = "4", features = ["derive"] }
-rayon = "1.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
 anyhow = "1"
 regex = "1"
 
 [dev-dependencies]
-tempfile = "3"

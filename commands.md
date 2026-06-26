@@ -1,37 +1,40 @@
 # Commands
 
-以下命令默认在仓库根目录执行：
+默认先进入仓库根目录：
 
 ```powershell
 Set-Location C:\projects\77xiangqi_engine
 ```
 
-## 1. 检查 `px0data` 是否可读
+数据主线约定：
+
+- Kaggle 数据集：`pikacat/px0data`
+- 本地目录：`C:\work\px0data\{version}\`
+- 训练入口：`nn\scripts\train\train_px0.py --px0-version <version>`
+- 如果本地已有 `training.*.gz`，直接复用
+- 如果只有 `archive.zip` / `data.bin`，自动解压整理
+- 如果目录为空，自动从 Kaggle 下载
+
+## 1. 首次准备环境
+
+```powershell
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install kagglehub
+```
+
+## 2. 检查某个 px0 版本是否可读
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\inspect_px0.py `
-  --glob "C:\work\px0data\unpacked\run1\training.*.gz" `
+  --px0-version 7 `
   --max-files 8 `
   --max-samples 256
 ```
 
-## 2. 生成 `px0` train/val 文件清单
-
-```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\split_px0_files.py `
-  --glob "C:\work\px0data\unpacked\run1\training.*.gz" `
-  --out-train data\rounds\px0_train_v1.json `
-  --out-val data\rounds\px0_val_v1.json `
-  --val-ratio 0.1 `
-  --seed 42
-```
-
-## 3. 启动新的 `px0` baseline 训练
+## 3. 直接训练指定版本
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --train-list data\rounds\px0_train_v1.json `
-  --val-list data\rounds\px0_val_v1.json `
+  --px0-version 7 `
   --out data\checkpoints\baseline_px0_wdl_v1.pt `
   --width 96 `
   --blocks 6 `
@@ -48,8 +51,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --train-list data\rounds\px0_train_v1.json `
-  --val-list data\rounds\px0_val_v1.json `
+  --px0-version 7 `
   --out data\checkpoints\baseline_px0_wdl_v1.pt `
   --width 96 `
   --blocks 6 `
@@ -63,7 +65,38 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
   --resume
 ```
 
-## 5. 导出当前 best baseline ONNX
+## 5. 强制重下并重建某个版本
+
+```powershell
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
+  --px0-version 7 `
+  --px0-force-download `
+  --out data\checkpoints\baseline_px0_wdl_v1.pt `
+  --width 96 `
+  --blocks 6 `
+  --batch-size 256 `
+  --steps 200000 `
+  --eval-every 1000 `
+  --val-batches 32 `
+  --num-workers 4 `
+  --device cuda `
+  --q-ratio 1.0
+```
+
+## 6. 如果你确实要手动生成 train/val manifest
+
+训练主线不需要这一步；只有想固定文件切分时才用：
+
+```powershell
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\split_px0_files.py `
+  --px0-version 7 `
+  --out-train data\rounds\px0_train_v1.json `
+  --out-val data\rounds\px0_val_v1.json `
+  --val-ratio 0.1 `
+  --seed 42
+```
+
+## 7. 导出 best checkpoint 为 ONNX
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
@@ -73,13 +106,11 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\expor
 
 说明：
 
-- 现在导出的 `value` 是 `WDL` 概率，不再是单标量
+- `value` 输出是 `WDL` 概率
 - 引擎侧按 `q = W - L` 消费 value
-- `q_ratio` 采用 lc0/px0 口径：`1.0=纯搜索`，`0.0=纯最终结果`
+- `q_ratio=1.0` 表示纯搜索监督
 
-## 6. 检查 ONNX 合约
-
-测试脚本默认检查 `data\policy.onnx`，所以先复制：
+## 8. 检查 ONNX 合约
 
 ```powershell
 Copy-Item data\checkpoints\baseline_px0_wdl_v1.best.onnx data\policy.onnx -Force
@@ -89,19 +120,21 @@ Copy-Item data\checkpoints\baseline_px0_wdl_v1.best.onnx data\policy.onnx -Force
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test_policy_onnx_contract.py
 ```
 
-## 7. 引擎 ONNX 冒烟
+## 9. 引擎 ONNX 冒烟
 
 ```powershell
 cargo run --release -p engin -- --onnx-smoke data\checkpoints\baseline_px0_wdl_v1.best.onnx
 ```
 
-## 8. 引擎 MCTS 基准
+这条命令只验证最小推理链路，不代表 GUI 正式接入效果。
+
+## 10. 引擎 bench
 
 ```powershell
 cargo run --release -p engin -- --bench --playouts 64 --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx --require-onnx
 ```
 
-## 9. 最小 UCI 联调
+## 11. 最小 UCI 联调
 
 ```powershell
 @'
@@ -114,25 +147,20 @@ quit
 '@ | C:\projects\77xiangqi_engine\target\release\engin.exe
 ```
 
-## 10. 当前 baseline 结果
+验证真实 history：
 
-这一轮 `baseline_px0_wdl_v1` 的最终结论：
+```powershell
+@'
+uci
+setoption name PolicyFile value C:/projects/77xiangqi_engine/data/checkpoints/baseline_px0_wdl_v1.best.onnx
+isready
+position startpos moves h2e2 h7e7
+go nodes 64
+quit
+'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+```
 
-- 当前主线配置：`width=96 blocks=6 batch=256 q_ratio=1.0`
-- 训练轮次：`200k steps`
-- 当前 best checkpoint：`data\checkpoints\baseline_px0_wdl_v1.best.pt`
-- 终盘附近最好验证指标：
-  - `val_policy ~= 2.4583`
-  - `val_value_ce ~= 0.7199`
-  - `val_value_q_mse ~= 0.0654`
-
-结论：
-
-- 这版已经可作为当前正式 baseline
-- 同配置继续硬跑收益已很小
-- 下一步优先做 `导出 ONNX -> 引擎联调 -> 小规模对照实验`
-
-## 11. 常用质量检查
+## 12. 质量检查
 
 ```powershell
 cargo check
@@ -143,14 +171,14 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m ruff check nn
 ```
 
 ```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test_px0_record.py nn\tests\test_dataset_px0.py nn\tests\test_nn_smoke.py nn\tests\test_train_policy_unpack.py
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests
 ```
 
 ```powershell
 cargo test -p engin --lib
 ```
 
-## 12. 清理训练产物
+## 13. 清理训练产物
 
 ```powershell
 Remove-Item -Force data\checkpoints\*.pt, data\checkpoints\*.onnx

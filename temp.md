@@ -12,6 +12,7 @@
 >>   --device cuda `
 >>   --q-ratio 1.0 `
 >>   --resume
+```
 torch 2.11.0+cu128 | cuda.is_available=True | device=cuda
 resume from data\checkpoints\baseline_px0_wdl_v1.pt | completed_steps=5000
 px0: train_files=360035 val_files=40004 batch_size=256 steps=200000 q_ratio=1.000
@@ -210,3 +211,4 @@ step 197000/200000 train_loss=3.0339 train_policy=2.6831 train_value_ce=0.3508 t
 step 198000/200000 train_loss=3.0836 train_policy=2.1749 train_value_ce=0.9087 train_value_q_mse=0.0860 val_loss=3.1816 val_policy=2.4595 val_value_ce=0.7221 val_value_q_mse=0.0665 lr=1.02e-05
 step 199000/200000 train_loss=3.3086 train_policy=2.5211 train_value_ce=0.7875 train_value_q_mse=0.0172 val_loss=3.1781 val_policy=2.4583 val_value_ce=0.7199 val_value_q_mse=0.0654 lr=1.01e-05
 step 200000/200000 train_loss=2.8904 train_policy=2.6754 train_value_ce=0.2150 train_value_q_mse=0.0196 val_loss=3.1829 val_policy=2.4604 val_value_ce=0.7225 val_value_q_mse=0.0667 lr=1.00e-05
+```

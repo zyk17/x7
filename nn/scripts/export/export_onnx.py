@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""将 checkpoint 导出为 ONNX（静态 batch=1）。"""
+"""将 checkpoint 导出为 ONNX（动态 batch）。"""
 
 from __future__ import annotations
 
@@ -71,6 +71,11 @@ def main() -> None:
         input_names=["board"],
         output_names=out_names,
         opset_version=17,
+        dynamic_axes={
+            "board": {0: "batch"},
+            "logits": {0: "batch"},
+            **({"value": {0: "batch"}} if value_head else {}),
+        },
         dynamo=False,
     )
     tail = "（value 已为 WDL 概率）" if value_head else ""

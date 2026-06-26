@@ -21,6 +21,7 @@ sys.path.insert(0, str(NN_ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nn.dataset_px0 import Px0ChunkDataset, Px0DatasetConfig
+from nn.px0_kaggle import DEFAULT_PX0_ROOT, ensure_px0_version
 from nn.model import (
     PolicyResNet,
     mix_wdl_targets,
@@ -35,6 +36,11 @@ from train_common import TRAIN_SEED, default_num_workers
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Train small policy/value model on PX0 v6 chunks")
+    ap.add_argument("--px0-version", default=None, help="Kaggle px0data version; if set, auto prepare local chunks")
+    ap.add_argument("--px0-root", type=Path, default=DEFAULT_PX0_ROOT)
+    ap.add_argument("--px0-val-ratio", type=float, default=0.1)
+    ap.add_argument("--px0-seed", type=int, default=42)
+    ap.add_argument("--px0-force-download", action="store_true")
     ap.add_argument("--train-glob", action="append", default=None, help="glob for training chunk files")
     ap.add_argument("--val-glob", action="append", default=None, help="glob for validation chunk files")
     ap.add_argument("--train-list", type=Path, default=None, help="JSON file list for training chunks")
@@ -63,12 +69,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    train_sources = int(bool(args.train_list)) + int(bool(args.train_glob))
-    val_sources = int(bool(args.val_list)) + int(bool(args.val_glob))
-    if train_sources != 1:
-        raise SystemExit("训练数据需要二选一：--train-glob 或 --train-list")
-    if val_sources != 1:
-        raise SystemExit("验证数据需要二选一：--val-glob 或 --val-list")
+    if args.px0_version:
+        if any([args.train_list, args.val_list, args.train_glob, args.val_glob]):
+            raise SystemExit("使用 --px0-version 时，不要再传 --train-* / --val-*")
+        if not (0.0 < float(args.px0_val_ratio) < 1.0):
+            raise SystemExit("--px0-val-ratio 须在 (0,1) 内")
+    else:
+        train_sources = int(bool(args.train_list)) + int(bool(args.train_glob))
+        val_sources = int(bool(args.val_list)) + int(bool(args.val_glob))
+        if train_sources != 1:
+            raise SystemExit("训练数据需要二选一：--train-glob 或 --train-list")
+        if val_sources != 1:
+            raise SystemExit("验证数据需要二选一：--val-glob 或 --val-list")
     if not (0.0 <= float(args.q_ratio) <= 1.0):
         raise SystemExit("--q-ratio 须在 [0,1] 内")
 
@@ -79,6 +91,31 @@ def take_logits_and_value(
     if not isinstance(output, tuple):
         raise TypeError("train_px0 requires value_head=True")
     return output
+
+
+def validate_resume_checkpoint(
+    ckpt: dict,
+    *,
+    args: argparse.Namespace,
+    train_files: list[Path],
+    val_files: list[Path],
+) -> None:
+    expected_q_ratio = float(args.q_ratio)
+    got_q_ratio = ckpt.get("q_ratio")
+    if got_q_ratio is not None and abs(float(got_q_ratio) - expected_q_ratio) > 1e-9:
+        raise SystemExit(
+            f"--resume 的 checkpoint q_ratio={float(got_q_ratio):.6f}，"
+            f"但当前命令是 q_ratio={expected_q_ratio:.6f}；请换新输出文件或取消 --resume"
+        )
+
+    ckpt_train_files = ckpt.get("train_files")
+    ckpt_val_files = ckpt.get("val_files")
+    current_train_files = [str(p.resolve()) for p in train_files]
+    current_val_files = [str(p.resolve()) for p in val_files]
+    if ckpt_train_files is not None and list(ckpt_train_files) != current_train_files:
+        raise SystemExit("--resume 的 checkpoint train_files 与当前数据集不一致；请换新输出文件或取消 --resume")
+    if ckpt_val_files is not None and list(ckpt_val_files) != current_val_files:
+        raise SystemExit("--resume 的 checkpoint val_files 与当前数据集不一致；请换新输出文件或取消 --resume")
 
 
 def run_val(
@@ -129,16 +166,29 @@ def run_val(
 
 
 def build_dataset_configs(args: argparse.Namespace) -> tuple[Px0DatasetConfig, Px0DatasetConfig]:
+    if args.px0_version:
+        prepared = ensure_px0_version(
+            args.px0_version,
+            root=args.px0_root,
+            val_ratio=float(args.px0_val_ratio),
+            seed=int(args.px0_seed),
+            force_download=bool(args.px0_force_download),
+        )
+        train_list = prepared.train_manifest
+        val_list = prepared.val_manifest
+    else:
+        train_list = args.train_list.resolve() if args.train_list else None
+        val_list = args.val_list.resolve() if args.val_list else None
     train_cfg = Px0DatasetConfig(
         patterns=tuple(args.train_glob or ()),
-        file_list_path=args.train_list.resolve() if args.train_list else None,
+        file_list_path=train_list,
         shuffle_files=True,
         max_files=int(args.train_max_files),
         limit_samples=int(args.train_limit_samples),
     )
     val_cfg = Px0DatasetConfig(
         patterns=tuple(args.val_glob or ()),
-        file_list_path=args.val_list.resolve() if args.val_list else None,
+        file_list_path=val_list,
         shuffle_files=False,
         max_files=int(args.val_max_files),
         limit_samples=int(args.val_limit_samples),
@@ -186,6 +236,12 @@ def main() -> None:
     best_val = float("inf")
     if args.resume and args.out.is_file():
         ckpt = torch.load(args.out, map_location=device)
+        validate_resume_checkpoint(
+            ckpt,
+            args=args,
+            train_files=train_ds.files,
+            val_files=val_ds.files,
+        )
         model.load_state_dict(ckpt["model"], strict=True)
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
@@ -206,6 +262,11 @@ def main() -> None:
         f"px0: train_files={len(train_ds.files)} val_files={len(val_ds.files)} "
         f"batch_size={int(args.batch_size)} steps={int(args.steps)} q_ratio={float(args.q_ratio):.3f}"
     )
+    if args.px0_version:
+        print(
+            f"px0_kaggle: version={args.px0_version} root={args.px0_root.resolve()} "
+            f"val_ratio={float(args.px0_val_ratio):.3f}"
+        )
 
     train_iter = iter(train_loader)
     for step in range(start_step + 1, int(args.steps) + 1):
@@ -275,6 +336,10 @@ def main() -> None:
                 "val_glob": list(args.val_glob or ()),
                 "train_list": str(args.train_list.resolve()) if args.train_list else None,
                 "val_list": str(args.val_list.resolve()) if args.val_list else None,
+                "px0_version": str(args.px0_version) if args.px0_version else None,
+                "px0_root": str(args.px0_root.resolve()) if args.px0_version else None,
+                "px0_val_ratio": float(args.px0_val_ratio) if args.px0_version else None,
+                "px0_seed": int(args.px0_seed) if args.px0_version else None,
                 "train_files": [str(p) for p in train_ds.files],
                 "val_files": [str(p) for p in val_ds.files],
                 "batch_size": int(args.batch_size),

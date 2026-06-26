@@ -6,7 +6,6 @@ from nn.board_compact import (
     fen_to_compact_board,
 )
 from nn.dataset_px0 import Px0ChunkDataset, Px0DatasetConfig
-from nn.dataset_xrsh import PolicyXrshDataset
 from nn.fen_tensor import fen_to_planes
 from nn.model import (
     PolicyResNet,
@@ -23,7 +22,6 @@ __all__ = [
     "PolicyResNet",
     "Px0ChunkDataset",
     "Px0DatasetConfig",
-    "PolicyXrshDataset",
     "compact_board_to_planes",
     "compact_board_to_torch_planes",
     "fen_to_compact_board",

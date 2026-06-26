@@ -20,8 +20,7 @@
 
 当前不再把下面这些当主线：
 
-- `XRSH` 扩样本
-- 本地大规模搜索标注
+- 本地大规模搜索标注建包
 - `15 planes + move_vocab` 的长期正式 I/O
 - Alpha-Beta 搜索
 
@@ -56,6 +55,10 @@
 
 - 搜索预算口径统一成 `playouts / nodes / deadline`
 - 线上与离线尽量共用一套搜索核心
+- 当前搜索主线固定为单线程 worker 风格：
+  `iteration -> gather minibatch -> batched eval -> backup`
+- 当前树统计正式包含：
+  `visits + in_flight`、`collision`、`multivisit`
 - 不再扩 Alpha-Beta 主线
 
 ### `crates/xiangqi_dataset`
@@ -63,11 +66,13 @@
 职责：
 
 - 最小数据辅助工具
-- 保留 PGN / XRSH / 小批量搜索标注能力
+- 保留 PGN / ICCS 清理能力
+- 作为后续自对弈数据预处理地基
 
 约束：
 
 - 不承担主规模训练数据生产
+- 不再保留 `XRSH` 正式数据格式
 - 不再向“本地大规模数据平台”演化
 
 ### `nn/`
@@ -91,7 +96,9 @@
 - 形状：`124 x 10 x 9`
 - 数据来源：`px0 v6`
 - 当前只支持：`classical input_format=1`
-- 不含历史
+- 编码语义：`8 x 15` history blocks + `4` aux planes
+- 线上主线：真实 `PositionHistory`
+- fallback：孤立 `FEN` 使用 `fen_only`
 
 ### 输出
 
@@ -125,22 +132,25 @@
 2. 不预设人类数据混入
 3. 后续只有在复盘解释或 second-stage fine-tune 明确有效时，再引入人类数据
 
-因此本地 `XRSH` 当前只剩下两种角色：
-
-- 调试工具
-- 可选的小支线实验
-
-如果你决定彻底不走这条支线，仓库内的 `XRSH` 数据、旧 checkpoint、旧 ONNX 都可以删除。
+因此当前仓库内已经不再保留 `XRSH` 正式支线；后续如需补数据，只在 `px0` 主线或未来自对弈预处理链路上继续演化。
 
 ## 6. 现在真正要维护的地基
 
 真正需要稳定维护的只有这些：
 
 1. `xiangqi_core` 规则正确
-2. `engin` 的 MCTS / UCI / ONNX 语义一致
+2. `engin` 的 MCTS / UCI / ONNX / history 编码语义一致
 3. `px0_record.py` 和 `dataset_px0.py` 能稳定读数据
 4. `train_px0.py` 能稳定长跑、保存、恢复、导出
 5. 导出的 ONNX 契约与引擎消费侧一致
+
+### `engin` 当前输入约束
+
+- UCI `position ... moves ...` 必须保留真实历史
+- 搜索 root 输入必须从 history 编码，不再伪造 history
+- 搜索过程只在 root 构造一次 history；simulation 仍基于 `Position do/undo`
+- 搜索 iteration 内允许收集多个待评估叶子，再统一做 batched ONNX 推理
+- 第三方 GUI 若只给最终 `FEN`，允许走 fallback，但不视为最佳接入方式
 
 ## 7. 删除原则
 
@@ -148,13 +158,12 @@
 
 - 旧 `*.pt`
 - 旧 `*.onnx`
-- `data/xrsh_*`
 - 旧人类 baseline 数据
 - 旧实验 CSV / 临时统计
 
-仓库内建议保留的最小数据文件：
+当前真正的主数据源不是仓库内文件，而是本地版本目录：
 
-- `data/rounds/px0_train_v1.json`
-- `data/rounds/px0_val_v1.json`
+- `C:\work\px0data\{version}\`
 
-它们只是分片清单，体积相对小，而且能直接复用你的本地 px0 数据目录。
+`data/rounds/*.json` 只是在你想固定一次 train/val 文件切分时才需要保留；
+如果不需要固定切分，直接走 `--px0-version` 即可，这些 manifest 也不属于必须长期保留的仓库资产。
