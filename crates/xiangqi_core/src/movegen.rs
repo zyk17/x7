@@ -269,7 +269,8 @@ fn generate_king_evasions(pos: &Position, list: &mut [ExtMove], ksq: Square) -> 
         t &= t - 1;
         // 目标格须不受对方攻击
         let after_occupied = (occupied ^ square_bb(ksq)) | square_bb(to);
-        if pos.checkers_to(them, to) & after_occupied == 0 {
+        let captured_square = (pos.piece_on(to) != Piece::NO_PIECE).then_some(to);
+        if pos.checkers_to_with_occupied(them, to, after_occupied, captured_square) == 0 {
             if count < list.len() {
                 list[count] = ExtMove {
                     mv: Move::make(ksq, to),
@@ -317,7 +318,8 @@ fn generate_king_evasions_with_check(
         let to: Square = unsafe { std::mem::transmute(t.trailing_zeros() as u8) };
         t &= t - 1;
         let after_occupied = (occupied ^ square_bb(ksq)) | square_bb(to);
-        if pos.checkers_to(them, to) & after_occupied == 0 {
+        let captured_square = (pos.piece_on(to) != Piece::NO_PIECE).then_some(to);
+        if pos.checkers_to_with_occupied(them, to, after_occupied, captured_square) == 0 {
             if count < list.len() {
                 list[count] = ExtMove {
                     mv: Move::make(ksq, to),

@@ -29,6 +29,6 @@
 - 默认先纯 `px0`
 - 不预设人类数据混入
 - value 主语义为 `WDL + qMix`
-- 默认 `q_ratio=1.0`，先以搜索 WDL 为主监督
+- 默认 `q_ratio=0.0`，先以最终结果 WDL 为主监督
 - 训练入口支持 `--px0-version`
 - 本地目录约定为 `C:\work\px0data\{version}\`

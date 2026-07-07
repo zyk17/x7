@@ -24,6 +24,56 @@ class PreparedPx0Version:
     val_manifest: Path
 
 
+def read_px0_manifest(path: Path | str) -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _manifest_matches(payload: dict, *, version: str, seed: int, val_ratio: float) -> bool:
+    return (
+        str(payload.get("format")) == "px0_file_list_v2"
+        and str(payload.get("dataset")) == "pikacat/px0data"
+        and str(payload.get("version")) == str(version)
+        and int(payload.get("seed", -1)) == int(seed)
+        and abs(float(payload.get("val_ratio", -1.0)) - float(val_ratio)) <= 1e-12
+    )
+
+
+def try_load_prepared_px0_version(
+    version: str,
+    *,
+    root: Path | str = DEFAULT_PX0_ROOT,
+    val_ratio: float = 0.1,
+    seed: int = 42,
+) -> PreparedPx0Version | None:
+    version_dir = px0_version_dir(version, root=root)
+    manifest_dir = version_dir / "manifests"
+    train_manifest = manifest_dir / "train.json"
+    val_manifest = manifest_dir / "val.json"
+    if not train_manifest.is_file() or not val_manifest.is_file():
+        return None
+
+    train_payload = read_px0_manifest(train_manifest)
+    val_payload = read_px0_manifest(val_manifest)
+    if not _manifest_matches(train_payload, version=version, seed=seed, val_ratio=val_ratio):
+        return None
+    if not _manifest_matches(val_payload, version=version, seed=seed, val_ratio=val_ratio):
+        return None
+
+    train_files = [Path(str(item)).resolve() for item in train_payload.get("files", [])]
+    val_files = [Path(str(item)).resolve() for item in val_payload.get("files", [])]
+    chunk_files = sorted({*train_files, *val_files})
+    if not train_files or not val_files or any(not path.is_file() for path in chunk_files):
+        return None
+
+    return PreparedPx0Version(
+        version=str(version),
+        version_dir=version_dir,
+        chunk_files=chunk_files,
+        train_manifest=train_manifest,
+        val_manifest=val_manifest,
+    )
+
+
 def kaggle_dataset_handle(version: str) -> str:
     version = str(version).strip()
     if not version or version.lower() == "latest":
@@ -101,6 +151,15 @@ def ensure_px0_version(
     version = str(version).strip()
     if not version:
         raise ValueError("px0 version 不能为空")
+    if not force_download:
+        prepared = try_load_prepared_px0_version(
+            version,
+            root=root,
+            val_ratio=val_ratio,
+            seed=seed,
+        )
+        if prepared is not None:
+            return prepared
     version_dir = px0_version_dir(version, root=root)
     version_dir.mkdir(parents=True, exist_ok=True)
 

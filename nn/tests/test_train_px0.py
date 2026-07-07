@@ -9,14 +9,14 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "train"))
 
-from train_px0 import validate_resume_checkpoint
+from train_px0 import validate_existing_output_checkpoint
 
 
 def _args(*, q_ratio: float) -> argparse.Namespace:
     return argparse.Namespace(q_ratio=q_ratio)
 
 
-def test_validate_resume_checkpoint_accepts_matching_state(tmp_path: Path) -> None:
+def test_validate_existing_output_checkpoint_accepts_matching_state(tmp_path: Path) -> None:
     train_file = (tmp_path / "train.gz").resolve()
     val_file = (tmp_path / "val.gz").resolve()
     ckpt = {
@@ -25,7 +25,7 @@ def test_validate_resume_checkpoint_accepts_matching_state(tmp_path: Path) -> No
         "val_files": [str(val_file)],
     }
 
-    validate_resume_checkpoint(
+    validate_existing_output_checkpoint(
         ckpt,
         args=_args(q_ratio=1.0),
         train_files=[train_file],
@@ -33,7 +33,7 @@ def test_validate_resume_checkpoint_accepts_matching_state(tmp_path: Path) -> No
     )
 
 
-def test_validate_resume_checkpoint_rejects_q_ratio_mismatch(tmp_path: Path) -> None:
+def test_validate_existing_output_checkpoint_rejects_q_ratio_mismatch(tmp_path: Path) -> None:
     train_file = (tmp_path / "train.gz").resolve()
     val_file = (tmp_path / "val.gz").resolve()
     ckpt = {
@@ -43,7 +43,7 @@ def test_validate_resume_checkpoint_rejects_q_ratio_mismatch(tmp_path: Path) -> 
     }
 
     with pytest.raises(SystemExit, match="q_ratio"):
-        validate_resume_checkpoint(
+        validate_existing_output_checkpoint(
             ckpt,
             args=_args(q_ratio=1.0),
             train_files=[train_file],
@@ -51,7 +51,7 @@ def test_validate_resume_checkpoint_rejects_q_ratio_mismatch(tmp_path: Path) -> 
         )
 
 
-def test_validate_resume_checkpoint_rejects_dataset_mismatch(tmp_path: Path) -> None:
+def test_validate_existing_output_checkpoint_rejects_dataset_mismatch(tmp_path: Path) -> None:
     train_file = (tmp_path / "train.gz").resolve()
     other_train_file = (tmp_path / "other_train.gz").resolve()
     val_file = (tmp_path / "val.gz").resolve()
@@ -62,7 +62,7 @@ def test_validate_resume_checkpoint_rejects_dataset_mismatch(tmp_path: Path) -> 
     }
 
     with pytest.raises(SystemExit, match="train_files"):
-        validate_resume_checkpoint(
+        validate_existing_output_checkpoint(
             ckpt,
             args=_args(q_ratio=1.0),
             train_files=[other_train_file],

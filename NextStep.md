@@ -7,7 +7,7 @@
 - 模型：`124x10x9 -> 2062 + WDL`
 - 引擎输入：`px0 classical` 真实 history 主线，`fen_only` fallback
 - 搜索核心：单线程 `iteration + minibatch + in_flight`
-- 训练配置：`width=96 blocks=6 batch=256 q_ratio=1.0`
+- 下一轮正式 baseline：`width=128 blocks=8 batch=256 q_ratio=0.0`
 - 已完成：`200k steps`
 - 当前 best：`baseline_px0_wdl_v1.best.pt`
 - 当前 best 指标大致为：

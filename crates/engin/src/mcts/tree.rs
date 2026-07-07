@@ -65,11 +65,7 @@ fn copy_subtree_rec(
         children: old_node.children.clone(),
     });
     remap.insert(old_id.0, new_id);
-    let child_ids = old_node
-        .children
-        .iter()
-        .map(|edge| edge.child)
-        .collect::<Vec<_>>();
+    let child_ids = old_node.children.iter().map(|edge| edge.child).collect::<Vec<_>>();
     for (idx, child) in child_ids.into_iter().enumerate() {
         if let Some(child_id) = child {
             let mapped_child = copy_subtree_rec(src, child_id, dst, remap);

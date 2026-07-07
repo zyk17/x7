@@ -39,14 +39,14 @@ fn perft_startpos_depth1() {
 #[test]
 fn perft_startpos_depth2() {
     let pos = Position::from_fen(START_FEN).unwrap();
-    assert_eq!(perft(&pos, 2), 1926);
+    assert_eq!(perft(&pos, 2), 1920);
 }
 
 #[test]
 fn perft_startpos_depth3() {
     let pos = Position::from_fen(START_FEN).unwrap();
-    // `legal()` 须排除吃将；旧期望值含误计的「吃将」分支（与 `do_move` 断言不一致）。
-    assert_eq!(perft(&pos, 3), 80063);
+    // 与 pyffish / Pikafish 规则语义对拍：当前起始局面 depth3 为 79666。
+    assert_eq!(perft(&pos, 3), 79666);
 }
 
 #[test]

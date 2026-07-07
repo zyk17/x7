@@ -17,6 +17,72 @@ from nn.px0_record import (
 )
 
 
+def _official_like_decode(record: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    (
+        version,
+        input_format,
+        probs_raw,
+        packed_planes,
+        stm,
+        rule50_count,
+        invariance_info,
+        _dep_result,
+        _root_q,
+        best_q,
+        _root_d,
+        best_d,
+        _root_m,
+        _best_m,
+        plies_left,
+        result_q,
+        result_d,
+        _played_q,
+        _played_d,
+        _played_m,
+        _orig_q,
+        _orig_d,
+        _orig_m,
+        _visits,
+        _played_idx,
+        _best_idx,
+        _reserved1,
+        _reserved2,
+        _reserved3,
+        _reserved4,
+    ) = V6_STRUCT.unpack(record)
+    assert version == 6
+    assert input_format == 1
+
+    planes = np.unpackbits(np.frombuffer(packed_planes, dtype=np.uint8), bitorder="little")
+    planes = planes.reshape((-1, 128))[:, :90].reshape((-1, 10, 9)).astype(np.float32)
+    stm_plane = np.full((1, 10, 9), float(stm), dtype=np.float32)
+    rule50_plane = np.full((1, 10, 9), float(rule50_count), dtype=np.float32)
+    aux_plane = np.zeros((1, 10, 9), dtype=np.float32)
+    if invariance_info >= 128:
+        aux_plane.fill(1.0)
+    edge_plane = np.ones((1, 10, 9), dtype=np.float32)
+    full_planes = np.concatenate([planes, stm_plane, rule50_plane, aux_plane, edge_plane], axis=0)
+
+    winner = np.asarray(
+        [
+            0.5 * (1.0 - result_d + result_q),
+            result_d,
+            0.5 * (1.0 - result_d - result_q),
+        ],
+        dtype=np.float32,
+    )
+    best = np.asarray(
+        [
+            0.5 * (1.0 - best_d + best_q),
+            best_d,
+            0.5 * (1.0 - best_d - best_q),
+        ],
+        dtype=np.float32,
+    )
+    policy = np.frombuffer(probs_raw, dtype=np.float32).copy()
+    return full_planes, policy, winner, best, np.asarray([float(plies_left)], dtype=np.float32)
+
+
 def _fake_v6_record() -> bytes:
     probs = np.zeros(PX0_POLICY_SIZE, dtype=np.float32)
     probs[7] = 1.0
@@ -67,6 +133,17 @@ def test_parse_v6_record_shapes() -> None:
     assert sample.winner_wdl.sum() == pytest.approx(1.0)
     assert sample.search_wdl.sum() == pytest.approx(1.0)
     assert sample.search_wdl[0] - sample.search_wdl[2] == pytest.approx(sample.search_q[0])
+
+
+def test_parse_v6_record_matches_official_chunkparser_semantics() -> None:
+    record = _fake_v6_record()
+    sample = parse_v6_record(record)
+    planes, policy, winner, best, plies_left = _official_like_decode(record)
+    np.testing.assert_allclose(sample.planes, planes)
+    np.testing.assert_allclose(sample.policy, policy)
+    np.testing.assert_allclose(sample.winner_wdl, winner)
+    np.testing.assert_allclose(sample.search_wdl, best)
+    np.testing.assert_allclose(sample.plies_left, plies_left)
 
 
 def test_iter_px0_chunk_file_reads_gzip(tmp_path: Path) -> None:

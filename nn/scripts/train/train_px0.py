@@ -46,8 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--train-list", type=Path, default=None, help="JSON file list for training chunks")
     ap.add_argument("--val-list", type=Path, default=None, help="JSON file list for validation chunks")
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--width", type=int, default=96)
-    ap.add_argument("--blocks", type=int, default=6)
+    ap.add_argument("--init-from", type=Path, default=None, help="initialize model weights from an existing checkpoint")
+    ap.add_argument("--width", type=int, default=128)
+    ap.add_argument("--blocks", type=int, default=8)
     ap.add_argument("--in-planes", type=int, default=124)
     ap.add_argument("--num-moves", type=int, default=2062)
     ap.add_argument("--batch-size", type=int, default=256)
@@ -61,14 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--value-loss-weight", type=float, default=1.0)
-    ap.add_argument("--q-ratio", type=float, default=1.0)
+    ap.add_argument("--q-ratio", type=float, default=0.0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--num-workers", type=int, default=default_num_workers())
-    ap.add_argument("--resume", action="store_true", help="resume from --out if it exists")
     return ap
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if int(args.width) <= 0 or int(args.width) % 4 != 0:
+        raise SystemExit("--width 须为正数且能被 4 整除")
+    if int(args.blocks) <= 0:
+        raise SystemExit("--blocks 须为正整数")
     if args.px0_version:
         if any([args.train_list, args.val_list, args.train_glob, args.val_glob]):
             raise SystemExit("使用 --px0-version 时，不要再传 --train-* / --val-*")
@@ -83,6 +87,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise SystemExit("验证数据需要二选一：--val-glob 或 --val-list")
     if not (0.0 <= float(args.q_ratio) <= 1.0):
         raise SystemExit("--q-ratio 须在 [0,1] 内")
+    if args.init_from is not None and not Path(args.init_from).is_file():
+        raise SystemExit(f"--init-from 文件不存在: {args.init_from}")
 
 
 def take_logits_and_value(
@@ -93,7 +99,7 @@ def take_logits_and_value(
     return output
 
 
-def validate_resume_checkpoint(
+def validate_existing_output_checkpoint(
     ckpt: dict,
     *,
     args: argparse.Namespace,
@@ -104,8 +110,8 @@ def validate_resume_checkpoint(
     got_q_ratio = ckpt.get("q_ratio")
     if got_q_ratio is not None and abs(float(got_q_ratio) - expected_q_ratio) > 1e-9:
         raise SystemExit(
-            f"--resume 的 checkpoint q_ratio={float(got_q_ratio):.6f}，"
-            f"但当前命令是 q_ratio={expected_q_ratio:.6f}；请换新输出文件或取消 --resume"
+            f"--out 已存在，但其中 checkpoint q_ratio={float(got_q_ratio):.6f}，"
+            f"当前命令 q_ratio={expected_q_ratio:.6f}；请换新输出文件或改用 --init-from 开启新阶段训练"
         )
 
     ckpt_train_files = ckpt.get("train_files")
@@ -113,9 +119,9 @@ def validate_resume_checkpoint(
     current_train_files = [str(p.resolve()) for p in train_files]
     current_val_files = [str(p.resolve()) for p in val_files]
     if ckpt_train_files is not None and list(ckpt_train_files) != current_train_files:
-        raise SystemExit("--resume 的 checkpoint train_files 与当前数据集不一致；请换新输出文件或取消 --resume")
+        raise SystemExit("--out 已存在，但其 train_files 与当前数据集不一致；请换新输出文件或改用 --init-from")
     if ckpt_val_files is not None and list(ckpt_val_files) != current_val_files:
-        raise SystemExit("--resume 的 checkpoint val_files 与当前数据集不一致；请换新输出文件或取消 --resume")
+        raise SystemExit("--out 已存在，但其 val_files 与当前数据集不一致；请换新输出文件或改用 --init-from")
 
 
 def run_val(
@@ -228,15 +234,18 @@ def main() -> None:
         num_blocks=int(args.blocks),
         num_moves=int(args.num_moves),
         value_head=True,
-        value_head_hidden_dim=64,
+        value_head_hidden_dim=128,
     ).to(device)
     opt = AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     scheduler = lr_scheduler(opt, epochs=max(1, int(args.steps)))
     start_step = 0
     best_val = float("inf")
-    if args.resume and args.out.is_file():
+    if args.out.is_file() and args.init_from is not None:
+        raise SystemExit("--out 已存在时不要再传 --init-from；默认会直接从 --out 续训")
+
+    if args.out.is_file():
         ckpt = torch.load(args.out, map_location=device)
-        validate_resume_checkpoint(
+        validate_existing_output_checkpoint(
             ckpt,
             args=args,
             train_files=train_ds.files,
@@ -257,6 +266,10 @@ def main() -> None:
             for _ in range(start_step):
                 scheduler.step()
         print(f"resume from {args.out} | completed_steps={start_step}")
+    elif args.init_from is not None:
+        ckpt = torch.load(args.init_from, map_location=device)
+        model.load_state_dict(ckpt["model"], strict=True)
+        print(f"init from {args.init_from} | start new phase with q_ratio={float(args.q_ratio):.3f}")
 
     print(
         f"px0: train_files={len(train_ds.files)} val_files={len(val_ds.files)} "
@@ -327,7 +340,7 @@ def main() -> None:
                 "format": "px0_v6",
                 "value_head": True,
                 "value_head_format": "wdl",
-                "value_head_hidden_dim": 64,
+                "value_head_hidden_dim": 128,
                 "value_target_kind": "qmix_wdl",
                 "q_ratio": float(args.q_ratio),
                 "completed_steps": step,

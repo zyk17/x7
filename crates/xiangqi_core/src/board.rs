@@ -181,18 +181,20 @@ pub fn knight_block_square(from: Square, dir: i8) -> Bitboard {
         return 0;
     }
 
-    let df = (file_of(to) as i32 - file_of(from) as i32).abs();
-    let dr = (rank_of(to) as i32 - rank_of(from) as i32).abs();
+    let file_delta = file_of(to) as i32 - file_of(from) as i32;
+    let rank_delta = rank_of(to) as i32 - rank_of(from) as i32;
+    let df = file_delta.abs();
+    let dr = rank_delta.abs();
     let block_sq_val = if df > 1 && dr > 1 {
         // 象向两格斜：阻挡为中间格
         from as i32 + (dir as i32 / 2)
     } else if df == 2 {
         // 马：马腿为横向一步格
-        let step = if to_val > from as i32 { EAST } else { WEST };
+        let step = if file_delta > 0 { EAST } else { WEST };
         from as i32 + step
     } else {
         // 马：马腿为纵向一步格
-        let step = if to_val > from as i32 { NORTH } else { SOUTH };
+        let step = if rank_delta > 0 { NORTH } else { SOUTH };
         from as i32 + step
     };
     if block_sq_val < 0 || block_sq_val >= SQUARE_NB as i32 {
@@ -721,6 +723,17 @@ impl Position {
     /// 颜色为 `c` 且能将军格子 `s` 的子力位棋盘。
     pub fn checkers_to(&self, c: Color, s: Square) -> Bitboard {
         let occupied = self.occupancy();
+        self.checkers_to_with_occupied(c, s, occupied, None)
+    }
+
+    /// 在给定占用位棋盘下，颜色为 `c` 且能将军格子 `s` 的子力位棋盘。
+    pub fn checkers_to_with_occupied(
+        &self,
+        c: Color,
+        s: Square,
+        occupied: Bitboard,
+        captured_square: Option<Square>,
+    ) -> Bitboard {
         let mut att = 0u128;
 
         // 兵
@@ -728,6 +741,10 @@ impl Position {
         let mut bb = pawns;
         while bb != 0 {
             let psq = unsafe { std::mem::transmute(bb.trailing_zeros() as u8) };
+            if Some(psq) == captured_square {
+                bb &= bb - 1;
+                continue;
+            }
             if pawn_attacks(psq, c) & square_bb(s) != 0 {
                 att |= square_bb(psq);
             }
@@ -739,6 +756,10 @@ impl Position {
         let mut bb = knights;
         while bb != 0 {
             let psq = unsafe { std::mem::transmute(bb.trailing_zeros() as u8) };
+            if Some(psq) == captured_square {
+                bb &= bb - 1;
+                continue;
+            }
             if knight_attacks(psq, occupied) & square_bb(s) != 0 {
                 att |= square_bb(psq);
             }
@@ -750,6 +771,10 @@ impl Position {
         let mut bb = rooks_kings;
         while bb != 0 {
             let psq = unsafe { std::mem::transmute(bb.trailing_zeros() as u8) };
+            if Some(psq) == captured_square {
+                bb &= bb - 1;
+                continue;
+            }
             if rook_attacks(psq, occupied) & square_bb(s) != 0 {
                 att |= square_bb(psq);
             }
@@ -761,6 +786,10 @@ impl Position {
         let mut bb = cannons;
         while bb != 0 {
             let psq = unsafe { std::mem::transmute(bb.trailing_zeros() as u8) };
+            if Some(psq) == captured_square {
+                bb &= bb - 1;
+                continue;
+            }
             if cannon_attacks(psq, occupied) & square_bb(s) != 0 {
                 att |= square_bb(psq);
             }
@@ -921,10 +950,11 @@ impl Position {
             return false;
         }
         let occupied = (self.occupancy() ^ square_bb(from)) | square_bb(to);
+        let captured_square = (captured != Piece::NO_PIECE).then_some(to);
 
         // 将/帅：目标格须不受对方攻击
         if type_of(pc) == PieceType::King {
-            return self.checkers_to(them, to) & occupied == 0;
+            return self.checkers_to_with_occupied(them, to, occupied, captured_square) == 0;
         }
 
         // 快路径：非将着且明显合法
@@ -942,8 +972,7 @@ impl Position {
         }
 
         // 一般情形：走后王不得仍被将军
-        let checkers = self.checkers_to(them, self.king_square(us));
-        checkers & !square_bb(to) == 0
+        self.checkers_to_with_occupied(them, self.king_square(us), occupied, captured_square) == 0
     }
 
     /// 该着是否将军。

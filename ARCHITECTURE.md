@@ -107,14 +107,14 @@
 
 ### 网络
 
-- shared trunk：`stem + residual blocks`
-- policy head：`1x1 conv -> flatten -> linear(2062)`
-- value head：`1x1 conv -> flatten -> mlp -> wdl(3)`
+- shared trunk：`stem + SE residual blocks`
+- policy head：`90-square token -> 1-layer policy encoder -> from-to attention -> px0 2062 move map`
+- value head：`1x1 conv -> flatten -> dense(128) -> wdl(3)`
 
 ### value 语义
 
 - 主训练 target：`q_ratio * search_wdl + (1 - q_ratio) * winner_wdl`
-- 当前默认：`q_ratio=1.0`
+- 当前默认：`q_ratio=0.0`
 - ONNX 导出：`value` 为 WDL 概率
 - 引擎消费：派生 `q = W - L`
 
@@ -122,7 +122,8 @@
 
 - 保持网络小
 - 保持实现清楚
-- 但不再用 `global average pooling -> single linear` 这种会过早抹掉空间信息的 policy 头
+- trunk 对齐 `px0` 的 `SE residual` 主体，而不是继续用更弱的 plain residual
+- policy 头不再用“纯 flatten + linear”作为正式主线，而是对齐 `px0/lc0` 的 from-to attention 语义
 
 ## 5. 数据策略
 

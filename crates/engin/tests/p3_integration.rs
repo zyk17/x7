@@ -134,4 +134,5 @@ fn uci_setoption_then_go() {
     assert!(s.contains("FpuReduction"));
     assert!(s.contains("FpuReductionAtRoot"));
     assert!(s.contains("SearchBatchSize"));
+    assert!(s.contains("Threads"));
 }

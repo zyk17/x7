@@ -1,28 +1,118 @@
-"""小型 ResNet backbone + px0/classical 风格 policy/value 头。"""
+"""小型 px0 风格 ResNet trunk + attention policy + WDL value。"""
 
 from __future__ import annotations
+
+import math
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+class SqueezeExcitation(nn.Module):
+    def __init__(self, channels: int, *, se_ratio: int = 2) -> None:
+        super().__init__()
+        if channels % int(se_ratio) != 0:
+            raise ValueError(f"channels={channels} 需被 se_ratio={se_ratio} 整除")
+        hidden = channels // int(se_ratio)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(channels, hidden)
+        self.fc2 = nn.Linear(hidden, channels * 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pooled = self.pool(x).flatten(1)
+        squeezed = F.relu(self.fc1(pooled))
+        excited = self.fc2(squeezed)
+        gamma, beta = excited.chunk(2, dim=1)
+        gamma = torch.sigmoid(gamma).unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        return gamma * x + beta
+
+
 class ResBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, *, se_ratio: int = 2) -> None:
         super().__init__()
         self.c1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.b1 = nn.BatchNorm2d(channels)
         self.c2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.b2 = nn.BatchNorm2d(channels)
+        self.se = SqueezeExcitation(channels, se_ratio=se_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.relu(self.b1(self.c1(x)))
-        y = self.b2(self.c2(y))
+        y = self.se(self.b2(self.c2(y)))
         return F.relu(x + y)
 
 
 BOARD_ROWS = 10
 BOARD_COLS = 9
+BOARD_SQUARES = BOARD_ROWS * BOARD_COLS
+
+
+def _load_px0_policy_attention_map() -> torch.Tensor:
+    repo_root = Path(__file__).resolve().parents[3]
+    moves_path = repo_root / "crates" / "engin" / "src" / "px0_policy_moves.txt"
+    indices: list[int] = []
+    for raw in moves_path.read_text(encoding="utf-8").splitlines():
+        move = raw.strip()
+        if len(move) != 4:
+            continue
+        from_file = ord(move[0]) - ord("a")
+        from_rank = ord(move[1]) - ord("0")
+        to_file = ord(move[2]) - ord("a")
+        to_rank = ord(move[3]) - ord("0")
+        from_sq = from_rank * BOARD_COLS + from_file
+        to_sq = to_rank * BOARD_COLS + to_file
+        indices.append(from_sq * BOARD_SQUARES + to_sq)
+    if len(indices) != 2062:
+        raise ValueError(f"unexpected px0 policy map size: {len(indices)}")
+    return torch.tensor(indices, dtype=torch.long)
+
+
+class AttentionPolicyHead(nn.Module):
+    def __init__(self, trunk_channels: int, num_moves: int, *, embed_dim: int) -> None:
+        super().__init__()
+        if int(embed_dim) <= 0 or int(embed_dim) % 4 != 0:
+            raise ValueError(f"embed_dim={embed_dim} 须为正数且能被 4 整除")
+        self.embed = nn.Sequential(
+            nn.Conv2d(trunk_channels, embed_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.square_bias = nn.Parameter(torch.zeros(BOARD_SQUARES, embed_dim))
+        self.encoder_ln1 = nn.LayerNorm(embed_dim)
+        self.encoder_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=4,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.encoder_ln2 = nn.LayerNorm(embed_dim)
+        self.encoder_ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.scale = math.sqrt(float(embed_dim))
+        policy_map = _load_px0_policy_attention_map()
+        if policy_map.numel() != int(num_moves):
+            raise ValueError(f"policy map size={policy_map.numel()} != num_moves={num_moves}")
+        self.register_buffer("policy_map", policy_map, persistent=False)
+
+    def forward(self, trunk: torch.Tensor) -> torch.Tensor:
+        tokens = self.embed(trunk).flatten(2).transpose(1, 2)
+        tokens = tokens + self.square_bias.unsqueeze(0)
+        attn_input = self.encoder_ln1(tokens)
+        attn_output, _ = self.encoder_attn(attn_input, attn_input, attn_input, need_weights=False)
+        tokens = tokens + attn_output
+        tokens = tokens + self.encoder_ffn(self.encoder_ln2(tokens))
+        q = self.q_proj(tokens)
+        k = self.k_proj(tokens)
+        attn = torch.matmul(q, k.transpose(1, 2)) / self.scale
+        return attn.flatten(1).index_select(1, self.policy_map)
 
 
 class PolicyResNet(nn.Module):
@@ -36,7 +126,7 @@ class PolicyResNet(nn.Module):
         num_moves: int = 2062,
         *,
         value_head: bool = False,
-        value_head_hidden_dim: int = 0,
+        value_head_hidden_dim: int = 128,
     ) -> None:
         super().__init__()
         self.in_planes = int(in_planes)
@@ -47,14 +137,9 @@ class PolicyResNet(nn.Module):
             nn.BatchNorm2d(width),
             nn.ReLU(inplace=True),
         )
-        self.blocks = nn.Sequential(*[ResBlock(width) for _ in range(num_blocks)])
+        self.blocks = nn.Sequential(*[ResBlock(width, se_ratio=2) for _ in range(num_blocks)])
         head_channels = min(32, width)
-        self.policy_head = nn.Sequential(
-            nn.Conv2d(width, head_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(head_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.fc = nn.Linear(head_channels * BOARD_ROWS * BOARD_COLS, num_moves)
+        self.policy_head = AttentionPolicyHead(width, num_moves, embed_dim=width)
         if self.value_head:
             self.value_head_module = nn.Sequential(
                 nn.Conv2d(width, head_channels, kernel_size=1, bias=False),
@@ -78,8 +163,7 @@ class PolicyResNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         h = self.blocks(self.stem(x))
-        policy_features = self.policy_head(h).flatten(1)
-        logits = self.fc(policy_features)
+        logits = self.policy_head(h)
         if not self.value_head:
             return logits
         value_features = self.value_head_module(h).flatten(1)

@@ -69,10 +69,9 @@ def _decode_planes(
     ).reshape((-1, 128))[:, : (PX0_ROWS * PX0_COLS)]
     planes = planes.reshape((-1, PX0_ROWS, PX0_COLS)).astype(np.float32)
 
-    rule50_divisor = 120.0 if input_format > 3 else 119.0
     rule50_plane = np.full(
         (1, PX0_ROWS, PX0_COLS),
-        float(rule50_count) / rule50_divisor,
+        float(rule50_count) / 120.0 if input_format > 3 else float(rule50_count),
         dtype=np.float32,
     )
 

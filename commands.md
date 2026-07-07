@@ -36,15 +36,15 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\inspect
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
   --px0-version 7 `
   --out data\checkpoints\baseline_px0_wdl_v1.pt `
-  --width 96 `
-  --blocks 6 `
+  --width 128 `
+  --blocks 8 `
   --batch-size 256 `
   --steps 200000 `
   --eval-every 1000 `
   --val-batches 32 `
   --num-workers 4 `
   --device cuda `
-  --q-ratio 1.0
+  --q-ratio 0.0
 ```
 
 ## 4. 继续训练
@@ -53,37 +53,61 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
   --px0-version 7 `
   --out data\checkpoints\baseline_px0_wdl_v1.pt `
-  --width 96 `
-  --blocks 6 `
+  --width 128 `
+  --blocks 8 `
   --batch-size 256 `
   --steps 200000 `
   --eval-every 1000 `
   --val-batches 32 `
   --num-workers 4 `
   --device cuda `
-  --q-ratio 1.0 `
-  --resume
+  --q-ratio 0.0
 ```
 
-## 5. 强制重下并重建某个版本
+说明：
+
+- `--out` 文件已存在时，脚本默认自动续训
+- 不需要再传 `--resume`
+
+## 5. 开启新阶段训练（从旧权重起步）
+
+例如先用 `q_ratio=0.0` 训出第一阶段，再切到新的 `q_ratio`：
+
+```powershell
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
+  --px0-version 7 `
+  --init-from data\checkpoints\baseline_px0_wdl_v1.best.pt `
+  --out data\checkpoints\baseline_px0_wdl_v1_qmix025.pt `
+  --width 128 `
+  --blocks 8 `
+  --batch-size 256 `
+  --steps 30000 `
+  --eval-every 1000 `
+  --val-batches 32 `
+  --num-workers 4 `
+  --device cuda `
+  --q-ratio 0.25
+```
+
+## 6. 强制重下并重建某个版本
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
   --px0-version 7 `
   --px0-force-download `
   --out data\checkpoints\baseline_px0_wdl_v1.pt `
-  --width 96 `
-  --blocks 6 `
+  --width 128 `
+  --blocks 8 `
   --batch-size 256 `
   --steps 200000 `
   --eval-every 1000 `
   --val-batches 32 `
   --num-workers 4 `
   --device cuda `
-  --q-ratio 1.0
+  --q-ratio 0.0
 ```
 
-## 6. 如果你确实要手动生成 train/val manifest
+## 7. 如果你确实要手动生成 train/val manifest
 
 训练主线不需要这一步；只有想固定文件切分时才用：
 
@@ -96,7 +120,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\split_p
   --seed 42
 ```
 
-## 7. 导出 best checkpoint 为 ONNX
+## 8. 导出 best checkpoint 为 ONNX
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
@@ -108,9 +132,13 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\expor
 
 - `value` 输出是 `WDL` 概率
 - 引擎侧按 `q = W - L` 消费 value
+- 当前 trunk：`SE residual`
+- 当前 policy：`attention`
+- 当前 value hidden：`128`
+- `q_ratio=0.0` 表示纯最终结果监督
 - `q_ratio=1.0` 表示纯搜索监督
 
-## 8. 检查 ONNX 合约
+## 9. 检查 ONNX 合约
 
 ```powershell
 Copy-Item data\checkpoints\baseline_px0_wdl_v1.best.onnx data\policy.onnx -Force
@@ -120,7 +148,7 @@ Copy-Item data\checkpoints\baseline_px0_wdl_v1.best.onnx data\policy.onnx -Force
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test_policy_onnx_contract.py
 ```
 
-## 9. 引擎 ONNX 冒烟
+## 10. 引擎 ONNX 冒烟
 
 ```powershell
 cargo run --release -p engin -- --onnx-smoke data\checkpoints\baseline_px0_wdl_v1.best.onnx
@@ -128,13 +156,46 @@ cargo run --release -p engin -- --onnx-smoke data\checkpoints\baseline_px0_wdl_v
 
 这条命令只验证最小推理链路，不代表 GUI 正式接入效果。
 
-## 10. 引擎 bench
+## 11. 独立 ONNX 局面评估
+
+说明：
+
+- 这是独立评估工具，不走 `engin` 主 UCI 入口
+- 同时输出：
+  - `policy_topk_legal`
+  - `wdl`
+  - `q`
+- 输入支持：
+  - 单行 `FEN`
+  - `position startpos moves ...`
+  - `position fen ... moves ...`
+
+单局面：
+
+```powershell
+cargo run --release -p engin --bin onnx_eval -- `
+  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --fen "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1" `
+  --topk 8
+```
+
+批量文件：
+
+```powershell
+cargo run --release -p engin --bin onnx_eval -- `
+  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --input data\eval_positions.txt `
+  --topk 8 `
+  --out data\eval_positions.ndjson
+```
+
+## 12. 引擎 bench
 
 ```powershell
 cargo run --release -p engin -- --bench --playouts 64 --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx --require-onnx
 ```
 
-## 11. 最小 UCI 联调
+## 13. 最小 UCI 联调
 
 ```powershell
 @'
@@ -160,7 +221,13 @@ quit
 '@ | C:\projects\77xiangqi_engine\target\release\engin.exe
 ```
 
-## 12. 质量检查
+默认不指定 `--bin` 时，`cargo run -p engin` 仍然启动主 UCI 引擎：
+
+```powershell
+cargo run --release -p engin
+```
+
+## 14. 质量检查
 
 ```powershell
 cargo check
@@ -176,11 +243,4 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests
 
 ```powershell
 cargo test -p engin --lib
-```
-
-## 13. 清理训练产物
-
-```powershell
-Remove-Item -Force data\checkpoints\*.pt, data\checkpoints\*.onnx
-Remove-Item -Force data\policy.onnx
 ```

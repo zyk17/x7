@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use xiangqi_core::movegen::{ExtMove, GenType};
@@ -8,7 +11,8 @@ use xiangqi_core::{generate, Position};
 use crate::history::PositionHistory;
 
 use super::{
-    MctsBudget, MctsConfig, MctsNode, MctsNodeId, MctsTree, PolicyValueEval, PolicyValueInput, PolicyValueTask,
+    MctsBudget, MctsConfig, MctsNode, MctsNodeId, MctsTree, OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput,
+    PolicyValueOutput, PolicyValueTask,
 };
 
 const SEARCH_BATCH_SIZE_CAP: usize = 64;
@@ -163,7 +167,7 @@ where
         if self.try_reuse_exact_root(history) {
             return Ok(self.root_id);
         }
-        if self.try_reuse_single_move_child(history) {
+        if self.try_reuse_appended_path(history) {
             return Ok(self.root_id);
         }
         self.tree.clear();
@@ -185,22 +189,17 @@ where
         )
     }
 
-    fn try_reuse_single_move_child(&mut self, history: &PositionHistory) -> bool {
+    fn try_reuse_appended_path(&mut self, history: &PositionHistory) -> bool {
         let (Some(root_id), Some(old_history)) = (self.root_id, self.root_history.as_ref()) else {
             return false;
         };
-        let Some(mv) = appended_history_move(old_history, history) else {
+        let Some(path) = appended_history_moves(old_history, history) else {
             return false;
         };
-        let Some(root) = self.tree.get(root_id) else {
+        if path.is_empty() {
             return false;
-        };
-        let Some(child_id) = root
-            .children
-            .iter()
-            .find(|edge| edge.mv == mv)
-            .and_then(|edge| edge.child)
-        else {
+        }
+        let Some(child_id) = self.follow_child_path(root_id, &path) else {
             return false;
         };
         let (new_tree, new_root_id) = self.tree.copy_subtree(child_id);
@@ -208,6 +207,19 @@ where
         self.root_id = Some(new_root_id);
         self.root_history = Some(history.clone_for_search());
         true
+    }
+
+    fn follow_child_path(&self, root_id: MctsNodeId, path: &[Move]) -> Option<MctsNodeId> {
+        let mut node_id = root_id;
+        for mv in path {
+            let node = self.tree.get(node_id)?;
+            node_id = node
+                .children
+                .iter()
+                .find(|edge| edge.mv == *mv)
+                .and_then(|edge| edge.child)?;
+        }
+        Some(node_id)
     }
 
     fn initialize_root(&mut self, history: &PositionHistory) -> Result<Option<MctsNodeId>, E::Error> {
@@ -374,15 +386,26 @@ where
     }
 
     fn apply_iteration(&mut self, iteration: SearchIteration) -> Result<(), E::Error> {
+        let outputs = Self::evaluate_iteration_with(&mut self.evaluator, &iteration)?;
+        self.apply_iteration_outputs(iteration, &outputs);
+        Ok(())
+    }
+
+    fn evaluate_iteration_with<V>(eval: &mut V, iteration: &SearchIteration) -> Result<Vec<PolicyValueOutput>, V::Error>
+    where
+        V: PolicyValueEval,
+    {
         let mut tasks = Vec::new();
         for pending in &iteration.pending {
             if let PendingKind::Expand { task } = &pending.kind {
                 tasks.push((**task).clone());
             }
         }
-        let outputs = self.evaluator.evaluate_many(&tasks)?;
-        let mut eval_cursor = 0usize;
+        eval.evaluate_many(&tasks)
+    }
 
+    fn apply_iteration_outputs(&mut self, iteration: SearchIteration, outputs: &[PolicyValueOutput]) {
+        let mut eval_cursor = 0usize;
         for pending in iteration.pending {
             match pending.kind {
                 PendingKind::ExistingTerminal { leaf_id, value } => {
@@ -403,8 +426,6 @@ where
                 }
             }
         }
-
-        Ok(())
     }
 
     fn add_expanded_child(
@@ -562,6 +583,141 @@ where
 
 }
 
+impl MctsEngine<OnnxPolicyValueEval> {
+    pub fn search_root_history_parallel_with_progress<F>(
+        &mut self,
+        history: &PositionHistory,
+        budget: MctsBudget,
+        threads: usize,
+        info_interval: Duration,
+        mut on_progress: F,
+    ) -> Result<MctsSearchResult, String>
+    where
+        F: FnMut(&MctsSearchProgress),
+    {
+        if threads <= 1 {
+            return self.search_root_history_with_progress(history, budget, info_interval, on_progress);
+        }
+
+        let Some(root_id) = self.prepare_root(history)? else {
+            return Ok(MctsSearchResult::default());
+        };
+        let root_history = history.clone_for_search();
+        let shared_policy = self.evaluator.policy.clone();
+        let stop = budget.stop.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let playouts = Arc::new(AtomicU32::new(0));
+        let seldepth = Arc::new(AtomicU32::new(0));
+        let active_workers = Arc::new(AtomicUsize::new(threads));
+        let first_error = Arc::new(Mutex::new(None::<String>));
+        let engine = Mutex::new(&mut *self);
+        let started_at = Instant::now();
+        let thread_count = threads.max(1);
+
+        thread::scope(|scope| {
+            for _ in 0..thread_count {
+                let stop = Arc::clone(&stop);
+                let playouts = Arc::clone(&playouts);
+                let seldepth = Arc::clone(&seldepth);
+                let active_workers = Arc::clone(&active_workers);
+                let first_error = Arc::clone(&first_error);
+                let shared_policy = shared_policy.clone();
+                let root_history = root_history.clone_for_search();
+                let budget = budget.clone();
+                let engine = &engine;
+                scope.spawn(move || {
+                    let mut local_eval = OnnxPolicyValueEval::new(shared_policy);
+                    loop {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let iteration = {
+                            let mut guard = engine.lock().unwrap_or_else(|e| e.into_inner());
+                            let engine_ref: &mut MctsEngine<OnnxPolicyValueEval> = &mut **guard;
+                            if budget_exhausted(&budget, playouts.load(Ordering::Relaxed), engine_ref.tree.len()) {
+                                None
+                            } else {
+                                let batch_limit = remaining_batch_capacity(
+                                    &budget,
+                                    playouts.load(Ordering::Relaxed),
+                                    engine_ref.tree.len(),
+                                    engine_ref.config.search_batch_size,
+                                )
+                                .unwrap_or(engine_ref.config.search_batch_size)
+                                .max(1);
+                                let iteration = engine_ref.gather_iteration(
+                                    root_id,
+                                    &root_history,
+                                    &budget,
+                                    playouts.load(Ordering::Relaxed),
+                                    batch_limit,
+                                );
+                                if iteration.playouts == 0 {
+                                    None
+                                } else {
+                                    Some(iteration)
+                                }
+                            }
+                        };
+                        let Some(iteration) = iteration else {
+                            break;
+                        };
+                        let iter_playouts = iteration.playouts;
+                        seldepth.fetch_max(iteration.seldepth, Ordering::Relaxed);
+                        let outputs = match MctsEngine::<OnnxPolicyValueEval>::evaluate_iteration_with(
+                            &mut local_eval,
+                            &iteration,
+                        ) {
+                            Ok(outputs) => outputs,
+                            Err(err) => {
+                                *first_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
+                                stop.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                        };
+                        {
+                            let mut guard = engine.lock().unwrap_or_else(|e| e.into_inner());
+                            let engine_ref: &mut MctsEngine<OnnxPolicyValueEval> = &mut **guard;
+                            engine_ref.apply_iteration_outputs(iteration, &outputs);
+                        }
+                        playouts.fetch_add(iter_playouts, Ordering::Relaxed);
+                    }
+                    active_workers.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+
+            if !info_interval.is_zero() {
+                let mut next_report_at = Instant::now() + info_interval;
+                while active_workers.load(Ordering::SeqCst) > 0 {
+                    let now = Instant::now();
+                    if now < next_report_at {
+                        thread::sleep(next_report_at - now);
+                    }
+                    if stop.load(Ordering::SeqCst) && active_workers.load(Ordering::SeqCst) == 0 {
+                        break;
+                    }
+                    let guard = engine.lock().unwrap_or_else(|e| e.into_inner());
+                    let engine_ref: &MctsEngine<OnnxPolicyValueEval> = &guard;
+                    on_progress(&engine_ref.progress_from_root(
+                        root_id,
+                        playouts.load(Ordering::Relaxed),
+                        seldepth.load(Ordering::Relaxed),
+                    ));
+                    next_report_at = Instant::now() + info_interval;
+                }
+            }
+        });
+
+        if let Some(err) = first_error.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            return Err(err);
+        }
+        debug_assert_eq!(self.total_in_flight(), 0);
+        let elapsed_playouts = playouts.load(Ordering::Relaxed);
+        let elapsed_seldepth = seldepth.load(Ordering::Relaxed);
+        let _ = started_at;
+        Ok(self.result_from_root(root_id, elapsed_playouts, elapsed_seldepth))
+    }
+}
+
 fn budget_exhausted(budget: &MctsBudget, playouts: u32, nodes: usize) -> bool {
     if let Some(target_playouts) = budget.max_playouts {
         if playouts >= target_playouts.max(1) {
@@ -605,36 +761,46 @@ fn remaining_batch_capacity(budget: &MctsBudget, playouts: u32, nodes: usize, ba
     }
 }
 
-fn appended_history_move(old_history: &PositionHistory, new_history: &PositionHistory) -> Option<Move> {
-    let old_positions = old_history.positions().map(Position::fen).collect::<Vec<_>>();
-    let new_positions = new_history.positions().map(Position::fen).collect::<Vec<_>>();
-    if new_positions.len() < 2 {
-        return None;
-    }
-    let suffix_matches = if new_positions.len() == old_positions.len() + 1 {
-        old_positions.iter().zip(new_positions.iter()).all(|(a, b)| a == b)
-    } else if new_positions.len() == old_positions.len() && old_positions.len() >= 2 {
-        old_positions[1..]
-            .iter()
-            .zip(new_positions[..new_positions.len() - 1].iter())
-            .all(|(a, b)| a == b)
-    } else {
-        false
-    };
-    if !suffix_matches {
+fn appended_history_moves(old_history: &PositionHistory, new_history: &PositionHistory) -> Option<Vec<Move>> {
+    let old_positions = old_history.positions().collect::<Vec<_>>();
+    let new_positions = new_history.positions().collect::<Vec<_>>();
+    let old_fens = old_positions.iter().map(|pos| pos.fen()).collect::<Vec<_>>();
+    let new_fens = new_positions.iter().map(|pos| pos.fen()).collect::<Vec<_>>();
+    if old_positions.is_empty() || new_positions.len() < 2 {
         return None;
     }
 
-    let old_pos = old_history.current();
-    let target_fen = new_history.current().fen();
+    let max_overlap = old_positions.len().min(new_positions.len());
+    let overlap = (1..=max_overlap)
+        .rev()
+        .find(|&len| {
+            old_fens[old_fens.len() - len..]
+                .iter()
+                .zip(new_fens[..len].iter())
+                .all(|(a, b)| a == b)
+        })?;
+    if overlap == new_positions.len() {
+        return Some(Vec::new());
+    }
+
+    let mut path = Vec::with_capacity(new_positions.len() - overlap);
+    for idx in (overlap - 1)..(new_positions.len() - 1) {
+        let mv = transition_move(new_positions[idx], new_positions[idx + 1])?;
+        path.push(mv);
+    }
+    Some(path)
+}
+
+fn transition_move(from: &Position, to: &Position) -> Option<Move> {
+    let target_fen = to.fen();
     let mut buf = [ExtMove {
         mv: Move::none(),
         value: 0,
     }; MAX_MOVES];
-    let n = generate(old_pos, GenType::Legal, &mut buf);
+    let n = generate(from, GenType::Legal, &mut buf);
     for edge in &buf[..n] {
         let mv = edge.mv;
-        let mut next = old_pos.clone_for_search();
+        let mut next = from.clone_for_search();
         next.do_move(mv);
         if next.fen() == target_fen {
             return Some(mv);
@@ -933,6 +1099,55 @@ mod tests {
             second.root_visits > second.playouts,
             "new root should inherit child visits"
         );
+    }
+
+    #[test]
+    fn appended_two_move_history_reuses_deeper_subtree_as_new_root() {
+        let mut engine = MctsEngine::new(MctsConfig::default(), StubEval);
+        let history = PositionHistory::new_startpos();
+        let first = engine
+            .search_root_history(
+                &history,
+                MctsBudget {
+                    max_playouts: Some(16),
+                    max_nodes: None,
+                    deadline: None,
+                    stop: None,
+                },
+            )
+            .expect("first");
+        let mv1 = first.best_move.expect("best move");
+
+        let mut history1 = history.clone_for_search();
+        history1.push_move(mv1);
+        let second = engine
+            .search_root_history(
+                &history1,
+                MctsBudget {
+                    max_playouts: Some(16),
+                    max_nodes: None,
+                    deadline: None,
+                    stop: None,
+                },
+            )
+            .expect("second");
+        let mv2 = second.best_move.expect("reply");
+
+        let mut history2 = history.clone_for_search();
+        history2.push_move(mv1);
+        history2.push_move(mv2);
+        let third = engine
+            .search_root_history(
+                &history2,
+                MctsBudget {
+                    max_playouts: Some(1),
+                    max_nodes: None,
+                    deadline: None,
+                    stop: None,
+                },
+            )
+            .expect("third");
+        assert!(third.root_visits > third.playouts, "deeper appended path should retain subtree visits");
     }
 
     #[test]

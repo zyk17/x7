@@ -38,7 +38,7 @@ def main() -> None:
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
-    in_planes = int(ckpt.get("in_planes", 15))
+    in_planes = int(ckpt.get("in_planes", 124))
     width = int(ckpt["width"])
     blocks = int(ckpt["blocks"])
     n_moves = int(ckpt["n_moves"])

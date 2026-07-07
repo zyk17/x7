@@ -11,6 +11,7 @@ from nn.px0_kaggle import (
     ensure_px0_version,
     kaggle_dataset_handle,
     px0_version_dir,
+    write_px0_manifest,
 )
 
 
@@ -90,3 +91,25 @@ def test_ensure_px0_version_force_download_rebuilds_tree(tmp_path: Path, monkeyp
     assert calls == [("21", version_dir, True)]
     assert not stale_chunk.exists()
     assert [p.name for p in prepared.chunk_files] == ["training.1.gz", "training.2.gz"]
+
+
+def test_ensure_px0_version_reuses_matching_manifests_without_rescan(tmp_path: Path, monkeypatch) -> None:
+    version_dir = px0_version_dir("30", root=tmp_path)
+    run_dir = version_dir / "run1"
+    run_dir.mkdir(parents=True)
+    chunk0 = (run_dir / "training.1.gz").resolve()
+    chunk1 = (run_dir / "training.2.gz").resolve()
+    chunk0.write_bytes(b"stub")
+    chunk1.write_bytes(b"stub")
+    manifest_dir = version_dir / "manifests"
+    write_px0_manifest(manifest_dir / "train.json", files=[chunk0], version="30", seed=9, val_ratio=0.5)
+    write_px0_manifest(manifest_dir / "val.json", files=[chunk1], version="30", seed=9, val_ratio=0.5)
+
+    def _unexpected_discover(_version_dir):
+        raise AssertionError("discover_px0_chunks should not run when manifests already match")
+
+    monkeypatch.setattr("nn.px0_kaggle.discover_px0_chunks", _unexpected_discover)
+    prepared = ensure_px0_version("30", root=tmp_path, val_ratio=0.5, seed=9)
+    assert prepared.train_manifest == manifest_dir / "train.json"
+    assert prepared.val_manifest == manifest_dir / "val.json"
+    assert prepared.chunk_files == [chunk0, chunk1]

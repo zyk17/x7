@@ -25,15 +25,15 @@
 
 网络结构保持小，但不再过度压缩：
 
-- shared trunk：`stem + residual blocks`
-- policy head：`1x1 conv -> flatten -> linear(2062)`
-- value head：`1x1 conv -> flatten -> mlp -> wdl(3)`
+- shared trunk：`stem + SE residual blocks`
+- policy head：`90-square token -> 1-layer policy encoder -> from-to attention -> px0 2062 move map`
+- value head：`1x1 conv -> flatten -> dense(128) -> wdl(3)`
 
 当前导出 / 引擎消费语义：
 
 - ONNX `value` 输出为 `WDL` 概率
 - 引擎侧统一按 `q = W - L` 消费 value
-- 当前默认 `q_ratio=1.0`，即主训练默认优先学搜索 `WDL`
+- 当前默认 `q_ratio=0.0`，即主训练默认优先学最终结果 `WDL`
 - 搜索核心已切成单线程 `iteration -> minibatch gather -> batched NN -> backup`
 - 当前搜索语义包含 `in_flight / collision / multivisit`
 - `position startpos moves ...` / `position fen ... moves ...` 会在引擎内保留真实历史

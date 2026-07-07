@@ -221,6 +221,7 @@ struct Engine {
     policy: SharedPolicy,
     policy_path: Option<PathBuf>,
     config: MctsConfig,
+    threads: usize,
     search_engine: SharedSearchEngine,
     default_playouts: u32,
     search_stop: Option<Arc<AtomicBool>>,
@@ -244,6 +245,7 @@ impl Engine {
             policy: policy.clone(),
             policy_path,
             config: MctsConfig::default(),
+            threads: 1,
             search_engine: Arc::new(Mutex::new(MctsEngine::new(
                 MctsConfig::default(),
                 OnnxPolicyValueEval::new(policy),
@@ -305,6 +307,7 @@ impl Engine {
         self.emit("option name FpuReduction type string default 0.22");
         self.emit("option name FpuReductionAtRoot type string default 0.22");
         self.emit("option name SearchBatchSize type spin default 32 min 1 max 64");
+        self.emit("option name Threads type spin default 1 min 1 max 32");
         self.emit(&format!(
             "info string policy {}",
             if self.policy.is_some() { "loaded" } else { "not_loaded" }
@@ -387,6 +390,13 @@ impl Engine {
                     }
                 }
             }
+            "Threads" => {
+                if let Some(ref v) = value {
+                    if let Ok(n) = v.trim().parse::<usize>() {
+                        self.threads = n.clamp(1, 32);
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -440,6 +450,7 @@ impl Engine {
             }
         };
         let config = self.config;
+        let threads = self.threads;
         let stop = Arc::new(AtomicBool::new(false));
         let output = Arc::clone(&self.output);
         let search_engine = Arc::clone(&self.search_engine);
@@ -456,10 +467,25 @@ impl Engine {
             let mut engine = search_engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.config = config;
 
-            match engine.search_root_history_with_progress(&history, budget, UCI_INFO_INTERVAL, |progress| {
-                let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                emit_mcts_progress(&output, progress, elapsed_ms);
-            }) {
+            let search_result = if threads > 1 {
+                engine.search_root_history_parallel_with_progress(
+                    &history,
+                    budget,
+                    threads,
+                    UCI_INFO_INTERVAL,
+                    |progress| {
+                        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        emit_mcts_progress(&output, progress, elapsed_ms);
+                    },
+                )
+            } else {
+                engine.search_root_history_with_progress(&history, budget, UCI_INFO_INTERVAL, |progress| {
+                    let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    emit_mcts_progress(&output, progress, elapsed_ms);
+                })
+            };
+
+            match search_result {
                 Ok(result) => {
                     let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     output(&uci_info_line(
@@ -740,6 +766,29 @@ mod tests {
         engine.handle_line("setoption name MultiPV value 2");
         engine.handle_line("go nodes 16");
         std::thread::sleep(Duration::from_millis(100));
+        engine.stop_and_join();
+
+        let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+        assert!(out.contains("bestmove"));
+        assert!(!out.ends_with("bestmove (none)"));
+    }
+
+    #[test]
+    fn threads_option_searches_without_hanging() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |line: &str| {
+                lines.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+            }) as EngineOutput
+        };
+        let mut engine = Engine::new_with_output(sink);
+        engine.policy = None;
+        engine.rebuild_search_engine();
+        engine.handle_line("setoption name Threads value 2");
+        engine.handle_line("position startpos");
+        engine.handle_line("go nodes 16");
+        std::thread::sleep(Duration::from_millis(150));
         engine.stop_and_join();
 
         let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
