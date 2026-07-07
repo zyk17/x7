@@ -179,7 +179,23 @@ fn main() -> io::Result<()> {
             }
         };
         let pos = history.current().clone_for_search();
-        let eval = match net.eval_history(&history) {
+        let board = match engin::fen_tensor::history_to_planes(&history) {
+            Ok(board) => board,
+            Err(err) => {
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({
+                        "line": line_no + 1,
+                        "input": input,
+                        "fen": pos.fen(),
+                        "error": err,
+                    })
+                )?;
+                continue;
+            }
+        };
+        let eval = match net.eval_board(&board) {
             Ok(eval) => eval,
             Err(err) => {
                 writeln!(

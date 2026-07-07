@@ -9,8 +9,6 @@ use ort::session::Session;
 use ort::value::TensorRef;
 use ort::Error;
 
-use crate::history::PositionHistory;
-
 /// 单次推理结果（与 `export_onnx.py` 输出名一致）。
 #[derive(Debug, Clone)]
 pub struct PolicyOutputs {
@@ -30,8 +28,6 @@ pub struct BatchPolicyOutputs {
 pub struct PolicyOnnx {
     session: Session,
     provider_chain: &'static str,
-    scratch_board: Array4<f32>,
-    scratch_batch: Array4<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,8 +74,6 @@ impl PolicyOnnx {
         Ok(Self {
             session,
             provider_chain: provider_mode.provider_chain(),
-            scratch_board: Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
-            scratch_batch: Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
         })
     }
 
@@ -101,19 +95,6 @@ impl PolicyOnnx {
 
     pub fn eval_boards(&mut self, boards: &Array4<f32>) -> Result<BatchPolicyOutputs, Error> {
         Self::run_session_batch(&mut self.session, boards)
-    }
-
-    pub fn eval_histories<'a>(
-        &mut self,
-        histories: impl IntoIterator<Item = &'a PositionHistory>,
-    ) -> Result<BatchPolicyOutputs, Error> {
-        let collected = histories.into_iter().collect::<Vec<_>>();
-        self.eval_history_slice(&collected)
-    }
-
-    pub fn eval_history_slice(&mut self, histories: &[&PositionHistory]) -> Result<BatchPolicyOutputs, Error> {
-        crate::fen_tensor::histories_to_planes_into(histories, &mut self.scratch_batch).map_err(Error::new)?;
-        Self::run_session_batch(&mut self.session, &self.scratch_batch)
     }
 
     fn run_session_single(session: &mut Session, board: &Array4<f32>) -> Result<PolicyOutputs, Error> {
@@ -193,12 +174,6 @@ impl PolicyOnnx {
     pub fn eval_fen(&mut self, fen: &str) -> Result<PolicyOutputs, Error> {
         let board = crate::fen_tensor::fen_to_planes(fen).map_err(Error::new)?;
         self.eval_board(&board)
-    }
-
-    /// [`PositionHistory`] → 平面 → 推理（正式主线）。
-    pub fn eval_history(&mut self, history: &PositionHistory) -> Result<PolicyOutputs, Error> {
-        crate::fen_tensor::history_to_planes_into(history, &mut self.scratch_board).map_err(Error::new)?;
-        Self::run_session_single(&mut self.session, &self.scratch_board)
     }
 
     /// [`xiangqi_core::Position`] → 平面 → 推理（搜索热路径，无 FEN 分配）。
@@ -297,6 +272,7 @@ mod tests {
     use super::*;
     use ndarray::s;
     use std::path::PathBuf;
+    use crate::PositionHistory;
     use xiangqi_core::uci_to_move;
 
     fn candidate_onnx_paths() -> [PathBuf; 2] {

@@ -64,6 +64,8 @@ pub trait PolicyValueEval {
 pub struct OnnxPolicyValueEval {
     pub policy: SharedPolicy,
     cache: SharedEvalCache,
+    scratch_board: ndarray::Array4<f32>,
+    scratch_batch: ndarray::Array4<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,11 +79,18 @@ impl OnnxPolicyValueEval {
         Self {
             policy,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
+            scratch_batch: ndarray::Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
         }
     }
 
     pub(crate) fn with_shared_cache(policy: SharedPolicy, cache: SharedEvalCache) -> Self {
-        Self { policy, cache }
+        Self {
+            policy,
+            cache,
+            scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
+            scratch_batch: ndarray::Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
+        }
     }
 
     pub(crate) fn shared_cache(&self) -> SharedEvalCache {
@@ -140,12 +149,11 @@ impl OnnxPolicyValueEval {
             miss_to_unique.push(slot);
         }
 
-        let history_refs = unique_misses
-            .iter()
-            .map(|&idx| &tasks[idx].history)
-            .collect::<Vec<_>>();
+        let history_refs = unique_misses.iter().map(|&idx| &tasks[idx].history).collect::<Vec<_>>();
+        crate::fen_tensor::histories_to_planes_into(&history_refs, &mut self.scratch_batch)
+            .map_err(|e| e.to_string())?;
         let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
-        let batch = net.eval_history_slice(&history_refs).map_err(|e| e.to_string())?;
+        let batch = net.eval_boards(&self.scratch_batch).map_err(|e| e.to_string())?;
         if batch.logits.len() != unique_misses.len() {
             return Err(format!(
                 "batched policy outputs mismatch: got {} expected {}",
@@ -200,10 +208,11 @@ impl PolicyValueEval for OnnxPolicyValueEval {
             return Ok(output_from_cached(&cached, &input.position, input.legal_moves));
         }
 
+        crate::fen_tensor::history_to_planes_into(input.history, &mut self.scratch_board).map_err(|e| e.to_string())?;
         let cached = {
             let out = {
                 let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
-                net.eval_history(input.history).map_err(|e| e.to_string())?
+                net.eval_board(&self.scratch_board).map_err(|e| e.to_string())?
             };
             CachedEval {
                 logits: out.logits,
@@ -261,12 +270,11 @@ impl PolicyValueEval for OnnxPolicyValueEval {
             miss_to_unique.push(slot);
         }
 
-        let history_refs = unique_misses
-            .iter()
-            .map(|&idx| &tasks[idx].history)
-            .collect::<Vec<_>>();
+        let history_refs = unique_misses.iter().map(|&idx| &tasks[idx].history).collect::<Vec<_>>();
+        crate::fen_tensor::histories_to_planes_into(&history_refs, &mut self.scratch_batch)
+            .map_err(|e| e.to_string())?;
         let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
-        let batch = net.eval_history_slice(&history_refs).map_err(|e| e.to_string())?;
+        let batch = net.eval_boards(&self.scratch_batch).map_err(|e| e.to_string())?;
         if batch.logits.len() != unique_misses.len() {
             return Err(format!(
                 "batched policy outputs mismatch: got {} expected {}",
