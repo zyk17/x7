@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use xiangqi_core::{uci_to_move, Position, START_FEN};
 
+use crate::benchmark::resolve_data_file;
 use crate::history::PositionHistory;
 use crate::mcts::{
     MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsSearchProgress, OnnxPolicyValueEval, SharedPolicy,
@@ -233,14 +234,19 @@ impl Engine {
     }
 
     fn new_with_output(output: EngineOutput) -> Self {
+        let policy_path = resolve_data_file("policy.onnx");
+        let policy = policy_path
+            .as_ref()
+            .and_then(|path| PolicyOnnx::from_file(path).ok())
+            .map(|net| Arc::new(Mutex::new(net)));
         Self {
             history: PositionHistory::new_startpos(),
-            policy: None,
-            policy_path: None,
+            policy: policy.clone(),
+            policy_path,
             config: MctsConfig::default(),
             search_engine: Arc::new(Mutex::new(MctsEngine::new(
                 MctsConfig::default(),
-                OnnxPolicyValueEval::new(None),
+                OnnxPolicyValueEval::new(policy),
             ))),
             default_playouts: 256,
             search_stop: None,
@@ -284,7 +290,12 @@ impl Engine {
     fn send_uci_ident(&self) {
         self.emit("id name 77xiangqi_engine");
         self.emit("id author github.com/77xiangqi_engine");
-        self.emit("option name PolicyFile type string default <empty>");
+        let policy_default = self
+            .policy_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<empty>".to_string());
+        self.emit(&format!("option name PolicyFile type string default {policy_default}"));
         self.emit("option name Playouts type spin default 256 min 1 max 1000000");
         self.emit("option name Visits type spin default 256 min 1 max 1000000");
         self.emit("option name Cpuct type string default 1.0");
@@ -292,7 +303,12 @@ impl Engine {
         self.emit("option name CpuctBase type string default 38739");
         self.emit("option name CpuctFactor type string default 3.894");
         self.emit("option name FpuReduction type string default 0.22");
-        self.emit("option name FpuReductionAtRoot type string default 1.0");
+        self.emit("option name FpuReductionAtRoot type string default 0.22");
+        self.emit("option name SearchBatchSize type spin default 32 min 1 max 64");
+        self.emit(&format!(
+            "info string policy {}",
+            if self.policy.is_some() { "loaded" } else { "not_loaded" }
+        ));
         self.emit("uciok");
     }
 
@@ -359,6 +375,14 @@ impl Engine {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<f32>() {
                         self.config.fpu_reduction_root = n.clamp(0.0, 4.0);
+                        self.rebuild_search_engine();
+                    }
+                }
+            }
+            "SearchBatchSize" => {
+                if let Some(ref v) = value {
+                    if let Ok(n) = v.trim().parse::<usize>() {
+                        self.config.search_batch_size = n.clamp(1, 64);
                         self.rebuild_search_engine();
                     }
                 }
@@ -478,9 +502,7 @@ impl Engine {
             }
             "ucinewgame" => self.stop_and_join(),
             "stop" => {
-                if let Some(s) = self.search_stop.as_ref() {
-                    s.store(true, Ordering::SeqCst);
-                }
+                self.stop_and_join();
             }
             "quit" => {
                 self.stop_and_join();
@@ -698,5 +720,30 @@ mod tests {
         let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
         assert!(out.contains("info string mcts"));
         assert!(out.contains("bestmove"));
+    }
+
+    #[test]
+    fn stop_then_position_then_go_still_searches() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |line: &str| {
+                lines.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+            }) as EngineOutput
+        };
+        let mut engine = Engine::new_with_output(sink);
+        engine.handle_line("position startpos");
+        engine.handle_line("go infinite");
+        std::thread::sleep(Duration::from_millis(50));
+        engine.handle_line("stop");
+        engine.handle_line("position startpos moves h2e2");
+        engine.handle_line("setoption name MultiPV value 2");
+        engine.handle_line("go nodes 16");
+        std::thread::sleep(Duration::from_millis(100));
+        engine.stop_and_join();
+
+        let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+        assert!(out.contains("bestmove"));
+        assert!(!out.ends_with("bestmove (none)"));
     }
 }

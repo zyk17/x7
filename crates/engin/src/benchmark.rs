@@ -124,6 +124,7 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                     "fpu_reduction": session.config.fpu_reduction,
                     "fpu_reduction_root": session.config.fpu_reduction_root,
                     "root_temperature": session.config.root_temperature,
+                    "search_batch_size": session.config.search_batch_size,
                 },
                 "budget": {
                     "max_playouts": session.budget.max_playouts,

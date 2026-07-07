@@ -12,6 +12,14 @@ pub(crate) struct HistoryEntry {
     pub repeated: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct HistoryDebugEntry {
+    pub fen: String,
+    pub repeated: bool,
+    pub side_to_move: char,
+    pub rule60: i32,
+}
+
 #[derive(Clone)]
 pub struct PositionHistory {
     entries: Vec<HistoryEntry>,
@@ -71,8 +79,32 @@ impl PositionHistory {
         self.entries.iter().map(|entry| &entry.position)
     }
 
+    pub fn debug_entries(&self) -> Vec<HistoryDebugEntry> {
+        self.entries
+            .iter()
+            .map(|entry| HistoryDebugEntry {
+                fen: entry.position.fen(),
+                repeated: entry.repeated,
+                side_to_move: if entry.position.side_to_move == xiangqi_core::types::Color::Black {
+                    'b'
+                } else {
+                    'w'
+                },
+                rule60: entry.position.state.rule60,
+            })
+            .collect()
+    }
+
+    pub fn current_is_repeated(&self) -> bool {
+        self.entries.last().map(|entry| entry.repeated).unwrap_or(false)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     pub fn same_input_window(&self, other: &Self) -> bool {
@@ -88,9 +120,8 @@ impl PositionHistory {
     }
 
     pub fn input_cache_key(&self) -> u64 {
-        let mut key = 0x9E37_79B9_7F4A_7C15u64
-            ^ ((self.entries.len() as u64) << 56)
-            ^ self.current().state.rule60 as u64;
+        let mut key =
+            0x9E37_79B9_7F4A_7C15u64 ^ ((self.entries.len() as u64) << 56) ^ self.current().state.rule60 as u64;
         for entry in &self.entries {
             key = key.rotate_left(9) ^ entry.position.nn_input_key().wrapping_mul(0x9E37_79B9_7F4A_7C15);
             if entry.repeated {
@@ -183,7 +214,10 @@ mod tests {
     fn history_window_is_capped() {
         let mut history = PositionHistory::new_startpos();
         for _ in 0..9 {
-            let u = legal_moves_uci(history.current()).into_iter().next().expect("legal move uci");
+            let u = legal_moves_uci(history.current())
+                .into_iter()
+                .next()
+                .expect("legal move uci");
             let mv = uci_to_move(history.current(), &u).expect("legal move");
             history.push_move(mv);
         }
@@ -194,14 +228,20 @@ mod tests {
     fn search_push_pop_restores_window() {
         let mut history = PositionHistory::new_startpos();
         for _ in 0..7 {
-            let u = legal_moves_uci(history.current()).into_iter().next().expect("legal move uci");
+            let u = legal_moves_uci(history.current())
+                .into_iter()
+                .next()
+                .expect("legal move uci");
             let mv = uci_to_move(history.current(), &u).expect("legal move");
             history.push_move(mv);
         }
         let before: Vec<String> = history.positions().map(Position::fen).collect();
         let current_before = history.current().fen();
 
-        let u = legal_moves_uci(history.current()).into_iter().next().expect("legal move uci");
+        let u = legal_moves_uci(history.current())
+            .into_iter()
+            .next()
+            .expect("legal move uci");
         let mv = uci_to_move(history.current(), &u).expect("legal move");
         let mut next = history.current().clone_for_search();
         next.do_move(mv);

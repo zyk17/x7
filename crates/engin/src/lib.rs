@@ -20,7 +20,7 @@ pub mod uci;
 
 pub use benchmark::{default_benchmark_fen_strings, resolve_data_file, BenchJsonMeta, BenchSessionParams};
 pub use eval::{material_stm, terminal_score};
-pub use history::{PositionHistory, PX0_HISTORY_LEN};
+pub use history::{HistoryDebugEntry, PositionHistory, PX0_HISTORY_LEN};
 pub use mcts::{
     EdgeStats, MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsNode, MctsNodeId, MctsSearchResult, MctsTree,
     OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput, SharedPolicy,

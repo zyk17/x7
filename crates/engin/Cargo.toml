@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 description = "End-user UCI chess engine: search + xiangqi_core + NN backend (ONNX). No dataset tooling."
 publish = false
+default-run = "engin"
 
 [dependencies]
 ndarray = "0.17"

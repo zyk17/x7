@@ -9,7 +9,7 @@ use crate::history::{HistoryEntry, PositionHistory, PX0_HISTORY_LEN};
 const PLANES_PER_BOARD: usize = 15;
 const AUX_BASE: usize = PLANES_PER_BOARD * PX0_HISTORY_LEN;
 const TOTAL_PLANES: usize = AUX_BASE + 4;
-pub(crate) const PX0_INPUT_SHAPE: (usize, usize, usize, usize) = (1, TOTAL_PLANES, 10, 9);
+pub const PX0_INPUT_SHAPE: (usize, usize, usize, usize) = (1, TOTAL_PLANES, 10, 9);
 
 fn piece_plane_offset(pt: PieceType) -> Option<usize> {
     match pt {
@@ -30,21 +30,13 @@ fn is_startpos_board(pos: &Position) -> bool {
 
 fn plane_coords(sq: Square, flip: bool) -> (usize, usize) {
     let rel_sq = if flip { flip_rank(sq) } else { sq };
-    (
-        9usize.saturating_sub(rank_of(rel_sq) as usize),
-        file_of(rel_sq) as usize,
-    )
+    (rank_of(rel_sq) as usize, file_of(rel_sq) as usize)
 }
 
-fn encode_history_block(
-    planes: &mut Array4<f32>,
-    batch: usize,
-    block: usize,
-    pos: &Position,
-    root_stm: Color,
-    flip: bool,
-) {
+fn encode_history_block(planes: &mut Array4<f32>, batch: usize, block: usize, pos: &Position, history_flip: bool) {
     let base = block * PLANES_PER_BOARD;
+    let stm = pos.side_to_move;
+    let rank_flip = (stm == Color::Black) ^ history_flip;
     for sq_u in 0u8..90 {
         let sq: Square = unsafe { std::mem::transmute(sq_u) };
         let pc = pos.piece_on(sq);
@@ -54,30 +46,15 @@ fn encode_history_block(
         let Some(offset) = piece_plane_offset(type_of(pc)) else {
             continue;
         };
-        let ours = color_of(pc) == root_stm;
+        let ours = if history_flip {
+            color_of(pc) != stm
+        } else {
+            color_of(pc) == stm
+        };
         let plane = base + if ours { offset } else { offset + 7 };
-        let (row, col) = plane_coords(sq, flip);
+        let (row, col) = plane_coords(sq, rank_flip);
         planes[[batch, plane, row, col]] = 1.0;
     }
-}
-
-fn history_slot(history: &PositionHistory, block: usize) -> Option<(&Position, bool)> {
-    let entries = history.entries();
-    if entries.is_empty() {
-        return None;
-    }
-
-    if block < entries.len() {
-        let idx = entries.len() - 1 - block;
-        let entry: &HistoryEntry = &entries[idx];
-        return Some((&entry.position, entry.repeated));
-    }
-
-    let earliest = entries.first().expect("non-empty history");
-    if is_startpos_board(&earliest.position) {
-        return None;
-    }
-    Some((&earliest.position, false))
 }
 
 fn encode_history_into(history: &PositionHistory, planes: &mut Array4<f32>) {
@@ -102,25 +79,39 @@ fn prepare_single_board(planes: &mut Array4<f32>) {
 
 fn encode_history_into_slot(history: &PositionHistory, planes: &mut Array4<f32>, batch: usize) {
     let current = history.current();
-    let root_stm = current.side_to_move;
-    let flip = root_stm == Color::Black;
+    let entries = history.entries();
+    let mut flip = false;
+    let mut history_idx = entries.len() as isize - 1;
 
     for block in 0..PX0_HISTORY_LEN {
-        let Some((pos, repeated)) = history_slot(history, block) else {
-            continue;
+        let entry: &HistoryEntry = if history_idx >= 0 {
+            &entries[history_idx as usize]
+        } else {
+            let earliest = entries.first().expect("non-empty history");
+            if is_startpos_board(&earliest.position) {
+                break;
+            }
+            earliest
         };
-        encode_history_block(planes, batch, block, pos, root_stm, flip);
-        if repeated {
+
+        encode_history_block(planes, batch, block, &entry.position, flip);
+        if entry.repeated {
             planes
                 .slice_mut(s![batch, block * PLANES_PER_BOARD + 14, .., ..])
                 .fill(1.0);
         }
+
+        if history_idx > 0 {
+            flip = !flip;
+        }
+        history_idx -= 1;
     }
 
     let stm_fill = if current.side_to_move == Color::Black { 1.0 } else { 0.0 };
     planes.slice_mut(s![batch, AUX_BASE, .., ..]).fill(stm_fill);
-    let rule60 = current.state.rule60.clamp(0, 119) as f32 / 119.0;
-    planes.slice_mut(s![batch, AUX_BASE + 1, .., ..]).fill(rule60);
+    planes
+        .slice_mut(s![batch, AUX_BASE + 1, .., ..])
+        .fill(current.state.rule60.max(0) as f32);
     planes.slice_mut(s![batch, AUX_BASE + 3, .., ..]).fill(1.0);
 }
 
@@ -130,41 +121,55 @@ fn encode_history(history: &PositionHistory) -> Array4<f32> {
     planes
 }
 
-pub(crate) fn history_to_planes(history: &PositionHistory) -> Result<Array4<f32>, String> {
-    if history.len() == 0 {
+pub fn history_to_planes(history: &PositionHistory) -> Result<Array4<f32>, String> {
+    if history.is_empty() {
         return Err("history 不能为空".into());
     }
     Ok(encode_history(history))
 }
 
-pub(crate) fn history_to_planes_into(history: &PositionHistory, planes: &mut Array4<f32>) -> Result<(), String> {
-    if history.len() == 0 {
+pub fn history_to_planes_into(history: &PositionHistory, planes: &mut Array4<f32>) -> Result<(), String> {
+    if history.is_empty() {
         return Err("history 不能为空".into());
     }
     encode_history_into(history, planes);
     Ok(())
 }
 
-pub(crate) fn histories_to_planes(histories: &[&PositionHistory]) -> Result<Array4<f32>, String> {
+pub fn histories_to_planes(histories: &[&PositionHistory]) -> Result<Array4<f32>, String> {
     if histories.is_empty() {
         return Err("histories 不能为空".into());
     }
     let mut planes = Array4::<f32>::zeros((histories.len(), PX0_INPUT_SHAPE.1, PX0_INPUT_SHAPE.2, PX0_INPUT_SHAPE.3));
-    for (batch, history) in histories.iter().enumerate() {
-        if history.len() == 0 {
-            return Err("history 不能为空".into());
-        }
-        encode_history_into_slot(history, &mut planes, batch);
-    }
+    histories_to_planes_into(histories, &mut planes)?;
     Ok(planes)
 }
 
-pub(crate) fn fen_to_planes(fen: &str) -> Result<Array4<f32>, String> {
+pub fn histories_to_planes_into(histories: &[&PositionHistory], planes: &mut Array4<f32>) -> Result<(), String> {
+    if histories.is_empty() {
+        return Err("histories 不能为空".into());
+    }
+    let expected_shape = (histories.len(), PX0_INPUT_SHAPE.1, PX0_INPUT_SHAPE.2, PX0_INPUT_SHAPE.3);
+    if planes.shape() != [expected_shape.0, expected_shape.1, expected_shape.2, expected_shape.3] {
+        *planes = Array4::<f32>::zeros(expected_shape);
+    } else {
+        planes.fill(0.0);
+    }
+    for (batch, history) in histories.iter().enumerate() {
+        if history.is_empty() {
+            return Err("history 不能为空".into());
+        }
+        encode_history_into_slot(history, planes, batch);
+    }
+    Ok(())
+}
+
+pub fn fen_to_planes(fen: &str) -> Result<Array4<f32>, String> {
     let history = PositionHistory::from_fen(fen)?;
     history_to_planes(&history)
 }
 
-pub(crate) fn position_to_planes(pos: &Position) -> Result<Array4<f32>, String> {
+pub fn position_to_planes(pos: &Position) -> Result<Array4<f32>, String> {
     let history = PositionHistory::from_position(pos.clone_for_search());
     history_to_planes(&history)
 }
@@ -221,6 +226,27 @@ mod tests {
             .mapv(f32::abs)
             .sum();
         assert!(diff > 1e-3, "diff={diff}");
+    }
+
+    #[test]
+    fn history_blocks_use_per_position_side_to_move_orientation() {
+        let mut history = PositionHistory::new_startpos();
+        let mv = uci_to_move(history.current(), "h2e2").expect("legal move");
+        history.push_move(mv);
+        let t = history_to_planes(&history).unwrap();
+
+        let block0_ours_rook = 0usize;
+        let block1_ours_rook = PLANES_PER_BOARD;
+        assert_eq!(
+            t[[0, block0_ours_rook, 0, 0]],
+            1.0,
+            "current black rook should be ours at bottom-left"
+        );
+        assert_eq!(
+            t[[0, block1_ours_rook, 0, 0]],
+            1.0,
+            "previous position should also be reoriented into the root side perspective"
+        );
     }
 
     #[test]

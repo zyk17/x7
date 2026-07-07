@@ -23,7 +23,7 @@ fn print_usage() {
         "用法:\n  engin                         UCI 模式（stdin/stdout）\n  \
          engin --onnx-smoke [ONNX] [FEN]  冒烟；缺省 ONNX=data/policy.onnx、FEN=起始局面\n  \
          engin --bench [选项]            MCTS 基准（NDJSON）\n  \
-         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --onnx PATH  --data-dir PATH  --require-onnx"
+         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --onnx PATH  --fen FEN  --data-dir PATH  --require-onnx"
     );
 }
 
@@ -34,6 +34,7 @@ struct BenchCli {
     onnx: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     require_onnx: bool,
+    fens: Vec<String>,
 }
 
 fn parse_bench_cli(rest: &[String]) -> BenchCli {
@@ -47,6 +48,7 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
     let mut onnx: Option<PathBuf> = None;
     let mut data_dir: Option<PathBuf> = None;
     let mut require_onnx = false;
+    let mut fens = Vec::new();
     let mut i = 0usize;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -82,6 +84,10 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
                 data_dir = Some(PathBuf::from(&rest[i + 1]));
                 i += 2;
             }
+            "--fen" if i + 1 < rest.len() => {
+                fens.push(rest[i + 1].clone());
+                i += 2;
+            }
             "--require-onnx" => {
                 require_onnx = true;
                 i += 1;
@@ -98,6 +104,7 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
         onnx,
         data_dir,
         require_onnx,
+        fens,
     }
 }
 
@@ -155,10 +162,17 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
         policy: &policy,
         meta: &meta,
     };
+    let default_fens;
+    let fens: &[String] = if cli.fens.is_empty() {
+        default_fens = default_benchmark_fen_strings().to_vec();
+        &default_fens
+    } else {
+        &cli.fens
+    };
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    write_benchmark_ndjson(&mut out, default_benchmark_fen_strings(), &session)
+    write_benchmark_ndjson(&mut out, fens, &session)
 }
 
 fn legal_top_lines(logits: &[f32], fen: &str, k: usize) -> Result<String, String> {

@@ -11,13 +11,13 @@ fn parse_square(bytes: &[u8]) -> Option<Square> {
     }
     let file = bytes[0];
     let rank = bytes[1];
-    if !(b'a'..=b'i').contains(&file) || !(b'0'..=b'9').contains(&rank) {
+    if !(b'a'..=b'i').contains(&file) || !rank.is_ascii_digit() {
         return None;
     }
     let f = (file - b'a') as u16;
     let r = (rank - b'0') as u16;
     let idx = r * 9 + f;
-    Some(unsafe { std::mem::transmute(idx as u8) })
+    Some(unsafe { std::mem::transmute::<u8, Square>(idx as u8) })
 }
 
 fn packed_idx(mv: Move) -> usize {

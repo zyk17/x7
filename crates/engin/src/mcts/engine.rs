@@ -11,7 +11,7 @@ use super::{
     MctsBudget, MctsConfig, MctsNode, MctsNodeId, MctsTree, PolicyValueEval, PolicyValueInput, PolicyValueTask,
 };
 
-const SEARCH_BATCH_SIZE: usize = 8;
+const SEARCH_BATCH_SIZE_CAP: usize = 64;
 const SEARCH_COLLISION_PLAYOUT_FACTOR: usize = 4;
 
 /// MCTS 单次搜索结果。
@@ -124,6 +124,7 @@ where
 
         let root_history = history.clone_for_search();
         let mut playouts = 0u32;
+        let mut seldepth = 0u32;
         let mut next_report_at = if info_interval.is_zero() {
             None
         } else {
@@ -131,8 +132,8 @@ where
         };
 
         while !budget_exhausted(&budget, playouts, self.tree.len()) {
-            let batch_limit = remaining_batch_capacity(&budget, playouts, self.tree.len())
-                .unwrap_or(SEARCH_BATCH_SIZE)
+            let batch_limit = remaining_batch_capacity(&budget, playouts, self.tree.len(), self.config.search_batch_size)
+                .unwrap_or(self.config.search_batch_size)
                 .max(1);
             let iteration = self.gather_iteration(root_id, &root_history, &budget, playouts, batch_limit);
             if iteration.playouts == 0 {
@@ -140,6 +141,7 @@ where
             }
 
             let iter_playouts = iteration.playouts;
+            seldepth = seldepth.max(iteration.seldepth);
             self.apply_iteration(iteration)?;
             debug_assert_eq!(self.total_in_flight(), 0);
 
@@ -148,13 +150,13 @@ where
             if let Some(deadline) = next_report_at {
                 let now = Instant::now();
                 if now >= deadline {
-                    on_progress(&self.progress_from_root(root_id, playouts));
+                    on_progress(&self.progress_from_root(root_id, playouts, seldepth));
                     next_report_at = Some(now + info_interval);
                 }
             }
         }
 
-        Ok(self.result_from_root(root_id, playouts))
+        Ok(self.result_from_root(root_id, playouts, seldepth))
     }
 
     fn prepare_root(&mut self, history: &PositionHistory) -> Result<Option<MctsNodeId>, E::Error> {
@@ -257,7 +259,9 @@ where
     ) -> SearchIteration {
         let mut iteration = SearchIteration::default();
         let mut slots = HashMap::<PendingKey, usize>::new();
-        let playout_limit = batch_limit.saturating_mul(SEARCH_COLLISION_PLAYOUT_FACTOR).max(batch_limit);
+        let playout_limit = batch_limit
+            .saturating_mul(SEARCH_COLLISION_PLAYOUT_FACTOR)
+            .max(batch_limit);
         while iteration.pending.len() < batch_limit && iteration.playouts < playout_limit as u32 {
             if budget_exhausted(
                 budget,
@@ -276,6 +280,7 @@ where
 
             let slot = iteration.pending.len();
             slots.insert(pending.key.clone(), slot);
+            iteration.seldepth = iteration.seldepth.max(pending.path.len() as u32);
             iteration.pending.push(pending);
         }
 
@@ -317,6 +322,18 @@ where
                 edge_idx,
             });
 
+            if history.current_is_repeated() {
+                return PendingNode {
+                    key: PendingKey::NewEdge(parent_id, edge_idx),
+                    path,
+                    kind: PendingKind::NewTerminal {
+                        state_key: pos.key(),
+                        value: 0.0,
+                    },
+                    multivisit: 1,
+                };
+            }
+
             if let Some(child_id) = child_id {
                 node_id = child_id;
                 continue;
@@ -345,11 +362,11 @@ where
                 key: PendingKey::NewEdge(parent_id, edge_idx),
                 path,
                 kind: PendingKind::Expand {
-                    task: PolicyValueTask {
+                    task: Box::new(PolicyValueTask {
                         position: pos,
                         history,
                         legal_moves,
-                    },
+                    }),
                 },
                 multivisit: 1,
             };
@@ -360,7 +377,7 @@ where
         let mut tasks = Vec::new();
         for pending in &iteration.pending {
             if let PendingKind::Expand { task } = &pending.kind {
-                tasks.push(task.clone());
+                tasks.push((**task).clone());
             }
         }
         let outputs = self.evaluator.evaluate_many(&tasks)?;
@@ -464,11 +481,7 @@ where
         }
     }
 
-    fn progress_from_root(
-        &self,
-        root_id: MctsNodeId,
-        playouts: u32,
-    ) -> MctsSearchProgress {
+    fn progress_from_root(&self, root_id: MctsNodeId, playouts: u32, seldepth: u32) -> MctsSearchProgress {
         let root = self.tree.get(root_id).expect("root must exist");
         let pv = self.extract_pv(root_id);
         let best_move = pv.first().copied();
@@ -479,14 +492,14 @@ where
             root_visits: root.visits,
             nodes: self.tree.len(),
             depth: self.depth_from_root(root_id),
-            seldepth: self.seldepth_from_root(root_id),
+            seldepth,
             root_value: root.mean_value(),
         }
     }
 
-    fn result_from_root(&self, root_id: MctsNodeId, playouts: u32) -> MctsSearchResult {
+    fn result_from_root(&self, root_id: MctsNodeId, playouts: u32, seldepth: u32) -> MctsSearchResult {
         let root = self.tree.get(root_id).expect("root must exist");
-        let progress = self.progress_from_root(root_id, playouts);
+        let progress = self.progress_from_root(root_id, playouts, seldepth);
         MctsSearchResult {
             best_move: progress.best_move,
             pv: progress.pv,
@@ -512,10 +525,7 @@ where
     fn extract_pv(&self, root_id: MctsNodeId) -> Vec<Move> {
         let mut pv = Vec::new();
         let mut node_id = root_id;
-        loop {
-            let Some(node) = self.tree.get(node_id) else {
-                break;
-            };
+        while let Some(node) = self.tree.get(node_id) {
             let Some(edge) = node.children.iter().max_by(|a, b| {
                 a.visits
                     .cmp(&b.visits)
@@ -550,27 +560,6 @@ where
         self.extract_pv(root_id).len() as u32
     }
 
-    fn seldepth_from_root(&self, root_id: MctsNodeId) -> u32 {
-        self.completed_depth(root_id)
-    }
-
-    fn completed_depth(&self, node_id: MctsNodeId) -> u32 {
-        let Some(node) = self.tree.get(node_id) else {
-            return 0;
-        };
-        let mut best = 0u32;
-        for edge in &node.children {
-            if edge.visits == 0 {
-                continue;
-            }
-            let depth = match edge.child {
-                Some(child_id) => 1 + self.completed_depth(child_id),
-                None => 1,
-            };
-            best = best.max(depth);
-        }
-        best
-    }
 }
 
 fn budget_exhausted(budget: &MctsBudget, playouts: u32, nodes: usize) -> bool {
@@ -597,16 +586,18 @@ fn budget_exhausted(budget: &MctsBudget, playouts: u32, nodes: usize) -> bool {
     false
 }
 
-fn remaining_batch_capacity(budget: &MctsBudget, playouts: u32, nodes: usize) -> Option<usize> {
+fn remaining_batch_capacity(budget: &MctsBudget, playouts: u32, nodes: usize, batch_size: usize) -> Option<usize> {
     let remaining_playouts = budget
         .max_playouts
         .map(|limit| limit.saturating_sub(playouts) as usize)
-        .unwrap_or(SEARCH_BATCH_SIZE);
+        .unwrap_or(batch_size);
     let remaining_nodes = budget
         .max_nodes
         .map(|limit| limit.saturating_sub(nodes as u32) as usize)
-        .unwrap_or(SEARCH_BATCH_SIZE);
-    let cap = remaining_playouts.min(remaining_nodes).min(SEARCH_BATCH_SIZE);
+        .unwrap_or(batch_size);
+    let cap = remaining_playouts
+        .min(remaining_nodes)
+        .min(batch_size.min(SEARCH_BATCH_SIZE_CAP));
     if cap == 0 {
         None
     } else {
@@ -621,10 +612,7 @@ fn appended_history_move(old_history: &PositionHistory, new_history: &PositionHi
         return None;
     }
     let suffix_matches = if new_positions.len() == old_positions.len() + 1 {
-        old_positions
-            .iter()
-            .zip(new_positions.iter())
-            .all(|(a, b)| a == b)
+        old_positions.iter().zip(new_positions.iter()).all(|(a, b)| a == b)
     } else if new_positions.len() == old_positions.len() && old_positions.len() >= 2 {
         old_positions[1..]
             .iter()
@@ -701,7 +689,7 @@ enum PendingKey {
 enum PendingKind {
     ExistingTerminal { leaf_id: MctsNodeId, value: f32 },
     NewTerminal { state_key: u64, value: f32 },
-    Expand { task: PolicyValueTask },
+    Expand { task: Box<PolicyValueTask> },
 }
 
 #[derive(Clone)]
@@ -716,6 +704,7 @@ struct PendingNode {
 struct SearchIteration {
     pending: Vec<PendingNode>,
     playouts: u32,
+    seldepth: u32,
 }
 
 impl SearchIteration {
@@ -758,8 +747,9 @@ mod tests {
         let history = PositionHistory::new_startpos();
         let root_id = engine.initialize_root(&history).expect("init ok").expect("root");
 
-        let iteration = engine.gather_iteration(root_id, &history, &MctsBudget::default(), 0, SEARCH_BATCH_SIZE);
-        assert_eq!(iteration.playouts, SEARCH_BATCH_SIZE as u32);
+        let batch_size = engine.config.search_batch_size;
+        let iteration = engine.gather_iteration(root_id, &history, &MctsBudget::default(), 0, batch_size);
+        assert_eq!(iteration.playouts, batch_size as u32);
 
         let mut unique = std::collections::HashSet::new();
         for pending in &iteration.pending {
@@ -816,7 +806,10 @@ mod tests {
 
         let iteration = engine.gather_iteration(root_id, &history, &MctsBudget::default(), 0, 4);
         assert_eq!(iteration.pending.len(), 1);
-        assert_eq!(iteration.pending[0].multivisit, (4 * SEARCH_COLLISION_PLAYOUT_FACTOR) as u32);
+        assert_eq!(
+            iteration.pending[0].multivisit,
+            (4 * SEARCH_COLLISION_PLAYOUT_FACTOR) as u32
+        );
 
         engine.apply_iteration(iteration).expect("apply ok");
         let root = engine.tree.get(root_id).expect("root");
@@ -867,7 +860,7 @@ mod tests {
             deadline: None,
             stop: None,
         };
-        let iteration = engine.gather_iteration(root_id, &history, &budget, 0, SEARCH_BATCH_SIZE);
+        let iteration = engine.gather_iteration(root_id, &history, &budget, 0, engine.config.search_batch_size);
         assert_eq!(iteration.playouts, 3);
     }
 
@@ -900,7 +893,10 @@ mod tests {
             )
             .expect("second");
         assert_eq!(second.playouts, 8);
-        assert!(second.root_visits >= 24, "root visits should continue from prior search");
+        assert!(
+            second.root_visits >= 24,
+            "root visits should continue from prior search"
+        );
     }
 
     #[test]
@@ -933,7 +929,10 @@ mod tests {
                 },
             )
             .expect("second");
-        assert!(second.root_visits > second.playouts, "new root should inherit child visits");
+        assert!(
+            second.root_visits > second.playouts,
+            "new root should inherit child visits"
+        );
     }
 
     #[test]
@@ -978,5 +977,81 @@ mod tests {
             )
             .expect("second");
         assert_eq!(second.root_visits, 1, "different history window must rebuild root");
+    }
+
+    #[test]
+    fn repeated_leaf_is_scored_as_draw() {
+        let mut history = PositionHistory::new_startpos();
+        for u in ["h0g2", "h9g7", "g2h0", "g7h9"] {
+            let mv = uci_to_move(history.current(), u).expect("legal move");
+            history.push_move(mv);
+        }
+        assert!(history.current_is_repeated(), "history should already contain repeated root");
+
+        let mut engine = MctsEngine::new(MctsConfig::default(), StubEval);
+        let result = engine
+            .search_root_history(
+                &history,
+                MctsBudget {
+                    max_playouts: Some(16),
+                    max_nodes: None,
+                    deadline: None,
+                    stop: None,
+                },
+            )
+            .expect("search");
+        assert!(result.best_move.is_some());
+        assert!(result.moves.iter().all(|mv| mv.q.abs() <= 1.0));
+    }
+
+    #[test]
+    fn reused_tree_does_not_inflate_reported_seldepth() {
+        let mut engine = MctsEngine::new(MctsConfig::default(), StubEval);
+        let root_id = engine.tree.add_node(MctsNode {
+            state_key: 1,
+            visits: 32,
+            value_sum: 0.0,
+            expanded: true,
+            terminal_value: None,
+            children: vec![super::super::EdgeStats {
+                mv: Move::make(xiangqi_core::types::Square::SQ_A0, xiangqi_core::types::Square::SQ_A1),
+                prior: 1.0,
+                visits: 32,
+                in_flight: 0,
+                value_sum: 0.0,
+                child: None,
+            }],
+        });
+        let reused_child = engine.tree.add_node(MctsNode {
+            state_key: 2,
+            visits: 32,
+            value_sum: 0.0,
+            expanded: true,
+            terminal_value: None,
+            children: vec![super::super::EdgeStats {
+                mv: Move::make(xiangqi_core::types::Square::SQ_A1, xiangqi_core::types::Square::SQ_A2),
+                prior: 1.0,
+                visits: 32,
+                in_flight: 0,
+                value_sum: 0.0,
+                child: None,
+            }],
+        });
+        let reused_leaf = engine.tree.add_node(MctsNode {
+            state_key: 3,
+            visits: 32,
+            value_sum: 0.0,
+            expanded: true,
+            terminal_value: Some(0.0),
+            children: Vec::new(),
+        });
+        engine.tree.get_mut(root_id).expect("root").children[0].child = Some(reused_child);
+        engine.tree.get_mut(reused_child).expect("child").children[0].child = Some(reused_leaf);
+
+        let progress = engine.progress_from_root(root_id, 1, 1);
+        let result = engine.result_from_root(root_id, 1, 1);
+        assert_eq!(progress.seldepth, 1);
+        assert_eq!(result.seldepth, 1);
+        assert_eq!(progress.depth, 2, "pv depth may still reflect reused subtree");
     }
 }

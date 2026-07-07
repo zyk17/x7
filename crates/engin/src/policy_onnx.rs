@@ -31,6 +31,7 @@ pub struct PolicyOnnx {
     session: Session,
     provider_chain: &'static str,
     scratch_board: Array4<f32>,
+    scratch_batch: Array4<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,9 +53,12 @@ impl PolicyOnnx {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         let provider_mode = ProviderMode::from_env();
+        let intra_threads = ort_intra_threads();
+        let inter_threads = ort_inter_threads();
         let mut builder = Session::builder()?
-            .with_parallel_execution(false)?
-            .with_intra_threads(1)?
+            .with_parallel_execution(inter_threads > 1)?
+            .with_intra_threads(intra_threads)?
+            .with_inter_threads(inter_threads)?
             .with_memory_pattern(true)?
             .with_optimization_level(GraphOptimizationLevel::All)?;
         builder = match provider_mode {
@@ -75,6 +79,7 @@ impl PolicyOnnx {
             session,
             provider_chain: provider_mode.provider_chain(),
             scratch_board: Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
+            scratch_batch: Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
         })
     }
 
@@ -112,8 +117,10 @@ impl PolicyOnnx {
         histories: impl IntoIterator<Item = &'a PositionHistory>,
     ) -> Result<BatchPolicyOutputs, Error> {
         let collected = histories.into_iter().collect::<Vec<_>>();
-        let boards = crate::fen_tensor::histories_to_planes(&collected).map_err(Error::new)?;
-        self.eval_boards(&boards)
+        crate::fen_tensor::histories_to_planes_into(&collected, &mut self.scratch_batch).map_err(Error::new)?;
+        let session = &mut self.session;
+        let boards = &self.scratch_batch;
+        Self::run_session_batch(session, boards)
     }
 
     fn run_session_batch(session: &mut Session, board: &Array4<f32>) -> Result<BatchPolicyOutputs, Error> {
@@ -191,6 +198,34 @@ fn cuda_provider() -> ort::execution_providers::ExecutionProviderDispatch {
 
 fn cpu_provider() -> ort::execution_providers::ExecutionProviderDispatch {
     ep::CPU::default().with_arena_allocator(true).build()
+}
+
+fn ort_intra_threads() -> usize {
+    std::env::var("ENGIN_ORT_INTRA_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(default_ort_intra_threads)
+}
+
+fn ort_inter_threads() -> usize {
+    std::env::var("ENGIN_ORT_INTER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(default_ort_inter_threads)
+}
+
+fn default_ort_intra_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 8))
+        .unwrap_or(4)
+}
+
+fn default_ort_inter_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 4))
+        .unwrap_or(2)
 }
 
 impl ProviderMode {

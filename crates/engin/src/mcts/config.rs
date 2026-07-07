@@ -43,20 +43,25 @@ pub struct MctsConfig {
     pub root_dirichlet_epsilon: f32,
     /// 根节点探索噪声 alpha；当前仅保留配置位。
     pub root_dirichlet_alpha: f32,
+    /// 单线程搜索每轮 gather 的目标 batch 大小。
+    pub search_batch_size: usize,
 }
 
 impl Default for MctsConfig {
     fn default() -> Self {
+        let fpu_reduction = 0.22;
         Self {
             cpuct: 1.0,
             cpuct_root: 1.745,
             cpuct_base: 38_739.0,
             cpuct_factor: 3.894,
-            fpu_reduction: 0.22,
-            fpu_reduction_root: 1.0,
+            fpu_reduction,
+            // px0 默认 root FPU 策略为 "same"，实际根节点默认值与非根相同。
+            fpu_reduction_root: fpu_reduction,
             root_temperature: 0.0,
             root_dirichlet_epsilon: 0.0,
             root_dirichlet_alpha: 0.3,
+            search_batch_size: 32,
         }
     }
 }
