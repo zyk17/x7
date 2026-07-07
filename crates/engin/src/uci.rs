@@ -19,6 +19,8 @@ use crate::policy_onnx::PolicySessionPool;
 static UCI_STDOUT_LOCK: Mutex<()> = Mutex::new(());
 const UCI_INFO_INTERVAL: Duration = Duration::from_millis(200);
 const UCI_ROOT_MOVE_TOP_K: usize = 5;
+const AUTO_THREADS: usize = 0;
+const MAX_THREADS: usize = 32;
 
 fn q_to_cp(q: f32) -> i32 {
     let wl = q.clamp(-0.999, 0.999) as f64;
@@ -289,6 +291,23 @@ impl Engine {
         )));
     }
 
+    fn auto_threads(&self) -> usize {
+        let cpu_cap = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 4))
+            .unwrap_or(2);
+        match self.policy.as_ref().map(|pool| pool.provider_chain()) {
+            Some(chain) if chain.contains("CUDA") || chain.contains("DirectML") => cpu_cap,
+            _ => 1,
+        }
+    }
+
+    fn resolved_threads(&self) -> usize {
+        match self.threads {
+            AUTO_THREADS => self.auto_threads(),
+            n => n.clamp(1, MAX_THREADS),
+        }
+    }
+
     fn send_uci_ident(&self) {
         self.emit("id name 77xiangqi_engine");
         self.emit("id author github.com/77xiangqi_engine");
@@ -307,7 +326,7 @@ impl Engine {
         self.emit("option name FpuReduction type string default 0.22");
         self.emit("option name FpuReductionAtRoot type string default 0.22");
         self.emit("option name SearchBatchSize type spin default 32 min 1 max 64");
-        self.emit("option name Threads type spin default 1 min 1 max 32");
+        self.emit("option name Threads type spin default 0 min 0 max 32");
         self.emit(&format!(
             "info string policy {}",
             if self.policy.is_some() { "loaded" } else { "not_loaded" }
@@ -393,7 +412,7 @@ impl Engine {
             "Threads" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<usize>() {
-                        self.threads = n.clamp(1, 32);
+                        self.threads = n.min(MAX_THREADS);
                     }
                 }
             }
@@ -450,7 +469,7 @@ impl Engine {
             }
         };
         let config = self.config;
-        let threads = self.threads;
+        let threads = self.resolved_threads();
         let stop = Arc::new(AtomicBool::new(false));
         let output = Arc::clone(&self.output);
         let search_engine = Arc::clone(&self.search_engine);
@@ -794,5 +813,13 @@ mod tests {
         let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
         assert!(out.contains("bestmove"));
         assert!(!out.ends_with("bestmove (none)"));
+    }
+
+    #[test]
+    fn threads_zero_is_accepted_as_auto() {
+        let mut engine = Engine::new();
+        engine.handle_line("setoption name Threads value 0");
+        assert_eq!(engine.threads, 0);
+        assert!(engine.resolved_threads() >= 1);
     }
 }

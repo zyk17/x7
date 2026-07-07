@@ -221,12 +221,22 @@ impl PolicySessionPool {
             .expect("policy session pool must contain at least one session")
     }
 
-    pub fn ensure_sessions(&self, count: usize) -> Result<Vec<Arc<Mutex<PolicyOnnx>>>, Error> {
+    pub fn provider_chain(&self) -> &'static str {
+        let session = self.primary();
+        let chain = session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .provider_chain();
+        chain
+    }
+
+    pub fn resize_sessions(&self, count: usize) -> Result<Vec<Arc<Mutex<PolicyOnnx>>>, Error> {
         let target = count.max(1);
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         while sessions.len() < target {
             sessions.push(Arc::new(Mutex::new(PolicyOnnx::from_file(&self.model_path)?)));
         }
+        sessions.truncate(target);
         Ok(sessions.iter().take(target).cloned().collect())
     }
 }
@@ -379,5 +389,18 @@ mod tests {
         assert_eq!(out.logits.len(), 2);
         assert!(!out.logits[0].is_empty());
         assert!(!out.logits[1].is_empty());
+    }
+
+    #[test]
+    fn pool_can_grow_and_shrink_if_policy_onnx_present() {
+        let Some(path) = candidate_onnx_paths().into_iter().find(|p| p.is_file()) else {
+            eprintln!("skip: no candidate onnx");
+            return;
+        };
+        let pool = PolicySessionPool::from_file(&path).expect("load pool");
+        let grown = pool.resize_sessions(3).expect("grow");
+        assert_eq!(grown.len(), 3);
+        let shrunk = pool.resize_sessions(1).expect("shrink");
+        assert_eq!(shrunk.len(), 1);
     }
 }

@@ -18,6 +18,7 @@ use super::{
 const SEARCH_BATCH_SIZE_CAP: usize = 64;
 const SEARCH_COLLISION_PLAYOUT_FACTOR: usize = 4;
 const EVAL_GATHER_WAIT: Duration = Duration::from_micros(200);
+const MAX_EVAL_CONSUMERS: usize = 4;
 
 /// MCTS 单次搜索结果。
 #[derive(Clone, Debug)]
@@ -617,17 +618,14 @@ impl MctsEngine<OnnxPolicyValueEval> {
         let coordinator = EvalCoordinator::new();
         let started_at = Instant::now();
         let thread_count = threads.max(1);
-        let eval_thread_count = if let Some(policy_pool) = shared_policy.as_ref() {
-            policy_pool
-                .ensure_sessions(thread_count)
-                .map_err(|e| e.to_string())?
-                .len()
+        let eval_thread_count = if shared_policy.is_some() {
+            thread_count.min(MAX_EVAL_CONSUMERS).max(1)
         } else {
             1
         };
         let eval_sessions = if let Some(policy_pool) = shared_policy.as_ref() {
             policy_pool
-                .ensure_sessions(eval_thread_count)
+                .resize_sessions(eval_thread_count)
                 .map_err(|e| e.to_string())?
         } else {
             Vec::new()
@@ -636,14 +634,22 @@ impl MctsEngine<OnnxPolicyValueEval> {
         let max_eval_tasks = (search_batch_size * thread_count.max(1)).min(256);
 
         thread::scope(|scope| {
-            if eval_sessions.is_empty() {
+            let eval_consumers = if eval_sessions.is_empty() {
+                vec![None]
+            } else {
+                eval_sessions.into_iter().map(Some).collect::<Vec<_>>()
+            };
+            for session in eval_consumers {
                 let coordinator = Arc::clone(&coordinator);
                 let stop = Arc::clone(&stop);
                 let first_error = Arc::clone(&first_error);
                 let shared_policy = shared_policy.clone();
                 let shared_cache = shared_cache.clone();
                 scope.spawn(move || {
-                    let mut shared_eval = OnnxPolicyValueEval::with_shared_cache(shared_policy, shared_cache);
+                    let mut shared_eval = match session {
+                        Some(session) => OnnxPolicyValueEval::with_session(shared_policy, Some(session), shared_cache),
+                        None => OnnxPolicyValueEval::with_shared_cache(shared_policy, shared_cache),
+                    };
                     while let Some(requests) = coordinator.drain_batch(max_eval_requests, max_eval_tasks) {
                         let total_tasks = requests.iter().map(|req| req.tasks.len()).sum::<usize>();
                         if total_tasks == 0 {
@@ -679,52 +685,6 @@ impl MctsEngine<OnnxPolicyValueEval> {
                         }
                     }
                 });
-            } else {
-                for session in eval_sessions {
-                    let coordinator = Arc::clone(&coordinator);
-                    let stop = Arc::clone(&stop);
-                    let first_error = Arc::clone(&first_error);
-                    let shared_policy = shared_policy.clone();
-                    let shared_cache = shared_cache.clone();
-                    scope.spawn(move || {
-                        let mut shared_eval =
-                            OnnxPolicyValueEval::with_session(shared_policy, Some(session), shared_cache);
-                        while let Some(requests) = coordinator.drain_batch(max_eval_requests, max_eval_tasks) {
-                            let total_tasks = requests.iter().map(|req| req.tasks.len()).sum::<usize>();
-                            if total_tasks == 0 {
-                                for request in requests {
-                                    request.complete(Ok(Vec::new()));
-                                }
-                                continue;
-                            }
-
-                            let mut flat_tasks = Vec::with_capacity(total_tasks);
-                            let mut request_lens = Vec::with_capacity(requests.len());
-                            for request in &requests {
-                                flat_tasks.extend(request.tasks.iter().cloned());
-                                request_lens.push(request.tasks.len());
-                            }
-
-                            match shared_eval.evaluate_many_shared(&flat_tasks) {
-                                Ok(outputs) => {
-                                    debug_assert_eq!(outputs.len(), request_lens.iter().sum::<usize>());
-                                    let mut outputs = outputs.into_iter();
-                                    for (request, len) in requests.into_iter().zip(request_lens.into_iter()) {
-                                        request.complete(Ok(outputs.by_ref().take(len).collect()));
-                                    }
-                                }
-                                Err(err) => {
-                                    *first_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.clone());
-                                    stop.store(true, Ordering::SeqCst);
-                                    for request in requests {
-                                        request.complete(Err(err.clone()));
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                }
             }
 
             for _ in 0..thread_count {
