@@ -256,4 +256,25 @@ mod tests {
         assert!((t[[0, AUX_BASE, 0, 0]] - 1.0).abs() < 1e-6);
         assert!((t[[0, AUX_BASE + 3, 0, 0]] - 1.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn repeated_history_sets_repetition_plane() {
+        let mut history = PositionHistory::new_startpos();
+        for u in ["h0g2", "h9g7", "g2h0", "g7h9"] {
+            let mv = uci_to_move(history.current(), u).expect("legal move");
+            history.push_move(mv);
+        }
+        assert!(history.current_is_repeated());
+
+        let t = history_to_planes(&history).unwrap();
+        assert_eq!(t[[0, 14, 0, 0]], 1.0, "current repeated position should mark repetition plane");
+    }
+
+    #[test]
+    fn isolated_fen_fallback_does_not_fake_repetition() {
+        let history = PositionHistory::from_fen(START_FEN).unwrap();
+        let t = history_to_planes(&history).unwrap();
+        assert_eq!(t[[0, 14, 0, 0]], 0.0);
+        assert_eq!(t[[0, 29, 0, 0]], 0.0);
+    }
 }

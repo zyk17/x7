@@ -165,6 +165,7 @@ where
 
     fn prepare_root(&mut self, history: &PositionHistory) -> Result<Option<MctsNodeId>, E::Error> {
         if self.try_reuse_exact_root(history) {
+            self.root_history = Some(history.clone_for_search());
             return Ok(self.root_id);
         }
         if self.try_reuse_appended_path(history) {
@@ -1268,5 +1269,73 @@ mod tests {
         assert_eq!(progress.seldepth, 1);
         assert_eq!(result.seldepth, 1);
         assert_eq!(progress.depth, 2, "pv depth may still reflect reused subtree");
+    }
+
+    #[test]
+    fn fresh_search_root_visits_match_playouts() {
+        let mut engine = MctsEngine::new(MctsConfig::default(), StubEval);
+        let history = PositionHistory::new_startpos();
+        let result = engine
+            .search_root_history(
+                &history,
+                MctsBudget {
+                    max_playouts: Some(24),
+                    max_nodes: None,
+                    deadline: None,
+                    stop: None,
+                },
+            )
+            .expect("search");
+        assert_eq!(result.playouts, 24);
+        assert_eq!(result.root_visits, 24);
+        assert!(result.nodes >= 1);
+    }
+
+    #[test]
+    fn non_appended_history_does_not_reuse_root_subtree() {
+        let mut engine = MctsEngine::new(MctsConfig::default(), StubEval);
+        let history = PositionHistory::new_startpos();
+        let first = engine
+            .search_root_history(
+                &history,
+                MctsBudget {
+                    max_playouts: Some(16),
+                    max_nodes: None,
+                    deadline: None,
+                    stop: None,
+                },
+            )
+            .expect("first");
+        let mv1 = first.best_move.expect("best move");
+
+        let mut history_a = history.clone_for_search();
+        history_a.push_move(mv1);
+        let _ = engine
+            .search_root_history(
+                &history_a,
+                MctsBudget {
+                    max_playouts: Some(8),
+                    max_nodes: None,
+                    deadline: None,
+                    stop: None,
+                },
+            )
+            .expect("second");
+
+        let mut history_b = PositionHistory::new_startpos();
+        let alt = uci_to_move(history_b.current(), "c3c4").expect("alt legal");
+        history_b.push_move(alt);
+        let third = engine
+            .search_root_history(
+                &history_b,
+                MctsBudget {
+                    max_playouts: Some(4),
+                    max_nodes: None,
+                    deadline: None,
+                    stop: None,
+                },
+            )
+            .expect("third");
+        assert_eq!(third.root_visits, 4, "non-appended history should rebuild root");
     }
 }

@@ -1,72 +1,79 @@
 # NextStep
 
-当前 `px0` 主线 baseline 已经跑完第一轮长训。
+当前阶段开始收敛，优先按 `lc0 / px0` 风格把规则层和搜索地基做稳。
 
-当前确认结果：
+当前正式共识：
 
-- 模型：`124x10x9 -> 2062 + WDL`
-- 引擎输入：`px0 classical` 真实 history 主线，`fen_only` fallback
-- 搜索核心：单线程 `iteration + minibatch + in_flight`
-- 下一轮正式 baseline：`width=128 blocks=8 batch=256 q_ratio=0.0`
-- 已完成：`200k steps`
-- 当前 best：`baseline_px0_wdl_v1.best.pt`
-- 当前 best 指标大致为：
-  - `val_policy ~= 2.4583`
-  - `val_value_ce ~= 0.7199`
-  - `val_value_q_mse ~= 0.0654`
+- 模型契约保持：`124x10x9 -> 2062 + WDL`
+- 引擎输入保持：真实 `history` 主线，`fen_only` fallback
+- 搜索主线保持：`MCTS`
+- 当前已支持：单线程主线 + 最小 shared-tree 多线程
+- 当前明确不做：
+  - `MultiPV`
+  - 复杂 ONNX backend / evaluator 池
+  - 本地大规模搜索标注主线
 
-下一阶段只做三件事：
+下一阶段只做三类高价值事项：
 
-## 1. 做真实历史链路联调
+## 1. 继续对齐 `xiangqi_core` 规则真相
 
 目标：
 
-- 把当前 ONNX 真正接入你们自己的 GUI 历史输入
-- 对比“只有最终 FEN”和“完整历史”两种输入差异
-- 重点观察 `pv / seldepth / bestmove` 是否比旧搜索稳定
-
-完成标准：
-
-- GUI 侧能按“重置局面 + 逐步追加 move”驱动引擎
-- 至少记录 2~3 个非起始局面的差异样例
-- 明确当前 baseline 是否仍然存在明显 opening 偏差与离谱应将问题
-
-## 2. 做小规模对照实验
-
-目标：
-
-- 不再重复跑同一条 200k 长训
-- 只做少量高价值对照，验证下一轮该改哪一个维度
+- 保持规则层和 `pyffish / px0` 可对拍
+- 优先消灭会直接污染搜索的规则误差
 
 优先顺序：
 
-1. `value_loss_weight` 上调一组
-2. `q_ratio` 做一组非 `1.0` 对照
-3. 视显存和速度决定是否把模型稍微放大一档
-4. 只在 baseline 行为仍明显异常时，再考虑继续调搜索常数
+1. 持续补 `rules_regression`
+2. 对可疑局面做合法着对拍
+3. 只修规则真相，不往规则层掺搜索策略
 
 完成标准：
 
-- 每组只跑 `10k~20k`
-- 记录与 `baseline_px0_wdl_v1` 的对比
-- 明确下一轮长期配置
+- 关键局面合法着与参考实现一致
+- 回归测试能固定住已知坑点
 
-## 3. 收掉旧支线与旧产物
+## 2. 继续收紧 `engin` 搜索语义
 
 目标：
 
-- 代码可留最小兼容
-- 仓库数据与实验产物尽量干净
+- 尽量和 `lc0 / px0` 的主线语义保持一致
+- 在不引入大后端系统的前提下，把搜索行为做对
+
+优先顺序：
+
+1. 继续完善 root tree reuse / subtree reuse
+2. 继续核对 `playouts / nodes / depth / seldepth / pv` 统计口径
+3. 继续检查 repetition / terminal 处理
+4. 用固定命令量化 `Threads` 和 `SearchBatchSize`
 
 完成标准：
 
-- 删除旧 `pt / onnx`
-- 只保留 `px0` 分片清单和必要脚本
-- `xiangqi_dataset` 只保留 PGN / 后续自对弈预处理地基
+- `bestmove` 稳定合法
+- `pv / seldepth / nps` 变化可解释
+- GUI 联调下不再出现明显 UCI 行为异常
 
-## 当前不该做的事
+## 3. 再回到模型质量
 
-1. 不再扩大本地搜索标注数据
-2. 不再围绕 `15-plane human bootstrap` 继续投入
+目标：
+
+- 不急着发散 head 和复杂架构
+- 先在当前正式契约下把 baseline 做稳
+
+优先顺序：
+
+1. 继续观察 opening policy 与 value 偏差
+2. 只做少量高价值训练对照
+3. 搜索地基稳定后再决定是否继续调模型
+
+完成标准：
+
+- 对模型问题和搜索问题的边界更清楚
+- 下一轮训练配置有明确依据
+
+## 当前明确先不做
+
+1. 不做 `MultiPV`
+2. 不做复杂 ONNX 推理后端优化
 3. 不引入新的 head
 4. 不为了未来复盘系统提前堆抽象

@@ -914,7 +914,7 @@ impl Position {
             let b = if is_cannon {
                 between & (occupied ^ square_bb(sniper_sq))
             } else {
-                between & occupied
+                between & (occupied ^ square_bb(sniper_sq))
             };
 
             if b != 0 {

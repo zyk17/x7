@@ -55,11 +55,15 @@
 
 - 搜索预算口径统一成 `playouts / nodes / deadline`
 - 线上与离线尽量共用一套搜索核心
-- 当前搜索主线固定为单线程 worker 风格：
+- 当前搜索主线固定为：
   `iteration -> gather minibatch -> batched eval -> backup`
+- 当前允许的并发形态是：
+  最小 `shared-tree` 多线程
 - 当前树统计正式包含：
   `visits + in_flight`、`collision`、`multivisit`
 - 不再扩 Alpha-Beta 主线
+- 当前明确先不做：
+  `MultiPV`、复杂 ONNX backend / evaluator 池
 
 ### `crates/xiangqi_dataset`
 
@@ -145,12 +149,18 @@
 4. `train_px0.py` 能稳定长跑、保存、恢复、导出
 5. 导出的 ONNX 契约与引擎消费侧一致
 
+当前最值得继续投入的是前两项：
+
+1. `xiangqi_core` 与参考实现对拍
+2. `engin` 搜索语义继续向 `lc0 / px0` 靠拢
+
 ### `engin` 当前输入约束
 
 - UCI `position ... moves ...` 必须保留真实历史
 - 搜索 root 输入必须从 history 编码，不再伪造 history
 - 搜索过程只在 root 构造一次 history；simulation 仍基于 `Position do/undo`
 - 搜索 iteration 内允许收集多个待评估叶子，再统一做 batched ONNX 推理
+- 当前多线程只做到最小 `shared-tree` worker 语义
 - 第三方 GUI 若只给最终 `FEN`，允许走 fallback，但不视为最佳接入方式
 
 ## 7. 删除原则

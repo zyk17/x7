@@ -195,6 +195,69 @@ cargo run --release -p engin --bin onnx_eval -- `
 cargo run --release -p engin -- --bench --playouts 64 --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx --require-onnx
 ```
 
+固定搜索对照建议直接这样跑：
+
+`Threads=1, SearchBatchSize=16`
+
+```powershell
+cargo run --release -p engin -- --bench `
+  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --require-onnx `
+  --movetime 2000 `
+  --threads 1 `
+  --search-batch-size 16
+```
+
+`Threads=1, SearchBatchSize=32`
+
+```powershell
+cargo run --release -p engin -- --bench `
+  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --require-onnx `
+  --movetime 2000 `
+  --threads 1 `
+  --search-batch-size 32
+```
+
+`Threads=1, SearchBatchSize=64`
+
+```powershell
+cargo run --release -p engin -- --bench `
+  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --require-onnx `
+  --movetime 2000 `
+  --threads 1 `
+  --search-batch-size 64
+```
+
+`Threads=2, SearchBatchSize=32`
+
+```powershell
+cargo run --release -p engin -- --bench `
+  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --require-onnx `
+  --movetime 2000 `
+  --threads 2 `
+  --search-batch-size 32
+```
+
+`Threads=4, SearchBatchSize=32`
+
+```powershell
+cargo run --release -p engin -- --bench `
+  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --require-onnx `
+  --movetime 2000 `
+  --threads 4 `
+  --search-batch-size 32
+```
+
+说明：
+
+- `nps` 这里按 `playouts / sec`
+- `nodes` 是树节点总量
+- `threads` 和 `search_batch_size` 会写进输出 JSON，便于后续对照
+
 ## 13. 最小 UCI 联调
 
 ```powershell
