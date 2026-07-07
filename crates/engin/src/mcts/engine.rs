@@ -17,6 +17,7 @@ use super::{
 
 const SEARCH_BATCH_SIZE_CAP: usize = 64;
 const SEARCH_COLLISION_PLAYOUT_FACTOR: usize = 4;
+const EVAL_GATHER_WAIT: Duration = Duration::from_micros(200);
 
 /// MCTS 单次搜索结果。
 #[derive(Clone, Debug)]
@@ -638,17 +639,18 @@ impl MctsEngine<OnnxPolicyValueEval> {
                         }
 
                         let mut flat_tasks = Vec::with_capacity(total_tasks);
-                        let mut ranges = Vec::with_capacity(requests.len());
+                        let mut request_lens = Vec::with_capacity(requests.len());
                         for request in &requests {
-                            let start = flat_tasks.len();
                             flat_tasks.extend(request.tasks.iter().cloned());
-                            ranges.push((start, flat_tasks.len()));
+                            request_lens.push(request.tasks.len());
                         }
 
                         match shared_eval.evaluate_many(&flat_tasks) {
                             Ok(outputs) => {
-                                for (request, (start, end)) in requests.into_iter().zip(ranges.into_iter()) {
-                                    request.complete(Ok(outputs[start..end].to_vec()));
+                                debug_assert_eq!(outputs.len(), request_lens.iter().sum::<usize>());
+                                let mut outputs = outputs.into_iter();
+                                for (request, len) in requests.into_iter().zip(request_lens.into_iter()) {
+                                    request.complete(Ok(outputs.by_ref().take(len).collect()));
                                 }
                             }
                             Err(err) => {
@@ -1469,17 +1471,33 @@ impl EvalCoordinator {
 
         let mut drained = Vec::new();
         let mut task_count = 0usize;
-        while let Some(front) = state.queue.front() {
-            if !drained.is_empty()
-                && (drained.len() >= max_requests || task_count.saturating_add(front.tasks.len()) > max_tasks)
-            {
-                break;
+        let gather_deadline = Instant::now() + EVAL_GATHER_WAIT;
+        loop {
+            while let Some(front) = state.queue.front() {
+                if !drained.is_empty()
+                    && (drained.len() >= max_requests || task_count.saturating_add(front.tasks.len()) > max_tasks)
+                {
+                    return Some(drained);
+                }
+                let request = state.queue.pop_front().expect("front exists");
+                task_count = task_count.saturating_add(request.tasks.len());
+                drained.push(request);
             }
-            let request = state.queue.pop_front().expect("front exists");
-            task_count = task_count.saturating_add(request.tasks.len());
-            drained.push(request);
+            if state.shutdown
+                || drained.is_empty()
+                || drained.len() >= max_requests
+                || task_count >= max_tasks
+                || Instant::now() >= gather_deadline
+            {
+                return Some(drained);
+            }
+            let timeout = gather_deadline.saturating_duration_since(Instant::now());
+            let (next_state, _) = self
+                .wake
+                .wait_timeout(state, timeout)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next_state;
         }
-        Some(drained)
     }
 
     fn shutdown(&self) {
