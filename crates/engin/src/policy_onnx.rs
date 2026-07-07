@@ -96,16 +96,7 @@ impl PolicyOnnx {
 
     /// 对局面张量推理（形状 `float32[1,124,10,9]`）。
     pub fn eval_board(&mut self, board: &Array4<f32>) -> Result<PolicyOutputs, Error> {
-        let batch = Self::run_session_batch(&mut self.session, board)?;
-        if batch.logits.len() != 1 {
-            return Err(Error::new(format!(
-                "logits 形状期望 [1,V]，得到 batch={}",
-                batch.logits.len()
-            )));
-        }
-        let logits = batch.logits.into_iter().next().expect("single batch");
-        let wdl = batch.wdl.map(|wdls| wdls.into_iter().next().expect("single batch"));
-        Ok(PolicyOutputs { logits, wdl })
+        Self::run_session_single(&mut self.session, board)
     }
 
     pub fn eval_boards(&mut self, boards: &Array4<f32>) -> Result<BatchPolicyOutputs, Error> {
@@ -117,10 +108,46 @@ impl PolicyOnnx {
         histories: impl IntoIterator<Item = &'a PositionHistory>,
     ) -> Result<BatchPolicyOutputs, Error> {
         let collected = histories.into_iter().collect::<Vec<_>>();
-        crate::fen_tensor::histories_to_planes_into(&collected, &mut self.scratch_batch).map_err(Error::new)?;
-        let session = &mut self.session;
-        let boards = &self.scratch_batch;
-        Self::run_session_batch(session, boards)
+        self.eval_history_slice(&collected)
+    }
+
+    pub fn eval_history_slice(&mut self, histories: &[&PositionHistory]) -> Result<BatchPolicyOutputs, Error> {
+        crate::fen_tensor::histories_to_planes_into(histories, &mut self.scratch_batch).map_err(Error::new)?;
+        Self::run_session_batch(&mut self.session, &self.scratch_batch)
+    }
+
+    fn run_session_single(session: &mut Session, board: &Array4<f32>) -> Result<PolicyOutputs, Error> {
+        let tensor_ref = TensorRef::from_array_view(board)?;
+        let outputs = session.run(ort::inputs!["board" => tensor_ref])?;
+
+        let logits_val = outputs
+            .get("logits")
+            .ok_or_else(|| Error::new("ONNX 输出缺少 logits"))?;
+        let (log_shape, log_slice) = logits_val.try_extract_tensor::<f32>()?;
+        if log_shape.len() != 2 || log_shape[0] != 1 || log_shape[1] <= 0 {
+            return Err(Error::new(format!("logits 形状期望 [1,V]，得到 {:?}", log_shape)));
+        }
+        let vocab = log_shape[1] as usize;
+        if log_slice.len() != vocab {
+            return Err(Error::new("logits 张量长度与形状不一致"));
+        }
+        let logits = log_slice.to_vec();
+
+        let wdl = if let Some(v) = outputs.get("value") {
+            let (shape, data) = v.try_extract_tensor::<f32>()?;
+            if shape.len() != 2 || shape[0] != 1 || shape[1] != 3i64 {
+                return Err(Error::new(format!("value 形状期望 [1,3]，得到 {:?}", shape)));
+            }
+            let sum = data[0] + data[1] + data[2];
+            if !sum.is_finite() || sum <= 0.0 {
+                return Err(Error::new("value WDL 概率非法"));
+            }
+            Some([data[0], data[1], data[2]])
+        } else {
+            None
+        };
+
+        Ok(PolicyOutputs { logits, wdl })
     }
 
     fn run_session_batch(session: &mut Session, board: &Array4<f32>) -> Result<BatchPolicyOutputs, Error> {
@@ -171,10 +198,7 @@ impl PolicyOnnx {
     /// [`PositionHistory`] → 平面 → 推理（正式主线）。
     pub fn eval_history(&mut self, history: &PositionHistory) -> Result<PolicyOutputs, Error> {
         crate::fen_tensor::history_to_planes_into(history, &mut self.scratch_board).map_err(Error::new)?;
-        let batch = Self::run_session_batch(&mut self.session, &self.scratch_board)?;
-        let logits = batch.logits.into_iter().next().expect("single batch");
-        let wdl = batch.wdl.map(|wdls| wdls.into_iter().next().expect("single batch"));
-        Ok(PolicyOutputs { logits, wdl })
+        Self::run_session_single(&mut self.session, &self.scratch_board)
     }
 
     /// [`xiangqi_core::Position`] → 平面 → 推理（搜索热路径，无 FEN 分配）。

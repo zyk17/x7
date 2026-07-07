@@ -140,10 +140,12 @@ impl OnnxPolicyValueEval {
             miss_to_unique.push(slot);
         }
 
+        let history_refs = unique_misses
+            .iter()
+            .map(|&idx| &tasks[idx].history)
+            .collect::<Vec<_>>();
         let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
-        let batch = net
-            .eval_histories(unique_misses.iter().map(|&idx| &tasks[idx].history))
-            .map_err(|e| e.to_string())?;
+        let batch = net.eval_history_slice(&history_refs).map_err(|e| e.to_string())?;
         if batch.logits.len() != unique_misses.len() {
             return Err(format!(
                 "batched policy outputs mismatch: got {} expected {}",
@@ -217,8 +219,87 @@ impl PolicyValueEval for OnnxPolicyValueEval {
     }
 
     fn evaluate_many(&mut self, tasks: &[PolicyValueTask]) -> Result<Vec<PolicyValueOutput>, Self::Error> {
-        let shared = tasks.iter().cloned().map(Arc::new).collect::<Vec<_>>();
-        self.evaluate_many_shared(&shared)
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(policy) = self.policy.as_ref() else {
+            return Ok(tasks
+                .iter()
+                .map(|task| uniform_output(task.legal_moves.len()))
+                .collect());
+        };
+
+        let mut outputs = vec![PolicyValueOutput::default(); tasks.len()];
+        let mut misses = Vec::new();
+        {
+            let cache = self.cache.lock().map_err(|_| "eval cache 锁中毒".to_string())?;
+            for (idx, task) in tasks.iter().enumerate() {
+                if let Some(cached) = cache.get(&task.history.input_cache_key()) {
+                    outputs[idx] = output_from_cached(cached, &task.position, &task.legal_moves);
+                } else {
+                    misses.push(idx);
+                }
+            }
+        }
+        if misses.is_empty() {
+            return Ok(outputs);
+        }
+
+        let mut unique_misses = Vec::new();
+        let mut unique_slots = HashMap::<u64, usize>::new();
+        let mut miss_to_unique = Vec::with_capacity(misses.len());
+        for &task_idx in &misses {
+            let key = tasks[task_idx].history.input_cache_key();
+            let slot = if let Some(&slot) = unique_slots.get(&key) {
+                slot
+            } else {
+                let slot = unique_misses.len();
+                unique_misses.push(task_idx);
+                unique_slots.insert(key, slot);
+                slot
+            };
+            miss_to_unique.push(slot);
+        }
+
+        let history_refs = unique_misses
+            .iter()
+            .map(|&idx| &tasks[idx].history)
+            .collect::<Vec<_>>();
+        let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
+        let batch = net.eval_history_slice(&history_refs).map_err(|e| e.to_string())?;
+        if batch.logits.len() != unique_misses.len() {
+            return Err(format!(
+                "batched policy outputs mismatch: got {} expected {}",
+                batch.logits.len(),
+                unique_misses.len()
+            ));
+        }
+
+        let mut cache = self.cache.lock().map_err(|_| "eval cache 锁中毒".to_string())?;
+        let mut unique_cached = Vec::with_capacity(unique_misses.len());
+        for (slot, &task_idx) in unique_misses.iter().enumerate() {
+            let cached = CachedEval {
+                logits: batch.logits[slot].clone(),
+                value: batch
+                    .wdl
+                    .as_ref()
+                    .and_then(|wdls| wdls.get(slot))
+                    .map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0))
+                    .unwrap_or(0.0),
+            };
+            cache.insert(tasks[task_idx].history.input_cache_key(), cached.clone());
+            unique_cached.push(cached);
+        }
+
+        for (&task_idx, &unique_slot) in misses.iter().zip(miss_to_unique.iter()) {
+            outputs[task_idx] = output_from_cached(
+                &unique_cached[unique_slot],
+                &tasks[task_idx].position,
+                &tasks[task_idx].legal_moves,
+            );
+        }
+
+        Ok(outputs)
     }
 }
 
