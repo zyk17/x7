@@ -14,7 +14,7 @@ use crate::history::PositionHistory;
 use crate::mcts::{
     MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsSearchProgress, OnnxPolicyValueEval, SharedPolicy,
 };
-use crate::policy_onnx::PolicyOnnx;
+use crate::policy_onnx::PolicySessionPool;
 
 static UCI_STDOUT_LOCK: Mutex<()> = Mutex::new(());
 const UCI_INFO_INTERVAL: Duration = Duration::from_millis(200);
@@ -238,8 +238,8 @@ impl Engine {
         let policy_path = resolve_data_file("policy.onnx");
         let policy = policy_path
             .as_ref()
-            .and_then(|path| PolicyOnnx::from_file(path).ok())
-            .map(|net| Arc::new(Mutex::new(net)));
+            .and_then(|path| PolicySessionPool::from_file(path).ok())
+            .map(Arc::new);
         Self {
             history: PositionHistory::new_startpos(),
             policy: policy.clone(),
@@ -274,8 +274,8 @@ impl Engine {
         self.policy = None;
         if let Some(ref p) = self.policy_path {
             if p.is_file() {
-                let net = PolicyOnnx::from_file(p).map_err(|e| e.to_string())?;
-                self.policy = Some(Arc::new(Mutex::new(net)));
+                let pool = PolicySessionPool::from_file(p).map_err(|e| e.to_string())?;
+                self.policy = Some(Arc::new(pool));
             }
         }
         self.rebuild_search_engine();

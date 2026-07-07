@@ -27,7 +27,7 @@ pub use mcts::{
 };
 pub use uci::{parse_position_history_uci, parse_position_uci};
 
-pub use policy_onnx::{PolicyOnnx, PolicyOutputs};
+pub use policy_onnx::{PolicyOnnx, PolicyOutputs, PolicySessionPool};
 pub use xiangqi_core::START_FEN;
 
 /// 自 stdin 读行并处理 UCI，应答至 stdout（实现位于 [`uci::run_uci_stdio`]）。

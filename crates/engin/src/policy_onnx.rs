@@ -1,6 +1,7 @@
 //! ONNX Runtime 加载 `policy.onnx`（`board` → `logits` + 可选 `value(WDL)`）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use ndarray::Array4;
 use ort::ep;
@@ -27,7 +28,13 @@ pub struct BatchPolicyOutputs {
 /// 封装 ORT [`Session`]，batch 固定为 1。
 pub struct PolicyOnnx {
     session: Session,
+    model_path: PathBuf,
     provider_chain: &'static str,
+}
+
+pub struct PolicySessionPool {
+    model_path: PathBuf,
+    sessions: Mutex<Vec<Arc<Mutex<PolicyOnnx>>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,8 +80,13 @@ impl PolicyOnnx {
         Self::check_io(&session)?;
         Ok(Self {
             session,
+            model_path: path.to_path_buf(),
             provider_chain: provider_mode.provider_chain(),
         })
+    }
+
+    pub fn clone_session(&self) -> Result<Self, Error> {
+        Self::from_file(&self.model_path)
     }
 
     fn check_io(session: &Session) -> Result<(), Error> {
@@ -184,6 +196,38 @@ impl PolicyOnnx {
 
     pub fn provider_chain(&self) -> &'static str {
         self.provider_chain
+    }
+}
+
+impl PolicySessionPool {
+    pub fn new(net: PolicyOnnx) -> Self {
+        let model_path = net.model_path.clone();
+        Self {
+            model_path,
+            sessions: Mutex::new(vec![Arc::new(Mutex::new(net))]),
+        }
+    }
+
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Ok(Self::new(PolicyOnnx::from_file(path)?))
+    }
+
+    pub fn primary(&self) -> Arc<Mutex<PolicyOnnx>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first()
+            .cloned()
+            .expect("policy session pool must contain at least one session")
+    }
+
+    pub fn ensure_sessions(&self, count: usize) -> Result<Vec<Arc<Mutex<PolicyOnnx>>>, Error> {
+        let target = count.max(1);
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        while sessions.len() < target {
+            sessions.push(Arc::new(Mutex::new(PolicyOnnx::from_file(&self.model_path)?)));
+        }
+        Ok(sessions.iter().take(target).cloned().collect())
     }
 }
 

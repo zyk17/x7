@@ -4,15 +4,13 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::{Arc, Mutex};
-
 use xiangqi_core::{legal_moves_uci, Position};
 
 use engin::benchmark::{
     default_benchmark_fen_strings, resolve_data_file, write_benchmark_ndjson, BenchJsonMeta, BenchSessionParams,
 };
 use engin::mcts::{MctsBudget, MctsConfig, SharedPolicy};
-use engin::{run_uci_stdio, PolicyOnnx, START_FEN};
+use engin::{run_uci_stdio, PolicyOnnx, PolicySessionPool, START_FEN};
 
 fn default_policy_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/policy.onnx")
@@ -148,9 +146,9 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
 
     if let Some(ref op) = onnx_path {
         meta.onnx_path = Some(op.display().to_string());
-        match PolicyOnnx::from_file(op) {
-            Ok(net) => {
-                policy = Some(Arc::new(Mutex::new(net)));
+        match PolicySessionPool::from_file(op) {
+            Ok(pool) => {
+                policy = Some(std::sync::Arc::new(pool));
                 meta.policy_session_loaded = true;
             }
             Err(err) => {

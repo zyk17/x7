@@ -6,10 +6,10 @@ use xiangqi_core::Color;
 use xiangqi_core::Position;
 
 use crate::history::PositionHistory;
-use crate::policy_onnx::PolicyOnnx;
+use crate::policy_onnx::{PolicyOnnx, PolicySessionPool};
 use crate::px0_policy::px0_policy_index;
 
-pub type SharedPolicy = Option<Arc<Mutex<PolicyOnnx>>>;
+pub type SharedPolicy = Option<Arc<PolicySessionPool>>;
 pub(crate) type SharedEvalCache = Arc<Mutex<HashMap<u64, CachedEval>>>;
 
 /// 评估输入。
@@ -63,6 +63,7 @@ pub trait PolicyValueEval {
 /// 复用现有 `PolicyOnnx` 的最小 MCTS 评估桥。
 pub struct OnnxPolicyValueEval {
     pub policy: SharedPolicy,
+    session: Option<Arc<Mutex<PolicyOnnx>>>,
     cache: SharedEvalCache,
     scratch_board: ndarray::Array4<f32>,
     scratch_batch: ndarray::Array4<f32>,
@@ -77,6 +78,7 @@ pub(crate) struct CachedEval {
 impl OnnxPolicyValueEval {
     pub fn new(policy: SharedPolicy) -> Self {
         Self {
+            session: policy.as_ref().map(|pool| pool.primary()),
             policy,
             cache: Arc::new(Mutex::new(HashMap::new())),
             scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
@@ -86,7 +88,22 @@ impl OnnxPolicyValueEval {
 
     pub(crate) fn with_shared_cache(policy: SharedPolicy, cache: SharedEvalCache) -> Self {
         Self {
+            session: policy.as_ref().map(|pool| pool.primary()),
             policy,
+            cache,
+            scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
+            scratch_batch: ndarray::Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
+        }
+    }
+
+    pub(crate) fn with_session(
+        policy: SharedPolicy,
+        session: Option<Arc<Mutex<PolicyOnnx>>>,
+        cache: SharedEvalCache,
+    ) -> Self {
+        Self {
+            policy,
+            session,
             cache,
             scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
             scratch_batch: ndarray::Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
@@ -110,7 +127,7 @@ impl OnnxPolicyValueEval {
         if tasks.is_empty() {
             return Ok(Vec::new());
         }
-        let Some(policy) = self.policy.as_ref() else {
+        let Some(session) = self.session.as_ref() else {
             return Ok(tasks
                 .iter()
                 .map(|task| uniform_output(task.legal_moves.len()))
@@ -152,7 +169,7 @@ impl OnnxPolicyValueEval {
         let history_refs = unique_misses.iter().map(|&idx| &tasks[idx].history).collect::<Vec<_>>();
         crate::fen_tensor::histories_to_planes_into(&history_refs, &mut self.scratch_batch)
             .map_err(|e| e.to_string())?;
-        let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
+        let mut net = session.lock().map_err(|_| "policy 锁中毒".to_string())?;
         let batch = net.eval_boards(&self.scratch_batch).map_err(|e| e.to_string())?;
         if batch.logits.len() != unique_misses.len() {
             return Err(format!(
@@ -194,7 +211,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
     type Error = String;
 
     fn evaluate(&mut self, input: PolicyValueInput<'_>) -> Result<PolicyValueOutput, Self::Error> {
-        let Some(policy) = self.policy.as_ref() else {
+        let Some(session) = self.session.as_ref() else {
             return Ok(uniform_output(input.legal_moves.len()));
         };
         let state_key = input.history.input_cache_key();
@@ -211,7 +228,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
         crate::fen_tensor::history_to_planes_into(input.history, &mut self.scratch_board).map_err(|e| e.to_string())?;
         let cached = {
             let out = {
-                let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
+                let mut net = session.lock().map_err(|_| "policy 锁中毒".to_string())?;
                 net.eval_board(&self.scratch_board).map_err(|e| e.to_string())?
             };
             CachedEval {
@@ -231,7 +248,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
         if tasks.is_empty() {
             return Ok(Vec::new());
         }
-        let Some(policy) = self.policy.as_ref() else {
+        let Some(session) = self.session.as_ref() else {
             return Ok(tasks
                 .iter()
                 .map(|task| uniform_output(task.legal_moves.len()))
@@ -273,7 +290,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
         let history_refs = unique_misses.iter().map(|&idx| &tasks[idx].history).collect::<Vec<_>>();
         crate::fen_tensor::histories_to_planes_into(&history_refs, &mut self.scratch_batch)
             .map_err(|e| e.to_string())?;
-        let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
+        let mut net = session.lock().map_err(|_| "policy 锁中毒".to_string())?;
         let batch = net.eval_boards(&self.scratch_batch).map_err(|e| e.to_string())?;
         if batch.logits.len() != unique_misses.len() {
             return Err(format!(
