@@ -10,6 +10,7 @@ use crate::policy_onnx::PolicyOnnx;
 use crate::px0_policy::px0_policy_index;
 
 pub type SharedPolicy = Option<Arc<Mutex<PolicyOnnx>>>;
+pub(crate) type SharedEvalCache = Arc<Mutex<HashMap<u64, CachedEval>>>;
 
 /// 评估输入。
 pub struct PolicyValueInput<'a> {
@@ -62,11 +63,11 @@ pub trait PolicyValueEval {
 /// 复用现有 `PolicyOnnx` 的最小 MCTS 评估桥。
 pub struct OnnxPolicyValueEval {
     pub policy: SharedPolicy,
-    cache: HashMap<u64, CachedEval>,
+    cache: SharedEvalCache,
 }
 
 #[derive(Clone, Debug)]
-struct CachedEval {
+pub(crate) struct CachedEval {
     logits: Vec<f32>,
     value: f32,
 }
@@ -75,7 +76,21 @@ impl OnnxPolicyValueEval {
     pub fn new(policy: SharedPolicy) -> Self {
         Self {
             policy,
-            cache: HashMap::new(),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(crate) fn with_shared_cache(policy: SharedPolicy, cache: SharedEvalCache) -> Self {
+        Self { policy, cache }
+    }
+
+    pub(crate) fn shared_cache(&self) -> SharedEvalCache {
+        Arc::clone(&self.cache)
+    }
+
+    pub fn clear_cache(&mut self) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
         }
     }
 }
@@ -88,8 +103,14 @@ impl PolicyValueEval for OnnxPolicyValueEval {
             return Ok(uniform_output(input.legal_moves.len()));
         };
         let state_key = input.history.input_cache_key();
-        if let Some(cached) = self.cache.get(&state_key) {
-            return Ok(output_from_cached(cached, &input.position, input.legal_moves));
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .map_err(|_| "eval cache 锁中毒".to_string())?
+            .get(&state_key)
+            .cloned()
+        {
+            return Ok(output_from_cached(&cached, &input.position, input.legal_moves));
         }
 
         let cached = {
@@ -103,7 +124,10 @@ impl PolicyValueEval for OnnxPolicyValueEval {
             }
         };
         let out = output_from_cached(&cached, &input.position, input.legal_moves);
-        self.cache.insert(state_key, cached);
+        self.cache
+            .lock()
+            .map_err(|_| "eval cache 锁中毒".to_string())?
+            .insert(state_key, cached);
         Ok(out)
     }
 
@@ -120,30 +144,51 @@ impl PolicyValueEval for OnnxPolicyValueEval {
 
         let mut outputs = vec![PolicyValueOutput::default(); tasks.len()];
         let mut misses = Vec::new();
-        for (idx, task) in tasks.iter().enumerate() {
-            if let Some(cached) = self.cache.get(&task.history.input_cache_key()) {
-                outputs[idx] = output_from_cached(cached, &task.position, &task.legal_moves);
-            } else {
-                misses.push(idx);
+        {
+            let cache = self.cache.lock().map_err(|_| "eval cache 锁中毒".to_string())?;
+            for (idx, task) in tasks.iter().enumerate() {
+                if let Some(cached) = cache.get(&task.history.input_cache_key()) {
+                    outputs[idx] = output_from_cached(cached, &task.position, &task.legal_moves);
+                } else {
+                    misses.push(idx);
+                }
             }
         }
         if misses.is_empty() {
             return Ok(outputs);
         }
 
+        let mut unique_misses = Vec::new();
+        let mut unique_slots = HashMap::<u64, usize>::new();
+        let mut miss_to_unique = Vec::with_capacity(misses.len());
+        for &task_idx in &misses {
+            let key = tasks[task_idx].history.input_cache_key();
+            let slot = if let Some(&slot) = unique_slots.get(&key) {
+                slot
+            } else {
+                let slot = unique_misses.len();
+                unique_misses.push(task_idx);
+                unique_slots.insert(key, slot);
+                slot
+            };
+            miss_to_unique.push(slot);
+        }
+
         let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
         let batch = net
-            .eval_histories(misses.iter().map(|&idx| &tasks[idx].history))
+            .eval_histories(unique_misses.iter().map(|&idx| &tasks[idx].history))
             .map_err(|e| e.to_string())?;
-        if batch.logits.len() != misses.len() {
+        if batch.logits.len() != unique_misses.len() {
             return Err(format!(
                 "batched policy outputs mismatch: got {} expected {}",
                 batch.logits.len(),
-                misses.len()
+                unique_misses.len()
             ));
         }
 
-        for (slot, &task_idx) in misses.iter().enumerate() {
+        let mut cache = self.cache.lock().map_err(|_| "eval cache 锁中毒".to_string())?;
+        let mut unique_cached = Vec::with_capacity(unique_misses.len());
+        for (slot, &task_idx) in unique_misses.iter().enumerate() {
             let cached = CachedEval {
                 logits: batch.logits[slot].clone(),
                 value: batch
@@ -153,8 +198,16 @@ impl PolicyValueEval for OnnxPolicyValueEval {
                     .map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0))
                     .unwrap_or(0.0),
             };
-            outputs[task_idx] = output_from_cached(&cached, &tasks[task_idx].position, &tasks[task_idx].legal_moves);
-            self.cache.insert(tasks[task_idx].history.input_cache_key(), cached);
+            cache.insert(tasks[task_idx].history.input_cache_key(), cached.clone());
+            unique_cached.push(cached);
+        }
+
+        for (&task_idx, &unique_slot) in misses.iter().zip(miss_to_unique.iter()) {
+            outputs[task_idx] = output_from_cached(
+                &unique_cached[unique_slot],
+                &tasks[task_idx].position,
+                &tasks[task_idx].legal_moves,
+            );
         }
 
         Ok(outputs)

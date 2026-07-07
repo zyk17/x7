@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -605,28 +605,76 @@ impl MctsEngine<OnnxPolicyValueEval> {
         };
         let root_history = history.clone_for_search();
         let shared_policy = self.evaluator.policy.clone();
+        let shared_cache = self.evaluator.shared_cache();
+        let search_batch_size = self.config.search_batch_size.max(1);
         let stop = budget.stop.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let playouts = Arc::new(AtomicU32::new(0));
         let seldepth = Arc::new(AtomicU32::new(0));
         let active_workers = Arc::new(AtomicUsize::new(threads));
         let first_error = Arc::new(Mutex::new(None::<String>));
         let engine = Mutex::new(&mut *self);
+        let coordinator = EvalCoordinator::new();
         let started_at = Instant::now();
         let thread_count = threads.max(1);
+        let max_eval_requests = thread_count.max(1);
+        let max_eval_tasks = (search_batch_size * thread_count.max(1)).min(256);
 
         thread::scope(|scope| {
+            {
+                let coordinator = Arc::clone(&coordinator);
+                let stop = Arc::clone(&stop);
+                let first_error = Arc::clone(&first_error);
+                let shared_policy = shared_policy.clone();
+                let shared_cache = shared_cache.clone();
+                scope.spawn(move || {
+                    let mut shared_eval = OnnxPolicyValueEval::with_shared_cache(shared_policy, shared_cache);
+                    while let Some(requests) = coordinator.drain_batch(max_eval_requests, max_eval_tasks) {
+                        let total_tasks = requests.iter().map(|req| req.tasks.len()).sum::<usize>();
+                        if total_tasks == 0 {
+                            for request in requests {
+                                request.complete(Ok(Vec::new()));
+                            }
+                            continue;
+                        }
+
+                        let mut flat_tasks = Vec::with_capacity(total_tasks);
+                        let mut ranges = Vec::with_capacity(requests.len());
+                        for request in &requests {
+                            let start = flat_tasks.len();
+                            flat_tasks.extend(request.tasks.iter().cloned());
+                            ranges.push((start, flat_tasks.len()));
+                        }
+
+                        match shared_eval.evaluate_many(&flat_tasks) {
+                            Ok(outputs) => {
+                                for (request, (start, end)) in requests.into_iter().zip(ranges.into_iter()) {
+                                    request.complete(Ok(outputs[start..end].to_vec()));
+                                }
+                            }
+                            Err(err) => {
+                                *first_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.clone());
+                                stop.store(true, Ordering::SeqCst);
+                                for request in requests {
+                                    request.complete(Err(err.clone()));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
             for _ in 0..thread_count {
                 let stop = Arc::clone(&stop);
                 let playouts = Arc::clone(&playouts);
                 let seldepth = Arc::clone(&seldepth);
                 let active_workers = Arc::clone(&active_workers);
                 let first_error = Arc::clone(&first_error);
-                let shared_policy = shared_policy.clone();
                 let root_history = root_history.clone_for_search();
                 let budget = budget.clone();
+                let coordinator = Arc::clone(&coordinator);
                 let engine = &engine;
                 scope.spawn(move || {
-                    let mut local_eval = OnnxPolicyValueEval::new(shared_policy);
                     loop {
                         if stop.load(Ordering::SeqCst) {
                             break;
@@ -664,10 +712,21 @@ impl MctsEngine<OnnxPolicyValueEval> {
                         };
                         let iter_playouts = iteration.playouts;
                         seldepth.fetch_max(iteration.seldepth, Ordering::Relaxed);
-                        let outputs = match MctsEngine::<OnnxPolicyValueEval>::evaluate_iteration_with(
-                            &mut local_eval,
-                            &iteration,
-                        ) {
+                        let tasks = iteration
+                            .pending
+                            .iter()
+                            .filter_map(|pending| match &pending.kind {
+                                PendingKind::Expand { task } => Some((**task).clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        let outputs = match if tasks.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            let request = EvalRequest::new(tasks);
+                            coordinator.submit(Arc::clone(&request));
+                            request.wait_result()
+                        } {
                             Ok(outputs) => outputs,
                             Err(err) => {
                                 *first_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
@@ -686,15 +745,16 @@ impl MctsEngine<OnnxPolicyValueEval> {
                 });
             }
 
-            if !info_interval.is_zero() {
-                let mut next_report_at = Instant::now() + info_interval;
-                while active_workers.load(Ordering::SeqCst) > 0 {
+            let mut next_report_at = if info_interval.is_zero() {
+                None
+            } else {
+                Some(Instant::now() + info_interval)
+            };
+            while active_workers.load(Ordering::SeqCst) > 0 {
+                if let Some(deadline) = next_report_at {
                     let now = Instant::now();
-                    if now < next_report_at {
-                        thread::sleep(next_report_at - now);
-                    }
-                    if stop.load(Ordering::SeqCst) && active_workers.load(Ordering::SeqCst) == 0 {
-                        break;
+                    if now < deadline {
+                        thread::sleep(deadline - now);
                     }
                     let guard = engine.lock().unwrap_or_else(|e| e.into_inner());
                     let engine_ref: &MctsEngine<OnnxPolicyValueEval> = &guard;
@@ -703,9 +763,12 @@ impl MctsEngine<OnnxPolicyValueEval> {
                         playouts.load(Ordering::Relaxed),
                         seldepth.load(Ordering::Relaxed),
                     ));
-                    next_report_at = Instant::now() + info_interval;
+                    next_report_at = Some(Instant::now() + info_interval);
+                } else {
+                    thread::sleep(Duration::from_millis(1));
                 }
             }
+            coordinator.shutdown();
         });
 
         if let Some(err) = first_error.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -1337,5 +1400,91 @@ mod tests {
             )
             .expect("third");
         assert_eq!(third.root_visits, 4, "non-appended history should rebuild root");
+    }
+}
+
+struct EvalRequest {
+    tasks: Vec<PolicyValueTask>,
+    result: Mutex<Option<Result<Vec<PolicyValueOutput>, String>>>,
+    ready: Condvar,
+}
+
+impl EvalRequest {
+    fn new(tasks: Vec<PolicyValueTask>) -> Arc<Self> {
+        Arc::new(Self {
+            tasks,
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn complete(&self, result: Result<Vec<PolicyValueOutput>, String>) {
+        let mut slot = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(result);
+        self.ready.notify_one();
+    }
+
+    fn wait_result(&self) -> Result<Vec<PolicyValueOutput>, String> {
+        let mut slot = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        while slot.is_none() {
+            slot = self.ready.wait(slot).unwrap_or_else(|e| e.into_inner());
+        }
+        slot.take().expect("eval result must be populated")
+    }
+}
+
+#[derive(Default)]
+struct EvalCoordinatorState {
+    queue: VecDeque<Arc<EvalRequest>>,
+    shutdown: bool,
+}
+
+struct EvalCoordinator {
+    state: Mutex<EvalCoordinatorState>,
+    wake: Condvar,
+}
+
+impl EvalCoordinator {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(EvalCoordinatorState::default()),
+            wake: Condvar::new(),
+        })
+    }
+
+    fn submit(&self, request: Arc<EvalRequest>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.queue.push_back(request);
+        self.wake.notify_one();
+    }
+
+    fn drain_batch(&self, max_requests: usize, max_tasks: usize) -> Option<Vec<Arc<EvalRequest>>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.queue.is_empty() && !state.shutdown {
+            state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        if state.queue.is_empty() && state.shutdown {
+            return None;
+        }
+
+        let mut drained = Vec::new();
+        let mut task_count = 0usize;
+        while let Some(front) = state.queue.front() {
+            if !drained.is_empty()
+                && (drained.len() >= max_requests || task_count.saturating_add(front.tasks.len()) > max_tasks)
+            {
+                break;
+            }
+            let request = state.queue.pop_front().expect("front exists");
+            task_count = task_count.saturating_add(request.tasks.len());
+            drained.push(request);
+        }
+        Some(drained)
+    }
+
+    fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.shutdown = true;
+        self.wake.notify_all();
     }
 }

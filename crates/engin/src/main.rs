@@ -23,7 +23,7 @@ fn print_usage() {
         "用法:\n  engin                         UCI 模式（stdin/stdout）\n  \
          engin --onnx-smoke [ONNX] [FEN]  冒烟；缺省 ONNX=data/policy.onnx、FEN=起始局面\n  \
          engin --bench [选项]            MCTS 基准（NDJSON）\n  \
-         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --threads N  --search-batch-size N  --onnx PATH  --fen FEN  --data-dir PATH  --require-onnx"
+         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --search-batch-size N  --onnx PATH  --fen FEN  --data-dir PATH  --require-onnx"
     );
 }
 
@@ -31,7 +31,6 @@ fn print_usage() {
 struct BenchCli {
     budget: MctsBudget,
     config: MctsConfig,
-    threads: usize,
     onnx: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     require_onnx: bool,
@@ -46,7 +45,6 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
         stop: None,
     };
     let mut config = MctsConfig::default();
-    let mut threads = 1usize;
     let mut onnx: Option<PathBuf> = None;
     let mut data_dir: Option<PathBuf> = None;
     let mut require_onnx = false;
@@ -75,12 +73,6 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
             "--cpuct" if i + 1 < rest.len() => {
                 if let Ok(n) = rest[i + 1].parse::<f32>() {
                     config.cpuct = n.clamp(0.01, 100.0);
-                }
-                i += 2;
-            }
-            "--threads" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<usize>() {
-                    threads = n.clamp(1, 32);
                 }
                 i += 2;
             }
@@ -115,7 +107,6 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
     BenchCli {
         budget,
         config,
-        threads,
         onnx,
         data_dir,
         require_onnx,
@@ -174,7 +165,6 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
     let session = BenchSessionParams {
         budget: cli.budget,
         config: cli.config,
-        threads: cli.threads,
         policy: &policy,
         meta: &meta,
     };

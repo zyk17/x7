@@ -71,7 +71,6 @@ pub struct BenchJsonMeta {
 pub struct BenchSessionParams<'a> {
     pub budget: MctsBudget,
     pub config: MctsConfig,
-    pub threads: usize,
     pub policy: &'a SharedPolicy,
     pub meta: &'a BenchJsonMeta,
 }
@@ -90,19 +89,7 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
 
     let mut engine = MctsEngine::new(session.config, OnnxPolicyValueEval::new(session.policy.clone()));
 
-    let search_result = if session.threads > 1 {
-        engine.search_root_history_parallel_with_progress(
-            &history,
-            session.budget.clone(),
-            session.threads,
-            std::time::Duration::ZERO,
-            |_| {},
-        )
-    } else {
-        engine.search_root_history(&history, session.budget.clone())
-    };
-
-    match search_result {
+    match engine.search_root_history(&history, session.budget.clone()) {
         Ok(result) => {
             let elapsed_ms = t0.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let nps = if elapsed_ms > 0 {
@@ -138,7 +125,6 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                     "fpu_reduction_root": session.config.fpu_reduction_root,
                     "root_temperature": session.config.root_temperature,
                     "search_batch_size": session.config.search_batch_size,
-                    "threads": session.threads,
                 },
                 "budget": {
                     "max_playouts": session.budget.max_playouts,

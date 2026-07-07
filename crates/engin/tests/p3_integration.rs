@@ -96,7 +96,6 @@ fn bench_json_has_expected_keys() {
             stop: None,
         },
         config: MctsConfig::default(),
-        threads: 1,
         policy: &policy,
         meta: &meta,
     };
@@ -106,7 +105,6 @@ fn bench_json_has_expected_keys() {
     assert!(v.get("mcts_config").is_some());
     assert!(v.get("playouts").is_some());
     assert!(v.get("root_visits").is_some());
-    assert_eq!(v["mcts_config"]["threads"].as_u64(), Some(1));
 }
 
 #[test]
