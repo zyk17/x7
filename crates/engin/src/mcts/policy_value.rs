@@ -93,45 +93,11 @@ impl OnnxPolicyValueEval {
             cache.clear();
         }
     }
-}
 
-impl PolicyValueEval for OnnxPolicyValueEval {
-    type Error = String;
-
-    fn evaluate(&mut self, input: PolicyValueInput<'_>) -> Result<PolicyValueOutput, Self::Error> {
-        let Some(policy) = self.policy.as_ref() else {
-            return Ok(uniform_output(input.legal_moves.len()));
-        };
-        let state_key = input.history.input_cache_key();
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .map_err(|_| "eval cache 锁中毒".to_string())?
-            .get(&state_key)
-            .cloned()
-        {
-            return Ok(output_from_cached(&cached, &input.position, input.legal_moves));
-        }
-
-        let cached = {
-            let out = {
-                let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
-                net.eval_history(input.history).map_err(|e| e.to_string())?
-            };
-            CachedEval {
-                logits: out.logits,
-                value: out.wdl.map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0)).unwrap_or(0.0),
-            }
-        };
-        let out = output_from_cached(&cached, &input.position, input.legal_moves);
-        self.cache
-            .lock()
-            .map_err(|_| "eval cache 锁中毒".to_string())?
-            .insert(state_key, cached);
-        Ok(out)
-    }
-
-    fn evaluate_many(&mut self, tasks: &[PolicyValueTask]) -> Result<Vec<PolicyValueOutput>, Self::Error> {
+    pub(crate) fn evaluate_many_shared(
+        &mut self,
+        tasks: &[Arc<PolicyValueTask>],
+    ) -> Result<Vec<PolicyValueOutput>, String> {
         if tasks.is_empty() {
             return Ok(Vec::new());
         }
@@ -211,6 +177,48 @@ impl PolicyValueEval for OnnxPolicyValueEval {
         }
 
         Ok(outputs)
+    }
+}
+
+impl PolicyValueEval for OnnxPolicyValueEval {
+    type Error = String;
+
+    fn evaluate(&mut self, input: PolicyValueInput<'_>) -> Result<PolicyValueOutput, Self::Error> {
+        let Some(policy) = self.policy.as_ref() else {
+            return Ok(uniform_output(input.legal_moves.len()));
+        };
+        let state_key = input.history.input_cache_key();
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .map_err(|_| "eval cache 锁中毒".to_string())?
+            .get(&state_key)
+            .cloned()
+        {
+            return Ok(output_from_cached(&cached, &input.position, input.legal_moves));
+        }
+
+        let cached = {
+            let out = {
+                let mut net = policy.lock().map_err(|_| "policy 锁中毒".to_string())?;
+                net.eval_history(input.history).map_err(|e| e.to_string())?
+            };
+            CachedEval {
+                logits: out.logits,
+                value: out.wdl.map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0)).unwrap_or(0.0),
+            }
+        };
+        let out = output_from_cached(&cached, &input.position, input.legal_moves);
+        self.cache
+            .lock()
+            .map_err(|_| "eval cache 锁中毒".to_string())?
+            .insert(state_key, cached);
+        Ok(out)
+    }
+
+    fn evaluate_many(&mut self, tasks: &[PolicyValueTask]) -> Result<Vec<PolicyValueOutput>, Self::Error> {
+        let shared = tasks.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        self.evaluate_many_shared(&shared)
     }
 }
 

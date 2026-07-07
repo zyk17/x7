@@ -376,7 +376,7 @@ where
                 key: PendingKey::NewEdge(parent_id, edge_idx),
                 path,
                 kind: PendingKind::Expand {
-                    task: Box::new(PolicyValueTask {
+                    task: Arc::new(PolicyValueTask {
                         position: pos,
                         history,
                         legal_moves,
@@ -400,7 +400,7 @@ where
         let mut tasks = Vec::new();
         for pending in &iteration.pending {
             if let PendingKind::Expand { task } = &pending.kind {
-                tasks.push((**task).clone());
+                tasks.push(task.as_ref().clone());
             }
         }
         eval.evaluate_many(&tasks)
@@ -423,7 +423,7 @@ where
                     let out = outputs.get(eval_cursor).expect("batched eval must match task count");
                     eval_cursor += 1;
                     let parent = pending.path.last().expect("expanded leaf must have parent");
-                    self.add_expanded_child(parent.node_id, parent.edge_idx, &task, out, pending.multivisit);
+                    self.add_expanded_child(parent.node_id, parent.edge_idx, task.as_ref(), out, pending.multivisit);
                     self.backup_path(&pending.path, out.value, pending.multivisit);
                 }
             }
@@ -645,7 +645,7 @@ impl MctsEngine<OnnxPolicyValueEval> {
                             request_lens.push(request.tasks.len());
                         }
 
-                        match shared_eval.evaluate_many(&flat_tasks) {
+                        match shared_eval.evaluate_many_shared(&flat_tasks) {
                             Ok(outputs) => {
                                 debug_assert_eq!(outputs.len(), request_lens.iter().sum::<usize>());
                                 let mut outputs = outputs.into_iter();
@@ -714,11 +714,11 @@ impl MctsEngine<OnnxPolicyValueEval> {
                         };
                         let iter_playouts = iteration.playouts;
                         seldepth.fetch_max(iteration.seldepth, Ordering::Relaxed);
-                        let tasks = iteration
+                            let tasks = iteration
                             .pending
                             .iter()
                             .filter_map(|pending| match &pending.kind {
-                                PendingKind::Expand { task } => Some((**task).clone()),
+                                PendingKind::Expand { task } => Some(Arc::clone(task)),
                                 _ => None,
                             })
                             .collect::<Vec<_>>();
@@ -921,7 +921,7 @@ enum PendingKey {
 enum PendingKind {
     ExistingTerminal { leaf_id: MctsNodeId, value: f32 },
     NewTerminal { state_key: u64, value: f32 },
-    Expand { task: Box<PolicyValueTask> },
+    Expand { task: Arc<PolicyValueTask> },
 }
 
 #[derive(Clone)]
@@ -1406,13 +1406,13 @@ mod tests {
 }
 
 struct EvalRequest {
-    tasks: Vec<PolicyValueTask>,
+    tasks: Vec<Arc<PolicyValueTask>>,
     result: Mutex<Option<Result<Vec<PolicyValueOutput>, String>>>,
     ready: Condvar,
 }
 
 impl EvalRequest {
-    fn new(tasks: Vec<PolicyValueTask>) -> Arc<Self> {
+    fn new(tasks: Vec<Arc<PolicyValueTask>>) -> Arc<Self> {
         Arc::new(Self {
             tasks,
             result: Mutex::new(None),
