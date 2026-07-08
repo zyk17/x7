@@ -15,7 +15,7 @@
 
 - 搜索：`MCTS`
 - 训练数据：`px0 / lc0` 风格外部 chunk
-- 模型：小型 shared trunk + `policy/value`
+- 模型：小型纯 CNN trunk + `policy/value`
 - value 监督：`WDL + qMix`
 
 当前不再把下面这些当主线：
@@ -85,6 +85,7 @@
 
 - 读取 `px0 v6` chunk
 - 训练小型 `policy + value`
+- 使用 train-only 辅助头改善 trunk / value 学习
 - 导出 ONNX
 
 约束：
@@ -111,9 +112,10 @@
 
 ### 网络
 
-- shared trunk：`stem + SE residual blocks`
-- policy head：`90-square token -> 1-layer policy encoder -> from-to attention -> px0 2062 move map`
-- value head：`1x1 conv -> flatten -> dense(128) -> wdl(3)`
+- shared trunk：`stem + pre-activation residual + global-pooling residual`
+- policy head：`pure CNN conv head -> px0 52x10x9 conv move map -> 2062`
+- value head：`global pooled CNN head -> wdl(3)`
+- train-only aux head：`moves-left`
 
 ### value 语义
 
@@ -126,8 +128,10 @@
 
 - 保持网络小
 - 保持实现清楚
-- trunk 对齐 `px0` 的 `SE residual` 主体，而不是继续用更弱的 plain residual
-- policy 头不再用“纯 flatten + linear”作为正式主线，而是对齐 `px0/lc0` 的 from-to attention 语义
+- trunk 向 `KataGo` 风格靠拢，用全局池化强化 value 学习
+- policy 正式主线改成纯 CNN，不再保留 `attention policy`
+- 引擎正式推理仍只消费 `policy + WDL`
+- 训练时允许 `moves-left` 辅助头，但不扩引擎正式输出契约
 
 ## 5. 数据策略
 
@@ -148,6 +152,14 @@
 3. `px0_record.py` 和 `dataset_px0.py` 能稳定读数据
 4. `train_px0.py` 能稳定长跑、保存、恢复、导出
 5. 导出的 ONNX 契约与引擎消费侧一致
+
+### `nn/` 当前训练额外使用的 px0 字段
+
+- `best_q / best_d`
+- `result_q / result_d`
+- `visits`
+- `policy_kld`
+- `plies_left`
 
 当前最值得继续投入的是前两项：
 

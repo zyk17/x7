@@ -12,8 +12,12 @@ from nn import (
     PolicyResNet,
     soft_policy_cross_entropy,
     mix_wdl_targets,
+    moves_left_loss,
     policy_cross_entropy,
+    policy_kld_to_weight,
+    value_q_mse_from_scalar,
     value_wdl_cross_entropy,
+    visits_to_sample_weight,
     wdl_logits_to_q,
 )
 
@@ -53,19 +57,23 @@ def test_value_wdl_forward_and_loss():
         num_blocks=2,
         num_moves=2062,
         value_head=True,
+        moves_left_head=True,
     )
     x = torch.zeros((1, 124, 10, 9), dtype=torch.float32)
-    logits, value = m(x)
+    logits, value, moves_left = m(x)
     assert logits.shape == (1, 2062)
     assert value.shape == (1, 3)
+    assert moves_left.shape == (1, 1)
     tgt = torch.tensor([[0.6, 0.1, 0.3]], dtype=torch.float32)
     loss = value_wdl_cross_entropy(value, tgt)
     assert loss.ndim == 0 and torch.isfinite(loss)
     q = wdl_logits_to_q(value)
     assert q.shape == (1,)
+    ml_loss = moves_left_loss(moves_left, torch.tensor([[24.0]], dtype=torch.float32))
+    assert ml_loss.ndim == 0 and torch.isfinite(ml_loss)
 
 
-def test_attention_policy_head_forward_shape():
+def test_pure_cnn_policy_head_forward_shape():
     m = PolicyResNet(in_planes=124, width=32, num_blocks=2, num_moves=2062)
     x = torch.zeros((2, 124, 10, 9), dtype=torch.float32)
     logits = m(x)
@@ -86,3 +94,12 @@ def test_mix_wdl_targets_uses_lc0_q_ratio_semantics():
     search = torch.tensor([[0.7, 0.1, 0.2]], dtype=torch.float32)
     assert torch.equal(mix_wdl_targets(winner, search, q_ratio=0.0), winner)
     assert torch.equal(mix_wdl_targets(winner, search, q_ratio=1.0), search)
+
+
+def test_aux_weights_and_scalar_q_loss_are_finite():
+    value_logits = torch.tensor([[0.2, -0.1, 0.0]], dtype=torch.float32)
+    tgt_q = torch.tensor([[0.4]], dtype=torch.float32)
+    sample_weight = visits_to_sample_weight(torch.tensor([[128.0]], dtype=torch.float32))
+    sample_weight = sample_weight * policy_kld_to_weight(torch.tensor([[0.7]], dtype=torch.float32))
+    loss = value_q_mse_from_scalar(value_logits, tgt_q, sample_weight=sample_weight)
+    assert loss.ndim == 0 and torch.isfinite(loss)

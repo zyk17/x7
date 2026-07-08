@@ -6,6 +6,8 @@
 - 2062 维 policy 概率
 - winner WDL
 - search q WDL（来自 best_q / best_d）
+- search visits
+- policy_kld
 - plies_left
 
 这里不试图兼容 lc0/px0 全部历史版本，也不引入 proto 依赖。
@@ -24,7 +26,7 @@ import numpy as np
 
 V6_VERSION = 6
 CLASSICAL_INPUT = 1
-V6_STRUCT = struct.Struct("<ii8248s1920sBBBb15fIHH4H")
+V6_STRUCT = struct.Struct("<ii8248s1920sBBBb15fIHHfI")
 V6_RECORD_SIZE = V6_STRUCT.size
 PX0_PLANES = 124
 PX0_ROWS = 10
@@ -40,6 +42,8 @@ class Px0Sample:
     winner_wdl: np.ndarray
     search_q: np.ndarray
     search_wdl: np.ndarray
+    search_visits: np.ndarray
+    policy_kld: np.ndarray
     plies_left: np.ndarray
 
 
@@ -121,13 +125,11 @@ def parse_v6_record(record: bytes) -> Px0Sample:
         _orig_q,
         _orig_d,
         _orig_m,
-        _visits,
+        visits,
         _played_idx,
         _best_idx,
-        _reserved1,
-        _reserved2,
-        _reserved3,
-        _reserved4,
+        policy_kld,
+        _reserved,
     ) = V6_STRUCT.unpack(record)
 
     if version != V6_VERSION:
@@ -154,6 +156,8 @@ def parse_v6_record(record: bytes) -> Px0Sample:
         winner_wdl=winner,
         search_q=np.asarray([float(best_q)], dtype=np.float32),
         search_wdl=search,
+        search_visits=np.asarray([float(visits)], dtype=np.float32),
+        policy_kld=np.asarray([float(policy_kld)], dtype=np.float32),
         plies_left=plies,
     )
 

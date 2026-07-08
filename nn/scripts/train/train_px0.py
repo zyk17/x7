@@ -25,13 +25,19 @@ from nn.px0_kaggle import DEFAULT_PX0_ROOT, ensure_px0_version
 from nn.model import (
     PolicyResNet,
     mix_wdl_targets,
+    moves_left_loss,
+    policy_kld_to_weight,
     soft_policy_cross_entropy,
-    value_q_mse,
+    value_q_mse_from_scalar,
     value_wdl_cross_entropy,
+    visits_to_sample_weight,
 )
 
 from train_checkpoint import lr_scheduler, save_checkpoint
 from train_common import TRAIN_SEED, default_num_workers
+
+VALUE_Q_AUX_WEIGHT = 0.25
+MOVES_LEFT_AUX_WEIGHT = 0.15
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,11 +98,17 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def take_logits_and_value(
-    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor]:
+    output: torch.Tensor | tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     if not isinstance(output, tuple):
         raise TypeError("train_px0 requires value_head=True")
-    return output
+    if len(output) == 2:
+        logits, value = output
+        return logits, value, None
+    if len(output) == 3:
+        logits, value, moves_left = output
+        return logits, value, moves_left
+    raise TypeError(f"unexpected model output len={len(output)}")
 
 
 def validate_existing_output_checkpoint(
@@ -106,6 +118,10 @@ def validate_existing_output_checkpoint(
     train_files: list[Path],
     val_files: list[Path],
 ) -> None:
+    if ckpt.get("trunk_kind") is not None and str(ckpt.get("trunk_kind")) != "katago_cnn_v1":
+        raise SystemExit("--out 已存在，但不是当前 katago_cnn_v1 架构；请换新输出文件重新训练")
+    if ckpt.get("moves_left_head") is not None and not bool(ckpt.get("moves_left_head", False)):
+        raise SystemExit("--out 已存在，但不含当前 moves_left 辅助头；请换新输出文件重新训练")
     expected_q_ratio = float(args.q_ratio)
     got_q_ratio = ckpt.get("q_ratio")
     if got_q_ratio is not None and abs(float(got_q_ratio) - expected_q_ratio) > 1e-9:
@@ -124,6 +140,10 @@ def validate_existing_output_checkpoint(
         raise SystemExit("--out 已存在，但其 val_files 与当前数据集不一致；请换新输出文件或改用 --init-from")
 
 
+def make_sample_weight(search_visits: torch.Tensor, policy_kld: torch.Tensor) -> torch.Tensor:
+    return visits_to_sample_weight(search_visits) * policy_kld_to_weight(policy_kld)
+
+
 def run_val(
     model: PolicyResNet,
     loader: DataLoader,
@@ -132,12 +152,13 @@ def run_val(
     val_batches: int,
     value_loss_weight: float,
     q_ratio: float,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, float]:
     model.eval()
     total_loss = 0.0
     total_policy = 0.0
     total_value_ce = 0.0
     total_value_q_mse = 0.0
+    total_moves_left = 0.0
     batches = 0
     with torch.no_grad():
         for batch in loader:
@@ -145,29 +166,51 @@ def run_val(
             raw_policy = batch["policy"].to(device=device, dtype=torch.float32)
             winner_wdl = batch["winner_wdl"].to(device=device, dtype=torch.float32)
             search_wdl = batch["search_wdl"].to(device=device, dtype=torch.float32)
+            search_q = batch["search_q"].to(device=device, dtype=torch.float32)
+            search_visits = batch["search_visits"].to(device=device, dtype=torch.float32)
+            policy_kld = batch["policy_kld"].to(device=device, dtype=torch.float32)
+            plies_left = batch["plies_left"].to(device=device, dtype=torch.float32)
+            sample_weight = make_sample_weight(search_visits, policy_kld)
             target_value = mix_wdl_targets(winner_wdl, search_wdl, q_ratio=q_ratio)
             legal_mask = raw_policy >= 0
             target_policy = raw_policy.clamp_min(0.0)
             output = model(boards)
-            policy_logits, pred_value = take_logits_and_value(output)
-            policy_loss = soft_policy_cross_entropy(policy_logits, target_policy, legal_mask)
-            value_ce = value_wdl_cross_entropy(pred_value, target_value)
-            value_q = value_q_mse(pred_value, target_value)
-            loss = policy_loss + float(value_loss_weight) * value_ce
+            policy_logits, pred_value, pred_moves_left = take_logits_and_value(output)
+            policy_loss = soft_policy_cross_entropy(
+                policy_logits,
+                target_policy,
+                legal_mask,
+                sample_weight=sample_weight,
+            )
+            value_ce = value_wdl_cross_entropy(pred_value, target_value, sample_weight=sample_weight)
+            value_q = value_q_mse_from_scalar(pred_value, search_q, sample_weight=sample_weight)
+            moves_left = (
+                moves_left_loss(pred_moves_left, plies_left, sample_weight=sample_weight)
+                if pred_moves_left is not None
+                else torch.zeros((), device=device)
+            )
+            loss = (
+                policy_loss
+                + float(value_loss_weight) * value_ce
+                + VALUE_Q_AUX_WEIGHT * value_q
+                + MOVES_LEFT_AUX_WEIGHT * moves_left
+            )
             total_loss += float(loss.item())
             total_policy += float(policy_loss.item())
             total_value_ce += float(value_ce.item())
             total_value_q_mse += float(value_q.item())
+            total_moves_left += float(moves_left.item())
             batches += 1
             if batches >= val_batches:
                 break
     if batches < 1:
-        return float("nan"), float("nan"), float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
     return (
         total_loss / batches,
         total_policy / batches,
         total_value_ce / batches,
         total_value_q_mse / batches,
+        total_moves_left / batches,
     )
 
 
@@ -234,7 +277,7 @@ def main() -> None:
         num_blocks=int(args.blocks),
         num_moves=int(args.num_moves),
         value_head=True,
-        value_head_hidden_dim=128,
+        moves_left_head=True,
     ).to(device)
     opt = AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     scheduler = lr_scheduler(opt, epochs=max(1, int(args.steps)))
@@ -294,23 +337,39 @@ def main() -> None:
         raw_policy = batch["policy"].to(device=device, dtype=torch.float32)
         winner_wdl = batch["winner_wdl"].to(device=device, dtype=torch.float32)
         search_wdl = batch["search_wdl"].to(device=device, dtype=torch.float32)
+        search_q = batch["search_q"].to(device=device, dtype=torch.float32)
+        search_visits = batch["search_visits"].to(device=device, dtype=torch.float32)
+        policy_kld = batch["policy_kld"].to(device=device, dtype=torch.float32)
+        plies_left = batch["plies_left"].to(device=device, dtype=torch.float32)
+        sample_weight = make_sample_weight(search_visits, policy_kld)
         target_value = mix_wdl_targets(winner_wdl, search_wdl, q_ratio=float(args.q_ratio))
         legal_mask = raw_policy >= 0
         target_policy = raw_policy.clamp_min(0.0)
 
         opt.zero_grad(set_to_none=True)
         output = model(boards)
-        policy_logits, pred_value = take_logits_and_value(output)
-        policy_loss = soft_policy_cross_entropy(policy_logits, target_policy, legal_mask)
-        value_ce = value_wdl_cross_entropy(pred_value, target_value)
-        value_q = value_q_mse(pred_value, target_value)
-        loss = policy_loss + float(args.value_loss_weight) * value_ce
+        policy_logits, pred_value, pred_moves_left = take_logits_and_value(output)
+        policy_loss = soft_policy_cross_entropy(
+            policy_logits,
+            target_policy,
+            legal_mask,
+            sample_weight=sample_weight,
+        )
+        value_ce = value_wdl_cross_entropy(pred_value, target_value, sample_weight=sample_weight)
+        value_q = value_q_mse_from_scalar(pred_value, search_q, sample_weight=sample_weight)
+        moves_left = moves_left_loss(pred_moves_left, plies_left, sample_weight=sample_weight)
+        loss = (
+            policy_loss
+            + float(args.value_loss_weight) * value_ce
+            + VALUE_Q_AUX_WEIGHT * value_q
+            + MOVES_LEFT_AUX_WEIGHT * moves_left
+        )
         loss.backward()
         opt.step()
         scheduler.step()
 
         if step == 1 or step % max(1, int(args.eval_every)) == 0 or step == int(args.steps):
-            val_loss, val_policy, val_value_ce, val_value_q_mse = run_val(
+            val_loss, val_policy, val_value_ce, val_value_q_mse, val_moves_left = run_val(
                 model,
                 val_loader,
                 device=device,
@@ -324,10 +383,12 @@ def main() -> None:
                 f"train_policy={policy_loss.item():.4f} "
                 f"train_value_ce={value_ce.item():.4f} "
                 f"train_value_q_mse={value_q.item():.4f} "
+                f"train_moves_left={moves_left.item():.4f} "
                 f"val_loss={val_loss:.4f} "
                 f"val_policy={val_policy:.4f} "
                 f"val_value_ce={val_value_ce:.4f} "
                 f"val_value_q_mse={val_value_q_mse:.4f} "
+                f"val_moves_left={val_moves_left:.4f} "
                 f"lr={opt.param_groups[0]['lr']:.2e}"
             )
             payload = {
@@ -339,8 +400,9 @@ def main() -> None:
                 "n_moves": int(args.num_moves),
                 "format": "px0_v6",
                 "value_head": True,
+                "moves_left_head": True,
+                "trunk_kind": str(getattr(model, "trunk_kind", "katago_cnn_v1")),
                 "value_head_format": "wdl",
-                "value_head_hidden_dim": 128,
                 "value_target_kind": "qmix_wdl",
                 "q_ratio": float(args.q_ratio),
                 "completed_steps": step,
@@ -359,8 +421,11 @@ def main() -> None:
                 "lr": float(args.lr),
                 "weight_decay": float(args.weight_decay),
                 "value_loss_weight": float(args.value_loss_weight),
+                "value_q_aux_weight": float(VALUE_Q_AUX_WEIGHT),
+                "moves_left_aux_weight": float(MOVES_LEFT_AUX_WEIGHT),
                 "last_val_value_ce": float(val_value_ce),
                 "last_val_value_q_mse": float(val_value_q_mse),
+                "last_val_moves_left": float(val_moves_left),
                 "created_utc": datetime.now(timezone.utc).isoformat(),
             }
             save_checkpoint(payload, args.out)

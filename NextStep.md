@@ -5,6 +5,7 @@
 当前正式共识：
 
 - 模型契约保持：`124x10x9 -> 2062 + WDL`
+- 训练主线改为：纯 CNN `KataGo` 风格 trunk，不再保留 `attention policy`
 - 引擎输入保持：真实 `history` 主线，`fen_only` fallback
 - 搜索主线保持：`MCTS`
 - 当前已支持：单线程主线 + 最小 shared-tree 多线程
@@ -53,27 +54,29 @@
 - `pv / seldepth / nps` 变化可解释
 - GUI 联调下不再出现明显 UCI 行为异常
 
-## 3. 再回到模型质量
+## 3. 优先把新网络 baseline 重新训起来
 
 目标：
 
-- 不急着发散 head 和复杂架构
-- 先在当前正式契约下把 baseline 做稳
+- 把新的纯 CNN trunk 跑通
+- 把 `px0` 里已有的 `q / visits / policy_kld / plies_left` 用起来
+- 在不扩正式引擎 I/O 的前提下，把 value 学习做稳
 
 优先顺序：
 
-1. 继续观察 opening policy 与 value 偏差
-2. 只做少量高价值训练对照
-3. 搜索地基稳定后再决定是否继续调模型
+1. 跑新 trunk 的短训与导出
+2. 看 `policy / value_ce / value_q_mse / moves_left` 是否同时下降
+3. 再决定 `q_ratio` 的阶段式训练策略
 
 完成标准：
 
-- 对模型问题和搜索问题的边界更清楚
-- 下一轮训练配置有明确依据
+- 新网络能稳定训练和导出
+- 评估结果不再受旧 `attention policy` 包袱干扰
+- 下一轮长训配置清楚
 
 ## 当前明确先不做
 
 1. 不做 `MultiPV`
 2. 不做复杂 ONNX 推理后端优化
-3. 不引入新的 head
+3. 不把训练辅助头扩成正式引擎输出契约
 4. 不为了未来复盘系统提前堆抽象

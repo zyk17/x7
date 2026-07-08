@@ -23,17 +23,19 @@
 - policy 输出：`2062` 维
 - value 输出：`3-way WDL`
 
-网络结构保持小，但不再过度压缩：
+网络结构保持小，但当前已经改成纯 CNN 主线：
 
-- shared trunk：`stem + SE residual blocks`
-- policy head：`90-square token -> 1-layer policy encoder -> from-to attention -> px0 2062 move map`
-- value head：`1x1 conv -> flatten -> dense(128) -> wdl(3)`
+- shared trunk：`stem + pre-activation residual + global-pooling residual`
+- policy head：`pure CNN conv policy head -> px0 52x10x9 conv move map -> 2062`
+- value head：`global pooled CNN value head -> wdl(3)`
+- aux train-only head：`moves-left`
 
 当前导出 / 引擎消费语义：
 
 - ONNX `value` 输出为 `WDL` 概率
 - 引擎侧统一按 `q = W - L` 消费 value
 - 当前默认 `q_ratio=0.0`，即主训练默认优先学最终结果 `WDL`
+- 当前训练会额外使用 `best_q / visits / policy_kld / plies_left`
 - 搜索核心已切成单线程 `iteration -> minibatch gather -> batched NN -> backup`
 - 当前搜索语义包含 `in_flight / collision / multivisit`
 - `position startpos moves ...` / `position fen ... moves ...` 会在引擎内保留真实历史

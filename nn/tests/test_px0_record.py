@@ -17,7 +17,9 @@ from nn.px0_record import (
 )
 
 
-def _official_like_decode(record: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _official_like_decode(
+    record: bytes,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     (
         version,
         input_format,
@@ -42,13 +44,11 @@ def _official_like_decode(record: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
         _orig_q,
         _orig_d,
         _orig_m,
-        _visits,
+        visits,
         _played_idx,
         _best_idx,
-        _reserved1,
-        _reserved2,
-        _reserved3,
-        _reserved4,
+        policy_kld,
+        _reserved,
     ) = V6_STRUCT.unpack(record)
     assert version == 6
     assert input_format == 1
@@ -80,7 +80,15 @@ def _official_like_decode(record: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
         dtype=np.float32,
     )
     policy = np.frombuffer(probs_raw, dtype=np.float32).copy()
-    return full_planes, policy, winner, best, np.asarray([float(plies_left)], dtype=np.float32)
+    return (
+        full_planes,
+        policy,
+        winner,
+        best,
+        np.asarray([float(visits)], dtype=np.float32),
+        np.asarray([float(policy_kld)], dtype=np.float32),
+        np.asarray([float(plies_left)], dtype=np.float32),
+    )
 
 
 def _fake_v6_record() -> bytes:
@@ -114,9 +122,7 @@ def _fake_v6_record() -> bytes:
         128,
         0,
         7,
-        0,
-        0,
-        0,
+        0.75,
         0,
     )
 
@@ -129,6 +135,8 @@ def test_parse_v6_record_shapes() -> None:
     assert sample.winner_wdl.shape == (3,)
     assert sample.search_q.shape == (1,)
     assert sample.search_wdl.shape == (3,)
+    assert sample.search_visits.shape == (1,)
+    assert sample.policy_kld.shape == (1,)
     assert sample.plies_left.shape == (1,)
     assert sample.winner_wdl.sum() == pytest.approx(1.0)
     assert sample.search_wdl.sum() == pytest.approx(1.0)
@@ -138,11 +146,13 @@ def test_parse_v6_record_shapes() -> None:
 def test_parse_v6_record_matches_official_chunkparser_semantics() -> None:
     record = _fake_v6_record()
     sample = parse_v6_record(record)
-    planes, policy, winner, best, plies_left = _official_like_decode(record)
+    planes, policy, winner, best, visits, policy_kld, plies_left = _official_like_decode(record)
     np.testing.assert_allclose(sample.planes, planes)
     np.testing.assert_allclose(sample.policy, policy)
     np.testing.assert_allclose(sample.winner_wdl, winner)
     np.testing.assert_allclose(sample.search_wdl, best)
+    np.testing.assert_allclose(sample.search_visits, visits)
+    np.testing.assert_allclose(sample.policy_kld, policy_kld)
     np.testing.assert_allclose(sample.plies_left, plies_left)
 
 
@@ -153,7 +163,7 @@ def test_iter_px0_chunk_file_reads_gzip(tmp_path: Path) -> None:
     items = list(iter_px0_chunk_file(chunk))
     assert len(items) == 1
     assert items[0].policy[7] == 1.0
-    assert V6_RECORD_SIZE == struct.calcsize("<ii8248s1920sBBBb15fIHH4H")
+    assert V6_RECORD_SIZE == struct.calcsize("<ii8248s1920sBBBb15fIHHfI")
 
 
 def test_parse_v6_record_rejects_non_classical_input() -> None:

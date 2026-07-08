@@ -70,6 +70,8 @@ class Px0ChunkDataset(IterableDataset[dict[str, torch.Tensor]]):
             "winner_wdl": torch.from_numpy(sample.winner_wdl),
             "search_q": torch.from_numpy(sample.search_q),
             "search_wdl": torch.from_numpy(sample.search_wdl),
+            "search_visits": torch.from_numpy(sample.search_visits),
+            "policy_kld": torch.from_numpy(sample.policy_kld),
             "plies_left": torch.from_numpy(sample.plies_left),
         }
 

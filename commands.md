@@ -25,7 +25,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install kagglehu
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\inspect_px0.py `
-  --px0-version 7 `
+  --px0-version 710 `
   --max-files 8 `
   --max-samples 256
 ```
@@ -34,8 +34,8 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\inspect
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --px0-version 7 `
-  --out data\checkpoints\baseline_px0_wdl_v1.pt `
+  --px0-version 710 `
+  --out data\checkpoints\baseline_px0_katago_v1.pt `
   --width 128 `
   --blocks 8 `
   --batch-size 256 `
@@ -51,8 +51,8 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --px0-version 7 `
-  --out data\checkpoints\baseline_px0_wdl_v1.pt `
+  --px0-version 710 `
+  --out data\checkpoints\baseline_px0_katago_v1.pt `
   --width 128 `
   --blocks 8 `
   --batch-size 256 `
@@ -75,9 +75,9 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --px0-version 7 `
-  --init-from data\checkpoints\baseline_px0_wdl_v1.best.pt `
-  --out data\checkpoints\baseline_px0_wdl_v1_qmix025.pt `
+  --px0-version 710 `
+  --init-from data\checkpoints\baseline_px0_katago_v1.best.pt `
+  --out data\checkpoints\baseline_px0_katago_v1_qmix025.pt `
   --width 128 `
   --blocks 8 `
   --batch-size 256 `
@@ -93,9 +93,9 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --px0-version 7 `
+  --px0-version 710 `
   --px0-force-download `
-  --out data\checkpoints\baseline_px0_wdl_v1.pt `
+  --out data\checkpoints\baseline_px0_katago_v1.pt `
   --width 128 `
   --blocks 8 `
   --batch-size 256 `
@@ -113,7 +113,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\split_px0_files.py `
-  --px0-version 7 `
+  --px0-version 710 `
   --out-train data\rounds\px0_train_v1.json `
   --out-val data\rounds\px0_val_v1.json `
   --val-ratio 0.1 `
@@ -124,25 +124,21 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\split_p
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
-  --checkpoint data\checkpoints\baseline_px0_wdl_v1.best.pt `
-  --out data\checkpoints\baseline_px0_wdl_v1.best.onnx
+  --checkpoint data\checkpoints\baseline_px0_katago_v1.best.pt `
+  --out data\policy.onnx
 ```
 
 说明：
 
 - `value` 输出是 `WDL` 概率
 - 引擎侧按 `q = W - L` 消费 value
-- 当前 trunk：`SE residual`
-- 当前 policy：`attention`
-- 当前 value hidden：`128`
+- 当前 trunk：`pre-activation residual + global-pooling residual`
+- 当前 policy：`pure CNN conv head`
+- 当前引擎正式只消费：`policy + WDL`
 - `q_ratio=0.0` 表示纯最终结果监督
 - `q_ratio=1.0` 表示纯搜索监督
 
 ## 9. 检查 ONNX 合约
-
-```powershell
-Copy-Item data\checkpoints\baseline_px0_wdl_v1.best.onnx data\policy.onnx -Force
-```
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test_policy_onnx_contract.py
@@ -151,7 +147,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test
 ## 10. 引擎 ONNX 冒烟
 
 ```powershell
-cargo run --release -p engin -- --onnx-smoke data\checkpoints\baseline_px0_wdl_v1.best.onnx
+cargo run --release -p engin -- --onnx-smoke data\policy.onnx
 ```
 
 这条命令只验证最小推理链路，不代表 GUI 正式接入效果。
@@ -174,7 +170,7 @@ cargo run --release -p engin -- --onnx-smoke data\checkpoints\baseline_px0_wdl_v
 
 ```powershell
 cargo run --release -p engin --bin onnx_eval -- `
-  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --onnx data\policy.onnx `
   --fen "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1" `
   --topk 8
 ```
@@ -183,7 +179,7 @@ cargo run --release -p engin --bin onnx_eval -- `
 
 ```powershell
 cargo run --release -p engin --bin onnx_eval -- `
-  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --onnx data\policy.onnx `
   --input data\eval_positions.txt `
   --topk 8 `
   --out data\eval_positions.ndjson
@@ -192,7 +188,7 @@ cargo run --release -p engin --bin onnx_eval -- `
 ## 12. 引擎 bench
 
 ```powershell
-cargo run --release -p engin -- --bench --playouts 64 --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx --require-onnx
+cargo run --release -p engin -- --bench --playouts 64 --onnx data\policy.onnx --require-onnx
 ```
 
 固定搜索对照建议直接这样跑：
@@ -201,7 +197,7 @@ cargo run --release -p engin -- --bench --playouts 64 --onnx data\checkpoints\ba
 
 ```powershell
 cargo run --release -p engin -- --bench `
-  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --onnx data\policy.onnx `
   --require-onnx `
   --movetime 2000 `
   --search-batch-size 16
@@ -211,7 +207,7 @@ cargo run --release -p engin -- --bench `
 
 ```powershell
 cargo run --release -p engin -- --bench `
-  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --onnx data\policy.onnx `
   --require-onnx `
   --movetime 2000 `
   --search-batch-size 32
@@ -221,7 +217,7 @@ cargo run --release -p engin -- --bench `
 
 ```powershell
 cargo run --release -p engin -- --bench `
-  --onnx data\checkpoints\baseline_px0_wdl_v1.best.onnx `
+  --onnx data\policy.onnx `
   --require-onnx `
   --movetime 2000 `
   --search-batch-size 64
@@ -238,7 +234,7 @@ cargo run --release -p engin -- --bench `
 ```powershell
 @'
 uci
-setoption name PolicyFile value C:/projects/77xiangqi_engine/data/checkpoints/baseline_px0_wdl_v1.best.onnx
+setoption name PolicyFile value C:/projects/77xiangqi_engine/data/policy.onnx
 isready
 position startpos
 go nodes 64
@@ -251,7 +247,7 @@ quit
 ```powershell
 @'
 uci
-setoption name PolicyFile value C:/projects/77xiangqi_engine/data/checkpoints/baseline_px0_wdl_v1.best.onnx
+setoption name PolicyFile value C:/projects/77xiangqi_engine/data/policy.onnx
 isready
 position startpos moves h2e2 h7e7
 go nodes 64

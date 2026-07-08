@@ -27,7 +27,12 @@ class PolicyOnnxExport(nn.Module):
         out = self.inner(x)
         if isinstance(out, torch.Tensor):
             return out
-        logits, value = out
+        if len(out) == 2:
+            logits, value = out
+        elif len(out) == 3:
+            logits, value, _moves_left = out
+        else:
+            raise TypeError(f"unexpected model output len={len(out)}")
         return logits, torch.softmax(value, dim=1)
 
 
@@ -44,6 +49,7 @@ def main() -> None:
     n_moves = int(ckpt["n_moves"])
     sd = ckpt["model"]
     value_head = bool(ckpt.get("value_head", False))
+    moves_left_head = bool(ckpt.get("moves_left_head", False))
     if not value_head and "fc_value.weight" in sd:
         value_head = True
     model = PolicyResNet(
@@ -52,7 +58,8 @@ def main() -> None:
         num_blocks=blocks,
         num_moves=n_moves,
         value_head=value_head,
-        value_head_hidden_dim=int(ckpt.get("value_head_hidden_dim", 0)),
+        moves_left_head=moves_left_head,
+        trunk_kind=str(ckpt.get("trunk_kind", "katago_cnn_v1")),
     )
     model.load_state_dict(sd, strict=True)
     model.eval()
