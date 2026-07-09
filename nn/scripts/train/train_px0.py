@@ -115,8 +115,6 @@ def validate_existing_output_checkpoint(
     ckpt: dict,
     *,
     args: argparse.Namespace,
-    train_files: list[Path],
-    val_files: list[Path],
 ) -> None:
     if ckpt.get("trunk_kind") is not None and str(ckpt.get("trunk_kind")) != "katago_cnn_v1":
         raise SystemExit("--out 已存在，但不是当前 katago_cnn_v1 架构；请换新输出文件重新训练")
@@ -130,14 +128,19 @@ def validate_existing_output_checkpoint(
             f"当前命令 q_ratio={expected_q_ratio:.6f}；请换新输出文件或改用 --init-from 开启新阶段训练"
         )
 
-    ckpt_train_files = ckpt.get("train_files")
-    ckpt_val_files = ckpt.get("val_files")
+def describe_dataset_change(ckpt: dict, *, train_files: list[Path], val_files: list[Path]) -> str | None:
+    prev_train_files = ckpt.get("train_files")
+    prev_val_files = ckpt.get("val_files")
     current_train_files = [str(p.resolve()) for p in train_files]
     current_val_files = [str(p.resolve()) for p in val_files]
-    if ckpt_train_files is not None and list(ckpt_train_files) != current_train_files:
-        raise SystemExit("--out 已存在，但其 train_files 与当前数据集不一致；请换新输出文件或改用 --init-from")
-    if ckpt_val_files is not None and list(ckpt_val_files) != current_val_files:
-        raise SystemExit("--out 已存在，但其 val_files 与当前数据集不一致；请换新输出文件或改用 --init-from")
+    if prev_train_files is None and prev_val_files is None:
+        return None
+    if list(prev_train_files or []) == current_train_files and list(prev_val_files or []) == current_val_files:
+        return None
+    return (
+        f"dataset changed: train_files {len(list(prev_train_files or []))}->{len(current_train_files)} "
+        f"val_files {len(list(prev_val_files or []))}->{len(current_val_files)}"
+    )
 
 
 def make_sample_weight(search_visits: torch.Tensor, policy_kld: torch.Tensor) -> torch.Tensor:
@@ -291,9 +294,8 @@ def main() -> None:
         validate_existing_output_checkpoint(
             ckpt,
             args=args,
-            train_files=train_ds.files,
-            val_files=val_ds.files,
         )
+        dataset_change = describe_dataset_change(ckpt, train_files=train_ds.files, val_files=val_ds.files)
         model.load_state_dict(ckpt["model"], strict=True)
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
@@ -309,6 +311,8 @@ def main() -> None:
             for _ in range(start_step):
                 scheduler.step()
         print(f"resume from {args.out} | completed_steps={start_step}")
+        if dataset_change is not None:
+            print(f"resume dataset phase -> {dataset_change}")
     elif args.init_from is not None:
         ckpt = torch.load(args.init_from, map_location=device)
         model.load_state_dict(ckpt["model"], strict=True)

@@ -11,6 +11,7 @@ pub struct EdgeStats {
     pub prior: f32,
     pub visits: u32,
     pub in_flight: u32,
+    pub expanding: bool,
     pub value_sum: f32,
     pub child: Option<MctsNodeId>,
 }
@@ -22,6 +23,7 @@ impl Default for EdgeStats {
             prior: 0.0,
             visits: 0,
             in_flight: 0,
+            expanding: false,
             value_sum: 0.0,
             child: None,
         }

@@ -267,7 +267,11 @@ mod tests {
         assert!(history.current_is_repeated());
 
         let t = history_to_planes(&history).unwrap();
-        assert_eq!(t[[0, 14, 0, 0]], 1.0, "current repeated position should mark repetition plane");
+        assert_eq!(
+            t[[0, 14, 0, 0]],
+            1.0,
+            "current repeated position should mark repetition plane"
+        );
     }
 
     #[test]

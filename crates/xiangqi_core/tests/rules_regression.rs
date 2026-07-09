@@ -4,7 +4,10 @@ use xiangqi_core::{legal_moves_uci, Position};
 fn knight_leg_block_is_respected() {
     let pos = Position::from_fen("4k4/9/9/9/9/9/9/9/1P7/1N2K4 w - - 0 1").expect("fen");
     let moves = legal_moves_uci(&pos);
-    assert!(!moves.iter().any(|mv| mv.starts_with("b0")), "blocked knight should have no legal moves: {moves:?}");
+    assert!(
+        !moves.iter().any(|mv| mv.starts_with("b0")),
+        "blocked knight should have no legal moves: {moves:?}"
+    );
 }
 
 #[test]
@@ -22,7 +25,10 @@ fn bishop_eye_block_is_respected() {
     let pos = Position::from_fen("4k4/9/9/9/9/9/9/4P4/9/2B1K4 w - - 0 1").expect("fen");
     let moves = legal_moves_uci(&pos);
     assert!(moves.contains(&"c0a2".to_string()));
-    assert!(!moves.contains(&"c0e2".to_string()), "blocked bishop eye should forbid c0e2: {moves:?}");
+    assert!(
+        !moves.contains(&"c0e2".to_string()),
+        "blocked bishop eye should forbid c0e2: {moves:?}"
+    );
 }
 
 #[test]
@@ -105,4 +111,18 @@ fn cannon_check_also_forbids_unrelated_moves() {
         "side in cannon check may not play unrelated rook move: {moves:?}"
     );
     assert!(!moves.is_empty(), "there should still be legal evasions: {moves:?}");
+}
+
+#[test]
+fn only_forced_king_escape_remains_in_check_position() {
+    let pos = Position::from_fen("R1cak4/4a4/4b1n2/2n5p/2P1p1b2/N4N3/8P/5C3/5r3/c1BA1KB2 w - - 0 1").expect("fen");
+    let moves = legal_moves_uci(&pos);
+    assert_eq!(moves, vec!["f0e0".to_string()]);
+}
+
+#[test]
+fn no_legal_moves_position_is_detected() {
+    let pos = Position::from_fen("3Rkab2/4a4/2P1b4/p3C1c1p/9/4P4/2N5P/9/4A4/1RB1KAB2 b - - 0 1").expect("fen");
+    let moves = legal_moves_uci(&pos);
+    assert!(moves.is_empty(), "expected no legal moves: {moves:?}");
 }

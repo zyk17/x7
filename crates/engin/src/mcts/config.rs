@@ -61,7 +61,7 @@ impl Default for MctsConfig {
             root_temperature: 0.0,
             root_dirichlet_epsilon: 0.0,
             root_dirichlet_alpha: 0.3,
-            search_batch_size: 32,
+            search_batch_size: 2048,
         }
     }
 }

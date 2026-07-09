@@ -46,7 +46,7 @@
 1. 继续完善 root tree reuse / subtree reuse
 2. 继续核对 `playouts / nodes / depth / seldepth / pv` 统计口径
 3. 继续检查 repetition / terminal 处理
-4. 用固定命令量化 `Threads` 和 `SearchBatchSize`
+4. 用固定命令量化 `MctsWorkers` 和 `MctsBatchCap`
 
 完成标准：
 

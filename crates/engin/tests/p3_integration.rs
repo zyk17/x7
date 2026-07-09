@@ -105,6 +105,7 @@ fn bench_json_has_expected_keys() {
     assert!(v.get("mcts_config").is_some());
     assert!(v.get("playouts").is_some());
     assert!(v.get("root_visits").is_some());
+    assert!(v.get("best_value").is_some());
 }
 
 #[test]
@@ -120,19 +121,14 @@ fn default_benchmark_fens_all_parse() {
 
 #[test]
 fn uci_setoption_then_go() {
-    let input = b"uci\nisready\nsetoption name Visits value 64\nsetoption name Cpuct value 1.5\nposition startpos\ngo nodes 2\nquit\n";
+    let input = b"uci\nisready\nsetoption name MctsPlayouts value 64\nsetoption name MctsCpuct value 1.5\nposition startpos\ngo nodes 2\nquit\n";
     let mut out = Vec::new();
     engin::uci::run_uci_for_test(Cursor::new(&input[..]), &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("bestmove"));
-    assert!(s.contains("Playouts"));
-    assert!(s.contains("Visits"));
-    assert!(s.contains("Cpuct"));
-    assert!(s.contains("CpuctAtRoot"));
-    assert!(s.contains("CpuctBase"));
-    assert!(s.contains("CpuctFactor"));
-    assert!(s.contains("FpuReduction"));
-    assert!(s.contains("FpuReductionAtRoot"));
-    assert!(s.contains("SearchBatchSize"));
-    assert!(s.contains("Threads"));
+    assert!(s.contains("MctsPlayouts"));
+    assert!(s.contains("MctsCpuct"));
+    assert!(s.contains("MctsFpuReduction"));
+    assert!(s.contains("MctsBatchCap"));
+    assert!(s.contains("MctsWorkers"));
 }

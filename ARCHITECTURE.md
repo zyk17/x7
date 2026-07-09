@@ -64,6 +64,9 @@
 - 不再扩 Alpha-Beta 主线
 - 当前明确先不做：
   `MultiPV`、复杂 ONNX backend / evaluator 池
+- 对外 UCI 选项保持收敛：
+  只公开 `PolicyFile / MctsPlayouts / MctsCpuct / MctsFpuReduction / MctsBatchCap / MctsWorkers`
+  不再兼容旧的 `Playouts / Visits / Cpuct / FpuReduction / SearchBatchSize / Threads`
 
 ### `crates/xiangqi_dataset`
 

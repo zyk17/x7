@@ -41,6 +41,27 @@
 - `position startpos moves ...` / `position fen ... moves ...` 会在引擎内保留真实历史
 - 只给最终 `FEN` 的第三方 GUI 仍可用，但属于 fallback 路径，强度可能下降
 
+## 当前 UCI 公开选项
+
+当前主 UCI 只公开这些日常需要的选项：
+
+- `PolicyFile`：ONNX 路径
+- `MctsPlayouts`：默认 playout 预算
+- `MctsCpuct`：主探索强度
+- `MctsFpuReduction`：未访问边的 first-play urgency 扣减
+- `MctsBatchCap`：单轮 gather / evaluator 的 batch 上限，不是固定目标值
+- `MctsWorkers`：shared-tree worker 数
+
+说明：
+
+- 不再兼容 `Playouts / Visits / Cpuct / FpuReduction / SearchBatchSize / Threads`
+- 这样可以避免和 `Pikafish / Stockfish` 风格 GUI 选项名冲突
+- 当前默认 `MctsWorkers=8`
+- 当前默认 `MctsBatchCap=2048`
+- 当前 `MctsBatchCap` 公开上限为 `8192`
+- 当前 `MctsWorkers` 公开上限为 `1024`
+- 当前搜索会按 root 访问数逐步放大 gather 大小，并在 evaluator 侧按动态目标 batch + 短等待 flush 提交
+
 ## 数据路线
 
 现在的默认决策是：

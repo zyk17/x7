@@ -20,7 +20,8 @@ static UCI_STDOUT_LOCK: Mutex<()> = Mutex::new(());
 const UCI_INFO_INTERVAL: Duration = Duration::from_millis(200);
 const UCI_ROOT_MOVE_TOP_K: usize = 5;
 const AUTO_THREADS: usize = 0;
-const MAX_THREADS: usize = 32;
+const DEFAULT_THREADS: usize = 8;
+const MAX_THREADS: usize = 1024;
 
 fn q_to_cp(q: f32) -> i32 {
     let wl = q.clamp(-0.999, 0.999) as f64;
@@ -28,7 +29,8 @@ fn q_to_cp(q: f32) -> i32 {
 }
 
 fn uci_info_line(
-    root_value: f32,
+    best_value: f32,
+    best_mate: Option<i32>,
     depth: u32,
     seldepth: u32,
     playouts: u32,
@@ -36,14 +38,18 @@ fn uci_info_line(
     elapsed_ms: u64,
     pv: &[xiangqi_core::Move],
 ) -> String {
-    let cp = q_to_cp(root_value);
     let nps = if elapsed_ms > 0 {
         (playouts as u128 * 1000 / u128::from(elapsed_ms)) as u64
     } else {
         0
     };
-    let mut line =
-        format!("info depth {depth} seldepth {seldepth} score cp {cp} nodes {nodes} nps {nps} time {elapsed_ms}");
+    let score = if let Some(mate) = best_mate {
+        format!("score mate {mate}")
+    } else {
+        let cp = q_to_cp(best_value);
+        format!("score cp {cp}")
+    };
+    let mut line = format!("info depth {depth} seldepth {seldepth} {score} nodes {nodes} nps {nps} time {elapsed_ms}");
     if !pv.is_empty() {
         line.push_str(" pv ");
         line.push_str(
@@ -66,15 +72,27 @@ fn uci_root_moves_line(moves: &[MctsMoveStat]) -> String {
     let body = stats
         .into_iter()
         .take(UCI_ROOT_MOVE_TOP_K)
-        .map(|s| format!("{}:{}:{:.3}", xiangqi_core::move_to_uci(s.mv), s.visits, s.q))
+        .map(|s| {
+            format!(
+                "{}:{}:{:.3}:{:.3}",
+                xiangqi_core::move_to_uci(s.mv),
+                s.visits,
+                s.q,
+                s.prior
+            )
+        })
         .collect::<Vec<_>>()
         .join(",");
-    format!("info string root_moves_top{UCI_ROOT_MOVE_TOP_K} {body}")
+    format!("info string root_moves_top{UCI_ROOT_MOVE_TOP_K} move:visits:q:prior {body}")
 }
 
 fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsSearchProgress, elapsed_ms: u64) {
+    if progress.playouts == 0 {
+        return;
+    }
     output(&uci_info_line(
-        progress.root_value,
+        progress.best_value,
+        progress.best_mate,
         progress.depth,
         progress.seldepth,
         progress.playouts,
@@ -85,9 +103,10 @@ fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsS
     if let Some(best_move) = progress.best_move {
         let best_uci = xiangqi_core::move_to_uci(best_move);
         output(&format!(
-            "info string mcts playouts={} root_visits={} nodes={} root_value={:.4} bestmove={}",
-            progress.playouts, progress.root_visits, progress.nodes, progress.root_value, best_uci
+            "info string mcts playouts={} root_visits={} nodes={} root_value={:.4} best_value={:.4} bestmove={}",
+            progress.playouts, progress.root_visits, progress.nodes, progress.root_value, progress.best_value, best_uci
         ));
+        output(&uci_root_moves_line(&progress.moves));
     }
 }
 
@@ -247,7 +266,7 @@ impl Engine {
             policy: policy.clone(),
             policy_path,
             config: MctsConfig::default(),
-            threads: 1,
+            threads: DEFAULT_THREADS,
             search_engine: Arc::new(Mutex::new(MctsEngine::new(
                 MctsConfig::default(),
                 OnnxPolicyValueEval::new(policy),
@@ -293,8 +312,8 @@ impl Engine {
 
     fn auto_threads(&self) -> usize {
         let cpu_cap = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 4))
-            .unwrap_or(2);
+            .map(|n| n.get().clamp(4, 16))
+            .unwrap_or(16);
         match self.policy.as_ref().map(|pool| pool.provider_chain()) {
             Some(chain) if chain.contains("CUDA") || chain.contains("DirectML") => cpu_cap,
             _ => 1,
@@ -317,16 +336,11 @@ impl Engine {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<empty>".to_string());
         self.emit(&format!("option name PolicyFile type string default {policy_default}"));
-        self.emit("option name Playouts type spin default 256 min 1 max 1000000");
-        self.emit("option name Visits type spin default 256 min 1 max 1000000");
-        self.emit("option name Cpuct type string default 1.0");
-        self.emit("option name CpuctAtRoot type string default 1.745");
-        self.emit("option name CpuctBase type string default 38739");
-        self.emit("option name CpuctFactor type string default 3.894");
-        self.emit("option name FpuReduction type string default 0.22");
-        self.emit("option name FpuReductionAtRoot type string default 0.22");
-        self.emit("option name SearchBatchSize type spin default 32 min 1 max 64");
-        self.emit("option name Threads type spin default 0 min 0 max 32");
+        self.emit("option name MctsPlayouts type spin default 256 min 1 max 1000000");
+        self.emit("option name MctsCpuct type string default 1.0");
+        self.emit("option name MctsFpuReduction type string default 0.22");
+        self.emit("option name MctsBatchCap type spin default 2048 min 1 max 8192");
+        self.emit("option name MctsWorkers type spin default 8 min 1 max 1024");
         self.emit(&format!(
             "info string policy {}",
             if self.policy.is_some() { "loaded" } else { "not_loaded" }
@@ -346,14 +360,14 @@ impl Engine {
                     .filter(|p| !p.as_os_str().is_empty());
                 self.reload_policy()?;
             }
-            "Playouts" | "Visits" => {
+            "MctsPlayouts" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<u32>() {
                         self.default_playouts = n.clamp(1, 1_000_000);
                     }
                 }
             }
-            "Cpuct" => {
+            "MctsCpuct" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<f32>() {
                         self.config.cpuct = n.clamp(0.01, 100.0);
@@ -361,58 +375,29 @@ impl Engine {
                     }
                 }
             }
-            "CpuctAtRoot" => {
-                if let Some(ref v) = value {
-                    if let Ok(n) = v.trim().parse::<f32>() {
-                        self.config.cpuct_root = n.clamp(0.01, 100.0);
-                        self.rebuild_search_engine();
-                    }
-                }
-            }
-            "CpuctBase" => {
-                if let Some(ref v) = value {
-                    if let Ok(n) = v.trim().parse::<f32>() {
-                        self.config.cpuct_base = n.clamp(1.0, 1_000_000_000.0);
-                        self.rebuild_search_engine();
-                    }
-                }
-            }
-            "CpuctFactor" => {
-                if let Some(ref v) = value {
-                    if let Ok(n) = v.trim().parse::<f32>() {
-                        self.config.cpuct_factor = n.clamp(0.0, 1_000.0);
-                        self.rebuild_search_engine();
-                    }
-                }
-            }
-            "FpuReduction" => {
+            "MctsFpuReduction" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<f32>() {
                         self.config.fpu_reduction = n.clamp(0.0, 2.0);
-                        self.rebuild_search_engine();
-                    }
-                }
-            }
-            "FpuReductionAtRoot" => {
-                if let Some(ref v) = value {
-                    if let Ok(n) = v.trim().parse::<f32>() {
                         self.config.fpu_reduction_root = n.clamp(0.0, 4.0);
                         self.rebuild_search_engine();
                     }
                 }
             }
-            "SearchBatchSize" => {
+            "MctsBatchCap" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<usize>() {
-                        self.config.search_batch_size = n.clamp(1, 64);
+                        self.config.search_batch_size = n.clamp(1, 8192);
                         self.rebuild_search_engine();
                     }
                 }
             }
-            "Threads" => {
+            "MctsWorkers" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<usize>() {
-                        self.threads = n.min(MAX_THREADS);
+                        if n >= 1 {
+                            self.threads = n.min(MAX_THREADS);
+                        }
                     }
                 }
             }
@@ -508,7 +493,8 @@ impl Engine {
                 Ok(result) => {
                     let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     output(&uci_info_line(
-                        result.root_value,
+                        result.best_value,
+                        result.best_mate,
                         result.depth,
                         result.seldepth,
                         result.playouts,
@@ -522,8 +508,8 @@ impl Engine {
                     if let Some(best_move) = result.best_move {
                         let best_uci = xiangqi_core::move_to_uci(best_move);
                         output(&format!(
-                            "info string mcts playouts={} root_visits={} nodes={} root_value={:.4}",
-                            result.playouts, result.root_visits, result.nodes, result.root_value
+                            "info string mcts playouts={} root_visits={} nodes={} root_value={:.4} best_value={:.4}",
+                            result.playouts, result.root_visits, result.nodes, result.root_value, result.best_value
                         ));
                         output(&format!("bestmove {best_uci}"));
                     } else {
@@ -687,11 +673,26 @@ mod tests {
     }
 
     #[test]
+    fn uci_info_line_prefers_mate_over_cp() {
+        let line = uci_info_line(0.25, Some(3), 6, 8, 64, 128, 50, &[]);
+        assert!(line.contains("score mate 3"));
+        assert!(!line.contains("score cp"));
+    }
+
+    #[test]
     fn go_nodes_maps_to_node_budget() {
         let engine = Engine::new();
         let budget = engine.budget_from_go(&parse_go("nodes 1234")).expect("budget");
         assert_eq!(budget.max_nodes, Some(1234));
         assert!(budget.max_playouts.is_none());
+    }
+
+    #[test]
+    fn mcts_playouts_updates_playouts_budget() {
+        let mut engine = Engine::new();
+        engine.handle_line("setoption name MctsPlayouts value 512");
+        let budget = engine.budget_from_go(&parse_go("")).expect("budget");
+        assert_eq!(budget.max_playouts, Some(512));
     }
 
     #[test]
@@ -705,15 +706,24 @@ mod tests {
 
     #[test]
     fn uci_dialog_smoke() {
-        let input = b"uci\nsetoption name Playouts value 64\nisready\nposition startpos\ngo nodes 1\nquit\n";
+        let input = b"uci\nsetoption name MctsPlayouts value 64\nisready\nposition startpos\ngo nodes 1\nquit\n";
         let mut out = Vec::new();
         run_uci_for_test(Cursor::new(&input[..]), &mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("uciok"));
         assert!(s.contains("readyok"));
         assert!(s.contains("bestmove"));
-        assert!(s.contains("Playouts"));
-        assert!(s.contains("Visits"));
+        assert!(s.contains("MctsPlayouts"));
+        assert!(s.contains("MctsCpuct"));
+        assert!(s.contains("MctsFpuReduction"));
+        assert!(s.contains("MctsBatchCap"));
+        assert!(s.contains("MctsWorkers"));
+        assert!(!s.contains("option name Playouts "));
+        assert!(!s.contains("option name Visits "));
+        assert!(!s.contains("option name Cpuct "));
+        assert!(!s.contains("option name FpuReduction "));
+        assert!(!s.contains("option name SearchBatchSize "));
+        assert!(!s.contains("option name Threads "));
     }
 
     #[test]
@@ -756,6 +766,7 @@ mod tests {
             }) as EngineOutput
         };
         let mut engine = Engine::new_with_output(sink);
+        engine.handle_line("setoption name MctsWorkers value 1");
         engine.handle_line("position startpos");
         engine.handle_line("go infinite");
         std::thread::sleep(UCI_INFO_INTERVAL + Duration::from_millis(50));
@@ -777,6 +788,7 @@ mod tests {
             }) as EngineOutput
         };
         let mut engine = Engine::new_with_output(sink);
+        engine.handle_line("setoption name MctsWorkers value 1");
         engine.handle_line("position startpos");
         engine.handle_line("go infinite");
         std::thread::sleep(Duration::from_millis(50));
@@ -784,7 +796,7 @@ mod tests {
         engine.handle_line("position startpos moves h2e2");
         engine.handle_line("setoption name MultiPV value 2");
         engine.handle_line("go nodes 16");
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(200));
         engine.stop_and_join();
 
         let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
@@ -804,7 +816,7 @@ mod tests {
         let mut engine = Engine::new_with_output(sink);
         engine.policy = None;
         engine.rebuild_search_engine();
-        engine.handle_line("setoption name Threads value 2");
+        engine.handle_line("setoption name MctsWorkers value 2");
         engine.handle_line("position startpos");
         engine.handle_line("go nodes 16");
         std::thread::sleep(Duration::from_millis(150));
@@ -816,10 +828,10 @@ mod tests {
     }
 
     #[test]
-    fn threads_zero_is_accepted_as_auto() {
+    fn mcts_workers_rejects_zero_and_keeps_default() {
         let mut engine = Engine::new();
-        engine.handle_line("setoption name Threads value 0");
-        assert_eq!(engine.threads, 0);
-        assert!(engine.resolved_threads() >= 1);
+        assert_eq!(engine.threads, DEFAULT_THREADS);
+        engine.handle_line("setoption name MctsWorkers value 0");
+        assert_eq!(engine.threads, DEFAULT_THREADS);
     }
 }

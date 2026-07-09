@@ -10,7 +10,7 @@ use crate::policy_onnx::{PolicyOnnx, PolicySessionPool};
 use crate::px0_policy::px0_policy_index;
 
 pub type SharedPolicy = Option<Arc<PolicySessionPool>>;
-pub(crate) type SharedEvalCache = Arc<Mutex<HashMap<u64, CachedEval>>>;
+pub(crate) type SharedEvalCache = Arc<EvalCache>;
 
 trait TaskLike {
     fn position(&self) -> &Position;
@@ -109,12 +109,50 @@ pub(crate) struct CachedEval {
     value: f32,
 }
 
+pub(crate) struct EvalCache {
+    shards: Vec<Mutex<HashMap<u64, CachedEval>>>,
+}
+
+impl EvalCache {
+    fn new(shards: usize) -> Self {
+        let shard_count = shards.max(1).next_power_of_two();
+        let mut maps = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            maps.push(Mutex::new(HashMap::new()));
+        }
+        Self { shards: maps }
+    }
+
+    fn shard_index(&self, key: u64) -> usize {
+        (key as usize) & (self.shards.len() - 1)
+    }
+
+    fn get(&self, key: u64) -> Option<CachedEval> {
+        let shard = self.shards[self.shard_index(key)].lock().ok()?;
+        shard.get(&key).cloned()
+    }
+
+    fn insert(&self, key: u64, value: CachedEval) {
+        if let Ok(mut shard) = self.shards[self.shard_index(key)].lock() {
+            shard.insert(key, value);
+        }
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            if let Ok(mut map) = shard.lock() {
+                map.clear();
+            }
+        }
+    }
+}
+
 impl OnnxPolicyValueEval {
     pub fn new(policy: SharedPolicy) -> Self {
         Self {
             session: policy.as_ref().map(|pool| pool.primary()),
             policy,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(EvalCache::new(16)),
             scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
             scratch_batch: ndarray::Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
         }
@@ -149,9 +187,7 @@ impl OnnxPolicyValueEval {
     }
 
     pub fn clear_cache(&mut self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.clear();
-        }
+        self.cache.clear();
     }
 
     fn evaluate_many_impl<T: TaskLike>(&mut self, tasks: &[T]) -> Result<Vec<PolicyValueOutput>, String> {
@@ -167,14 +203,11 @@ impl OnnxPolicyValueEval {
 
         let mut outputs = vec![PolicyValueOutput::default(); tasks.len()];
         let mut misses = Vec::new();
-        {
-            let cache = self.cache.lock().map_err(|_| "eval cache 锁中毒".to_string())?;
-            for (idx, task) in tasks.iter().enumerate() {
-                if let Some(cached) = cache.get(&task.history().input_cache_key()) {
-                    outputs[idx] = output_from_cached(cached, task.position(), task.legal_moves());
-                } else {
-                    misses.push(idx);
-                }
+        for (idx, task) in tasks.iter().enumerate() {
+            if let Some(cached) = self.cache.get(task.history().input_cache_key()) {
+                outputs[idx] = output_from_cached(&cached, task.position(), task.legal_moves());
+            } else {
+                misses.push(idx);
             }
         }
         if misses.is_empty() {
@@ -197,7 +230,10 @@ impl OnnxPolicyValueEval {
             miss_to_unique.push(slot);
         }
 
-        let history_refs = unique_misses.iter().map(|&idx| tasks[idx].history()).collect::<Vec<_>>();
+        let history_refs = unique_misses
+            .iter()
+            .map(|&idx| tasks[idx].history())
+            .collect::<Vec<_>>();
         crate::fen_tensor::histories_to_planes_into(&history_refs, &mut self.scratch_batch)
             .map_err(|e| e.to_string())?;
         let mut net = session.lock().map_err(|_| "policy 锁中毒".to_string())?;
@@ -210,7 +246,6 @@ impl OnnxPolicyValueEval {
             ));
         }
 
-        let mut cache = self.cache.lock().map_err(|_| "eval cache 锁中毒".to_string())?;
         let mut unique_cached = Vec::with_capacity(unique_misses.len());
         for (slot, &task_idx) in unique_misses.iter().enumerate() {
             let cached = CachedEval {
@@ -222,7 +257,8 @@ impl OnnxPolicyValueEval {
                     .map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0))
                     .unwrap_or(0.0),
             };
-            cache.insert(tasks[task_idx].history().input_cache_key(), cached.clone());
+            self.cache
+                .insert(tasks[task_idx].history().input_cache_key(), cached.clone());
             unique_cached.push(cached);
         }
 
@@ -237,7 +273,10 @@ impl OnnxPolicyValueEval {
         Ok(outputs)
     }
 
-    pub(crate) fn evaluate_many_shared(&mut self, tasks: &[Arc<PolicyValueTask>]) -> Result<Vec<PolicyValueOutput>, String> {
+    pub(crate) fn evaluate_many_shared(
+        &mut self,
+        tasks: &[Arc<PolicyValueTask>],
+    ) -> Result<Vec<PolicyValueOutput>, String> {
         self.evaluate_many_impl(tasks)
     }
 }
@@ -250,13 +289,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
             return Ok(uniform_output(input.legal_moves.len()));
         };
         let state_key = input.history.input_cache_key();
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .map_err(|_| "eval cache 锁中毒".to_string())?
-            .get(&state_key)
-            .cloned()
-        {
+        if let Some(cached) = self.cache.get(state_key) {
             return Ok(output_from_cached(&cached, &input.position, input.legal_moves));
         }
 
@@ -272,10 +305,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
             }
         };
         let out = output_from_cached(&cached, &input.position, input.legal_moves);
-        self.cache
-            .lock()
-            .map_err(|_| "eval cache 锁中毒".to_string())?
-            .insert(state_key, cached);
+        self.cache.insert(state_key, cached);
         Ok(out)
     }
 

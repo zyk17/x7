@@ -35,9 +35,9 @@
 - [x] 对齐 `xiangqi_core` perft / 合法着到 `pyffish`
 - [x] 补 `rules_regression` 基础回归
 - [x] root tree reuse 从“单步”扩到“连续追加历史”
-- [x] 接上最小 `Threads` shared-tree 搜索
+- [x] 接上最小 `MctsWorkers` shared-tree 搜索
 - [ ] 用自家 GUI 做一次“真实 history”联调
-- [ ] 记录 `Threads=1/2/4` 与 `SearchBatchSize=16/32/64` 的固定对照结果
+- [ ] 记录 `MctsWorkers=1/2/4/8` 与 `MctsBatchCap` 对照结果
 - [ ] 继续检查 `pv / seldepth / nps` 是否和行为一致
 - [ ] 检查 repetition / terminal 处理是否还有边界问题
 

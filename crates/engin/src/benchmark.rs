@@ -101,6 +101,8 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                 "fen": fen,
                 "bestmove": result.best_move.map(xiangqi_core::move_to_uci),
                 "root_value": result.root_value,
+                "best_value": result.best_value,
+                "best_mate": result.best_mate,
                 "playouts": result.playouts,
                 "root_visits": result.root_visits,
                 "nodes": result.nodes,

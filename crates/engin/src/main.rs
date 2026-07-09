@@ -76,7 +76,7 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
             }
             "--search-batch-size" if i + 1 < rest.len() => {
                 if let Ok(n) = rest[i + 1].parse::<usize>() {
-                    config.search_batch_size = n.clamp(1, 64);
+                    config.search_batch_size = n.clamp(1, 8192);
                 }
                 i += 2;
             }

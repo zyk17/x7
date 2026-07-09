@@ -193,7 +193,7 @@ cargo run --release -p engin -- --bench --playouts 64 --onnx data\policy.onnx --
 
 固定搜索对照建议直接这样跑：
 
-`SearchBatchSize=16`
+`MctsBatchCap=16`
 
 ```powershell
 cargo run --release -p engin -- --bench `
@@ -203,7 +203,7 @@ cargo run --release -p engin -- --bench `
   --search-batch-size 16
 ```
 
-`SearchBatchSize=32`
+`MctsBatchCap=32`
 
 ```powershell
 cargo run --release -p engin -- --bench `
@@ -213,7 +213,7 @@ cargo run --release -p engin -- --bench `
   --search-batch-size 32
 ```
 
-`SearchBatchSize=64`
+`MctsBatchCap=64`
 
 ```powershell
 cargo run --release -p engin -- --bench `
@@ -260,6 +260,24 @@ quit
 ```powershell
 cargo run --release -p engin
 ```
+
+当前主 UCI 公开选项建议只关注：
+
+- `PolicyFile`
+- `MctsPlayouts`
+- `MctsCpuct`
+- `MctsFpuReduction`
+- `MctsBatchCap`
+- `MctsWorkers`
+
+说明：
+
+- 不再兼容 `Playouts / Visits / Cpuct / FpuReduction / SearchBatchSize / Threads`
+- 当前默认 `MctsWorkers=8`
+- 默认 `MctsBatchCap=2048`
+- `MctsBatchCap` 是 batch 上限，不是固定目标值
+- 搜索过程中的 `info string root_moves_top5` 现在格式为 `move:visits:q:prior`
+- 目前建议优先测试的 `MctsBatchCap` 档位是 `64 / 128 / 256 / 512 / 1024 / 2048 / 4096 / 8192`
 
 ## 14. 质量检查
 

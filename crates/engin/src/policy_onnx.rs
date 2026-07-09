@@ -56,8 +56,8 @@ impl PolicyOnnx {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         let provider_mode = ProviderMode::from_env();
-        let intra_threads = ort_intra_threads();
-        let inter_threads = ort_inter_threads();
+        let intra_threads = ort_intra_threads(provider_mode);
+        let inter_threads = ort_inter_threads(provider_mode);
         let mut builder = Session::builder()?
             .with_parallel_execution(inter_threads > 1)?
             .with_intra_threads(intra_threads)?
@@ -223,10 +223,7 @@ impl PolicySessionPool {
 
     pub fn provider_chain(&self) -> &'static str {
         let session = self.primary();
-        let chain = session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .provider_chain();
+        let chain = session.lock().unwrap_or_else(|e| e.into_inner()).provider_chain();
         chain
     }
 
@@ -253,29 +250,35 @@ fn cpu_provider() -> ort::execution_providers::ExecutionProviderDispatch {
     ep::CPU::default().with_arena_allocator(true).build()
 }
 
-fn ort_intra_threads() -> usize {
+fn ort_intra_threads(provider_mode: ProviderMode) -> usize {
     std::env::var("ENGIN_ORT_INTRA_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(default_ort_intra_threads)
+        .unwrap_or_else(|| default_ort_intra_threads(provider_mode))
 }
 
-fn ort_inter_threads() -> usize {
+fn ort_inter_threads(provider_mode: ProviderMode) -> usize {
     std::env::var("ENGIN_ORT_INTER_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(default_ort_inter_threads)
+        .unwrap_or_else(|| default_ort_inter_threads(provider_mode))
 }
 
-fn default_ort_intra_threads() -> usize {
+fn default_ort_intra_threads(provider_mode: ProviderMode) -> usize {
+    if provider_mode.prefers_gpu() {
+        return 1;
+    }
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(1, 8))
         .unwrap_or(4)
 }
 
-fn default_ort_inter_threads() -> usize {
+fn default_ort_inter_threads(provider_mode: ProviderMode) -> usize {
+    if provider_mode.prefers_gpu() {
+        return 1;
+    }
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(1, 4))
         .unwrap_or(2)
@@ -319,14 +322,18 @@ impl ProviderMode {
             Self::CpuOnly => "CPU",
         }
     }
+
+    fn prefers_gpu(self) -> bool {
+        !matches!(self, Self::CpuOnly)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PositionHistory;
     use ndarray::s;
     use std::path::PathBuf;
-    use crate::PositionHistory;
     use xiangqi_core::uci_to_move;
 
     fn candidate_onnx_paths() -> [PathBuf; 2] {
