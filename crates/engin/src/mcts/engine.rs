@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -23,9 +23,12 @@ const MAX_WORKER_PIPELINE_DEPTH: usize = 4;
 const MAX_PARALLEL_GATHER_CHUNK: usize = 128;
 const STOPPED_EVAL: &str = "__stopped__";
 const BACKEND_IDLING_MIN_WORK: usize = 64;
+const PENDING_POLL_WAIT: Duration = Duration::from_millis(1);
 const PREFETCH_BATCH_CAP: usize = 32;
 const PREFETCH_ROOT_CANDIDATES: usize = 4;
 const PREFETCH_CHILD_CANDIDATES: usize = 4;
+const ROOT_SPREAD_VISITS: f32 = 64.0;
+const ROOT_INFLIGHT_SPREAD_FACTOR: f32 = 4.0;
 
 /// MCTS 单次搜索结果。
 #[derive(Clone, Debug)]
@@ -440,7 +443,7 @@ impl MctsEngine<OnnxPolicyValueEval> {
             if policy_uses_gpu(policy_pool) {
                 1
             } else {
-                thread_count.min(MAX_EVAL_CONSUMERS).max(1)
+                thread_count.clamp(1, MAX_EVAL_CONSUMERS)
             }
         } else {
             1
@@ -500,12 +503,16 @@ impl MctsEngine<OnnxPolicyValueEval> {
                             Ok(outputs) => {
                                 debug_assert_eq!(outputs.len(), requests.iter().map(|req| req.tasks.len()).sum::<usize>());
                                 let mut outputs = outputs.into_iter();
-                                for (request, apply_len) in requests.into_iter().zip(request_apply_lens.into_iter()) {
+                                for (request, apply_len) in requests.into_iter().zip(request_apply_lens) {
+                                    coordinator.release_eval_keys(&request.eval_keys);
                                     let request_outputs = outputs.by_ref().take(request.tasks.len()).collect::<Vec<_>>();
                                     request.complete(Ok(request_outputs.into_iter().take(apply_len).collect()));
                                 }
                             }
                             Err(err) => {
+                                for request in &requests {
+                                    coordinator.release_eval_keys(&request.eval_keys);
+                                }
                                 if err != STOPPED_EVAL {
                                     *first_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.clone());
                                     stop.store(true, Ordering::SeqCst);
@@ -542,22 +549,9 @@ impl MctsEngine<OnnxPolicyValueEval> {
                         if stop.load(Ordering::SeqCst) {
                             break;
                         }
-                        let queued_work = pending.iter().map(|entry| entry.request.tasks.len()).sum::<usize>();
-                        if !pending.is_empty() && coordinator.should_yield_gather(queued_work, thread_count) {
-                            let mut completed = collect_ready_evals(&mut pending);
-                            if completed.is_empty() {
-                                let Some(next_eval) = pending.pop_front() else {
-                                    break;
-                                };
-                                let Some(result) = next_eval.request.wait_result_until_stop(&stop) else {
-                                    pending.push_front(next_eval);
-                                    cancel_pending_evals(&mut pending, tree, &reserved_playouts);
-                                    break;
-                                };
-                                completed.push((next_eval, result));
-                                completed.extend(collect_ready_evals(&mut pending));
-                            }
-                            if !apply_completed_batch(
+                        let completed = collect_ready_evals(&mut pending);
+                        if !completed.is_empty() {
+                            if !apply_completed_evals(
                                 completed,
                                 &first_error,
                                 &stop,
@@ -569,13 +563,32 @@ impl MctsEngine<OnnxPolicyValueEval> {
                             }
                             continue;
                         }
+                        let queued_work = pending.iter().map(|entry| entry.request.tasks.len()).sum::<usize>();
+                        if !pending.is_empty() && coordinator.should_yield_gather(queued_work, thread_count) {
+                            match collect_or_wait_pending_evals(&mut pending, &stop, tree, &reserved_playouts) {
+                                PendingWait::Completed(completed) => {
+                                    if !apply_completed_evals(
+                                        completed,
+                                        &first_error,
+                                        &stop,
+                                        tree,
+                                        &reserved_playouts,
+                                        &playouts,
+                                    ) {
+                                        break;
+                                    }
+                                }
+                                PendingWait::Stop | PendingWait::Empty => break,
+                            }
+                            continue;
+                        }
                         if pending.len() < worker_pipeline_depth && !stop.load(Ordering::SeqCst) {
                             let maybe_iteration = {
                                 let started_playouts = playouts
                                     .load(Ordering::Relaxed)
                                     .saturating_add(reserved_playouts.load(Ordering::Relaxed));
                                 let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
-                                let tree_ref: &mut MctsTree = &mut **guard;
+                                let tree_ref: &mut MctsTree = &mut guard;
                                 if budget_exhausted(&budget, started_playouts, tree_ref.len()) {
                                     None
                                 } else {
@@ -617,45 +630,47 @@ impl MctsEngine<OnnxPolicyValueEval> {
                                     seldepth.fetch_max(fast_iteration.seldepth, Ordering::Relaxed);
                                     playouts.fetch_add(fast_playouts, Ordering::Relaxed);
                                     let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
-                                    let tree_ref: &mut MctsTree = &mut **guard;
+                                    let tree_ref: &mut MctsTree = &mut guard;
                                     apply_iteration_outputs_with(tree_ref, fast_iteration, &fast_outputs);
                                 }
 
                                 if let Some(iteration) = slow_iteration {
+                                    let (iteration, mut tasks, eval_keys) =
+                                        reserve_iteration_eval_tasks(iteration, &coordinator, tree);
+                                    if iteration.playouts == 0 {
+                                        continue;
+                                    }
                                     let iter_playouts = iteration.playouts;
                                     seldepth.fetch_max(iteration.seldepth, Ordering::Relaxed);
-                                    let mut tasks = iteration
-                                        .pending
+                                    let mut seen_keys = tasks
                                         .iter()
-                                        .filter_map(|entry| match &entry.kind {
-                                            PendingKind::Expand { task } => Some(Arc::clone(task)),
-                                            _ => None,
-                                        })
-                                        .collect::<Vec<_>>();
+                                        .map(|task| task.history.input_cache_key())
+                                        .collect::<HashSet<_>>();
                                     let apply_len = tasks.len();
                                     if apply_len > 0 && apply_len < PREFETCH_BATCH_CAP {
                                         let prefetch_budget = PREFETCH_BATCH_CAP.saturating_sub(apply_len);
                                         if prefetch_budget > 0 {
-                                            let prefetch = {
+                                            let prefetch_candidates = {
                                                 let guard = tree.lock().unwrap_or_else(|e| e.into_inner());
                                                 let tree_ref: &MctsTree = &guard;
-                                                collect_prefetch_tasks_with(
-                                                    tree_ref,
-                                                    root_id,
-                                                    &root_history,
-                                                    &shared_cache,
-                                                    prefetch_budget,
-                                                )
+                                                collect_prefetch_candidates_with(tree_ref, root_id)
                                             };
+                                            let prefetch = collect_prefetch_tasks_with(
+                                                &prefetch_candidates,
+                                                &root_history,
+                                                &shared_cache,
+                                                &mut seen_keys,
+                                                prefetch_budget,
+                                            );
                                             tasks.extend(prefetch);
                                         }
                                     }
                                     let request = if tasks.is_empty() {
-                                        let request = EvalRequest::new(Vec::new(), 0);
+                                        let request = EvalRequest::new(Vec::new(), 0, Vec::new());
                                         request.complete(Ok(Vec::new()));
                                         request
                                     } else {
-                                        let request = EvalRequest::new(tasks, apply_len);
+                                        let request = EvalRequest::new(tasks, apply_len, eval_keys);
                                         coordinator.submit(Arc::clone(&request));
                                         request
                                     };
@@ -666,27 +681,44 @@ impl MctsEngine<OnnxPolicyValueEval> {
                                         playouts: iter_playouts,
                                     });
                                 }
-                                if pending.len() < worker_pipeline_depth && !stop.load(Ordering::SeqCst) {
-                                    continue;
+                                if !stop.load(Ordering::SeqCst) {
+                                    if coordinator.should_poll_pending(pending.len(), worker_pipeline_depth)
+                                        || (pending.is_empty() && coordinator.has_eval_activity())
+                                    {
+                                        thread::sleep(PENDING_POLL_WAIT);
+                                        continue;
+                                    }
+                                    if pending.len() < worker_pipeline_depth {
+                                        continue;
+                                    }
                                 }
                             }
                         }
 
-                        let mut completed = collect_ready_evals(&mut pending);
+                        let completed = collect_ready_evals(&mut pending);
                         if completed.is_empty() {
-                            let Some(next_eval) = pending.pop_front() else {
-                                break;
-                            };
-                            let Some(result) = next_eval.request.wait_result_until_stop(&stop) else {
-                                pending.push_front(next_eval);
-                                cancel_pending_evals(&mut pending, tree, &reserved_playouts);
-                                break;
-                            };
-                            completed.push((next_eval, result));
-                            completed.extend(collect_ready_evals(&mut pending));
-                        }
-
-                        if !apply_completed_batch(
+                            if coordinator.should_poll_pending(pending.len(), worker_pipeline_depth)
+                                && !stop.load(Ordering::SeqCst)
+                            {
+                                thread::sleep(PENDING_POLL_WAIT);
+                                continue;
+                            }
+                            match collect_or_wait_pending_evals(&mut pending, &stop, tree, &reserved_playouts) {
+                                PendingWait::Completed(completed) => {
+                                    if !apply_completed_evals(
+                                        completed,
+                                        &first_error,
+                                        &stop,
+                                        tree,
+                                        &reserved_playouts,
+                                        &playouts,
+                                    ) {
+                                        break;
+                                    }
+                                }
+                                PendingWait::Stop | PendingWait::Empty => break,
+                            }
+                        } else if !apply_completed_evals(
                             completed,
                             &first_error,
                             &stop,
@@ -836,7 +868,7 @@ fn gather_iteration_incremental_with(
     while iteration.pending.len() < batch_limit && iteration.playouts < playout_limit as u32 {
         let pending = {
             let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
-            let tree_ref: &mut MctsTree = &mut **guard;
+            let tree_ref: &mut MctsTree = &mut guard;
             if budget_exhausted(
                 budget,
                 base_playouts.saturating_add(iteration.playouts),
@@ -1042,25 +1074,67 @@ fn split_iteration_for_fast_path(
 }
 
 fn collect_prefetch_tasks_with(
-    tree: &MctsTree,
-    root_id: MctsNodeId,
+    candidates: &[PrefetchCandidate],
     root_history: &PositionHistory,
     cache: &super::policy_value::SharedEvalCache,
+    seen_keys: &mut HashSet<u64>,
     budget: usize,
 ) -> Vec<Arc<PolicyValueTask>> {
     if budget == 0 {
         return Vec::new();
     }
+
+    let mut tasks = Vec::new();
+    for candidate in candidates {
+        let mut child_history = root_history.clone_for_search();
+        let mut child_pos = root_history.current().clone_for_search();
+        child_pos.do_move(candidate.root_mv);
+        child_history.push_search_position(child_pos.clone_for_search());
+
+        let mut history = child_history.clone_for_search();
+        let mut pos = child_pos.clone_for_search();
+        pos.do_move(candidate.child_mv);
+        history.push_search_position(pos.clone_for_search());
+        let cache_key = history.input_cache_key();
+        if history.current_is_repeated()
+            || super::policy_value::cache_contains_history(cache, &history)
+            || !seen_keys.insert(cache_key)
+        {
+            continue;
+        }
+
+        let mut buf = [ExtMove {
+            mv: Move::none(),
+            value: 0,
+        }; MAX_MOVES];
+        let n = generate(&pos, GenType::Legal, &mut buf);
+        if n == 0 {
+            continue;
+        }
+        let legal_moves = buf[..n].iter().map(|entry| entry.mv).collect::<Vec<_>>();
+        tasks.push(Arc::new(PolicyValueTask {
+            position: pos,
+            history,
+            legal_moves,
+        }));
+        if tasks.len() >= budget {
+            return tasks;
+        }
+    }
+
+    tasks
+}
+
+fn collect_prefetch_candidates_with(tree: &MctsTree, root_id: MctsNodeId) -> Vec<PrefetchCandidate> {
     let Some(root) = tree.get(root_id) else {
         return Vec::new();
     };
 
-    let mut tasks = Vec::new();
+    let mut candidates = Vec::new();
     let mut root_edges = root
         .children
         .iter()
-        .enumerate()
-        .filter_map(|(idx, edge)| edge.child.map(|child| (idx, edge, child)))
+        .filter_map(|edge| edge.child.map(|child| (edge.mv, edge, child)))
         .collect::<Vec<_>>();
     root_edges.sort_by(|(_, lhs, _), (_, rhs, _)| {
         rhs.visits
@@ -1068,18 +1142,13 @@ fn collect_prefetch_tasks_with(
             .then_with(|| rhs.prior.partial_cmp(&lhs.prior).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    for (_, root_edge, child_id) in root_edges.into_iter().take(PREFETCH_ROOT_CANDIDATES) {
+    for (root_mv, _, child_id) in root_edges.into_iter().take(PREFETCH_ROOT_CANDIDATES) {
         let Some(child) = tree.get(child_id) else {
             continue;
         };
         if child.terminal_value.is_some() {
             continue;
         }
-
-        let mut child_history = root_history.clone_for_search();
-        let mut child_pos = root_history.current().clone_for_search();
-        child_pos.do_move(root_edge.mv);
-        child_history.push_search_position(child_pos.clone_for_search());
 
         let mut child_edges = child.children.iter().collect::<Vec<_>>();
         child_edges.sort_by(|lhs, rhs| {
@@ -1092,36 +1161,14 @@ fn collect_prefetch_tasks_with(
             if edge.child.is_some() || edge.expanding {
                 continue;
             }
-
-            let mut history = child_history.clone_for_search();
-            let mut pos = child_pos.clone_for_search();
-            pos.do_move(edge.mv);
-            history.push_search_position(pos.clone_for_search());
-            if history.current_is_repeated() || super::policy_value::cache_contains_history(cache, &history) {
-                continue;
-            }
-
-            let mut buf = [ExtMove {
-                mv: Move::none(),
-                value: 0,
-            }; MAX_MOVES];
-            let n = generate(&pos, GenType::Legal, &mut buf);
-            if n == 0 {
-                continue;
-            }
-            let legal_moves = buf[..n].iter().map(|entry| entry.mv).collect::<Vec<_>>();
-            tasks.push(Arc::new(PolicyValueTask {
-                position: pos,
-                history,
-                legal_moves,
-            }));
-            if tasks.len() >= budget {
-                return tasks;
-            }
+            candidates.push(PrefetchCandidate {
+                root_mv,
+                child_mv: edge.mv,
+            });
         }
     }
 
-    tasks
+    candidates
 }
 
 fn cancel_iteration_with(tree: &mut MctsTree, iteration: SearchIteration) {
@@ -1310,7 +1357,11 @@ fn pv_summary_from_tree(tree: &MctsTree, root_id: MctsNodeId) -> PvSummary {
         };
         ply += 1;
         if let Some(terminal_value) = tree.get(child_id).and_then(|child| child.terminal_value) {
-            let root_q = if ply % 2 == 0 { terminal_value } else { -terminal_value };
+            let root_q = if ply.is_multiple_of(2) {
+                terminal_value
+            } else {
+                -terminal_value
+            };
             if best_value.abs() >= 0.999 && root_q.signum() == best_value.signum() {
                 let mate_moves = ((ply as i32) + 1) / 2;
                 best_mate = Some(if root_q > 0.0 { mate_moves } else { -mate_moves });
@@ -1452,6 +1503,11 @@ fn select_edge(node: &MctsNode, config: MctsConfig, is_root: bool) -> usize {
     let mut best_idx = 0usize;
     let mut best_score = f32::NEG_INFINITY;
     let has_selectable_idle_edge = node.children.iter().any(|edge| edge.child.is_some() || !edge.expanding);
+    let root_spread_phase = if is_root && has_selectable_idle_edge {
+        ((ROOT_SPREAD_VISITS - parent_effective_visits).max(0.0) / ROOT_SPREAD_VISITS).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
 
     for (idx, edge) in node.children.iter().enumerate() {
         if has_selectable_idle_edge && edge.child.is_none() && edge.expanding {
@@ -1462,7 +1518,12 @@ fn select_edge(node: &MctsNode, config: MctsConfig, is_root: bool) -> usize {
         } else {
             edge.mean_q()
         };
-        let effective_visits = edge.visits.saturating_add(edge.in_flight) as f32;
+        let root_extra_inflight = if edge.in_flight > 0 {
+            (edge.in_flight as f32) * root_spread_phase * ROOT_INFLIGHT_SPREAD_FACTOR
+        } else {
+            0.0
+        };
+        let effective_visits = edge.visits as f32 + edge.in_flight as f32 + root_extra_inflight;
         let u = cpuct * edge.prior * sqrt_parent / (1.0 + effective_visits);
         let score = q + u;
         if score > best_score {
@@ -1506,6 +1567,12 @@ struct SearchIteration {
     pending: Vec<PendingNode>,
     playouts: u32,
     seldepth: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PrefetchCandidate {
+    root_mv: Move,
+    child_mv: Move,
 }
 
 #[derive(Default)]
@@ -1619,6 +1686,30 @@ mod tests {
     }
 
     #[test]
+    fn pending_poll_prefers_short_async_wait_over_hard_block() {
+        let coordinator = EvalCoordinator::new();
+        coordinator.active_consumers.fetch_add(1, Ordering::Relaxed);
+        assert!(coordinator.should_poll_pending(1, 4));
+        assert!(coordinator.should_poll_pending(3, 4));
+        assert!(!coordinator.should_poll_pending(4, 4));
+        coordinator.active_consumers.fetch_sub(1, Ordering::Relaxed);
+        assert!(!coordinator.should_poll_pending(1, 4));
+        coordinator.queued_tasks.fetch_add(8, Ordering::Relaxed);
+        assert!(coordinator.should_poll_pending(1, 4));
+    }
+
+    #[test]
+    fn eval_activity_is_visible_even_without_local_pending() {
+        let coordinator = EvalCoordinator::new();
+        assert!(!coordinator.has_eval_activity());
+        coordinator.queued_tasks.fetch_add(1, Ordering::Relaxed);
+        assert!(coordinator.has_eval_activity());
+        coordinator.queued_tasks.fetch_sub(1, Ordering::Relaxed);
+        coordinator.active_consumers.fetch_add(1, Ordering::Relaxed);
+        assert!(coordinator.has_eval_activity());
+    }
+
+    #[test]
     fn parallel_gather_limit_keeps_worker_chunks_small() {
         assert_eq!(parallel_gather_limit(32, 8), 4);
         assert_eq!(parallel_gather_limit(256, 8), 32);
@@ -1664,6 +1755,38 @@ mod tests {
             child: None,
         });
         assert_eq!(select_edge(&node, MctsConfig::default(), true), 1);
+    }
+
+    #[test]
+    fn select_edge_spreads_root_early_when_top_edge_is_inflight() {
+        let mut node = MctsNode {
+            state_key: 1,
+            visits: 8,
+            value_sum: 0.0,
+            expanded: true,
+            terminal_value: None,
+            children: Vec::new(),
+        };
+        node.children.push(super::super::EdgeStats {
+            mv: Move::make(xiangqi_core::types::Square::SQ_A0, xiangqi_core::types::Square::SQ_A1),
+            prior: 0.9,
+            visits: 0,
+            in_flight: 1,
+            expanding: false,
+            value_sum: 0.0,
+            child: Some(MctsNodeId(1)),
+        });
+        node.children.push(super::super::EdgeStats {
+            mv: Move::make(xiangqi_core::types::Square::SQ_B0, xiangqi_core::types::Square::SQ_B1),
+            prior: 0.35,
+            visits: 0,
+            in_flight: 0,
+            expanding: false,
+            value_sum: 0.0,
+            child: Some(MctsNodeId(2)),
+        });
+        assert_eq!(select_edge(&node, MctsConfig::default(), true), 1);
+        assert_eq!(select_edge(&node, MctsConfig::default(), false), 0);
     }
 
     #[test]
@@ -1928,6 +2051,63 @@ mod tests {
             )
             .expect("search ok");
         assert!(result.best_move.is_some());
+    }
+
+    #[test]
+    fn apply_completed_batch_rolls_back_all_reserved_playouts_on_error() {
+        let mut engine = MctsEngine::new(MctsConfig::default(), StubEval);
+        let history = PositionHistory::new_startpos();
+        let root_id = engine.initialize_root(&history).expect("init ok").expect("root");
+        let iteration = engine.gather_iteration(root_id, &history, &MctsBudget::default(), 0, 4);
+        assert!(iteration.playouts > 0);
+
+        let reserved_playouts = Arc::new(AtomicU32::new(iteration.playouts + 7));
+        let playouts = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let first_error = Arc::new(Mutex::new(None));
+        let tree_ref = &mut engine.tree;
+        let tree = Mutex::new(tree_ref);
+
+        let request = EvalRequest::new(Vec::new(), 0, Vec::new());
+        let completed = vec![
+            (
+                PendingEval {
+                    iteration,
+                    request: Arc::clone(&request),
+                    playouts: 4,
+                },
+                Err("boom".to_string()),
+            ),
+            (
+                PendingEval {
+                    iteration: SearchIteration::default(),
+                    request,
+                    playouts: 7,
+                },
+                Ok(Vec::new()),
+            ),
+        ];
+
+        assert!(!apply_completed_batch(
+            completed,
+            &first_error,
+            &stop,
+            &tree,
+            &reserved_playouts,
+            &playouts,
+        ));
+
+        assert_eq!(reserved_playouts.load(Ordering::Relaxed), 0);
+        assert_eq!(playouts.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            first_error.lock().unwrap_or_else(|e| e.into_inner()).as_deref(),
+            Some("boom")
+        );
+        assert!(stop.load(Ordering::SeqCst));
+
+        let root = engine.tree.get(root_id).expect("root");
+        assert!(root.children.iter().all(|edge| edge.in_flight == 0));
+        assert!(root.children.iter().all(|edge| !edge.expanding));
     }
 
     #[test]
@@ -2266,15 +2446,17 @@ mod tests {
 struct EvalRequest {
     tasks: Vec<Arc<PolicyValueTask>>,
     apply_len: usize,
+    eval_keys: Vec<u64>,
     result: Mutex<Option<Result<Vec<PolicyValueOutput>, String>>>,
     ready: Condvar,
 }
 
 impl EvalRequest {
-    fn new(tasks: Vec<Arc<PolicyValueTask>>, apply_len: usize) -> Arc<Self> {
+    fn new(tasks: Vec<Arc<PolicyValueTask>>, apply_len: usize, eval_keys: Vec<u64>) -> Arc<Self> {
         Arc::new(Self {
             tasks,
             apply_len,
+            eval_keys,
             result: Mutex::new(None),
             ready: Condvar::new(),
         })
@@ -2328,12 +2510,19 @@ struct EvalCoordinator {
     wake: Condvar,
     queued_tasks: AtomicUsize,
     active_consumers: AtomicUsize,
+    in_flight_keys: Mutex<HashSet<u64>>,
 }
 
 struct PendingEval {
     iteration: SearchIteration,
     request: Arc<EvalRequest>,
     playouts: u32,
+}
+
+enum PendingWait {
+    Completed(Vec<(PendingEval, Result<Vec<PolicyValueOutput>, String>)>),
+    Stop,
+    Empty,
 }
 
 fn collect_ready_evals(
@@ -2353,6 +2542,87 @@ fn collect_ready_evals(
     completed
 }
 
+fn apply_completed_evals(
+    completed: Vec<(PendingEval, Result<Vec<PolicyValueOutput>, String>)>,
+    first_error: &Arc<Mutex<Option<String>>>,
+    stop: &Arc<AtomicBool>,
+    tree: &Mutex<&mut MctsTree>,
+    reserved_playouts: &Arc<AtomicU32>,
+    playouts: &Arc<AtomicU32>,
+) -> bool {
+    apply_completed_batch(
+        completed,
+        first_error,
+        stop,
+        tree,
+        reserved_playouts,
+        playouts,
+    )
+}
+
+fn collect_or_wait_pending_evals(
+    pending: &mut VecDeque<PendingEval>,
+    stop: &Arc<AtomicBool>,
+    tree: &Mutex<&mut MctsTree>,
+    reserved_playouts: &Arc<AtomicU32>,
+) -> PendingWait {
+    let mut completed = collect_ready_evals(pending);
+    if !completed.is_empty() {
+        return PendingWait::Completed(completed);
+    }
+
+    let Some(next_eval) = pending.pop_front() else {
+        return PendingWait::Empty;
+    };
+    let Some(result) = next_eval.request.wait_result_until_stop(stop) else {
+        pending.push_front(next_eval);
+        cancel_pending_evals(pending, tree, reserved_playouts);
+        return PendingWait::Stop;
+    };
+    completed.push((next_eval, result));
+    completed.extend(collect_ready_evals(pending));
+    PendingWait::Completed(completed)
+}
+
+fn reserve_iteration_eval_tasks(
+    iteration: SearchIteration,
+    coordinator: &EvalCoordinator,
+    tree: &Mutex<&mut MctsTree>,
+) -> (SearchIteration, Vec<Arc<PolicyValueTask>>, Vec<u64>) {
+    let mut kept = SearchIteration::default();
+    let mut tasks = Vec::new();
+    let mut eval_keys = Vec::new();
+    let mut local_keys = HashSet::new();
+    let mut dropped = Vec::new();
+
+    for pending in iteration.pending {
+        if let PendingKind::Expand { task } = &pending.kind {
+            let key = task.history.input_cache_key();
+            if local_keys.insert(key) {
+                if !coordinator.try_reserve_eval_key(key) {
+                    dropped.push(pending);
+                    continue;
+                }
+                eval_keys.push(key);
+            }
+            tasks.push(Arc::clone(task));
+        }
+        kept.seldepth = kept.seldepth.max(pending.path.len() as u32);
+        kept.playouts = kept.playouts.saturating_add(pending.multivisit);
+        kept.pending.push(pending);
+    }
+
+    if !dropped.is_empty() {
+        let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
+        let tree_ref: &mut MctsTree = &mut guard;
+        for pending in dropped {
+            cancel_pending_with(tree_ref, &pending);
+        }
+    }
+
+    (kept, tasks, eval_keys)
+}
+
 fn cancel_pending_evals(
     pending: &mut VecDeque<PendingEval>,
     tree: &Mutex<&mut MctsTree>,
@@ -2364,7 +2634,7 @@ fn cancel_pending_evals(
     let canceled_playouts = pending.iter().map(|entry| entry.playouts).sum::<u32>();
     reserved_playouts.fetch_sub(canceled_playouts, Ordering::Relaxed);
     let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
-    let tree_ref: &mut MctsTree = &mut **guard;
+    let tree_ref: &mut MctsTree = &mut guard;
     while let Some(next_eval) = pending.pop_front() {
         cancel_iteration_with(tree_ref, next_eval.iteration);
     }
@@ -2402,34 +2672,31 @@ fn apply_completed_batch(
         return true;
     }
 
-    let applied_playouts = completed
+    let total_playouts = completed
         .iter()
         .map(|(pending_eval, _)| pending_eval.playouts)
         .sum::<u32>();
-    for (pending_eval, result) in &completed {
-        if let Err(err) = result {
-            reserved_playouts.fetch_sub(pending_eval.playouts, Ordering::Relaxed);
-            if err == STOPPED_EVAL {
-                let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
-                let tree_ref: &mut MctsTree = &mut **guard;
-                for (pending_eval, _) in completed {
-                    cancel_iteration_with(tree_ref, pending_eval.iteration);
-                }
-                return false;
-            }
-            *first_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.clone());
-            stop.store(true, Ordering::SeqCst);
-            return false;
+    if let Some(err) = completed.iter().find_map(|(_, result)| result.as_ref().err().cloned()) {
+        reserved_playouts.fetch_sub(total_playouts, Ordering::Relaxed);
+        let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
+        let tree_ref: &mut MctsTree = &mut guard;
+        for (pending_eval, _) in completed {
+            cancel_iteration_with(tree_ref, pending_eval.iteration);
         }
+        if err != STOPPED_EVAL {
+            *first_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
+            stop.store(true, Ordering::SeqCst);
+        }
+        return false;
     }
 
-    reserved_playouts.fetch_sub(applied_playouts, Ordering::Relaxed);
-    playouts.fetch_add(applied_playouts, Ordering::Relaxed);
+    reserved_playouts.fetch_sub(total_playouts, Ordering::Relaxed);
+    playouts.fetch_add(total_playouts, Ordering::Relaxed);
 
+    let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
+    let tree_ref: &mut MctsTree = &mut guard;
     for (pending_eval, result) in completed {
         let outputs = result.as_ref().expect("errors handled above");
-        let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
-        let tree_ref: &mut MctsTree = &mut **guard;
         apply_iteration_outputs_with(tree_ref, pending_eval.iteration, outputs);
     }
     true
@@ -2442,6 +2709,7 @@ impl EvalCoordinator {
             wake: Condvar::new(),
             queued_tasks: AtomicUsize::new(0),
             active_consumers: AtomicUsize::new(0),
+            in_flight_keys: Mutex::new(HashSet::new()),
         })
     }
 
@@ -2517,6 +2785,32 @@ impl EvalCoordinator {
             && self.queued_tasks.load(Ordering::Relaxed) >= queued_work
             && threads > 1
     }
+
+    fn should_poll_pending(&self, pending_requests: usize, pipeline_depth: usize) -> bool {
+        pending_requests > 0
+            && pending_requests < pipeline_depth.max(1)
+            && (self.active_consumers.load(Ordering::Relaxed) > 0
+                || self.queued_tasks.load(Ordering::Relaxed) > 0)
+    }
+
+    fn has_eval_activity(&self) -> bool {
+        self.active_consumers.load(Ordering::Relaxed) > 0 || self.queued_tasks.load(Ordering::Relaxed) > 0
+    }
+
+    fn try_reserve_eval_key(&self, key: u64) -> bool {
+        let mut keys = self.in_flight_keys.lock().unwrap_or_else(|e| e.into_inner());
+        keys.insert(key)
+    }
+
+    fn release_eval_keys(&self, keys: &[u64]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut in_flight = self.in_flight_keys.lock().unwrap_or_else(|e| e.into_inner());
+        for &key in keys {
+            in_flight.remove(&key);
+        }
+    }
 }
 
 fn dynamic_eval_target(batch_cap: usize, threads: usize) -> usize {
@@ -2554,7 +2848,7 @@ fn parallel_gather_limit(batch_limit: usize, threads: usize) -> usize {
 fn eval_chunk_limit(batch_cap: usize, threads: usize, uses_gpu: bool) -> usize {
     let target = dynamic_eval_target(batch_cap, threads);
     if uses_gpu {
-        target.min(32).max(1)
+        target.clamp(1, 32)
     } else {
         target.max(1)
     }

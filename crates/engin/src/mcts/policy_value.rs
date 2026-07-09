@@ -290,7 +290,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
         };
         let state_key = input.history.input_cache_key();
         if let Some(cached) = self.cache.get(state_key) {
-            return Ok(output_from_cached(&cached, &input.position, input.legal_moves));
+            return Ok(output_from_cached(&cached, input.position, input.legal_moves));
         }
 
         crate::fen_tensor::history_to_planes_into(input.history, &mut self.scratch_board).map_err(|e| e.to_string())?;
@@ -304,7 +304,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
                 value: out.wdl.map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0)).unwrap_or(0.0),
             }
         };
-        let out = output_from_cached(&cached, &input.position, input.legal_moves);
+        let out = output_from_cached(&cached, input.position, input.legal_moves);
         self.cache.insert(state_key, cached);
         Ok(out)
     }

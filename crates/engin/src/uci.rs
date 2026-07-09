@@ -28,7 +28,7 @@ fn q_to_cp(q: f32) -> i32 {
     (90.0 * (1.5637541897 * wl).tan()).round() as i32
 }
 
-fn uci_info_line(
+struct UciInfoView<'a> {
     best_value: f32,
     best_mate: Option<i32>,
     depth: u32,
@@ -36,8 +36,20 @@ fn uci_info_line(
     playouts: u32,
     nodes: usize,
     elapsed_ms: u64,
-    pv: &[xiangqi_core::Move],
-) -> String {
+    pv: &'a [xiangqi_core::Move],
+}
+
+fn uci_info_line(view: UciInfoView<'_>) -> String {
+    let UciInfoView {
+        best_value,
+        best_mate,
+        depth,
+        seldepth,
+        playouts,
+        nodes,
+        elapsed_ms,
+        pv,
+    } = view;
     let nps = if elapsed_ms > 0 {
         (playouts as u128 * 1000 / u128::from(elapsed_ms)) as u64
     } else {
@@ -90,16 +102,16 @@ fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsS
     if progress.playouts == 0 {
         return;
     }
-    output(&uci_info_line(
-        progress.best_value,
-        progress.best_mate,
-        progress.depth,
-        progress.seldepth,
-        progress.playouts,
-        progress.nodes,
+    output(&uci_info_line(UciInfoView {
+        best_value: progress.best_value,
+        best_mate: progress.best_mate,
+        depth: progress.depth,
+        seldepth: progress.seldepth,
+        playouts: progress.playouts,
+        nodes: progress.nodes,
         elapsed_ms,
-        &progress.pv,
-    ));
+        pv: &progress.pv,
+    }));
     if let Some(best_move) = progress.best_move {
         let best_uci = xiangqi_core::move_to_uci(best_move);
         output(&format!(
@@ -492,16 +504,16 @@ impl Engine {
             match search_result {
                 Ok(result) => {
                     let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                    output(&uci_info_line(
-                        result.best_value,
-                        result.best_mate,
-                        result.depth,
-                        result.seldepth,
-                        result.playouts,
-                        result.nodes,
+                    output(&uci_info_line(UciInfoView {
+                        best_value: result.best_value,
+                        best_mate: result.best_mate,
+                        depth: result.depth,
+                        seldepth: result.seldepth,
+                        playouts: result.playouts,
+                        nodes: result.nodes,
                         elapsed_ms,
-                        &result.pv,
-                    ));
+                        pv: &result.pv,
+                    }));
                     if !result.moves.is_empty() {
                         output(&uci_root_moves_line(&result.moves));
                     }
@@ -674,7 +686,16 @@ mod tests {
 
     #[test]
     fn uci_info_line_prefers_mate_over_cp() {
-        let line = uci_info_line(0.25, Some(3), 6, 8, 64, 128, 50, &[]);
+        let line = uci_info_line(UciInfoView {
+            best_value: 0.25,
+            best_mate: Some(3),
+            depth: 6,
+            seldepth: 8,
+            playouts: 64,
+            nodes: 128,
+            elapsed_ms: 50,
+            pv: &[],
+        });
         assert!(line.contains("score mate 3"));
         assert!(!line.contains("score cp"));
     }
