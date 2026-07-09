@@ -22,6 +22,10 @@ const MAX_EVAL_CONSUMERS: usize = 8;
 const MAX_WORKER_PIPELINE_DEPTH: usize = 4;
 const MAX_PARALLEL_GATHER_CHUNK: usize = 128;
 const STOPPED_EVAL: &str = "__stopped__";
+const BACKEND_IDLING_MIN_WORK: usize = 64;
+const PREFETCH_BATCH_CAP: usize = 32;
+const PREFETCH_ROOT_CANDIDATES: usize = 4;
+const PREFETCH_CHILD_CANDIDATES: usize = 4;
 
 /// MCTS 单次搜索结果。
 #[derive(Clone, Debug)]
@@ -474,27 +478,31 @@ impl MctsEngine<OnnxPolicyValueEval> {
                         dynamic_eval_target(search_batch_size, thread_count),
                         max_eval_tasks,
                     ) {
+                        coordinator.begin_consumer_work();
                         let total_tasks = requests.iter().map(|req| req.tasks.len()).sum::<usize>();
                         if total_tasks == 0 {
                             for request in requests {
                                 request.complete(Ok(Vec::new()));
                             }
+                            coordinator.end_consumer_work();
                             continue;
                         }
 
                         let mut flat_tasks = Vec::with_capacity(total_tasks);
-                        let mut request_lens = Vec::with_capacity(requests.len());
+                        let mut request_apply_lens = Vec::with_capacity(requests.len());
                         for request in &requests {
                             flat_tasks.extend(request.tasks.iter().cloned());
-                            request_lens.push(request.tasks.len());
+                            request_apply_lens.push(request.apply_len);
                         }
 
+                        let mut should_break = false;
                         match evaluate_flat_tasks_chunked(&mut shared_eval, &flat_tasks, eval_chunk_cap, &stop) {
                             Ok(outputs) => {
-                                debug_assert_eq!(outputs.len(), request_lens.iter().sum::<usize>());
+                                debug_assert_eq!(outputs.len(), requests.iter().map(|req| req.tasks.len()).sum::<usize>());
                                 let mut outputs = outputs.into_iter();
-                                for (request, len) in requests.into_iter().zip(request_lens.into_iter()) {
-                                    request.complete(Ok(outputs.by_ref().take(len).collect()));
+                                for (request, apply_len) in requests.into_iter().zip(request_apply_lens.into_iter()) {
+                                    let request_outputs = outputs.by_ref().take(request.tasks.len()).collect::<Vec<_>>();
+                                    request.complete(Ok(request_outputs.into_iter().take(apply_len).collect()));
                                 }
                             }
                             Err(err) => {
@@ -505,8 +513,12 @@ impl MctsEngine<OnnxPolicyValueEval> {
                                 for request in requests {
                                     request.complete(Err(err.clone()));
                                 }
-                                break;
+                                should_break = true;
                             }
+                        }
+                        coordinator.end_consumer_work();
+                        if should_break {
+                            break;
                         }
                     }
                 });
@@ -522,12 +534,40 @@ impl MctsEngine<OnnxPolicyValueEval> {
                 let root_history = root_history.clone_for_search();
                 let budget = budget.clone();
                 let coordinator = Arc::clone(&coordinator);
+                let shared_cache = shared_cache.clone();
                 let tree = &tree;
                 scope.spawn(move || {
                     let mut pending = VecDeque::<PendingEval>::new();
                     loop {
                         if stop.load(Ordering::SeqCst) {
                             break;
+                        }
+                        let queued_work = pending.iter().map(|entry| entry.request.tasks.len()).sum::<usize>();
+                        if !pending.is_empty() && coordinator.should_yield_gather(queued_work, thread_count) {
+                            let mut completed = collect_ready_evals(&mut pending);
+                            if completed.is_empty() {
+                                let Some(next_eval) = pending.pop_front() else {
+                                    break;
+                                };
+                                let Some(result) = next_eval.request.wait_result_until_stop(&stop) else {
+                                    pending.push_front(next_eval);
+                                    cancel_pending_evals(&mut pending, tree, &reserved_playouts);
+                                    break;
+                                };
+                                completed.push((next_eval, result));
+                                completed.extend(collect_ready_evals(&mut pending));
+                            }
+                            if !apply_completed_batch(
+                                completed,
+                                &first_error,
+                                &stop,
+                                tree,
+                                &reserved_playouts,
+                                &playouts,
+                            ) {
+                                break;
+                            }
+                            continue;
                         }
                         if pending.len() < worker_pipeline_depth && !stop.load(Ordering::SeqCst) {
                             let maybe_iteration = {
@@ -569,31 +609,63 @@ impl MctsEngine<OnnxPolicyValueEval> {
                                 }
                             };
                             if let Some(iteration) = maybe_iteration {
-                                let iter_playouts = iteration.playouts;
-                                seldepth.fetch_max(iteration.seldepth, Ordering::Relaxed);
-                                let tasks = iteration
-                                    .pending
-                                    .iter()
-                                    .filter_map(|entry| match &entry.kind {
-                                        PendingKind::Expand { task } => Some(Arc::clone(task)),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>();
-                                let request = if tasks.is_empty() {
-                                    let request = EvalRequest::new(Vec::new());
-                                    request.complete(Ok(Vec::new()));
-                                    request
-                                } else {
-                                    let request = EvalRequest::new(tasks);
-                                    coordinator.submit(Arc::clone(&request));
-                                    request
-                                };
-                                reserved_playouts.fetch_add(iter_playouts, Ordering::Relaxed);
-                                pending.push_back(PendingEval {
-                                    iteration,
-                                    request,
-                                    playouts: iter_playouts,
-                                });
+                                let (fast_iteration, slow_iteration) =
+                                    split_iteration_for_fast_path(iteration, &shared_cache);
+
+                                if let Some((fast_iteration, fast_outputs)) = fast_iteration {
+                                    let fast_playouts = fast_iteration.playouts;
+                                    seldepth.fetch_max(fast_iteration.seldepth, Ordering::Relaxed);
+                                    playouts.fetch_add(fast_playouts, Ordering::Relaxed);
+                                    let mut guard = tree.lock().unwrap_or_else(|e| e.into_inner());
+                                    let tree_ref: &mut MctsTree = &mut **guard;
+                                    apply_iteration_outputs_with(tree_ref, fast_iteration, &fast_outputs);
+                                }
+
+                                if let Some(iteration) = slow_iteration {
+                                    let iter_playouts = iteration.playouts;
+                                    seldepth.fetch_max(iteration.seldepth, Ordering::Relaxed);
+                                    let mut tasks = iteration
+                                        .pending
+                                        .iter()
+                                        .filter_map(|entry| match &entry.kind {
+                                            PendingKind::Expand { task } => Some(Arc::clone(task)),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>();
+                                    let apply_len = tasks.len();
+                                    if apply_len > 0 && apply_len < PREFETCH_BATCH_CAP {
+                                        let prefetch_budget = PREFETCH_BATCH_CAP.saturating_sub(apply_len);
+                                        if prefetch_budget > 0 {
+                                            let prefetch = {
+                                                let guard = tree.lock().unwrap_or_else(|e| e.into_inner());
+                                                let tree_ref: &MctsTree = &guard;
+                                                collect_prefetch_tasks_with(
+                                                    tree_ref,
+                                                    root_id,
+                                                    &root_history,
+                                                    &shared_cache,
+                                                    prefetch_budget,
+                                                )
+                                            };
+                                            tasks.extend(prefetch);
+                                        }
+                                    }
+                                    let request = if tasks.is_empty() {
+                                        let request = EvalRequest::new(Vec::new(), 0);
+                                        request.complete(Ok(Vec::new()));
+                                        request
+                                    } else {
+                                        let request = EvalRequest::new(tasks, apply_len);
+                                        coordinator.submit(Arc::clone(&request));
+                                        request
+                                    };
+                                    reserved_playouts.fetch_add(iter_playouts, Ordering::Relaxed);
+                                    pending.push_back(PendingEval {
+                                        iteration,
+                                        request,
+                                        playouts: iter_playouts,
+                                    });
+                                }
                                 if pending.len() < worker_pipeline_depth && !stop.load(Ordering::SeqCst) {
                                     continue;
                                 }
@@ -932,6 +1004,124 @@ fn apply_iteration_outputs_with(tree: &mut MctsTree, iteration: SearchIteration,
             }
         }
     }
+}
+
+fn split_iteration_for_fast_path(
+    iteration: SearchIteration,
+    cache: &super::policy_value::SharedEvalCache,
+) -> (Option<(SearchIteration, Vec<PolicyValueOutput>)>, Option<SearchIteration>) {
+    let mut fast_iteration = SearchIteration::default();
+    let mut fast_outputs = Vec::new();
+    let mut slow_iteration = SearchIteration::default();
+
+    for pending in iteration.pending {
+        match &pending.kind {
+            PendingKind::ExistingTerminal { .. } | PendingKind::NewTerminal { .. } => {
+                fast_iteration.seldepth = fast_iteration.seldepth.max(pending.path.len() as u32);
+                fast_iteration.playouts = fast_iteration.playouts.saturating_add(pending.multivisit);
+                fast_iteration.pending.push(pending);
+            }
+            PendingKind::Expand { task } => {
+                if let Some(output) = super::policy_value::cached_output_for_task(cache, task.as_ref()) {
+                    fast_iteration.seldepth = fast_iteration.seldepth.max(pending.path.len() as u32);
+                    fast_iteration.playouts = fast_iteration.playouts.saturating_add(pending.multivisit);
+                    fast_outputs.push(output);
+                    fast_iteration.pending.push(pending);
+                } else {
+                    slow_iteration.seldepth = slow_iteration.seldepth.max(pending.path.len() as u32);
+                    slow_iteration.playouts = slow_iteration.playouts.saturating_add(pending.multivisit);
+                    slow_iteration.pending.push(pending);
+                }
+            }
+        }
+    }
+
+    let fast = (!fast_iteration.pending.is_empty()).then_some((fast_iteration, fast_outputs));
+    let slow = (!slow_iteration.pending.is_empty()).then_some(slow_iteration);
+    (fast, slow)
+}
+
+fn collect_prefetch_tasks_with(
+    tree: &MctsTree,
+    root_id: MctsNodeId,
+    root_history: &PositionHistory,
+    cache: &super::policy_value::SharedEvalCache,
+    budget: usize,
+) -> Vec<Arc<PolicyValueTask>> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    let Some(root) = tree.get(root_id) else {
+        return Vec::new();
+    };
+
+    let mut tasks = Vec::new();
+    let mut root_edges = root
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, edge)| edge.child.map(|child| (idx, edge, child)))
+        .collect::<Vec<_>>();
+    root_edges.sort_by(|(_, lhs, _), (_, rhs, _)| {
+        rhs.visits
+            .cmp(&lhs.visits)
+            .then_with(|| rhs.prior.partial_cmp(&lhs.prior).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    for (_, root_edge, child_id) in root_edges.into_iter().take(PREFETCH_ROOT_CANDIDATES) {
+        let Some(child) = tree.get(child_id) else {
+            continue;
+        };
+        if child.terminal_value.is_some() {
+            continue;
+        }
+
+        let mut child_history = root_history.clone_for_search();
+        let mut child_pos = root_history.current().clone_for_search();
+        child_pos.do_move(root_edge.mv);
+        child_history.push_search_position(child_pos.clone_for_search());
+
+        let mut child_edges = child.children.iter().collect::<Vec<_>>();
+        child_edges.sort_by(|lhs, rhs| {
+            rhs.visits
+                .cmp(&lhs.visits)
+                .then_with(|| rhs.prior.partial_cmp(&lhs.prior).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        for edge in child_edges.into_iter().take(PREFETCH_CHILD_CANDIDATES) {
+            if edge.child.is_some() || edge.expanding {
+                continue;
+            }
+
+            let mut history = child_history.clone_for_search();
+            let mut pos = child_pos.clone_for_search();
+            pos.do_move(edge.mv);
+            history.push_search_position(pos.clone_for_search());
+            if history.current_is_repeated() || super::policy_value::cache_contains_history(cache, &history) {
+                continue;
+            }
+
+            let mut buf = [ExtMove {
+                mv: Move::none(),
+                value: 0,
+            }; MAX_MOVES];
+            let n = generate(&pos, GenType::Legal, &mut buf);
+            if n == 0 {
+                continue;
+            }
+            let legal_moves = buf[..n].iter().map(|entry| entry.mv).collect::<Vec<_>>();
+            tasks.push(Arc::new(PolicyValueTask {
+                position: pos,
+                history,
+                legal_moves,
+            }));
+            if tasks.len() >= budget {
+                return tasks;
+            }
+        }
+    }
+
+    tasks
 }
 
 fn cancel_iteration_with(tree: &mut MctsTree, iteration: SearchIteration) {
@@ -2075,14 +2265,16 @@ mod tests {
 
 struct EvalRequest {
     tasks: Vec<Arc<PolicyValueTask>>,
+    apply_len: usize,
     result: Mutex<Option<Result<Vec<PolicyValueOutput>, String>>>,
     ready: Condvar,
 }
 
 impl EvalRequest {
-    fn new(tasks: Vec<Arc<PolicyValueTask>>) -> Arc<Self> {
+    fn new(tasks: Vec<Arc<PolicyValueTask>>, apply_len: usize) -> Arc<Self> {
         Arc::new(Self {
             tasks,
+            apply_len,
             result: Mutex::new(None),
             ready: Condvar::new(),
         })
@@ -2134,6 +2326,8 @@ struct EvalCoordinatorState {
 struct EvalCoordinator {
     state: Mutex<EvalCoordinatorState>,
     wake: Condvar,
+    queued_tasks: AtomicUsize,
+    active_consumers: AtomicUsize,
 }
 
 struct PendingEval {
@@ -2246,10 +2440,13 @@ impl EvalCoordinator {
         Arc::new(Self {
             state: Mutex::new(EvalCoordinatorState::default()),
             wake: Condvar::new(),
+            queued_tasks: AtomicUsize::new(0),
+            active_consumers: AtomicUsize::new(0),
         })
     }
 
     fn submit(&self, request: Arc<EvalRequest>) {
+        self.queued_tasks.fetch_add(request.tasks.len(), Ordering::Relaxed);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.queue.push_back(request);
         self.wake.notify_one();
@@ -2277,6 +2474,7 @@ impl EvalCoordinator {
                 }
                 let request = state.queue.pop_front().expect("front exists");
                 task_count = task_count.saturating_add(request.tasks.len());
+                self.queued_tasks.fetch_sub(request.tasks.len(), Ordering::Relaxed);
                 drained.push(request);
                 if task_count >= target_tasks || drained.len() >= max_requests {
                     return Some(drained);
@@ -2303,6 +2501,21 @@ impl EvalCoordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.shutdown = true;
         self.wake.notify_all();
+    }
+
+    fn begin_consumer_work(&self) {
+        self.active_consumers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn end_consumer_work(&self) {
+        self.active_consumers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn should_yield_gather(&self, queued_work: usize, threads: usize) -> bool {
+        queued_work >= BACKEND_IDLING_MIN_WORK
+            && self.active_consumers.load(Ordering::Relaxed) == 0
+            && self.queued_tasks.load(Ordering::Relaxed) >= queued_work
+            && threads > 1
     }
 }
 

@@ -367,3 +367,12 @@ fn output_from_cached(cached: &CachedEval, position: &Position, legal_moves: &[M
         value: cached.value,
     }
 }
+
+pub(crate) fn cached_output_for_task(cache: &SharedEvalCache, task: &PolicyValueTask) -> Option<PolicyValueOutput> {
+    let cached = cache.get(task.history.input_cache_key())?;
+    Some(output_from_cached(&cached, &task.position, &task.legal_moves))
+}
+
+pub(crate) fn cache_contains_history(cache: &SharedEvalCache, history: &PositionHistory) -> bool {
+    cache.get(history.input_cache_key()).is_some()
+}
