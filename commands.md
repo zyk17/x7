@@ -228,6 +228,21 @@ cargo run --release -p engin -- --bench `
 - `nps` 这里按 `playouts / sec`
 - `nodes` 是树节点总量
 - `search_batch_size` 会写进输出 JSON，便于后续对照
+- `eval_cache.hits/misses` 使用 lookup 口径（可直接比较）
+- `eval_cache.miss_keys` 是去重后真实未命中 key 数（更接近实际 NN 负载）
+- `retry_without_playout`：预算未耗尽时 gather 返回 0 playout 的重试次数
+
+P2 root 访问分配 A/B（固定局面）建议：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\search_regression.ps1
+```
+
+重点对比输出里的：
+
+- `pv` 长度
+- `seldepth`
+- `root_moves[].visits` 分布
 
 ## 13. 最小 UCI 联调
 

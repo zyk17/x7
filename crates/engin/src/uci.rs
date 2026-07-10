@@ -13,6 +13,7 @@ use crate::benchmark::resolve_data_file;
 use crate::history::PositionHistory;
 use crate::mcts::{
     MctsBudget, MctsConfig, MctsEngine, MctsSearchProgress, MctsTree, OnnxPolicyValueEval, SharedPolicy,
+    SearchStats,
 };
 use crate::policy_onnx::PolicySessionPool;
 
@@ -51,16 +52,7 @@ fn uci_info_line(view: UciInfoView<'_>) -> String {
         nps_elapsed_ms,
         pv,
     } = view;
-    let nps_basis_ms = if nps_elapsed_ms > 0 {
-        nps_elapsed_ms
-    } else {
-        elapsed_ms
-    };
-    let nps = if nps_basis_ms > 0 {
-        (playouts as u128 * 1000 / u128::from(nps_basis_ms)) as u64
-    } else {
-        0
-    };
+    let nps = SearchStats::playouts_per_second(playouts, nps_elapsed_ms);
     let score = if let Some(mate) = best_mate {
         format!("score mate {mate}")
     } else {
@@ -96,6 +88,12 @@ fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsS
         nps_elapsed_ms: progress.nps_elapsed_ms,
         pv: &progress.pv,
     }));
+    if progress.retry_without_playout > 0 {
+        output(&format!(
+            "info string retry_without_playout {}",
+            progress.retry_without_playout
+        ));
+    }
 }
 
 type EngineOutput = Arc<dyn Fn(&str) + Send + Sync + 'static>;
@@ -513,6 +511,12 @@ impl Engine {
                         nps_elapsed_ms: result.nps_elapsed_ms,
                         pv: &result.pv,
                     }));
+                    if result.retry_without_playout > 0 {
+                        output(&format!(
+                            "info string retry_without_playout {}",
+                            result.retry_without_playout
+                        ));
+                    }
                     if let Some(best_move) = result.best_move {
                         let best_uci = xiangqi_core::move_to_uci(best_move);
                         output(&format!("bestmove {best_uci}"));
@@ -691,6 +695,23 @@ mod tests {
         });
         assert!(line.contains("score mate 3"));
         assert!(!line.contains("score cp"));
+    }
+
+    #[test]
+    fn uci_info_line_nps_zero_before_nn_timing() {
+        let line = uci_info_line(UciInfoView {
+            best_value: 0.0,
+            best_mate: None,
+            depth: 4,
+            seldepth: 4,
+            playouts: 32,
+            nodes: 32,
+            elapsed_ms: 200,
+            nps_elapsed_ms: 0,
+            pv: &[],
+        });
+        assert!(line.contains("nps 0"));
+        assert!(line.contains("time 200"));
     }
 
     #[test]

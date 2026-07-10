@@ -12,7 +12,7 @@ use super::coordinator::{
 };
 use super::worker::{
     apply_minibatch, budget_exhausted, gather_minibatch, progress_from_tree, result_from_tree,
-    total_in_flight_in_tree, worker_batch_limit, GatherParams, PendingKind,
+    total_in_flight_in_tree, worker_batch_limit, GatherParams, PendingKind, SelectionScratch,
 };
 use super::{
     MctsBudget, MctsConfig, MctsNodeId, MctsSearchProgress, MctsSearchResult, MctsTree, OnnxPolicyValueEval,
@@ -21,6 +21,81 @@ use super::{
 
 const WATCHDOG_MIN_WAIT: Duration = Duration::from_millis(1);
 const WATCHDOG_MAX_WAIT: Duration = Duration::from_millis(100);
+const RETRY_SLEEP: Duration = Duration::from_millis(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EmptyIterationAction {
+    Break,
+    Continue,
+    Yield,
+    Sleep,
+}
+
+#[inline]
+fn is_unbounded_search(budget: &MctsBudget) -> bool {
+    budget.max_playouts.is_none()
+        && budget.max_nodes.is_none()
+        && budget.max_depth.is_none()
+        && budget.deadline.is_none()
+}
+
+#[inline]
+fn should_yield_backend_pressure(threads: usize, backend_waiting: i32, threshold: i32) -> bool {
+    threads > 1 && backend_waiting > threshold
+}
+
+#[inline]
+fn should_yield_retry(retry_without_playout: u32, retry_yield_interval: u32) -> bool {
+    retry_without_playout >= retry_yield_interval.max(1)
+}
+
+#[inline]
+fn should_sleep_retry(config: MctsConfig, budget: &MctsBudget, retry_without_playout: u32) -> bool {
+    is_unbounded_search(budget) && retry_without_playout >= config.retry_sleep_interval.max(1)
+}
+
+fn empty_iteration_action(
+    budget: &MctsBudget,
+    config: MctsConfig,
+    stats: &SearchStats,
+    retry_without_playout: u32,
+) -> EmptyIterationAction {
+    if budget_exhausted(
+        budget,
+        stats.total_playouts(),
+        0,
+        stats.initial_visits(),
+        Some(stats),
+    ) {
+        return EmptyIterationAction::Break;
+    }
+    if should_sleep_retry(config, budget, retry_without_playout) {
+        return EmptyIterationAction::Sleep;
+    }
+    if should_yield_retry(retry_without_playout, config.retry_yield_interval) {
+        return EmptyIterationAction::Yield;
+    }
+    EmptyIterationAction::Continue
+}
+
+fn apply_empty_iteration(
+    budget: &MctsBudget,
+    config: MctsConfig,
+    stats: &SearchStats,
+    retry_without_playout: &mut u32,
+) -> EmptyIterationAction {
+    let action = empty_iteration_action(budget, config, stats, *retry_without_playout);
+    if matches!(action, EmptyIterationAction::Break) {
+        return action;
+    }
+    stats.add_retry_without_playout();
+    *retry_without_playout = retry_without_playout.saturating_add(1);
+    let action = empty_iteration_action(budget, config, stats, *retry_without_playout);
+    if matches!(action, EmptyIterationAction::Yield | EmptyIterationAction::Sleep) {
+        *retry_without_playout = 0;
+    }
+    action
+}
 
 pub(crate) struct SearchSession<'a, E> {
     pub tree: &'a mut MctsTree,
@@ -30,6 +105,7 @@ pub(crate) struct SearchSession<'a, E> {
     pub budget: MctsBudget,
     pub stats: Arc<SearchStats>,
     pub eval: &'a mut E,
+    pub selection_scratch: SelectionScratch,
 }
 
 impl<'a, E> SearchSession<'a, E>
@@ -50,6 +126,7 @@ where
         } else {
             Some(std::time::Instant::now() + info_interval)
         };
+        let mut retry_without_playout = 0u32;
 
         while !budget_exhausted(
             &self.budget,
@@ -58,8 +135,26 @@ where
             self.stats.initial_visits(),
             Some(self.stats.as_ref()),
         ) {
-            if !execute_one_iteration(self, batch_limit)? {
-                break;
+            if execute_one_iteration(self, batch_limit)? {
+                retry_without_playout = 0;
+            } else {
+                match apply_empty_iteration(
+                    &self.budget,
+                    self.config,
+                    self.stats.as_ref(),
+                    &mut retry_without_playout,
+                ) {
+                    EmptyIterationAction::Break => break,
+                    EmptyIterationAction::Continue => continue,
+                    EmptyIterationAction::Yield => {
+                        thread::yield_now();
+                        continue;
+                    }
+                    EmptyIterationAction::Sleep => {
+                        thread::sleep(RETRY_SLEEP);
+                        continue;
+                    }
+                }
             }
             if let Some(deadline) = next_report_at {
                 let now = std::time::Instant::now();
@@ -83,7 +178,6 @@ pub(crate) fn execute_one_iteration<E>(
 where
     E: PolicyValueEval,
 {
-    let mut backend = BackendComputation::new(session.eval);
     let gather_params = GatherParams {
         config: session.config,
         budget: &session.budget,
@@ -102,26 +196,42 @@ where
         backend_waiting: 0,
     };
 
-    let iteration = gather_minibatch(session.tree, &session.root_history, &gather_params);
+    let iteration = gather_minibatch(
+        session.tree,
+        &session.root_history,
+        &gather_params,
+        &mut session.selection_scratch,
+    );
     if iteration.playouts == 0 {
         return Ok(false);
     }
 
-    for pending in &iteration.pending {
-        if let PendingKind::Expand { task } = &pending.kind {
-            backend.add_input(task.as_ref());
-        }
-    }
+    let needs_eval = iteration
+        .pending
+        .iter()
+        .any(|pending| matches!(pending.kind, PendingKind::Expand { .. }));
 
-    let outputs = match backend.compute_blocking() {
-        Ok(outputs) => outputs,
-        Err(err) => {
-            super::worker::cancel_minibatch(session.tree, iteration);
-            return Err(err);
+    let outputs = if needs_eval {
+        let mut backend = BackendComputation::new(session.eval);
+        for pending in &iteration.pending {
+            if let PendingKind::Expand { task } = &pending.kind {
+                backend.add_input(task);
+            }
         }
+        match backend.compute_blocking() {
+            Ok(outputs) => {
+                session.stats.mark_first_batch();
+                outputs
+            }
+            Err(err) => {
+                super::worker::cancel_minibatch(session.tree, iteration);
+                return Err(err);
+            }
+        }
+    } else {
+        Vec::new()
     };
 
-    session.stats.mark_first_batch();
     session.stats.add_minibatch(&iteration);
     let shared = SharedCollisions::default();
     shared.collect(&iteration);
@@ -202,9 +312,20 @@ where
             let pending_searchers = pending_searchers.clone();
             scope.spawn(move || {
                 let mut eval = OnnxPolicyValueEval::with_shared_cache(shared_policy, shared_cache);
+                let mut retry_without_playout = 0u32;
+                let mut selection_scratch = SelectionScratch::default();
                 loop {
                     if stop.load(Ordering::SeqCst) {
                         break;
+                    }
+
+                    if should_yield_backend_pressure(
+                        threads,
+                        backend_waiting.load(Ordering::Relaxed),
+                        config.thread_idling_threshold,
+                    ) {
+                        thread::yield_now();
+                        continue;
                     }
 
                     if let Some(pending) = pending_searchers.as_ref() {
@@ -236,7 +357,12 @@ where
                                 thread_count: threads,
                                 backend_waiting: backend_waiting.load(Ordering::Relaxed),
                             };
-                            let iteration = gather_minibatch(&mut tree_guard, &root_history, &gather_params);
+                            let iteration = gather_minibatch(
+                                &mut tree_guard,
+                                &root_history,
+                                &gather_params,
+                                &mut selection_scratch,
+                            );
                             if iteration.playouts == 0 {
                                 None
                             } else {
@@ -251,8 +377,20 @@ where
                     }
 
                     let Some(iteration) = iteration else {
-                        break;
+                        match apply_empty_iteration(&budget, config, stats.as_ref(), &mut retry_without_playout) {
+                            EmptyIterationAction::Break => break,
+                            EmptyIterationAction::Continue => continue,
+                            EmptyIterationAction::Yield => {
+                                thread::yield_now();
+                                continue;
+                            }
+                            EmptyIterationAction::Sleep => {
+                                thread::sleep(RETRY_SLEEP);
+                                continue;
+                            }
+                        }
                     };
+                    retry_without_playout = 0;
 
                     if !stats.try_add_minibatch(&budget, &iteration) {
                         let mut tree_guard = shared_tree.write().unwrap_or_else(|e| e.into_inner());
@@ -264,7 +402,7 @@ where
                     let mut needs_eval = false;
                     for pending in &iteration.pending {
                         if let PendingKind::Expand { task } = &pending.kind {
-                            backend.add_input(task.as_ref());
+                            backend.add_input(task);
                             needs_eval = true;
                         }
                     }
@@ -287,7 +425,6 @@ where
                             }
                         }
                     } else {
-                        stats.mark_first_batch();
                         Vec::new()
                     };
                     backend_waiting.fetch_sub(1, Ordering::Relaxed);
@@ -319,4 +456,101 @@ where
     ensure_tree_quiescent(&restored)?;
     *tree = restored;
     Ok(result_from_tree(tree, root_id, stats.as_ref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_empty_iteration, empty_iteration_action, should_sleep_retry, should_yield_backend_pressure,
+        should_yield_retry, EmptyIterationAction, MctsBudget,
+    };
+    use crate::mcts::{MctsConfig, SearchStats};
+    use std::time::Duration;
+
+    #[test]
+    fn backend_pressure_yield_only_for_parallel() {
+        assert!(!should_yield_backend_pressure(1, 10, 1));
+        assert!(!should_yield_backend_pressure(4, 1, 1));
+        assert!(should_yield_backend_pressure(4, 2, 1));
+    }
+
+    #[test]
+    fn retry_yield_honors_min_interval() {
+        assert!(!should_yield_retry(0, 0));
+        assert!(should_yield_retry(1, 0));
+        assert!(!should_yield_retry(3, 4));
+        assert!(should_yield_retry(4, 4));
+    }
+
+    #[test]
+    fn sleep_retry_only_for_unbounded_budget() {
+        let config = MctsConfig {
+            retry_sleep_interval: 8,
+            ..MctsConfig::default()
+        };
+        let bounded = MctsBudget {
+            max_playouts: Some(100),
+            ..MctsBudget::default()
+        };
+        let unbounded = MctsBudget::default();
+        assert!(!should_sleep_retry(config, &bounded, 8));
+        assert!(should_sleep_retry(config, &unbounded, 8));
+    }
+
+    #[test]
+    fn empty_iteration_breaks_when_budget_done() {
+        let stats = SearchStats::new(0);
+        let budget = MctsBudget {
+            deadline: Some(std::time::Instant::now() - Duration::from_millis(1)),
+            ..MctsBudget::default()
+        };
+        assert_eq!(
+            empty_iteration_action(&budget, MctsConfig::default(), &stats, 1),
+            EmptyIterationAction::Break
+        );
+    }
+
+    #[test]
+    fn empty_iteration_continues_when_budget_remains() {
+        let stats = SearchStats::new(0);
+        let budget = MctsBudget {
+            max_playouts: Some(100),
+            ..MctsBudget::default()
+        };
+        assert_eq!(
+            empty_iteration_action(&budget, MctsConfig::default(), &stats, 1),
+            EmptyIterationAction::Continue
+        );
+    }
+
+    #[test]
+    fn apply_empty_iteration_does_not_count_break_on_exit() {
+        let stats = SearchStats::new(0);
+        let budget = MctsBudget {
+            deadline: Some(std::time::Instant::now() - Duration::from_millis(1)),
+            ..MctsBudget::default()
+        };
+        let mut local = 0u32;
+        assert_eq!(
+            apply_empty_iteration(&budget, MctsConfig::default(), &stats, &mut local),
+            EmptyIterationAction::Break
+        );
+        assert_eq!(stats.retry_without_playout(), 0);
+    }
+
+    #[test]
+    fn apply_empty_iteration_counts_real_retries() {
+        let stats = SearchStats::new(0);
+        let budget = MctsBudget {
+            max_playouts: Some(100),
+            ..MctsBudget::default()
+        };
+        let mut local = 0u32;
+        assert_eq!(
+            apply_empty_iteration(&budget, MctsConfig::default(), &stats, &mut local),
+            EmptyIterationAction::Continue
+        );
+        assert_eq!(stats.retry_without_playout(), 1);
+        assert_eq!(local, 1);
+    }
 }

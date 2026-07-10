@@ -27,6 +27,9 @@ impl MctsBudget {
 /// MCTS 主配置。
 #[derive(Clone, Copy, Debug)]
 pub struct MctsConfig {
+    /// P2 边界提醒：
+    /// - 只做 tree-based MCTS 并发/流水线优化
+    /// - 不引入 DAG/传统 TT/MultiPV/新 time manager
     /// 非根节点 PUCT 初始探索系数。
     pub cpuct: f32,
     /// 根节点 PUCT 初始探索系数。
@@ -61,6 +64,12 @@ pub struct MctsConfig {
     pub idling_minimum_work: i32,
     /// px0 `SmartPruningFactor`；0 关闭根节点剪枝。
     pub smart_pruning_factor: f32,
+    /// root 层对 in-flight 的折算系数，<1 可减少“过度平均”。
+    pub root_inflight_fraction: f32,
+    /// worker 在“无有效 playout”重试多少次后主动 yield。
+    pub retry_yield_interval: u32,
+    /// 无预算上限搜索（如 `go infinite`）连续空转多少次后 sleep 1ms，避免纯 CPU 空转。
+    pub retry_sleep_interval: u32,
 }
 
 impl Default for MctsConfig {
@@ -87,6 +96,9 @@ impl Default for MctsConfig {
             thread_idling_threshold: 1,
             idling_minimum_work: 0,
             smart_pruning_factor: 1.0,
+            root_inflight_fraction: 0.5,
+            retry_yield_interval: 64,
+            retry_sleep_interval: 512,
         }
     }
 }

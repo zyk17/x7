@@ -220,6 +220,42 @@ impl PositionHistory {
             transient_evicted: Vec::new(),
         }
     }
+
+    /// 仅复制 NN 编码所需状态；不复制 `game_moves` 等持久对局字段。
+    pub(crate) fn clone_nn_input_state(&self) -> Self {
+        Self {
+            game_start: self.game_start.clone_for_search(),
+            game_moves: Vec::new(),
+            entries: self.entries.clone(),
+            key_counts: self.key_counts.clone(),
+            transient_evicted: Vec::new(),
+        }
+    }
+
+    /// 在搜索根 history 上叠加 selection 路径，仅在 expand 时物化 NN 输入 history。
+    pub(crate) fn extended_with_search_path(&self, suffix: &[Position]) -> Self {
+        let mut history = self.clone_nn_input_state();
+        for pos in suffix {
+            history.push_search_position(pos.clone_for_search());
+        }
+        history
+    }
+
+    pub(crate) fn key_counts(&self) -> &HashMap<u64, usize> {
+        &self.key_counts
+    }
+
+    /// selection 热路径：沿路径增量维护重复检测，避免每次 pick 复制整张 `key_counts`。
+    pub(crate) fn push_search_path_position(
+        base_key_counts: &HashMap<u64, usize>,
+        path_key_counts: &mut HashMap<u64, usize>,
+        pos: &Position,
+    ) -> bool {
+        let key = pos.nn_input_key();
+        let repeated = base_key_counts.contains_key(&key) || path_key_counts.contains_key(&key);
+        *path_key_counts.entry(key).or_insert(0) += 1;
+        repeated
+    }
 }
 
 impl Default for PositionHistory {
@@ -293,5 +329,73 @@ mod tests {
         assert_eq!(a.current().fen(), b.current().fen());
         assert!(!a.same_input_window(&b));
         assert_ne!(a.input_cache_key(), b.input_cache_key());
+    }
+
+    #[test]
+    fn push_search_path_position_matches_full_clone_semantics() {
+        let mut base = PositionHistory::new_startpos();
+        for _ in 0..3 {
+            let u = legal_moves_uci(base.current())
+                .into_iter()
+                .next()
+                .expect("legal move uci");
+            let mv = uci_to_move(base.current(), &u).expect("legal move");
+            base.push_move(mv);
+        }
+        let mut cloned = base.clone_for_search();
+        let mut overlay = HashMap::new();
+
+        for _ in 0..2 {
+            let u = legal_moves_uci(base.current())
+                .into_iter()
+                .next()
+                .expect("legal move uci");
+            let mv = uci_to_move(base.current(), &u).expect("legal move");
+            let mut next = base.current().clone_for_search();
+            next.do_move(mv);
+            let from_clone = {
+                cloned.push_search_position(next.clone_for_search());
+                cloned.current_is_repeated()
+            };
+            let from_overlay =
+                PositionHistory::push_search_path_position(base.key_counts(), &mut overlay, &next);
+            assert_eq!(from_clone, from_overlay);
+        }
+    }
+
+    #[test]
+    fn extended_with_search_path_skips_game_moves_but_keeps_nn_input() {
+        let mut base = PositionHistory::new_startpos();
+        for _ in 0..4 {
+            let u = legal_moves_uci(base.current())
+                .into_iter()
+                .next()
+                .expect("legal move uci");
+            let mv = uci_to_move(base.current(), &u).expect("legal move");
+            base.push_move(mv);
+        }
+        assert!(!base.game_moves().is_empty());
+
+        let u = legal_moves_uci(base.current())
+            .into_iter()
+            .next()
+            .expect("legal move uci");
+        let mv = uci_to_move(base.current(), &u).expect("legal move");
+        let mut suffix_pos = base.current().clone_for_search();
+        suffix_pos.do_move(mv);
+        let suffix = vec![suffix_pos.clone_for_search()];
+
+        let full = {
+            let mut history = base.clone_for_search();
+            for pos in &suffix {
+                history.push_search_position(pos.clone_for_search());
+            }
+            history
+        };
+        let lean = base.extended_with_search_path(&suffix);
+
+        assert!(lean.game_moves().is_empty());
+        assert_eq!(lean.input_cache_key(), full.input_cache_key());
+        assert!(lean.same_input_window(&full));
     }
 }

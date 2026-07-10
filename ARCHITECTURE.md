@@ -181,6 +181,35 @@
 - 当前多线程只做到最小 `shared-tree` worker 语义
 - 第三方 GUI 若只给最终 `FEN`，允许走 fallback，但不视为最佳接入方式
 
+### `engin` 当前复用边界
+
+- 已有主线复用：`tree reuse`
+  - `advance_root`
+  - `reset_to_position`
+  - `position ... moves ...` 增量复用
+- P2 可做的复用：`eval cache`
+  - 只缓存 `position/history -> NN output`
+  - 用于减少重复推理
+- 当前不做的复用：传统 `TT`
+  - 不做 `hash -> bound/value/bestmove`
+  - 不做跨分支搜索统计合并
+  - 不做 `graph / DAG` 主结构
+
+### `engin` 当前 P2 方向
+
+- 框架继续对齐 `px0 classic`
+- worker 并发行为参考 `KataGo`
+- 重点吸收：
+  - 高失败重试容忍（单/并行语义一致；`retry_without_playout` 可观测）
+  - 无预算上限时空转 `yield` + 周期性 `sleep` 退让
+  - virtual loss / in-flight 分流
+  - gather / backend / backup 的持续流水线
+  - root 附近“宽而不乱”的访问分配
+- 当前明确不吸收：
+  - `KataGo graphHash`
+  - `useGraphSearch`
+  - ownership / score utility / pattern bonus 等扩展系统
+
 ## 7. 删除原则
 
 仓库内可以不保留的内容：

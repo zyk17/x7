@@ -9,6 +9,7 @@ use crate::history::PositionHistory;
 
 use super::search::{run_parallel_with_progress, SearchSession};
 use super::node::TerminalKind;
+use super::worker::SelectionScratch;
 use super::{
     EdgeStats, MctsBudget, MctsConfig, MctsNode, MctsNodeId, MctsTree, OnnxPolicyValueEval, PolicyValueEval,
     PolicyValueInput, SearchStats,
@@ -38,6 +39,8 @@ pub struct MctsSearchResult {
     pub best_value: f32,
     pub best_mate: Option<i32>,
     pub nps_elapsed_ms: u64,
+    /// 预算未耗尽时 gather 返回 0 playout 的重试次数。
+    pub retry_without_playout: u64,
     pub moves: Vec<MctsMoveStat>,
 }
 
@@ -55,6 +58,7 @@ pub struct MctsSearchProgress {
     pub best_value: f32,
     pub best_mate: Option<i32>,
     pub nps_elapsed_ms: u64,
+    pub retry_without_playout: u64,
     pub moves: Vec<MctsMoveStat>,
 }
 
@@ -133,6 +137,7 @@ where
             budget,
             stats: Arc::new(SearchStats::new(initial_visits)),
             eval: &mut self.evaluator,
+            selection_scratch: SelectionScratch::default(),
         };
         session.run_with_progress(info_interval, on_progress)
     }
@@ -290,7 +295,7 @@ mod tests {
     use crate::mcts::worker::{
         apply_minibatch, cancel_minibatch, gather_minibatch, progress_from_tree, pv_summary_from_tree,
         result_from_tree, select_edge, total_in_flight_in_tree, GatherParams, PathStep, PendingKey, PendingKind,
-        PendingNode, SearchIteration,
+        PendingNode, SearchIteration, SelectionScratch,
     };
     use super::TerminalKind;
     use super::*;
@@ -330,6 +335,7 @@ mod tests {
             budget: budget.clone(),
             stats: Arc::new(SearchStats::new(0)),
             eval: &mut engine.evaluator,
+            selection_scratch: SelectionScratch::default(),
         };
         execute_one_iteration(&mut session, batch_limit)?;
         Ok(())
@@ -380,7 +386,8 @@ mod tests {
             0,
             None,
         );
-        let iteration = gather_minibatch(&mut engine.tree, &history, &params);
+        let mut scratch = SelectionScratch::default();
+        let iteration = gather_minibatch(&mut engine.tree, &history, &params, &mut scratch);
         assert!(!iteration.pending.is_empty());
         assert!(iteration.pending.len() <= batch_size);
         assert!(iteration.playouts >= iteration.pending.len() as u32);
@@ -478,7 +485,8 @@ mod tests {
         let budget = MctsBudget::default();
         let root_visits = engine.tree.get(root_id).map(|root| root.visits).unwrap_or(0);
         let params = make_gather_params(engine.config, &budget, root_id, root_visits, 4, 0, None);
-        let iteration = gather_minibatch(&mut engine.tree, &history, &params);
+        let mut scratch = SelectionScratch::default();
+        let iteration = gather_minibatch(&mut engine.tree, &history, &params, &mut scratch);
         assert!(iteration.pending.iter().any(|pending| {
             matches!(pending.kind, PendingKind::NewTerminal { .. } | PendingKind::Expand { .. })
         }));
@@ -529,7 +537,8 @@ mod tests {
         let budget = MctsBudget::default();
         let root_visits = engine.tree.get(root_id).map(|root| root.visits).unwrap_or(0);
         let params = make_gather_params(engine.config, &budget, root_id, root_visits, 4, 0, None);
-        let iteration = gather_minibatch(&mut engine.tree, &history, &params);
+        let mut scratch = SelectionScratch::default();
+        let iteration = gather_minibatch(&mut engine.tree, &history, &params, &mut scratch);
         assert_eq!(iteration.pending.len(), 1);
         assert_eq!(iteration.pending[0].multivisit, 4);
         apply_minibatch(&mut engine.tree, iteration, &[], None);
@@ -554,7 +563,8 @@ mod tests {
             let budget = MctsBudget::default();
             let root_visits = engine.tree.get(root_id).map(|root| root.visits).unwrap_or(0);
             let params = make_gather_params(engine.config, &budget, root_id, root_visits, 4, 0, None);
-            gather_minibatch(&mut engine.tree, &history, &params)
+            let mut scratch = SelectionScratch::default();
+            gather_minibatch(&mut engine.tree, &history, &params, &mut scratch)
         };
         assert!(pv_summary_from_tree(&engine.tree, root_id).pv.is_empty());
     }
@@ -655,23 +665,24 @@ mod tests {
         let budget = MctsBudget::default();
         let root_visits = engine.tree.get(root_id).map(|root| root.visits).unwrap_or(0);
         let params = make_gather_params(engine.config, &budget, root_id, root_visits, 4, 0, None);
-        let first = gather_minibatch(&mut engine.tree, &history, &params);
+        let mut scratch = SelectionScratch::default();
+        let first = gather_minibatch(&mut engine.tree, &history, &params, &mut scratch);
         assert_eq!(first.pending.len(), 1);
         assert_eq!(first.pending[0].multivisit, 4);
-        let second = gather_minibatch(&mut engine.tree, &history, &params);
+        let second = gather_minibatch(&mut engine.tree, &history, &params, &mut scratch);
         assert_eq!(second.pending.len(), 1);
         assert_eq!(second.playouts, 1);
 
         let mut backend = BackendComputation::new(&mut engine.evaluator);
         for pending in &first.pending {
             if let PendingKind::Expand { task } = &pending.kind {
-                backend.add_input(task.as_ref());
+                backend.add_input(task);
             }
         }
         let outputs = backend.compute_blocking().expect("eval ok");
         apply_minibatch(&mut engine.tree, first, &outputs, None);
 
-        let third = gather_minibatch(&mut engine.tree, &history, &params);
+        let third = gather_minibatch(&mut engine.tree, &history, &params, &mut scratch);
         assert!(third.playouts > 0);
     }
 
@@ -825,6 +836,7 @@ mod tests {
             },
             stats: Arc::new(SearchStats::new(0)),
             eval: &mut engine.evaluator,
+            selection_scratch: SelectionScratch::default(),
         };
         execute_one_iteration(&mut session, engine.config.search_batch_size).expect("iteration ok");
         assert_eq!(total_in_flight_in_tree(session.tree), 0);
@@ -875,7 +887,8 @@ mod tests {
             0,
             None,
         );
-        let iteration = gather_minibatch(&mut engine.tree, &history, &params);
+        let mut scratch = SelectionScratch::default();
+        let iteration = gather_minibatch(&mut engine.tree, &history, &params, &mut scratch);
         assert_eq!(iteration.playouts, 3);
     }
 

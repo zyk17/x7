@@ -1,6 +1,7 @@
 //! MCTS 主线骨架。
 //!
 //! 这里定义当前项目搜索主线需要的稳定接口与基础数据结构。
+//! P2 边界：继续对齐 px0 classic + KataGo 并发细节，不引入 DAG/TT/MultiPV/新 time manager。
 
 mod backend;
 mod config;
@@ -30,8 +31,9 @@ pub struct SearchStats {
     total_playouts: AtomicU32,
     cum_depth: AtomicU64,
     max_depth: AtomicU32,
-    nps_start: RwLock<Instant>,
+    nps_start: RwLock<Option<Instant>>,
     nns_started: AtomicBool,
+    retry_without_playout: AtomicU64,
 }
 
 impl SearchStats {
@@ -41,8 +43,9 @@ impl SearchStats {
             total_playouts: AtomicU32::new(0),
             cum_depth: AtomicU64::new(0),
             max_depth: AtomicU32::new(0),
-            nps_start: RwLock::new(Instant::now()),
+            nps_start: RwLock::new(None),
             nns_started: AtomicBool::new(false),
+            retry_without_playout: AtomicU64::new(0),
         }
     }
 
@@ -76,19 +79,40 @@ impl SearchStats {
     }
 
     pub fn nps_elapsed_ms(&self) -> u64 {
+        if !self.nns_started.load(Ordering::Relaxed) {
+            return 0;
+        }
         self.nps_start
             .read()
-            .map(|start| start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+            .ok()
+            .and_then(|start| start.map(|t| t.elapsed().as_millis().min(u128::from(u64::MAX)) as u64))
             .unwrap_or(0)
+    }
+
+    pub fn retry_without_playout(&self) -> u64 {
+        self.retry_without_playout.load(Ordering::Relaxed)
+    }
+
+    /// px0 风格 nps：仅首批 NN 后开始计时的 playouts/s；未开始时返回 0。
+    pub fn playouts_per_second(playouts: u32, nps_elapsed_ms: u64) -> u64 {
+        if nps_elapsed_ms > 0 {
+            (playouts as u128 * 1000 / u128::from(nps_elapsed_ms)) as u64
+        } else {
+            0
+        }
     }
 
     /// px0：首次 NN batch 后才开始计 nps。
     pub fn mark_first_batch(&self) {
         if !self.nns_started.swap(true, Ordering::Relaxed) {
             if let Ok(mut start) = self.nps_start.write() {
-                *start = Instant::now();
+                *start = Some(Instant::now());
             }
         }
+    }
+
+    pub(crate) fn add_retry_without_playout(&self) {
+        self.retry_without_playout.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_minibatch_depth(&self, iteration: &worker::SearchIteration) {
@@ -147,5 +171,25 @@ impl SearchStats {
         if playouts > 0 {
             self.total_playouts.fetch_sub(playouts, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchStats;
+
+    #[test]
+    fn nps_elapsed_is_zero_before_first_nn_batch() {
+        let stats = SearchStats::new(0);
+        assert_eq!(stats.nps_elapsed_ms(), 0);
+        stats.mark_first_batch();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(stats.nps_elapsed_ms() > 0);
+    }
+
+    #[test]
+    fn playouts_per_second_waits_for_nn_timing() {
+        assert_eq!(SearchStats::playouts_per_second(128, 0), 0);
+        assert_eq!(SearchStats::playouts_per_second(1000, 1000), 1000);
     }
 }

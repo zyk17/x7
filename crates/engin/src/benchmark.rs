@@ -9,7 +9,7 @@ use serde_json::json;
 use xiangqi_core::{legal_moves_uci, uci_to_move, Position, START_FEN};
 
 use crate::history::PositionHistory;
-use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, OnnxPolicyValueEval, SharedPolicy};
+use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, OnnxPolicyValueEval, SharedPolicy, SearchStats};
 
 /// 解析 bench 行：`FEN` 或 `FEN moves uci ...`（对齐 UCI position）。
 pub fn history_from_bench_line(line: &str) -> Result<PositionHistory, String> {
@@ -125,17 +125,9 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
 
     match search_result {
         Ok(result) => {
+            let eval_cache = engine.evaluator.cache_stats();
             let elapsed_ms = t0.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let nps_basis_ms = if result.nps_elapsed_ms > 0 {
-                result.nps_elapsed_ms
-            } else {
-                elapsed_ms
-            };
-            let nps = if nps_basis_ms > 0 {
-                (result.playouts as u128 * 1000 / u128::from(nps_basis_ms)) as u64
-            } else {
-                0
-            };
+            let nps = SearchStats::playouts_per_second(result.playouts, result.nps_elapsed_ms);
             json!({
                 "fen": fen,
                 "bestmove": result.best_move.map(xiangqi_core::move_to_uci),
@@ -179,6 +171,14 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                     "policy_session_loaded": session.meta.policy_session_loaded,
                     "threads": session.threads,
                 },
+                "eval_cache": {
+                    "hits": eval_cache.hits,
+                    "misses": eval_cache.misses,
+                    "lookup_hits": eval_cache.lookup_hits,
+                    "lookup_misses": eval_cache.lookup_misses,
+                    "miss_keys": eval_cache.miss_keys,
+                },
+                "retry_without_playout": result.retry_without_playout,
             })
         }
         Err(err) => json!({

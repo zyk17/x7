@@ -6,6 +6,7 @@ use std::time::Instant;
 use xiangqi_core::movegen::{ExtMove, GenType};
 use xiangqi_core::types::{Move, MAX_MOVES};
 use xiangqi_core::generate;
+use xiangqi_core::Position;
 
 use crate::history::PositionHistory;
 
@@ -124,6 +125,7 @@ pub(crate) fn gather_minibatch(
     tree: &mut MctsTree,
     root_history: &PositionHistory,
     params: &GatherParams<'_>,
+    scratch: &mut SelectionScratch,
 ) -> SearchIteration {
     let mut iteration = SearchIteration::default();
     let mut slots = HashMap::<PendingKey, usize>::new();
@@ -151,6 +153,8 @@ pub(crate) fn gather_minibatch(
         ) {
             break;
         }
+        // P2.3：当 backend 已拥堵且当前 minibatch 已有可消费工作时，尽快 flush，
+        // 避免 worker 在 gather 里继续无意义等待导致吞吐抖动。
         if params.thread_count > 1
             && minibatch_non_collision > 0
             && needs_nn
@@ -171,6 +175,7 @@ pub(crate) fn gather_minibatch(
             params.stats,
             params.budget,
             params.base_playouts.saturating_add(iteration.playouts),
+            scratch,
         ) else {
             break;
         };
@@ -199,6 +204,27 @@ pub(crate) fn gather_minibatch(
     iteration
 }
 
+pub(crate) struct SelectionScratch {
+    path_positions: Vec<Position>,
+    path_key_counts: HashMap<u64, usize>,
+}
+
+impl Default for SelectionScratch {
+    fn default() -> Self {
+        Self {
+            path_positions: Vec::with_capacity(16),
+            path_key_counts: HashMap::new(),
+        }
+    }
+}
+
+impl SelectionScratch {
+    fn reset(&mut self) {
+        self.path_positions.clear();
+        self.path_key_counts.clear();
+    }
+}
+
 pub(crate) fn select_pending(
     tree: &mut MctsTree,
     config: MctsConfig,
@@ -207,11 +233,13 @@ pub(crate) fn select_pending(
     stats: Option<&SearchStats>,
     budget: &MctsBudget,
     session_playouts: u32,
+    scratch: &mut SelectionScratch,
 ) -> Option<PendingNode> {
+    scratch.reset();
     let mut path = Vec::<PathStep>::new();
     let mut node_id = root_id;
     let mut pos = root_history.current().clone_for_search();
-    let mut history = root_history.clone_for_search();
+    let base_key_counts = root_history.key_counts();
     let remaining_playouts = remaining_playout_budget(budget, session_playouts, 0, stats.map(|s| s.initial_visits()).unwrap_or(0), u32::MAX);
 
     loop {
@@ -281,13 +309,18 @@ pub(crate) fn select_pending(
 
         let parent_id = node_id;
         pos.do_move(mv);
-        history.push_search_position(pos.clone_for_search());
+        let repeated = PositionHistory::push_search_path_position(
+            base_key_counts,
+            &mut scratch.path_key_counts,
+            &pos,
+        );
+        scratch.path_positions.push(pos.clone_for_search());
         path.push(PathStep {
             node_id: parent_id,
             edge_idx,
         });
 
-        if history.current_is_repeated() {
+        if repeated {
             let (wl, d, m) = (0.0, 1.0, path.len() as f32);
             return Some(PendingNode {
                 key: PendingKey::NewEdge(parent_id, edge_idx),
@@ -333,6 +366,7 @@ pub(crate) fn select_pending(
         }
 
         let legal_moves = buf[..n].iter().map(|e| e.mv).collect::<Vec<_>>();
+        let history = root_history.extended_with_search_path(&scratch.path_positions);
         return Some(PendingNode {
             key: PendingKey::NewEdge(parent_id, edge_idx),
             path,
@@ -474,6 +508,7 @@ pub(crate) fn progress_from_tree(tree: &MctsTree, root_id: MctsNodeId, stats: &S
         best_value: summary.best_value,
         best_mate: summary.best_mate,
         nps_elapsed_ms: stats.nps_elapsed_ms(),
+        retry_without_playout: stats.retry_without_playout(),
         moves: root
             .children
             .iter()
@@ -503,6 +538,7 @@ pub(crate) fn result_from_tree(tree: &MctsTree, root_id: MctsNodeId, stats: &Sea
         best_value: progress.best_value,
         best_mate: progress.best_mate,
         nps_elapsed_ms: progress.nps_elapsed_ms,
+        retry_without_playout: progress.retry_without_playout,
         moves: root
             .children
             .iter()
@@ -749,7 +785,8 @@ pub(crate) fn select_edge(
         } else {
             edge.mean_q_with_draw(draw_score)
         };
-        let u = cpuct * edge.prior * sqrt_parent / (1.0 + edge.n_started() as f32);
+        let started = edge_started_for_selection(edge, is_root, config);
+        let u = cpuct * edge.prior * sqrt_parent / (1.0 + started);
         let score = q + u;
         if score > best_score {
             best_score = score;
@@ -759,6 +796,15 @@ pub(crate) fn select_edge(
 
     let _ = stats;
     best_idx
+}
+
+#[inline]
+fn edge_started_for_selection(edge: &EdgeStats, is_root: bool, config: MctsConfig) -> f32 {
+    if is_root {
+        edge.visits as f32 + edge.in_flight as f32 * config.root_inflight_fraction.clamp(0.0, 1.0)
+    } else {
+        edge.n_started() as f32
+    }
 }
 
 fn add_expanded_child(
@@ -824,4 +870,24 @@ fn add_terminal_child(
     let edge = &mut tree.get_mut(parent_id).expect("parent node must exist").children[edge_idx];
     edge.child = Some(child_id);
     child_id
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::edge_started_for_selection;
+    use crate::mcts::{EdgeStats, MctsConfig};
+
+    #[test]
+    fn root_inflight_fraction_reduces_started_penalty() {
+        let edge = EdgeStats {
+            in_flight: 4,
+            ..EdgeStats::default()
+        };
+        let config = MctsConfig::default();
+        let non_root = edge_started_for_selection(&edge, false, config);
+        let root = edge_started_for_selection(&edge, true, config);
+        assert!(root < non_root);
+        assert_eq!(root, 2.0);
+        assert_eq!(non_root, 4.0);
+    }
 }

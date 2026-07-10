@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use xiangqi_core::types::Move;
@@ -109,6 +110,14 @@ pub trait PolicyValueEval {
         }
         Ok(out)
     }
+
+    fn evaluate_many_arcs(&mut self, tasks: &[Arc<PolicyValueTask>]) -> Result<Vec<PolicyValueOutput>, Self::Error> {
+        let mut out = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            out.push(self.evaluate(task.as_input())?);
+        }
+        Ok(out)
+    }
 }
 
 /// 复用现有 `PolicyOnnx` 的最小 MCTS 评估桥。
@@ -128,6 +137,9 @@ pub(crate) struct CachedEval {
 
 pub(crate) struct EvalCache {
     shards: Vec<Mutex<HashMap<u64, CachedEval>>>,
+    lookup_hits: AtomicU64,
+    lookup_misses: AtomicU64,
+    miss_keys: AtomicU64,
 }
 
 impl EvalCache {
@@ -137,7 +149,12 @@ impl EvalCache {
         for _ in 0..shard_count {
             maps.push(Mutex::new(HashMap::new()));
         }
-        Self { shards: maps }
+        Self {
+            shards: maps,
+            lookup_hits: AtomicU64::new(0),
+            lookup_misses: AtomicU64::new(0),
+            miss_keys: AtomicU64::new(0),
+        }
     }
 
     fn shard_index(&self, key: u64) -> usize {
@@ -146,7 +163,23 @@ impl EvalCache {
 
     fn get(&self, key: u64) -> Option<CachedEval> {
         let shard = self.shards[self.shard_index(key)].lock().ok()?;
-        shard.get(&key).cloned()
+        let out = shard.get(&key).cloned();
+        if out.is_some() {
+            self.lookup_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        out
+    }
+
+    fn record_lookup_miss(&self, n: u64) {
+        if n > 0 {
+            self.lookup_misses.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    fn record_miss_keys(&self, n: u64) {
+        if n > 0 {
+            self.miss_keys.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     fn insert(&self, key: u64, value: CachedEval) {
@@ -161,7 +194,33 @@ impl EvalCache {
                 map.clear();
             }
         }
+        self.lookup_hits.store(0, Ordering::Relaxed);
+        self.lookup_misses.store(0, Ordering::Relaxed);
+        self.miss_keys.store(0, Ordering::Relaxed);
     }
+
+    fn stats(&self) -> EvalCacheStats {
+        let lookup_hits = self.lookup_hits.load(Ordering::Relaxed);
+        let lookup_misses = self.lookup_misses.load(Ordering::Relaxed);
+        let miss_keys = self.miss_keys.load(Ordering::Relaxed);
+        EvalCacheStats {
+            lookup_hits,
+            lookup_misses,
+            miss_keys,
+            // 对外兼容：hits/misses 统一保持 lookup 口径（可直接比较）。
+            hits: lookup_hits,
+            misses: lookup_misses,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvalCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub lookup_hits: u64,
+    pub lookup_misses: u64,
+    pub miss_keys: u64,
 }
 
 impl OnnxPolicyValueEval {
@@ -193,6 +252,10 @@ impl OnnxPolicyValueEval {
         self.cache.clear();
     }
 
+    pub fn cache_stats(&self) -> EvalCacheStats {
+        self.cache.stats()
+    }
+
     fn evaluate_many_impl<T: TaskLike>(&mut self, tasks: &[T]) -> Result<Vec<PolicyValueOutput>, String> {
         if tasks.is_empty() {
             return Ok(Vec::new());
@@ -213,6 +276,7 @@ impl OnnxPolicyValueEval {
                 misses.push(idx);
             }
         }
+        self.cache.record_lookup_miss(misses.len() as u64);
         if misses.is_empty() {
             return Ok(outputs);
         }
@@ -232,6 +296,7 @@ impl OnnxPolicyValueEval {
             };
             miss_to_unique.push(slot);
         }
+        self.cache.record_miss_keys(unique_misses.len() as u64);
 
         let history_refs = unique_misses
             .iter()
@@ -289,6 +354,8 @@ impl PolicyValueEval for OnnxPolicyValueEval {
         if let Some(cached) = self.cache.get(state_key) {
             return Ok(output_from_cached(&cached, input.position, input.legal_moves));
         }
+        self.cache.record_lookup_miss(1);
+        self.cache.record_miss_keys(1);
 
         crate::fen_tensor::history_to_planes_into(input.history, &mut self.scratch_board).map_err(|e| e.to_string())?;
         let cached = {
@@ -307,6 +374,10 @@ impl PolicyValueEval for OnnxPolicyValueEval {
     }
 
     fn evaluate_many(&mut self, tasks: &[PolicyValueTask]) -> Result<Vec<PolicyValueOutput>, Self::Error> {
+        self.evaluate_many_impl(tasks)
+    }
+
+    fn evaluate_many_arcs(&mut self, tasks: &[Arc<PolicyValueTask>]) -> Result<Vec<PolicyValueOutput>, Self::Error> {
         self.evaluate_many_impl(tasks)
     }
 }
@@ -363,4 +434,40 @@ fn output_from_cached(cached: &CachedEval, position: &Position, legal_moves: &[M
     }
     normalize_priors(&mut priors);
     PolicyValueOutput::from_stm_wdl(priors, cached.wdl)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_cache_lookup_hit_miss_stats() {
+        let cache = EvalCache::new(4);
+        let key = 42u64;
+        assert!(cache.get(key).is_none());
+        cache.record_lookup_miss(1);
+        cache.record_miss_keys(1);
+        let cached = CachedEval {
+            logits: vec![0.1],
+            wdl: [0.5, 0.0, 0.5],
+        };
+        cache.insert(key, cached.clone());
+        assert!(cache.get(key).is_some());
+        let stats = cache.stats();
+        assert_eq!(stats.lookup_hits, 1);
+        assert_eq!(stats.lookup_misses, 1);
+        assert_eq!(stats.miss_keys, 1);
+        assert_eq!(stats.hits, stats.lookup_hits);
+        assert_eq!(stats.misses, stats.lookup_misses);
+    }
+
+    #[test]
+    fn eval_cache_miss_keys_deduplicated_in_stats() {
+        let cache = EvalCache::new(4);
+        cache.record_lookup_miss(3);
+        cache.record_miss_keys(1);
+        let stats = cache.stats();
+        assert_eq!(stats.lookup_misses, 3);
+        assert_eq!(stats.miss_keys, 1);
+    }
 }
