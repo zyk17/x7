@@ -1,4 +1,4 @@
-//! ONNX Runtime 加载 `policy.onnx`（`board` → `logits` + 可选 `value(WDL)`）。
+//! ONNX Runtime 加载 `x7.onnx`（`board` → `logits` + 可选 `value(WDL)`）。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -338,8 +338,8 @@ mod tests {
 
     fn candidate_onnx_paths() -> [PathBuf; 2] {
         [
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/checkpoints/policy.onnx"),
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/policy.onnx"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/checkpoints/x7.onnx"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx"),
         ]
     }
 
@@ -357,7 +357,7 @@ mod tests {
         let out = match p.eval_fen(crate::START_FEN) {
             Ok(out) => out,
             Err(err) if err.to_string().contains("value 形状期望 [1,3]") => {
-                eprintln!("skip old scalar policy.onnx: {err}");
+                eprintln!("skip old scalar x7.onnx: {err}");
                 return;
             }
             Err(err) => panic!("infer: {err}"),

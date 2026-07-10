@@ -35,9 +35,9 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\inspect
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
   --px0-version 710 `
-  --out data\checkpoints\baseline_px0_katago_v1.pt `
-  --width 128 `
-  --blocks 8 `
+  --out data\checkpoints\x7_qmix_000_01.pt `
+  --width 160 `
+  --blocks 10 `
   --batch-size 256 `
   --steps 200000 `
   --eval-every 1000 `
@@ -52,9 +52,9 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
   --px0-version 710 `
-  --out data\checkpoints\baseline_px0_katago_v1.pt `
-  --width 128 `
-  --blocks 8 `
+  --out data\checkpoints\x7_qmix_000_01.pt `
+  --width 160 `
+  --blocks 10 `
   --batch-size 256 `
   --steps 200000 `
   --eval-every 1000 `
@@ -76,10 +76,10 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
   --px0-version 710 `
-  --init-from data\checkpoints\baseline_px0_katago_v1.best.pt `
-  --out data\checkpoints\baseline_px0_katago_v1_qmix025.pt `
-  --width 128 `
-  --blocks 8 `
+  --init-from data\checkpoints\x7_qmix_075_01.best.pt `
+  --out data\checkpoints\x7_qmix_025_01.pt `
+  --width 160 `
+  --blocks 10 `
   --batch-size 256 `
   --steps 30000 `
   --eval-every 1000 `
@@ -95,9 +95,9 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
   --px0-version 710 `
   --px0-force-download `
-  --out data\checkpoints\baseline_px0_katago_v1.pt `
-  --width 128 `
-  --blocks 8 `
+  --out data\checkpoints\x7_qmix_000_01.pt `
+  --width 160 `
+  --blocks 10 `
   --batch-size 256 `
   --steps 200000 `
   --eval-every 1000 `
@@ -124,8 +124,8 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\split_p
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
-  --checkpoint data\checkpoints\baseline_px0_katago_v1.best.pt `
-  --out data\policy.onnx
+  --checkpoint data\checkpoints\x7_qmix_075_01.best.pt `
+  --out data\x7.onnx
 ```
 
 说明：
@@ -147,7 +147,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test
 ## 10. 引擎 ONNX 冒烟
 
 ```powershell
-cargo run --release -p engin -- --onnx-smoke data\policy.onnx
+cargo run --release -p engin -- --onnx-smoke data\x7.onnx
 ```
 
 这条命令只验证最小推理链路，不代表 GUI 正式接入效果。
@@ -170,7 +170,7 @@ cargo run --release -p engin -- --onnx-smoke data\policy.onnx
 
 ```powershell
 cargo run --release -p engin --bin onnx_eval -- `
-  --onnx data\policy.onnx `
+  --onnx data\x7.onnx `
   --fen "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1" `
   --topk 8
 ```
@@ -179,7 +179,7 @@ cargo run --release -p engin --bin onnx_eval -- `
 
 ```powershell
 cargo run --release -p engin --bin onnx_eval -- `
-  --onnx data\policy.onnx `
+  --onnx data\x7.onnx `
   --input data\eval_positions.txt `
   --topk 8 `
   --out data\eval_positions.ndjson
@@ -188,7 +188,7 @@ cargo run --release -p engin --bin onnx_eval -- `
 ## 12. 引擎 bench
 
 ```powershell
-cargo run --release -p engin -- --bench --playouts 64 --onnx data\policy.onnx --require-onnx
+cargo run --release -p engin -- --bench --playouts 64 --onnx data\x7.onnx --require-onnx
 ```
 
 固定搜索对照建议直接这样跑：
@@ -197,7 +197,7 @@ cargo run --release -p engin -- --bench --playouts 64 --onnx data\policy.onnx --
 
 ```powershell
 cargo run --release -p engin -- --bench `
-  --onnx data\policy.onnx `
+  --onnx data\x7.onnx `
   --require-onnx `
   --movetime 2000 `
   --search-batch-size 16
@@ -207,7 +207,7 @@ cargo run --release -p engin -- --bench `
 
 ```powershell
 cargo run --release -p engin -- --bench `
-  --onnx data\policy.onnx `
+  --onnx data\x7.onnx `
   --require-onnx `
   --movetime 2000 `
   --search-batch-size 32
@@ -217,7 +217,7 @@ cargo run --release -p engin -- --bench `
 
 ```powershell
 cargo run --release -p engin -- --bench `
-  --onnx data\policy.onnx `
+  --onnx data\x7.onnx `
   --require-onnx `
   --movetime 2000 `
   --search-batch-size 64
@@ -234,7 +234,7 @@ cargo run --release -p engin -- --bench `
 ```powershell
 @'
 uci
-setoption name PolicyFile value C:/projects/77xiangqi_engine/data/policy.onnx
+setoption name PolicyFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos
 go nodes 64
@@ -247,7 +247,7 @@ quit
 ```powershell
 @'
 uci
-setoption name PolicyFile value C:/projects/77xiangqi_engine/data/policy.onnx
+setoption name PolicyFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos moves h2e2 h7e7
 go nodes 64
@@ -276,7 +276,6 @@ cargo run --release -p engin
 - 当前默认 `MctsWorkers=8`
 - 默认 `MctsBatchCap=2048`
 - `MctsBatchCap` 是 batch 上限，不是固定目标值
-- 搜索过程中的 `info string root_moves_top5` 现在格式为 `move:visits:q:prior`
 - 目前建议优先测试的 `MctsBatchCap` 档位是 `64 / 128 / 256 / 512 / 1024 / 2048 / 4096 / 8192`
 
 ## 14. 质量检查

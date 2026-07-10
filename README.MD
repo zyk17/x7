@@ -34,7 +34,10 @@
 
 - ONNX `value` 输出为 `WDL` 概率
 - 引擎侧统一按 `q = W - L` 消费 value
-- 当前默认 `q_ratio=0.0`，即主训练默认优先学最终结果 `WDL`
+- 当前 value 目标为固定标量 `q_ratio` 下的 `winner_wdl / search_wdl` 混合
+- `q_ratio=0.0` 表示只学最终结果，`q_ratio=1.0` 表示只学搜索目标
+- 分阶段训练时允许通过新输出文件或 `--init-from` 切到新的固定 `q_ratio`
+- 当前默认 baseline 容量为 `10x160`
 - 当前训练会额外使用 `best_q / visits / policy_kld / plies_left`
 - 搜索核心已切成单线程 `iteration -> minibatch gather -> batched NN -> backup`
 - 当前搜索语义包含 `in_flight / collision / multivisit`

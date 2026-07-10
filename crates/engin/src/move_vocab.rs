@@ -1,9 +1,11 @@
+//! px0 固定 2062 维 move head 词表：UCI 着法 ↔ logits 下标。
+
 use std::sync::OnceLock;
 
 use xiangqi_core::types::{flip_rank, Square};
 use xiangqi_core::Move;
 
-const PX0_POLICY_MOVES: &str = include_str!("px0_policy_moves.txt");
+const MOVE_VOCAB: &str = include_str!("move_vocab.txt");
 
 fn parse_square(bytes: &[u8]) -> Option<Square> {
     if bytes.len() != 2 {
@@ -24,11 +26,11 @@ fn packed_idx(mv: Move) -> usize {
     ((mv.from_sq().to_u8() as usize) << 7) | mv.to_sq().to_u8() as usize
 }
 
-fn px0_index_table() -> &'static [i16; 128 * 128] {
+fn index_table() -> &'static [i16; 128 * 128] {
     static TABLE: OnceLock<[i16; 128 * 128]> = OnceLock::new();
     TABLE.get_or_init(|| {
         let mut table = [-1i16; 128 * 128];
-        for (idx, line) in PX0_POLICY_MOVES.lines().enumerate() {
+        for (idx, line) in MOVE_VOCAB.lines().enumerate() {
             let bytes = line.as_bytes();
             let Some(from) = parse_square(&bytes[0..2]) else {
                 continue;
@@ -43,23 +45,23 @@ fn px0_index_table() -> &'static [i16; 128 * 128] {
     })
 }
 
-fn px0_moves() -> &'static [&'static str] {
+fn vocab_moves() -> &'static [&'static str] {
     static MOVES: OnceLock<Vec<&'static str>> = OnceLock::new();
-    MOVES.get_or_init(|| PX0_POLICY_MOVES.lines().collect()).as_slice()
+    MOVES.get_or_init(|| MOVE_VOCAB.lines().collect()).as_slice()
 }
 
-pub fn px0_policy_index(mv: Move, black_to_move: bool) -> Option<usize> {
+pub fn move_vocab_index(mv: Move, black_to_move: bool) -> Option<usize> {
     let mapped = if black_to_move {
         Move::make(flip_rank(mv.from_sq()), flip_rank(mv.to_sq()))
     } else {
         mv
     };
-    let idx = px0_index_table()[packed_idx(mapped)];
+    let idx = index_table()[packed_idx(mapped)];
     (idx >= 0).then_some(idx as usize)
 }
 
-pub fn px0_policy_move(index: usize, black_to_move: bool) -> Option<Move> {
-    let uci = *px0_moves().get(index)?;
+pub fn move_vocab_move(index: usize, black_to_move: bool) -> Option<Move> {
+    let uci = *vocab_moves().get(index)?;
     let bytes = uci.as_bytes();
     let from = parse_square(&bytes[0..2])?;
     let to = parse_square(&bytes[2..4])?;

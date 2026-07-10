@@ -13,13 +13,13 @@ use engin::mcts::{MctsBudget, MctsConfig, SharedPolicy};
 use engin::{run_uci_stdio, PolicyOnnx, PolicySessionPool, START_FEN};
 
 fn default_policy_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/policy.onnx")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx")
 }
 
 fn print_usage() {
     eprintln!(
         "用法:\n  engin                         UCI 模式（stdin/stdout）\n  \
-         engin --onnx-smoke [ONNX] [FEN]  冒烟；缺省 ONNX=data/policy.onnx、FEN=起始局面\n  \
+         engin --onnx-smoke [ONNX] [FEN]  冒烟；缺省 ONNX=data/x7.onnx、FEN=起始局面\n  \
          engin --bench [选项]            MCTS 基准（NDJSON）\n  \
          --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --search-batch-size N  --onnx PATH  --fen FEN  --data-dir PATH  --require-onnx"
     );
@@ -33,12 +33,14 @@ struct BenchCli {
     data_dir: Option<PathBuf>,
     require_onnx: bool,
     fens: Vec<String>,
+    threads: usize,
 }
 
 fn parse_bench_cli(rest: &[String]) -> BenchCli {
     let mut budget = MctsBudget {
         max_playouts: Some(256),
         max_nodes: None,
+        max_depth: None,
         deadline: None,
         stop: None,
     };
@@ -47,6 +49,7 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
     let mut data_dir: Option<PathBuf> = None;
     let mut require_onnx = false;
     let mut fens = Vec::new();
+    let mut threads = 1usize;
     let mut i = 0usize;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -92,6 +95,12 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
                 fens.push(rest[i + 1].clone());
                 i += 2;
             }
+            "--threads" if i + 1 < rest.len() => {
+                if let Ok(n) = rest[i + 1].parse::<usize>() {
+                    threads = n.max(1);
+                }
+                i += 2;
+            }
             "--require-onnx" => {
                 require_onnx = true;
                 i += 1;
@@ -109,6 +118,7 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
         data_dir,
         require_onnx,
         fens,
+        threads,
     }
 }
 
@@ -119,10 +129,10 @@ fn resolve_bench_onnx(cli: &BenchCli) -> Option<PathBuf> {
         .or_else(|| {
             cli.data_dir
                 .as_ref()
-                .map(|d| d.join("policy.onnx"))
+                .map(|d| d.join("x7.onnx"))
                 .filter(|p| p.is_file())
         })
-        .or_else(|| resolve_data_file("policy.onnx"));
+        .or_else(|| resolve_data_file("x7.onnx"));
     onnx
 }
 
@@ -137,7 +147,7 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
         }
     }
     if cli.require_onnx && onnx_path.is_none() {
-        eprintln!("--bench: 未找到 policy.onnx");
+        eprintln!("--bench: 未找到 x7.onnx");
         process::exit(1);
     }
 
@@ -165,6 +175,7 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
         config: cli.config,
         policy: &policy,
         meta: &meta,
+        threads: cli.threads,
     };
     let default_fens;
     let fens: &[String] = if cli.fens.is_empty() {
@@ -187,7 +198,7 @@ fn legal_top_lines(logits: &[f32], fen: &str, k: usize) -> Result<String, String
         let Some(mv) = xiangqi_core::uci_to_move(&pos, &u) else {
             continue;
         };
-        let Some(idx) = engin::px0_policy::px0_policy_index(mv, black_to_move) else {
+        let Some(idx) = engin::move_vocab::move_vocab_index(mv, black_to_move) else {
             continue;
         };
         if idx < logits.len() {

@@ -4,7 +4,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process;
 
-use engin::{parse_position_history_uci, px0_policy, PolicyOnnx, PositionHistory};
+use engin::{move_vocab, parse_position_history_uci, PolicyOnnx, PositionHistory};
 use serde_json::json;
 use xiangqi_core::{legal_moves_uci, uci_to_move, Position};
 
@@ -107,7 +107,7 @@ fn legal_top_entries(pos: &Position, logits: &[f32], k: usize) -> Vec<PolicyEntr
         .into_iter()
         .filter_map(|uci| {
             let mv = uci_to_move(pos, &uci)?;
-            let idx = px0_policy::px0_policy_index(mv, black_to_move)?;
+            let idx = move_vocab::move_vocab_index(mv, black_to_move)?;
             let logit = *logits.get(idx)?;
             Some(PolicyEntry { idx, uci, logit })
         })

@@ -1,4 +1,4 @@
-"""校验仓库根目录 `data/policy.onnx` 与 `export_onnx.py` 约定一致。
+"""校验仓库根目录 `data/x7.onnx` 与 `export_onnx.py` 约定一致。
 
 `data/` 通常 gitignore，本地导出后放入即可运行本测试；缺失则跳过。
 """
@@ -13,7 +13,7 @@ onnx = pytest.importorskip("onnx")
 from onnx import TensorProto, shape_inference
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-POLICY_ONNX = REPO_ROOT / "data" / "policy.onnx"
+POLICY_ONNX = REPO_ROOT / "data" / "x7.onnx"
 
 _ALLOWED_SUFFIXES = ((), ("value",))
 
@@ -74,7 +74,7 @@ def test_policy_onnx_contract_matches_export_script() -> None:
         elem, dims = _tensor_elem_type_and_shape(o)
         assert elem == TensorProto.FLOAT
         if dims == [1]:
-            pytest.skip("stale scalar data/policy.onnx; re-export WDL onnx via scripts/export/export_onnx.py")
+            pytest.skip("stale scalar data/x7.onnx; re-export WDL onnx via scripts/export/export_onnx.py")
         assert dims in ([1, 3], ["batch", 3]), f"{o.name} expected float32[B,3] WDL probabilities, got {dims}"
 
 
@@ -99,5 +99,5 @@ def test_policy_onnx_optional_runtime_inference_smoke() -> None:
     assert out[0].shape[0] == 1 and out[0].ndim == 2
     for i in range(1, len(out)):
         if out[i].shape == (1,):
-            pytest.skip("stale scalar data/policy.onnx; re-export WDL onnx via scripts/export/export_onnx.py")
+            pytest.skip("stale scalar data/x7.onnx; re-export WDL onnx via scripts/export/export_onnx.py")
         assert out[i].shape == (1, 3)

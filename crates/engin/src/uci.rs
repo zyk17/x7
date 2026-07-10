@@ -12,13 +12,12 @@ use xiangqi_core::{uci_to_move, Position, START_FEN};
 use crate::benchmark::resolve_data_file;
 use crate::history::PositionHistory;
 use crate::mcts::{
-    MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, MctsSearchProgress, OnnxPolicyValueEval, SharedPolicy,
+    MctsBudget, MctsConfig, MctsEngine, MctsSearchProgress, MctsTree, OnnxPolicyValueEval, SharedPolicy,
 };
 use crate::policy_onnx::PolicySessionPool;
 
 static UCI_STDOUT_LOCK: Mutex<()> = Mutex::new(());
 const UCI_INFO_INTERVAL: Duration = Duration::from_millis(200);
-const UCI_ROOT_MOVE_TOP_K: usize = 5;
 const AUTO_THREADS: usize = 0;
 const DEFAULT_THREADS: usize = 8;
 const MAX_THREADS: usize = 1024;
@@ -36,6 +35,7 @@ struct UciInfoView<'a> {
     playouts: u32,
     nodes: usize,
     elapsed_ms: u64,
+    nps_elapsed_ms: u64,
     pv: &'a [xiangqi_core::Move],
 }
 
@@ -48,10 +48,16 @@ fn uci_info_line(view: UciInfoView<'_>) -> String {
         playouts,
         nodes,
         elapsed_ms,
+        nps_elapsed_ms,
         pv,
     } = view;
-    let nps = if elapsed_ms > 0 {
-        (playouts as u128 * 1000 / u128::from(elapsed_ms)) as u64
+    let nps_basis_ms = if nps_elapsed_ms > 0 {
+        nps_elapsed_ms
+    } else {
+        elapsed_ms
+    };
+    let nps = if nps_basis_ms > 0 {
+        (playouts as u128 * 1000 / u128::from(nps_basis_ms)) as u64
     } else {
         0
     };
@@ -74,29 +80,6 @@ fn uci_info_line(view: UciInfoView<'_>) -> String {
     line
 }
 
-fn uci_root_moves_line(moves: &[MctsMoveStat]) -> String {
-    let mut stats = moves.to_vec();
-    stats.sort_by(|a, b| {
-        b.visits
-            .cmp(&a.visits)
-            .then_with(|| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal))
-    });
-    let body = stats
-        .into_iter()
-        .take(UCI_ROOT_MOVE_TOP_K)
-        .map(|s| {
-            format!(
-                "{}:{}:{:.3}:{:.3}",
-                xiangqi_core::move_to_uci(s.mv),
-                s.visits,
-                s.q,
-                s.prior
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("info string root_moves_top{UCI_ROOT_MOVE_TOP_K} move:visits:q:prior {body}")
-}
 
 fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsSearchProgress, elapsed_ms: u64) {
     if progress.playouts == 0 {
@@ -110,16 +93,9 @@ fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsS
         playouts: progress.playouts,
         nodes: progress.nodes,
         elapsed_ms,
+        nps_elapsed_ms: progress.nps_elapsed_ms,
         pv: &progress.pv,
     }));
-    if let Some(best_move) = progress.best_move {
-        let best_uci = xiangqi_core::move_to_uci(best_move);
-        output(&format!(
-            "info string mcts playouts={} root_visits={} nodes={} root_value={:.4} best_value={:.4} bestmove={}",
-            progress.playouts, progress.root_visits, progress.nodes, progress.root_value, progress.best_value, best_uci
-        ));
-        output(&uci_root_moves_line(&progress.moves));
-    }
 }
 
 type EngineOutput = Arc<dyn Fn(&str) + Send + Sync + 'static>;
@@ -268,7 +244,7 @@ impl Engine {
     }
 
     fn new_with_output(output: EngineOutput) -> Self {
-        let policy_path = resolve_data_file("policy.onnx");
+        let policy_path = resolve_data_file("x7.onnx");
         let policy = policy_path
             .as_ref()
             .and_then(|path| PolicySessionPool::from_file(path).ok())
@@ -311,15 +287,36 @@ impl Engine {
                 self.policy = Some(Arc::new(pool));
             }
         }
-        self.rebuild_search_engine();
+        self.rebuild_search_engine(false);
         Ok(())
     }
 
-    fn rebuild_search_engine(&mut self) {
-        self.search_engine = Arc::new(Mutex::new(MctsEngine::new(
+    /// `preserve_tree=false`：换权重后必须丢弃旧树（prior/Q/visit 来自旧模型）。
+    fn rebuild_search_engine(&mut self, preserve_tree: bool) {
+        let mut engine = self
+            .search_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let preserved = if preserve_tree {
+            (
+                std::mem::take(&mut engine.tree),
+                engine.root_id,
+                engine.root_history.take(),
+            )
+        } else {
+            (MctsTree::new(), None, None)
+        };
+        drop(engine);
+        let mut fresh = MctsEngine::new(
             self.config,
             OnnxPolicyValueEval::new(self.policy.clone()),
-        )));
+        );
+        if preserve_tree {
+            fresh.tree = preserved.0;
+            fresh.root_id = preserved.1;
+            fresh.root_history = preserved.2;
+        }
+        self.search_engine = Arc::new(Mutex::new(fresh));
     }
 
     fn auto_threads(&self) -> usize {
@@ -383,7 +380,7 @@ impl Engine {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<f32>() {
                         self.config.cpuct = n.clamp(0.01, 100.0);
-                        self.rebuild_search_engine();
+                        self.rebuild_search_engine(true);
                     }
                 }
             }
@@ -392,7 +389,7 @@ impl Engine {
                     if let Ok(n) = v.trim().parse::<f32>() {
                         self.config.fpu_reduction = n.clamp(0.0, 2.0);
                         self.config.fpu_reduction_root = n.clamp(0.0, 4.0);
-                        self.rebuild_search_engine();
+                        self.rebuild_search_engine(true);
                     }
                 }
             }
@@ -400,7 +397,7 @@ impl Engine {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<usize>() {
                         self.config.search_batch_size = n.clamp(1, 8192);
-                        self.rebuild_search_engine();
+                        self.rebuild_search_engine(true);
                     }
                 }
             }
@@ -427,6 +424,7 @@ impl Engine {
             return Ok(MctsBudget {
                 max_playouts: None,
                 max_nodes: Some(nodes.min(u64::from(u32::MAX)) as u32),
+                max_depth: None,
                 deadline: None,
                 stop: None,
             });
@@ -436,20 +434,20 @@ impl Engine {
             return Ok(MctsBudget {
                 max_playouts: None,
                 max_nodes: None,
+                max_depth: None,
                 deadline: None,
                 stop: None,
             });
         }
 
         if let Some(depth) = params.depth {
-            return Err(format!(
-                "go depth {depth} 暂不支持；请使用 go nodes / go movetime / go infinite"
-            ));
+            return Ok(MctsBudget::from_depth(depth));
         }
 
         Ok(MctsBudget {
             max_playouts: Some(self.default_playouts.max(1)),
             max_nodes: None,
+            max_depth: None,
             deadline: None,
             stop: None,
         })
@@ -512,17 +510,11 @@ impl Engine {
                         playouts: result.playouts,
                         nodes: result.nodes,
                         elapsed_ms,
+                        nps_elapsed_ms: result.nps_elapsed_ms,
                         pv: &result.pv,
                     }));
-                    if !result.moves.is_empty() {
-                        output(&uci_root_moves_line(&result.moves));
-                    }
                     if let Some(best_move) = result.best_move {
                         let best_uci = xiangqi_core::move_to_uci(best_move);
-                        output(&format!(
-                            "info string mcts playouts={} root_visits={} nodes={} root_value={:.4} best_value={:.4}",
-                            result.playouts, result.root_visits, result.nodes, result.root_value, result.best_value
-                        ));
                         output(&format!("bestmove {best_uci}"));
                     } else {
                         output("bestmove (none)");
@@ -694,6 +686,7 @@ mod tests {
             playouts: 64,
             nodes: 128,
             elapsed_ms: 50,
+            nps_elapsed_ms: 50,
             pv: &[],
         });
         assert!(line.contains("score mate 3"));
@@ -748,13 +741,25 @@ mod tests {
     }
 
     #[test]
-    fn go_depth_reports_unsupported() {
-        let input = b"uci\nposition startpos\ngo depth 2\nquit\n";
-        let mut out = Vec::new();
-        run_uci_for_test(Cursor::new(&input[..]), &mut out).unwrap();
-        let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("暂不支持"));
-        assert!(s.contains("bestmove (none)"));
+    fn go_depth_stops_at_target_depth() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |line: &str| {
+                lines.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+            }) as EngineOutput
+        };
+        let mut engine = Engine::new_with_output(sink);
+        engine.handle_line("setoption name MctsWorkers value 1");
+        engine.handle_line("position startpos");
+        engine.handle_line("go depth 2");
+        std::thread::sleep(Duration::from_millis(200));
+        engine.stop_and_join();
+
+        let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+        assert!(out.contains("info depth"));
+        assert!(out.contains("bestmove"));
+        assert!(!out.contains("暂不支持"));
     }
 
     #[test]
@@ -795,7 +800,7 @@ mod tests {
         engine.stop_and_join();
 
         let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
-        assert!(out.contains("info string mcts"));
+        assert!(out.contains("info depth"));
         assert!(out.contains("bestmove"));
     }
 
@@ -836,7 +841,7 @@ mod tests {
         };
         let mut engine = Engine::new_with_output(sink);
         engine.policy = None;
-        engine.rebuild_search_engine();
+        engine.rebuild_search_engine(true);
         engine.handle_line("setoption name MctsWorkers value 2");
         engine.handle_line("position startpos");
         engine.handle_line("go nodes 16");
@@ -846,6 +851,29 @@ mod tests {
         let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
         assert!(out.contains("bestmove"));
         assert!(!out.ends_with("bestmove (none)"));
+    }
+
+    #[test]
+    fn policy_reload_discards_search_tree() {
+        let mut engine = Engine::new();
+        engine.handle_line("setoption name MctsWorkers value 1");
+        engine.handle_line("position startpos");
+        engine.handle_line("go nodes 16");
+        std::thread::sleep(Duration::from_millis(200));
+        engine.stop_and_join();
+
+        {
+            let mcts = engine.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(mcts.tree.len() > 0, "search should materialize tree nodes");
+            assert!(mcts.root_id.is_some());
+        }
+
+        engine.reload_policy().expect("reload");
+
+        let mcts = engine.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(mcts.tree.len(), 0);
+        assert!(mcts.root_id.is_none());
+        assert!(mcts.root_history.is_none());
     }
 
     #[test]

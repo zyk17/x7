@@ -15,7 +15,7 @@ pub mod fen_tensor;
 pub mod history;
 pub mod mcts;
 pub mod policy_onnx;
-pub mod px0_policy;
+pub mod move_vocab;
 pub mod uci;
 
 pub use benchmark::{default_benchmark_fen_strings, resolve_data_file, BenchJsonMeta, BenchSessionParams};

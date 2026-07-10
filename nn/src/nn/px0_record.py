@@ -5,6 +5,7 @@
 - 124 x 10 x 9 输入平面
 - 2062 维 policy 概率
 - winner WDL
+- root WDL
 - search q WDL（来自 best_q / best_d）
 - search visits
 - policy_kld
@@ -40,6 +41,7 @@ class Px0Sample:
     policy: np.ndarray
     winner_q: np.ndarray
     winner_wdl: np.ndarray
+    root_wdl: np.ndarray
     search_q: np.ndarray
     search_wdl: np.ndarray
     search_visits: np.ndarray
@@ -110,9 +112,9 @@ def parse_v6_record(record: bytes) -> Px0Sample:
         rule50_count,
         invariance_info,
         _dep_result,
-        _root_q,
+        root_q,
         best_q,
-        _root_d,
+        root_d,
         best_d,
         _root_m,
         _best_m,
@@ -147,6 +149,7 @@ def parse_v6_record(record: bytes) -> Px0Sample:
         input_format=int(input_format),
     )
     winner = _winner_wdl(float(result_q), float(result_d))
+    root = _search_wdl(float(root_q), float(root_d))
     search = _search_wdl(float(best_q), float(best_d))
     plies = np.asarray([float(plies_left)], dtype=np.float32)
     return Px0Sample(
@@ -154,6 +157,7 @@ def parse_v6_record(record: bytes) -> Px0Sample:
         policy=policy,
         winner_q=np.asarray([float(result_q)], dtype=np.float32),
         winner_wdl=winner,
+        root_wdl=root,
         search_q=np.asarray([float(best_q)], dtype=np.float32),
         search_wdl=search,
         search_visits=np.asarray([float(visits)], dtype=np.float32),

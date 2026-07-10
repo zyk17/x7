@@ -53,8 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--val-list", type=Path, default=None, help="JSON file list for validation chunks")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--init-from", type=Path, default=None, help="initialize model weights from an existing checkpoint")
-    ap.add_argument("--width", type=int, default=128)
-    ap.add_argument("--blocks", type=int, default=8)
+    ap.add_argument("--width", type=int, default=160)
+    ap.add_argument("--blocks", type=int, default=10)
     ap.add_argument("--in-planes", type=int, default=124)
     ap.add_argument("--num-moves", type=int, default=2062)
     ap.add_argument("--batch-size", type=int, default=256)
@@ -115,6 +115,8 @@ def validate_existing_output_checkpoint(
     ckpt: dict,
     *,
     args: argparse.Namespace,
+    train_files: list[Path],
+    val_files: list[Path],
 ) -> None:
     if ckpt.get("trunk_kind") is not None and str(ckpt.get("trunk_kind")) != "katago_cnn_v1":
         raise SystemExit("--out 已存在，但不是当前 katago_cnn_v1 架构；请换新输出文件重新训练")
@@ -127,20 +129,18 @@ def validate_existing_output_checkpoint(
             f"--out 已存在，但其中 checkpoint q_ratio={float(got_q_ratio):.6f}，"
             f"当前命令 q_ratio={expected_q_ratio:.6f}；请换新输出文件或改用 --init-from 开启新阶段训练"
         )
-
-def describe_dataset_change(ckpt: dict, *, train_files: list[Path], val_files: list[Path]) -> str | None:
     prev_train_files = ckpt.get("train_files")
     prev_val_files = ckpt.get("val_files")
     current_train_files = [str(p.resolve()) for p in train_files]
     current_val_files = [str(p.resolve()) for p in val_files]
-    if prev_train_files is None and prev_val_files is None:
-        return None
-    if list(prev_train_files or []) == current_train_files and list(prev_val_files or []) == current_val_files:
-        return None
-    return (
-        f"dataset changed: train_files {len(list(prev_train_files or []))}->{len(current_train_files)} "
-        f"val_files {len(list(prev_val_files or []))}->{len(current_val_files)}"
-    )
+    if prev_train_files is not None and list(prev_train_files) != current_train_files:
+        raise SystemExit(
+            "--out 已存在，但 train_files 与 checkpoint 不一致；请换新输出文件或改用 --init-from"
+        )
+    if prev_val_files is not None and list(prev_val_files) != current_val_files:
+        raise SystemExit(
+            "--out 已存在，但 val_files 与 checkpoint 不一致；请换新输出文件或改用 --init-from"
+        )
 
 
 def make_sample_weight(search_visits: torch.Tensor, policy_kld: torch.Tensor) -> torch.Tensor:
@@ -174,9 +174,9 @@ def run_val(
             policy_kld = batch["policy_kld"].to(device=device, dtype=torch.float32)
             plies_left = batch["plies_left"].to(device=device, dtype=torch.float32)
             sample_weight = make_sample_weight(search_visits, policy_kld)
-            target_value = mix_wdl_targets(winner_wdl, search_wdl, q_ratio=q_ratio)
             legal_mask = raw_policy >= 0
             target_policy = raw_policy.clamp_min(0.0)
+            target_value = mix_wdl_targets(winner_wdl, search_wdl, q_ratio=float(q_ratio))
             output = model(boards)
             policy_logits, pred_value, pred_moves_left = take_logits_and_value(output)
             policy_loss = soft_policy_cross_entropy(
@@ -294,8 +294,9 @@ def main() -> None:
         validate_existing_output_checkpoint(
             ckpt,
             args=args,
+            train_files=train_ds.files,
+            val_files=val_ds.files,
         )
-        dataset_change = describe_dataset_change(ckpt, train_files=train_ds.files, val_files=val_ds.files)
         model.load_state_dict(ckpt["model"], strict=True)
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
@@ -311,8 +312,6 @@ def main() -> None:
             for _ in range(start_step):
                 scheduler.step()
         print(f"resume from {args.out} | completed_steps={start_step}")
-        if dataset_change is not None:
-            print(f"resume dataset phase -> {dataset_change}")
     elif args.init_from is not None:
         ckpt = torch.load(args.init_from, map_location=device)
         model.load_state_dict(ckpt["model"], strict=True)
@@ -320,7 +319,9 @@ def main() -> None:
 
     print(
         f"px0: train_files={len(train_ds.files)} val_files={len(val_ds.files)} "
-        f"batch_size={int(args.batch_size)} steps={int(args.steps)} q_ratio={float(args.q_ratio):.3f}"
+        f"batch_size={int(args.batch_size)} steps={int(args.steps)} "
+        f"width={int(args.width)} blocks={int(args.blocks)} "
+        f"q_ratio={float(args.q_ratio):.3f}"
     )
     if args.px0_version:
         print(
@@ -346,9 +347,9 @@ def main() -> None:
         policy_kld = batch["policy_kld"].to(device=device, dtype=torch.float32)
         plies_left = batch["plies_left"].to(device=device, dtype=torch.float32)
         sample_weight = make_sample_weight(search_visits, policy_kld)
-        target_value = mix_wdl_targets(winner_wdl, search_wdl, q_ratio=float(args.q_ratio))
         legal_mask = raw_policy >= 0
         target_policy = raw_policy.clamp_min(0.0)
+        target_value = mix_wdl_targets(winner_wdl, search_wdl, q_ratio=float(args.q_ratio))
 
         opt.zero_grad(set_to_none=True)
         output = model(boards)

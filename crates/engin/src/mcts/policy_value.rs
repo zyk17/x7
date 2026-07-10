@@ -7,7 +7,7 @@ use xiangqi_core::Position;
 
 use crate::history::PositionHistory;
 use crate::policy_onnx::{PolicyOnnx, PolicySessionPool};
-use crate::px0_policy::px0_policy_index;
+use crate::move_vocab::move_vocab_index;
 
 pub type SharedPolicy = Option<Arc<PolicySessionPool>>;
 pub(crate) type SharedEvalCache = Arc<EvalCache>;
@@ -70,13 +70,30 @@ impl TaskLike for Arc<PolicyValueTask> {
     }
 }
 
-/// 单次网络评估输出。
+/// 单次网络评估输出（fetch 后 wl 为 parent-move 视角）。
 #[derive(Clone, Debug, Default)]
 pub struct PolicyValueOutput {
-    /// 与 `legal_moves` 对齐的先验分布。
     pub priors: Vec<f32>,
-    /// 当前行棋方视角 q = w - l，范围预期为 [-1, 1]。
+    pub wl: f32,
+    pub d: f32,
+    pub m: f32,
+    /// 与 `wl` 相同，保留旧调用方兼容。
     pub value: f32,
+}
+
+impl PolicyValueOutput {
+    pub fn from_stm_wdl(priors: Vec<f32>, wdl: [f32; 3]) -> Self {
+        let wl_stm = (wdl[0] - wdl[2]).clamp(-1.0, 1.0);
+        let wl = -wl_stm;
+        let d = wdl[1].clamp(0.0, 1.0);
+        Self {
+            priors,
+            wl,
+            d,
+            m: 0.0,
+            value: wl,
+        }
+    }
 }
 
 /// MCTS 对网络评估器的最小依赖接口。
@@ -106,7 +123,7 @@ pub struct OnnxPolicyValueEval {
 #[derive(Clone, Debug)]
 pub(crate) struct CachedEval {
     logits: Vec<f32>,
-    value: f32,
+    wdl: [f32; 3],
 }
 
 pub(crate) struct EvalCache {
@@ -162,20 +179,6 @@ impl OnnxPolicyValueEval {
         Self {
             session: policy.as_ref().map(|pool| pool.primary()),
             policy,
-            cache,
-            scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
-            scratch_batch: ndarray::Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
-        }
-    }
-
-    pub(crate) fn with_session(
-        policy: SharedPolicy,
-        session: Option<Arc<Mutex<PolicyOnnx>>>,
-        cache: SharedEvalCache,
-    ) -> Self {
-        Self {
-            policy,
-            session,
             cache,
             scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
             scratch_batch: ndarray::Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
@@ -248,14 +251,15 @@ impl OnnxPolicyValueEval {
 
         let mut unique_cached = Vec::with_capacity(unique_misses.len());
         for (slot, &task_idx) in unique_misses.iter().enumerate() {
+            let wdl = batch
+                .wdl
+                .as_ref()
+                .and_then(|wdls| wdls.get(slot))
+                .copied()
+                .unwrap_or([0.5, 0.0, 0.5]);
             let cached = CachedEval {
                 logits: batch.logits[slot].clone(),
-                value: batch
-                    .wdl
-                    .as_ref()
-                    .and_then(|wdls| wdls.get(slot))
-                    .map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0))
-                    .unwrap_or(0.0),
+                wdl,
             };
             self.cache
                 .insert(tasks[task_idx].history().input_cache_key(), cached.clone());
@@ -271,13 +275,6 @@ impl OnnxPolicyValueEval {
         }
 
         Ok(outputs)
-    }
-
-    pub(crate) fn evaluate_many_shared(
-        &mut self,
-        tasks: &[Arc<PolicyValueTask>],
-    ) -> Result<Vec<PolicyValueOutput>, String> {
-        self.evaluate_many_impl(tasks)
     }
 }
 
@@ -301,7 +298,7 @@ impl PolicyValueEval for OnnxPolicyValueEval {
             };
             CachedEval {
                 logits: out.logits,
-                value: out.wdl.map(|wdl| (wdl[0] - wdl[2]).clamp(-1.0, 1.0)).unwrap_or(0.0),
+                wdl: out.wdl.unwrap_or([0.5, 0.0, 0.5]),
             }
         };
         let out = output_from_cached(&cached, input.position, input.legal_moves);
@@ -318,6 +315,9 @@ fn uniform_output(len: usize) -> PolicyValueOutput {
     let p = if len == 0 { 0.0 } else { 1.0 / len as f32 };
     PolicyValueOutput {
         priors: vec![p; len],
+        wl: 0.0,
+        d: 0.0,
+        m: 0.0,
         value: 0.0,
     }
 }
@@ -355,24 +355,12 @@ fn output_from_cached(cached: &CachedEval, position: &Position, legal_moves: &[M
     let mut priors = Vec::with_capacity(legal_moves.len());
     let black_to_move = position.side_to_move == Color::Black;
     for mv in legal_moves {
-        let prior = px0_policy_index(*mv, black_to_move)
+        let prior = move_vocab_index(*mv, black_to_move)
             .and_then(|idx| cached.logits.get(idx))
             .copied()
             .unwrap_or(0.0);
         priors.push(prior);
     }
     normalize_priors(&mut priors);
-    PolicyValueOutput {
-        priors,
-        value: cached.value,
-    }
-}
-
-pub(crate) fn cached_output_for_task(cache: &SharedEvalCache, task: &PolicyValueTask) -> Option<PolicyValueOutput> {
-    let cached = cache.get(task.history.input_cache_key())?;
-    Some(output_from_cached(&cached, &task.position, &task.legal_moves))
-}
-
-pub(crate) fn cache_contains_history(cache: &SharedEvalCache, history: &PositionHistory) -> bool {
-    cache.get(history.input_cache_key()).is_some()
+    PolicyValueOutput::from_stm_wdl(priors, cached.wdl)
 }

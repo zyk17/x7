@@ -39,7 +39,7 @@ class PolicyOnnxExport(nn.Module):
 def main() -> None:
     ap = argparse.ArgumentParser(description="checkpoint → ONNX")
     ap.add_argument("--checkpoint", type=Path, required=True)
-    ap.add_argument("--out", type=Path, required=True, help="例如 data/policy.onnx")
+    ap.add_argument("--out", type=Path, required=True, help="例如 data/x7.onnx")
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")

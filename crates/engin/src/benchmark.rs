@@ -11,6 +11,23 @@ use xiangqi_core::{legal_moves_uci, uci_to_move, Position, START_FEN};
 use crate::history::PositionHistory;
 use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, MctsMoveStat, OnnxPolicyValueEval, SharedPolicy};
 
+/// 解析 bench 行：`FEN` 或 `FEN moves uci ...`（对齐 UCI position）。
+pub fn history_from_bench_line(line: &str) -> Result<PositionHistory, String> {
+    let line = line.trim();
+    if let Some(idx) = line.find(" moves ") {
+        let fen = line[..idx].trim();
+        let moves = line[idx + " moves ".len()..].trim();
+        let mut history = PositionHistory::from_fen(fen).map_err(|e| e.to_string())?;
+        for uci in moves.split_whitespace() {
+            let mv = uci_to_move(history.current(), uci).ok_or_else(|| format!("非法着法: {uci}"))?;
+            history.push_move(mv);
+        }
+        Ok(history)
+    } else {
+        PositionHistory::from_fen(line).map_err(|e| e.to_string())
+    }
+}
+
 static DEFAULT_BENCHMARK_FEN_STRINGS: OnceLock<Vec<String>> = OnceLock::new();
 
 pub fn default_benchmark_fen_strings() -> &'static [String] {
@@ -73,11 +90,12 @@ pub struct BenchSessionParams<'a> {
     pub config: MctsConfig,
     pub policy: &'a SharedPolicy,
     pub meta: &'a BenchJsonMeta,
+    pub threads: usize,
 }
 
 pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json::Value {
     let t0 = Instant::now();
-    let history = match PositionHistory::from_fen(fen) {
+    let history = match history_from_bench_line(fen) {
         Ok(history) => history,
         Err(err) => {
             return json!({
@@ -89,23 +107,46 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
 
     let mut engine = MctsEngine::new(session.config, OnnxPolicyValueEval::new(session.policy.clone()));
 
-    match engine.search_root_history(&history, session.budget.clone()) {
+    let search_result = if session.threads > 1 {
+        engine
+            .search_root_history_parallel_with_progress(
+                &history,
+                session.budget.clone(),
+                session.threads,
+                std::time::Duration::ZERO,
+                |_| {},
+            )
+            .map_err(|e| e.to_string())
+    } else {
+        engine
+            .search_root_history(&history, session.budget.clone())
+            .map_err(|e| e.to_string())
+    };
+
+    match search_result {
         Ok(result) => {
             let elapsed_ms = t0.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let nps = if elapsed_ms > 0 {
-                (result.playouts as u128 * 1000 / u128::from(elapsed_ms)) as u64
+            let nps_basis_ms = if result.nps_elapsed_ms > 0 {
+                result.nps_elapsed_ms
+            } else {
+                elapsed_ms
+            };
+            let nps = if nps_basis_ms > 0 {
+                (result.playouts as u128 * 1000 / u128::from(nps_basis_ms)) as u64
             } else {
                 0
             };
             json!({
                 "fen": fen,
                 "bestmove": result.best_move.map(xiangqi_core::move_to_uci),
+                "pv": result.pv.iter().map(|mv| xiangqi_core::move_to_uci(*mv)).collect::<Vec<_>>(),
                 "root_value": result.root_value,
                 "best_value": result.best_value,
                 "best_mate": result.best_mate,
                 "playouts": result.playouts,
                 "root_visits": result.root_visits,
                 "nodes": result.nodes,
+                "tree_nodes": result.tree_nodes,
                 "depth": result.depth,
                 "seldepth": result.seldepth,
                 "time_ms": elapsed_ms,
@@ -136,6 +177,7 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                 "bench_config": {
                     "onnx_path": session.meta.onnx_path,
                     "policy_session_loaded": session.meta.policy_session_loaded,
+                    "threads": session.threads,
                 },
             })
         }

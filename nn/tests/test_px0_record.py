@@ -19,7 +19,7 @@ from nn.px0_record import (
 
 def _official_like_decode(
     record: bytes,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     (
         version,
         input_format,
@@ -29,9 +29,9 @@ def _official_like_decode(
         rule50_count,
         invariance_info,
         _dep_result,
-        _root_q,
+        root_q,
         best_q,
-        _root_d,
+        root_d,
         best_d,
         _root_m,
         _best_m,
@@ -71,6 +71,14 @@ def _official_like_decode(
         ],
         dtype=np.float32,
     )
+    root = np.asarray(
+        [
+            0.5 * (1.0 - root_d + root_q),
+            root_d,
+            0.5 * (1.0 - root_d - root_q),
+        ],
+        dtype=np.float32,
+    )
     best = np.asarray(
         [
             0.5 * (1.0 - best_d + best_q),
@@ -84,6 +92,7 @@ def _official_like_decode(
         full_planes,
         policy,
         winner,
+        root,
         best,
         np.asarray([float(visits)], dtype=np.float32),
         np.asarray([float(policy_kld)], dtype=np.float32),
@@ -133,12 +142,14 @@ def test_parse_v6_record_shapes() -> None:
     assert sample.policy.shape == (PX0_POLICY_SIZE,)
     assert sample.winner_q.shape == (1,)
     assert sample.winner_wdl.shape == (3,)
+    assert sample.root_wdl.shape == (3,)
     assert sample.search_q.shape == (1,)
     assert sample.search_wdl.shape == (3,)
     assert sample.search_visits.shape == (1,)
     assert sample.policy_kld.shape == (1,)
     assert sample.plies_left.shape == (1,)
     assert sample.winner_wdl.sum() == pytest.approx(1.0)
+    assert sample.root_wdl.sum() == pytest.approx(1.0)
     assert sample.search_wdl.sum() == pytest.approx(1.0)
     assert sample.search_wdl[0] - sample.search_wdl[2] == pytest.approx(sample.search_q[0])
 
@@ -146,10 +157,11 @@ def test_parse_v6_record_shapes() -> None:
 def test_parse_v6_record_matches_official_chunkparser_semantics() -> None:
     record = _fake_v6_record()
     sample = parse_v6_record(record)
-    planes, policy, winner, best, visits, policy_kld, plies_left = _official_like_decode(record)
+    planes, policy, winner, root, best, visits, policy_kld, plies_left = _official_like_decode(record)
     np.testing.assert_allclose(sample.planes, planes)
     np.testing.assert_allclose(sample.policy, policy)
     np.testing.assert_allclose(sample.winner_wdl, winner)
+    np.testing.assert_allclose(sample.root_wdl, root)
     np.testing.assert_allclose(sample.search_wdl, best)
     np.testing.assert_allclose(sample.search_visits, visits)
     np.testing.assert_allclose(sample.policy_kld, policy_kld)

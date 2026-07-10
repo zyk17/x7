@@ -122,8 +122,11 @@
 
 ### value 语义
 
-- 主训练 target：`q_ratio * search_wdl + (1 - q_ratio) * winner_wdl`
-- 当前默认：`q_ratio=0.0`
+- 主训练 target：固定标量 `q_ratio` 下混合 `winner_wdl` 与 `search_wdl`
+- `q_ratio=0.0` 时等价于只学 `winner_wdl`
+- `q_ratio=1.0` 时等价于只学 `search_wdl`
+- 训练阶段允许按阶段切换固定 `q_ratio`，但单次训练运行内保持常量
+- 当前默认 baseline 容量为 `10x160`
 - ONNX 导出：`value` 为 WDL 概率
 - 引擎消费：派生 `q = W - L`
 

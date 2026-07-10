@@ -45,17 +45,17 @@ def _knight_move(start: str, direction: tuple[int, int]) -> str | None:
     return _slide_move(start, direction, 1)
 
 
-def _load_px0_policy_moves() -> list[str]:
+def _load_move_vocab() -> list[str]:
     repo_root = Path(__file__).resolve().parents[3]
-    moves_path = repo_root / "crates" / "engin" / "src" / "px0_policy_moves.txt"
+    moves_path = repo_root / "crates" / "engin" / "src" / "move_vocab.txt"
     moves = [line.strip() for line in moves_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if len(moves) != 2062:
-        raise ValueError(f"unexpected px0 policy size: {len(moves)}")
+        raise ValueError(f"unexpected move vocab size: {len(moves)}")
     return moves
 
 
 def _build_conv_policy_index() -> torch.Tensor:
-    policy_moves = _load_px0_policy_moves()
+    policy_moves = _load_move_vocab()
     move_to_policy_idx = {move: idx for idx, move in enumerate(policy_moves)}
 
     conv_moves: list[str | None] = []
@@ -212,8 +212,8 @@ class PolicyResNet(nn.Module):
     def __init__(
         self,
         in_planes: int = 124,
-        width: int = 128,
-        num_blocks: int = 8,
+        width: int = 160,
+        num_blocks: int = 10,
         num_moves: int = 2062,
         *,
         value_head: bool = False,
@@ -349,8 +349,16 @@ def mix_wdl_targets(
     winner_wdl: torch.Tensor,
     search_wdl: torch.Tensor,
     *,
-    q_ratio: float,
+    q_ratio: float | torch.Tensor,
 ) -> torch.Tensor:
+    if isinstance(q_ratio, torch.Tensor):
+        ratio = q_ratio.to(device=winner_wdl.device, dtype=winner_wdl.dtype)
+        if ratio.ndim == 0:
+            ratio = ratio.reshape(1)
+        if ratio.ndim == 1:
+            ratio = ratio.unsqueeze(1)
+        return ratio * search_wdl + (1.0 - ratio) * winner_wdl
+
     q_ratio = float(q_ratio)
     if q_ratio <= 0.0:
         return winner_wdl
@@ -465,6 +473,21 @@ def visits_to_sample_weight(visits: torch.Tensor) -> torch.Tensor:
     scale = math.log1p(256.0)
     weight = torch.log1p(visits) / scale
     return weight.clamp_(min=0.25, max=2.0)
+
+
+def visits_to_q_ratio(
+    visits: torch.Tensor,
+    *,
+    q_ratio: float,
+    scale: float = 512.0,
+) -> torch.Tensor:
+    if scale <= 0.0:
+        raise ValueError("scale 须为正数")
+    if visits.ndim == 1:
+        visits = visits.unsqueeze(1)
+    visits = visits.clamp_min(0.0)
+    trust = torch.log1p(visits) / math.log1p(float(scale))
+    return float(q_ratio) * trust.clamp_(min=0.0, max=1.0)
 
 
 def policy_kld_to_weight(policy_kld: torch.Tensor) -> torch.Tensor:

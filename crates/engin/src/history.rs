@@ -22,6 +22,8 @@ pub struct HistoryDebugEntry {
 
 #[derive(Clone)]
 pub struct PositionHistory {
+    game_start: Position,
+    game_moves: Vec<xiangqi_core::Move>,
     entries: Vec<HistoryEntry>,
     key_counts: HashMap<u64, usize>,
     transient_evicted: Vec<Option<HistoryEntry>>,
@@ -40,6 +42,8 @@ impl PositionHistory {
 
     pub fn from_position(pos: Position) -> Self {
         let mut history = Self {
+            game_start: pos.clone_for_search(),
+            game_moves: Vec::new(),
             entries: Vec::with_capacity(PX0_HISTORY_LEN),
             key_counts: HashMap::new(),
             transient_evicted: Vec::new(),
@@ -53,6 +57,8 @@ impl PositionHistory {
             return Err("history 不能为空".into());
         }
         let mut history = Self {
+            game_start: positions[0].clone_for_search(),
+            game_moves: Vec::new(),
             entries: Vec::with_capacity(PX0_HISTORY_LEN),
             key_counts: HashMap::new(),
             transient_evicted: Vec::new(),
@@ -61,6 +67,18 @@ impl PositionHistory {
             history.push_position(pos.clone_for_search());
         }
         Ok(history)
+    }
+
+    pub fn game_start(&self) -> &Position {
+        &self.game_start
+    }
+
+    pub fn game_moves(&self) -> &[xiangqi_core::Move] {
+        &self.game_moves
+    }
+
+    pub fn game_start_key(&self) -> u64 {
+        self.game_start.nn_input_key()
     }
 
     pub fn current(&self) -> &Position {
@@ -132,6 +150,8 @@ impl PositionHistory {
     }
 
     pub fn reset_from_position(&mut self, pos: Position) {
+        self.game_start = pos.clone_for_search();
+        self.game_moves.clear();
         self.entries.clear();
         self.key_counts.clear();
         self.transient_evicted.clear();
@@ -139,6 +159,7 @@ impl PositionHistory {
     }
 
     pub fn push_move(&mut self, mv: xiangqi_core::Move) {
+        self.game_moves.push(mv);
         let mut next = self.current().clone_for_search();
         next.do_move(mv);
         self.push_persistent_position(next);
@@ -192,6 +213,8 @@ impl PositionHistory {
 
     pub fn clone_for_search(&self) -> Self {
         Self {
+            game_start: self.game_start.clone_for_search(),
+            game_moves: self.game_moves.clone(),
             entries: self.entries.clone(),
             key_counts: self.key_counts.clone(),
             transient_evicted: Vec::new(),

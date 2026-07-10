@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 pub struct MctsBudget {
     pub max_playouts: Option<u32>,
     pub max_nodes: Option<u32>,
+    pub max_depth: Option<u32>,
     pub deadline: Option<Instant>,
     pub stop: Option<Arc<AtomicBool>>,
 }
@@ -16,6 +17,7 @@ impl MctsBudget {
         Self {
             max_playouts: None,
             max_nodes: None,
+            max_depth: None,
             deadline: Some(Instant::now() + Duration::from_millis(ms)),
             stop: None,
         }
@@ -45,6 +47,20 @@ pub struct MctsConfig {
     pub root_dirichlet_alpha: f32,
     /// 单线程搜索每轮 gather 的目标 batch 大小。
     pub search_batch_size: usize,
+    /// px0 `DrawScore`；奇偶层 Q 会取反。
+    pub draw_score: f32,
+    /// px0 `MaxConcurrentSearchers`；0 表示不限制。
+    pub max_concurrent_searchers: i32,
+    /// px0 `MaxCollisionVisits`。
+    pub max_collision_visits: i32,
+    pub max_collision_visits_scaling_start: i32,
+    pub max_collision_visits_scaling_end: i32,
+    pub max_collision_visits_scaling_power: f32,
+    /// px0 `ThreadIdlingThreshold` / `IdlingMinimumWork`。
+    pub thread_idling_threshold: i32,
+    pub idling_minimum_work: i32,
+    /// px0 `SmartPruningFactor`；0 关闭根节点剪枝。
+    pub smart_pruning_factor: f32,
 }
 
 impl Default for MctsConfig {
@@ -62,6 +78,28 @@ impl Default for MctsConfig {
             root_dirichlet_epsilon: 0.0,
             root_dirichlet_alpha: 0.3,
             search_batch_size: 2048,
+            draw_score: 0.0,
+            max_concurrent_searchers: 1,
+            max_collision_visits: 80_000,
+            max_collision_visits_scaling_start: 28,
+            max_collision_visits_scaling_end: 100_000,
+            max_collision_visits_scaling_power: 1.0,
+            thread_idling_threshold: 1,
+            idling_minimum_work: 0,
+            smart_pruning_factor: 1.0,
+        }
+    }
+}
+
+impl MctsBudget {
+    /// UCI `go depth`：平均 depth 达到该值后停止。
+    pub fn from_depth(depth: u32) -> Self {
+        Self {
+            max_playouts: None,
+            max_nodes: None,
+            max_depth: Some(depth),
+            deadline: None,
+            stop: None,
         }
     }
 }

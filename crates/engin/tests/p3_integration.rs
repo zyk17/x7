@@ -48,6 +48,7 @@ fn mcts_returns_legal_bestmove_without_onnx() {
             MctsBudget {
                 max_playouts: Some(64),
                 max_nodes: None,
+                max_depth: None,
                 deadline: None,
                 stop: None,
             },
@@ -72,6 +73,7 @@ fn mcts_bestmove_resolves_check_without_onnx() {
             MctsBudget {
                 max_playouts: Some(32),
                 max_nodes: None,
+                max_depth: None,
                 deadline: None,
                 stop: None,
             },
@@ -92,12 +94,14 @@ fn bench_json_has_expected_keys() {
         budget: MctsBudget {
             max_playouts: Some(32),
             max_nodes: None,
+            max_depth: None,
             deadline: None,
             stop: None,
         },
         config: MctsConfig::default(),
         policy: &policy,
         meta: &meta,
+        threads: 1,
     };
     let v = bench_one_json(START_FEN, &session);
     assert!(v.get("bestmove").is_some() || v.get("error").is_some());
