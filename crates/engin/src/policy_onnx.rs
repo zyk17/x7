@@ -70,9 +70,7 @@ impl BackendAttributes {
     pub(crate) fn from_active_provider(provider: ActiveExecutionProvider) -> Self {
         let runs_on_cpu = matches!(provider, ActiveExecutionProvider::Cpu);
         let suggested_num_search_threads = if runs_on_cpu {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
         } else {
             1
         };
@@ -112,10 +110,7 @@ fn onnx_minibatch_sizes(provider: ActiveExecutionProvider) -> (usize, usize) {
         batch = (LC0_ONNX_MAX_BATCH_SIZE / steps as usize) as i32;
     }
 
-    (
-        batch as usize * steps as usize,
-        LC0_ONNX_MAX_BATCH_SIZE,
-    )
+    (batch as usize * steps as usize, LC0_ONNX_MAX_BATCH_SIZE)
 }
 
 /// lc0 `StartThreads(0)`：`suggested_num_search_threads + !runs_on_cpu`。
@@ -306,12 +301,7 @@ impl PolicySessionPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .first()
-            .map(|session| {
-                session
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .provider_chain()
-            })
+            .map(|session| session.lock().unwrap_or_else(|e| e.into_inner()).provider_chain())
             .unwrap_or("CPU")
     }
 
@@ -336,10 +326,7 @@ impl PolicySessionPool {
     }
 }
 
-fn open_session(
-    path: &Path,
-    mode: ProviderMode,
-) -> Result<(Session, ActiveExecutionProvider), Error> {
+fn open_session(path: &Path, mode: ProviderMode) -> Result<(Session, ActiveExecutionProvider), Error> {
     let mut last_err = None;
     for provider in mode.candidate_providers() {
         match build_session(path, *provider) {
@@ -361,9 +348,9 @@ fn build_session(path: &Path, provider: ActiveExecutionProvider) -> Result<Sessi
         .with_optimization_level(GraphOptimizationLevel::All)?;
     builder = match provider {
         ActiveExecutionProvider::Cuda => builder.with_execution_providers([cuda_provider()])?,
-        ActiveExecutionProvider::DirectMl => builder.with_execution_providers([ep::DirectML::default()
-            .with_device_id(0)
-            .build()])?,
+        ActiveExecutionProvider::DirectMl => {
+            builder.with_execution_providers([ep::DirectML::default().with_device_id(0).build()])?
+        }
         ActiveExecutionProvider::Cpu => builder.with_execution_providers([cpu_provider()])?,
     };
     builder.commit_from_file(path)
@@ -573,64 +560,5 @@ mod tests {
         assert_eq!(grown.len(), 3);
         let shrunk = pool.resize_sessions(1).expect("shrink");
         assert_eq!(shrunk.len(), 1);
-    }
-
-    #[test]
-    #[ignore = "slow onnx parallel smoke; run manually"]
-    fn parallel_mcts_reaches_nodes_budget_with_onnx() {
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        use crate::history::PositionHistory;
-        use crate::mcts::{MctsBudget, MctsConfig, MctsEngine, OnnxPolicyValueEval};
-
-        let Some(path) = candidate_onnx_paths().into_iter().find(|p| p.is_file()) else {
-            eprintln!("skip: no candidate onnx");
-            return;
-        };
-        let pool = PolicySessionPool::from_file(&path).expect("load pool");
-        let policy = Arc::new(pool);
-        let mut engine = MctsEngine::new(
-            MctsConfig {
-                minibatch_size: 256,
-                ..MctsConfig::default()
-            },
-            OnnxPolicyValueEval::new(Some(policy), MctsConfig::default().nn_cache_size),
-        );
-        let history = PositionHistory::new_startpos();
-        let result = engine
-            .search_root_history_parallel_with_progress(
-                &history,
-                MctsBudget {
-                    max_playouts: None,
-                    max_nodes: Some(2048),
-                    max_depth: None,
-                    max_mate: None,
-                    deadline: None,
-                    stop: None,
-                },
-                8,
-                Duration::ZERO,
-                None,
-                |_| {},
-            )
-            .expect("parallel onnx search must finish");
-        assert_eq!(result.nodes, 2048);
-        assert!(result.best_move.is_some());
-        assert!(
-            result.seldepth >= 10,
-            "seldepth should grow with search: got {}",
-            result.seldepth
-        );
-        let nps = crate::mcts::SearchStats::playouts_per_second(result.playouts, result.nps_elapsed_ms);
-        eprintln!(
-            "parallel_mcts: nodes={} playouts={} seldepth={} pv_len={} nps={} time_ms~{}",
-            result.nodes,
-            result.playouts,
-            result.seldepth,
-            result.pv.len(),
-            nps,
-            result.nps_elapsed_ms
-        );
     }
 }

@@ -1,6 +1,5 @@
 //! 中国象棋核心：局面、规则与合法着生成。
 //!
-//! 实现上曾参考公开引擎常见写法与互操作约定；本 crate 为**独立整理**的库形态
 //! Zobrist 使用全局 `OnceLock`（种子 `1070372`），与常见皮卡鱼族实现一致以便对拍。
 //!
 //! 以下为与参考实现风格接近处的告警抑制（如 `transmute`、区间判断写法等）。
@@ -16,11 +15,13 @@
 pub mod board;
 pub mod misc;
 pub mod movegen;
+pub mod rule;
 pub mod types;
 pub mod uci_format;
 
 pub use board::{global_zobrist, Position, UndoFrame, Zobrist};
 pub use movegen::{generate, ExtMove, GenType};
+pub use rule::{has_mating_material, is_under_check, them_chased, us_chased, GameResult};
 pub use types::{Color, File, Key, Move, Piece, PieceType, Rank, Square, Value, MAX_MOVES as TYPES_MAX_MOVES};
 pub use uci_format::{move_to_uci, parse_move_uci, square_to_algebraic, uci_to_move, write_move_uci_bytes, START_FEN};
 

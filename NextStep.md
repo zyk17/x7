@@ -1,41 +1,31 @@
 # NextStep
 
-## 当前结论
+## 当前阶段：重建 lc0 classic 搜索核心
 
-当前主线只做搜索，并且按 `lc0 classic` 抄。
+旧 `crates/engin/src/mcts/` 已整体删除。当前不接受“修旧搜索”或以旧接口为约束的实现。
 
-**搜索基建：功能已接入，并发回归尚未完全收口。** 本轮已修 `Threads=2` 提前 stop 导致 `bestmove (none)` 的路径；`MaybeTriggerStop` / `PerPVCounters` / UCI 口径仍待证明 1:1。
+唯一主参考：`C:\Users\Administrator\projects\lc0`。
 
-不再做的事情：
+## 逐函数移植顺序
 
-- 不先讨论模型
-- 不先讨论中残局 value
-- 不先参考 `px0` 改搜索结构
-- 不先吸收 `KataGo` 的 graph / DAG / cache 主线
+| 阶段 | lc0 参考 | 本仓库目标 | 完成条件 |
+|---|---|---|---|
+| S0 | `src/search/classic/search.h:50-203` | 新建最小 `mcts/` 数据结构：`Node`、`Edge`、`Search`、`SearchWorker` | 无 UCI 接线；节点字段可逐项对照 |
+| S1 | `search.cc:921-1047`、`search.h:254-300` | 单线程 `RunBlocking` 及 iteration 7 阶段调度 | 无 ONNX 时能按 budget 结束；root 不预展开 |
+| S2 | `search.cc:1507-1920`、`search.h:407-416` | `PickNodesToExtend` / `PickNodesToExtendTask` | root 与子节点同一路径；in-flight 可回滚 |
+| S3 | `search.cc:1921-2149` | `ExtendNode` | 合法着、象棋终局、rule60、重复规则只在此处接入 |
+| S4 | `search.cc:2151-2216` | `FetchMinibatchResults` | ONNX 在树锁外；无 ONNX fallback 明确可测 |
+| S5 | `search.cc:2217-2373` | `DoBackupUpdateSingleNode` / PV / 计数 | nodes、playouts、visits、in_flight 逐项不变量测试 |
+| S6 | `search.cc:261-396,617-646,896-920` | UCI info、stop、线程生命周期 | `go nodes` / `go movetime` 正确；再恢复 UCI `go` |
+| S7 | `search.cc:1060-1490`、`search.h:209-419` | batch、task workers、OOO eval 与 shared tree | 只在 S0-S6 trace 对齐后开始 |
 
-## lc0 classic 对齐清单（搜索基建）
+## 中国象棋最小偏离点
 
-| # | 项 | lc0 参考 | 本仓库落点 | 状态 |
-|---|-----|----------|------------|------|
-| 1 | task worker 收口 | `search.h:229,408,419` | `task_workers.rs` | 功能已接入 |
-| 2 | `PopulateCommonIterationStats` | `search.cc:930-1001` | `iteration_stats.rs` | 集中层已建；字段/口径待对照 |
-| 3 | `MaybeTriggerStop` | `search.cc:617-646,1009` | `iteration_stats.rs` | budget 链已收口；非完整 lc0（无 FireStop/OnSearchDone/SmartPruning） |
-| 4 | `PerPVCounters` | `params.cc:367` | `config.rs` / `uci.rs` | option + 输出已接；同局面日志未核 |
-| 5 | `RunBlocking` / worker 生命周期 | `search.cc:911-921` | `search.rs` | 单线程 do-while；并行 Watchdog |
-| 6 | UCI info 统计口径 | `search.cc:930,1008,2375` | `uci.rs` | 冒烟有；lc0 同局面日志待核 |
-| 7 | tree reuse / position moves | `node.cc:493-519` | `engine.rs` / `tree.rs` | 功能已接入；长链 UCI 待补 |
-| 8 | **并发回归** | — | `search.rs` / `uci.rs` | **进行中**：stop 清 in-flight；Threads=2 全量测试 |
+| 内容 | 参考 | 本仓库 |
+|---|---|---|
+| 合法着 / do-undo | lc0 `chess/board.*` 的接口位置 | `crates/xiangqi_core/src/board.rs`、`movegen.rs` |
+| history / repetition | lc0 `chess/position_history.*` | `crates/engin/src/history.rs` |
+| 重复裁决、长将长捉、rule60 | 需先核对 px0 象棋规则后接入 | `crates/xiangqi_core/src/rule.rs` |
+| 网络输入 | lc0 NN 输入接口，仅替换为 px0 124 planes | `crates/engin/src/fen_tensor.rs` |
 
-## 固定执行顺序
-
-1. **并发回归通过**（`cargo test -p engin` 含 `threads_option_searches_without_hanging`）
-2. UCI info / PerPVCounters 同局面 lc0 日志对照
-3. `MaybeTriggerStop` 补 lc0 FireStop / time hints / SmartPruning 链
-4. GPU + task_workers integration
-
-## review 标准
-
-1. 是否一比一对照 `lc0`（含上表「待核/子集」项）
-2. 是否又出现“名字像 lc0、行为不是 lc0”
-3. **`cargo test -p engin` 全绿**（含 Threads=2）
-4. 是否破坏 `history / tree reuse / UCI` 语义闭合
+没有找到 lc0 对照位置时，不实现，先记录到 `TODO.md`。

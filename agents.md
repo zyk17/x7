@@ -14,7 +14,7 @@
 ## 2. 当前项目共识
 
 - 这是新项目，不背历史方案包袱
-- 搜索主路线只有 **MCTS**
+- 搜索主路线只有 **MCTS**；旧 MCTS 已删除，当前处于按 lc0 classic 重建阶段
 - 网络只保留 **policy + value**
 - 主训练数据路线改为 **px0 / lc0 风格外部数据**
 - 当前正式模型契约是 **124x10x9 -> 2062 + WDL**
@@ -32,13 +32,13 @@
 ## 3. 当前代码边界
 
 - `crates/xiangqi_core`：规则核心
-- `crates/engin`：MCTS、ONNX、UCI
-- `crates/xiangqi_dataset`：最小 PGN / 自对弈预处理地基
+- `crates/engin`：history、ONNX、policy 映射、最小 UCI，以及待重建的 MCTS
 - `nn/`：训练与导出
 
 不要再往仓库里放：
 
 - Alpha-Beta 主线代码
+- 旧 MCTS 的兼容层、旧搜索统计、旧 benchmark
 - 多套正式训练格式长期并存
 - 旧 XRSH 训练/标注链路
 - 为“未来社区平台”提前做的大抽象
@@ -51,8 +51,9 @@
 - 性能优化应在清晰实现上定点推进
 - 避免重复分配、重复推理、重复序列化
 - Python 只做训练与离线数据，不搬规则热路径
-- 搜索 / benchmark / UCI 的统计口径必须一致
+- 搜索恢复后，搜索 / benchmark / UCI 的统计口径必须一致
 - `position ... moves ...` 不允许再退化成“只保留最终局面”
+- MCTS 在重建完成前，`go` 必须明确返回不可搜索状态；不得返回 heuristic 或旧树结果
 
 ## 5. 参考纪律
 
@@ -60,6 +61,7 @@
   - `C:\Users\Administrator\projects\lc0`
   - `C:\Users\Administrator\projects\lczero-training`
 - 目标是**一比一还原主线语义**，禁止先凭主观理解自创实现，再用补丁修语义。
+- 旧 `crates/engin/src/mcts/` 不得作为实现参考或兼容目标；新的 Rust 函数必须注明对应 lc0 函数/连续行区间。
 - 禁止“名字像 lc0，行为不是 lc0”的接口。
 - 禁止在未确认参考实现前，对搜索主循环、预算、统计、batch、stop、tree reuse 做主观改造。
 - 如果中国象棋与国际象棋存在规则差异，必须先确认差异点，再做最小必要偏离；不能借“规则不同”提前扩大发挥空间。

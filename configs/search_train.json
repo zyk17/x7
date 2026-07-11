@@ -1,8 +1,0 @@
-{
-  "name": "search_train",
-  "description": "离线搜索标注 / 训练蒸馏：更深、更稳，根节点不加噪声",
-  "visits": 512,
-  "cpuct": 1.25,
-  "root_dirichlet_epsilon": 0.0,
-  "root_temperature": 0.0
-}

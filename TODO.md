@@ -1,50 +1,33 @@
 # TODO
 
-> 只保留当前未完成事项。  
-> 当前主线只做搜索。
+> 只保留未完成的搜索重建事项。旧 MCTS 任务已删除，不作为兼容目标。
 
-## 已完成（功能接入，非 1:1 证明）
+## S0：节点与搜索容器
 
-- [x] task worker picking/processing 拆分 + 死字段清理
-- [x] `iteration_stats.rs` 集中 stats/stop 入口（**子集**，非完整 lc0）
-- [x] `PerPVCounters` UCI option + 按 PV 输出 `nodes`（**未同局面核对**）
-- [x] tree reuse：`ResetToPosition` / `TrimTreeAtHead` / `expand_root_at`
-- [x] 单线程 `RunBlocking` do-while 形状
+- [ ] 按 `C:\Users\Administrator\projects\lc0\src\search\classic\node.h`、`node.cc` 建立最小 Node/Edge 字段。
+- [ ] 按 `search.h:50-203,209-419` 建立 `Search` / `SearchWorker` 边界。
+- [ ] 为 visits、in-flight、parent、child、WDL 累加建立不变量测试。
 
-## 当前阻塞 — 必须先过
+## S1：单线程生命周期
 
-### 1. 并发回归
+- [ ] 按 `search.cc:921-1047` 译 `RunBlocking` 与 iteration 统计。
+- [ ] 按 `search.h:254-300` 建立 `InitializeIteration -> Gather -> NN -> Fetch -> Backup` 数据流。
+- [ ] root 不允许单独预展开；必须与普通节点走同一 ExtendNode 路径。
 
-- [x] 并行 stop 路径 `clear_in_flight_in_tree`，避免 `ensure_tree_quiescent` → `bestmove (none)`
-- [x] `threads_option_searches_without_hanging` 改为 `join_search`（不 sleep+stop）
-- [x] `parallel_threads_two_completes_nodes_budget` 引擎级回归
-- [ ] **`cargo test -p engin` 全套件稳定全绿**（含满负载）
+## S2：选择与扩展
 
-落点：`search.rs`、`worker.rs`、`uci.rs`、`engine.rs`
+- [ ] 按 `search.cc:1507-1920` 译 selection、collision、in-flight、multivisit。
+- [ ] 按 `search.cc:1921-2149` 译 `ExtendNode`，再最小接入象棋合法着与终局规则。
+- [ ] 在 `rule60`、重复与 RuleJudge 接入前，记录对应 px0 象棋参考的确切文件与行号。
 
-## 当前未完成 — 对齐证明
+## S3：推理与回传
 
-### 2. `MaybeTriggerStop` 完整 lc0 语义
+- [ ] 按 `search.cc:2151-2216` 译 batch fetch；ONNX 不得持树锁。
+- [ ] 按 `search.cc:2217-2373` 译 backup、PV、边界与计数。
+- [ ] 对每个 budget 建立 `total_playouts == successful_backups`、搜索结束 `in_flight == 0` 测试。
 
-- [ ] FireStop / bestmove 发送 / `OnSearchDone` / time manager hints
-- [ ] SmartPruningStopper / KldGainStopper
+## S4：外部行为
 
-参考：`search.cc:617-646,1009`；`stoppers.cc`  
-落点：`iteration_stats.rs`、`stoppers.rs`
-
-### 3. UCI info + `PerPVCounters` 口径
-
-- [ ] 固定 FEN 与 lc0 日志逐项对照 `depth/seldepth/nodes/nps/pv`
-
-参考：`search.cc:930,1008,2375`；`params.cc:367`  
-落点：`uci.rs`、`worker.rs`
-
-### 4. 回归护栏
-
-- [ ] GPU + task_workers integration
-
-## 暂不做
-
-- `KataGo` 路线
-- 新 stop/stats/tree worker 抽象
-- 模型训练主线
+- [ ] 按 `search.cc:261-396,617-646,896-920` 恢复 UCI info、stop 与 worker 生命周期。
+- [ ] 仅在单线程 trace 对齐后，按 `search.cc:1060-1490` 接 batch/task workers/shared tree。
+- [ ] MultiPV、tree reuse、prefetch、NN cache 最后逐项恢复；每项都附 lc0 对照测试。

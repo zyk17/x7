@@ -1,6 +1,4 @@
 //! UCI 坐标与着法串（**常见皮卡鱼族象棋 UCI**：`a0`～`i9`，纵坐标 **0～9** 对应内部 `rank_of` 0～9）。
-//!
-//! 说明：旧版曾使用纵坐标 **1～10**（与部分 Python `pyffish` 字符串习惯一致），与 **常见引擎 UCI（0～9）** 不兼容；现已统一为 0～9。
 
 use crate::board::Position;
 use crate::types::*;

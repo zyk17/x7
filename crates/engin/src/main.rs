@@ -1,16 +1,11 @@
-//! 用户侧引擎：默认 UCI；`--onnx-smoke` 为 ONNX 冒烟；`--bench` 为 MCTS 基准。
+//! 用户侧引擎：默认最小 UCI；`--onnx-smoke` 为 ONNX 冒烟。
 
 use std::env;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 use xiangqi_core::{legal_moves_uci, Position};
 
-use engin::benchmark::{
-    default_benchmark_fen_strings, resolve_data_file, write_benchmark_ndjson, BenchJsonMeta, BenchSessionParams,
-};
-use engin::mcts::{MctsBudget, MctsConfig, SharedPolicy};
-use engin::{policy_onnx::resolved_search_threads, run_uci_stdio, PolicyOnnx, PolicySessionPool, START_FEN};
+use engin::{run_uci_stdio, PolicyOnnx, START_FEN};
 
 fn default_policy_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx")
@@ -20,184 +15,8 @@ fn print_usage() {
     eprintln!(
         "用法:\n  engin                         UCI 模式（stdin/stdout）\n  \
          engin --onnx-smoke [ONNX] [FEN]  冒烟；缺省 ONNX=data/x7.onnx、FEN=起始局面\n  \
-         engin --bench [选项]            MCTS 基准（NDJSON）\n  \
-         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --minibatch-size N  --onnx PATH  --fen FEN  --data-dir PATH  --require-onnx  --threads N"
+         搜索核心正在按 lc0 classic 重建；UCI `go` 当前只返回 bestmove 0000。"
     );
-}
-
-#[derive(Debug)]
-struct BenchCli {
-    budget: MctsBudget,
-    config: MctsConfig,
-    onnx: Option<PathBuf>,
-    data_dir: Option<PathBuf>,
-    require_onnx: bool,
-    fens: Vec<String>,
-    threads: usize,
-}
-
-fn parse_bench_cli(rest: &[String]) -> BenchCli {
-    let mut budget = MctsBudget {
-        max_playouts: Some(256),
-        max_nodes: None,
-        max_depth: None,
-        max_mate: None,
-        deadline: None,
-        stop: None,
-    };
-    let mut config = MctsConfig::default();
-    let mut onnx: Option<PathBuf> = None;
-    let mut data_dir: Option<PathBuf> = None;
-    let mut require_onnx = false;
-    let mut fens = Vec::new();
-    let mut threads = 0usize;
-    let mut i = 0usize;
-    while i < rest.len() {
-        match rest[i].as_str() {
-            "--playouts" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<u32>() {
-                    budget.max_playouts = Some(n.max(1));
-                }
-                i += 2;
-            }
-            "--nodes" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<u32>() {
-                    budget.max_nodes = Some(n.max(1));
-                }
-                i += 2;
-            }
-            "--movetime" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<u64>() {
-                    budget.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(n.max(1)));
-                }
-                i += 2;
-            }
-            "--cpuct" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<f32>() {
-                    config.cpuct = n.clamp(0.01, 100.0);
-                }
-                i += 2;
-            }
-            "--minibatch-size" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<i32>() {
-                    config.minibatch_size = n.clamp(0, 1024);
-                }
-                i += 2;
-            }
-            "--onnx" if i + 1 < rest.len() => {
-                onnx = Some(PathBuf::from(&rest[i + 1]));
-                i += 2;
-            }
-            "--data-dir" if i + 1 < rest.len() => {
-                data_dir = Some(PathBuf::from(&rest[i + 1]));
-                i += 2;
-            }
-            "--fen" if i + 1 < rest.len() => {
-                fens.push(rest[i + 1].clone());
-                i += 2;
-            }
-            "--threads" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<usize>() {
-                    threads = n.min(128);
-                }
-                i += 2;
-            }
-            "--require-onnx" => {
-                require_onnx = true;
-                i += 1;
-            }
-            other => {
-                eprintln!("--bench: 忽略未知参数 {other}");
-                i += 1;
-            }
-        }
-    }
-    BenchCli {
-        budget,
-        config,
-        onnx,
-        data_dir,
-        require_onnx,
-        fens,
-        threads,
-    }
-}
-
-fn resolve_bench_onnx(cli: &BenchCli) -> Option<PathBuf> {
-    let onnx = cli
-        .onnx
-        .clone()
-        .or_else(|| {
-            cli.data_dir
-                .as_ref()
-                .map(|d| d.join("x7.onnx"))
-                .filter(|p| p.is_file())
-        })
-        .or_else(|| resolve_data_file("x7.onnx"));
-    onnx
-}
-
-fn run_bench_cli(rest: &[String]) -> io::Result<()> {
-    let cli = parse_bench_cli(rest);
-    let onnx_path = resolve_bench_onnx(&cli);
-
-    if let Some(ref p) = cli.onnx {
-        if !p.is_file() {
-            eprintln!("--bench: --onnx 路径不存在: {}", p.display());
-            process::exit(1);
-        }
-    }
-    if cli.require_onnx && onnx_path.is_none() {
-        eprintln!("--bench: 未找到 x7.onnx");
-        process::exit(1);
-    }
-
-    let mut policy: SharedPolicy = None;
-    let mut meta = BenchJsonMeta::default();
-
-    if let Some(ref op) = onnx_path {
-        meta.onnx_path = Some(op.display().to_string());
-        match PolicySessionPool::from_file(op) {
-            Ok(pool) => {
-                policy = Some(std::sync::Arc::new(pool));
-                meta.policy_session_loaded = true;
-            }
-            Err(err) => {
-                eprintln!("--bench: 加载 ONNX 失败: {err}");
-                if cli.require_onnx {
-                    process::exit(1);
-                }
-            }
-        }
-    }
-
-    let resolved_threads = if cli.threads == 0 {
-        policy
-            .as_ref()
-            .map(|pool| resolved_search_threads(0, &pool.backend_attributes()))
-            .unwrap_or(1)
-    } else {
-        cli.threads.max(1)
-    };
-
-    let session = BenchSessionParams {
-        budget: cli.budget,
-        config: cli.config,
-        policy: &policy,
-        meta: &meta,
-        threads: resolved_threads,
-    };
-    let default_fens;
-    let fens: &[String] = if cli.fens.is_empty() {
-        default_fens = default_benchmark_fen_strings().to_vec();
-        &default_fens
-    } else {
-        &cli.fens
-    };
-
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    write_benchmark_ndjson(&mut out, fens, &session)
 }
 
 fn legal_top_lines(logits: &[f32], fen: &str, k: usize) -> Result<String, String> {
@@ -250,15 +69,6 @@ fn main() {
 
     if first == "--help" || first == "-h" {
         print_usage();
-        return;
-    }
-
-    if first == "--bench" {
-        let rest: Vec<String> = args.collect();
-        if let Err(e) = run_bench_cli(&rest) {
-            eprintln!("--bench I/O: {e}");
-            process::exit(1);
-        }
         return;
     }
 

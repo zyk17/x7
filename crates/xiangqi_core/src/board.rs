@@ -1,4 +1,4 @@
-//! 中国象棋 **局面表示**（实现曾参考公开引擎常见结构；本文件为独立整理）。
+//! 中国象棋 **局面表示**。
 //!
 //! 9×10 共 90 格（`SQ_A0`～`SQ_I9`）。提供：棋子放置/移除/移动、FEN 解析与输出、
 //! `do_move` / `undo_move`、合法性/将军/牵马检测、Zobrist 键、NNUE 用中间编码占位等。
@@ -1265,8 +1265,28 @@ impl Position {
         Ok(())
     }
 
+    /// px0 `ChessBoard::Mirror()`（board.cc:62-76）：纵线翻转 + 交换双方子力。
+    pub fn mirrored(&self) -> Position {
+        let mut m = Position::new_with_global_zobrist();
+        for sq_val in 0..SQUARE_NB {
+            let sq: Square = unsafe { std::mem::transmute(sq_val as u8) };
+            let pc = self.piece_on(sq);
+            if pc == Piece::NO_PIECE {
+                continue;
+            }
+            let flipped_sq = flip_rank(sq);
+            let mirrored_pc = make_piece(!color_of(pc), type_of(pc));
+            m.put_piece(mirrored_pc, flipped_sq);
+        }
+        m.side_to_move = !self.side_to_move;
+        m.state.rule60 = self.state.rule60;
+        m.game_ply = self.game_ply;
+        m.init_state();
+        m
+    }
+
     /// 计算初始 Zobrist 与其它状态字段。
-    fn init_state(&mut self) {
+    pub(crate) fn init_state(&mut self) {
         let us = self.side_to_move;
         let them = !us;
 

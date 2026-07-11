@@ -79,15 +79,15 @@ fn prepare_single_board(planes: &mut Array4<f32>) {
 
 fn encode_history_into_slot(history: &PositionHistory, planes: &mut Array4<f32>, batch: usize) {
     let current = history.current();
-    let entries = history.entries();
+    let window = history.nn_input_window();
     let mut flip = false;
-    let mut history_idx = entries.len() as isize - 1;
+    let mut history_idx = window.len() as isize - 1;
 
     for block in 0..PX0_HISTORY_LEN {
         let entry: &HistoryEntry = if history_idx >= 0 {
-            &entries[history_idx as usize]
+            &window[history_idx as usize]
         } else {
-            let earliest = entries.first().expect("non-empty history");
+            let earliest = window.first().expect("non-empty history");
             if is_startpos_board(&earliest.position) {
                 break;
             }
@@ -95,7 +95,7 @@ fn encode_history_into_slot(history: &PositionHistory, planes: &mut Array4<f32>,
         };
 
         encode_history_block(planes, batch, block, &entry.position, flip);
-        if entry.repeated {
+        if entry.is_repeated() {
             planes
                 .slice_mut(s![batch, block * PLANES_PER_BOARD + 14, .., ..])
                 .fill(1.0);

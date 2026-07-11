@@ -1,15 +1,25 @@
-//! 引擎侧最小 history 容器：固定保留最近窗口，供 px0 classical 输入编码使用。
+//! px0 `PositionHistory`：完整局面链（`position.h` / `position.cc`）。
+//!
+//! NN 的 8 帧窗口不在此截断，仅在 [`crate::fen_tensor`] 编码时取最近
+//! [`PX0_HISTORY_LEN`] 帧（px0 `encoder.cc:157-158` `history_planes=8`）。
 
-use std::collections::HashMap;
-
-use xiangqi_core::{Position, START_FEN};
+use xiangqi_core::{is_under_check, them_chased, us_chased, GameResult, Move, Position, START_FEN};
 
 pub const PX0_HISTORY_LEN: usize = 8;
+const RULE60_DRAW: i32 = 120;
 
 #[derive(Clone)]
-pub(crate) struct HistoryEntry {
+pub struct HistoryEntry {
     pub position: Position,
-    pub repeated: bool,
+    repetitions: i32,
+    plies_since_prev_repetition: i32,
+}
+
+impl HistoryEntry {
+    /// px0 `GetRepetitions() >= 1` → repetition plane（`encoder.cc:168-198`）。
+    pub fn is_repeated(&self) -> bool {
+        self.repetitions >= 1
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -23,10 +33,8 @@ pub struct HistoryDebugEntry {
 #[derive(Clone)]
 pub struct PositionHistory {
     game_start: Position,
-    game_moves: Vec<xiangqi_core::Move>,
-    entries: Vec<HistoryEntry>,
-    key_counts: HashMap<u64, usize>,
-    transient_evicted: Vec<Option<HistoryEntry>>,
+    game_moves: Vec<Move>,
+    positions: Vec<HistoryEntry>,
 }
 
 impl PositionHistory {
@@ -44,11 +52,9 @@ impl PositionHistory {
         let mut history = Self {
             game_start: pos.clone_for_search(),
             game_moves: Vec::new(),
-            entries: Vec::with_capacity(PX0_HISTORY_LEN),
-            key_counts: HashMap::new(),
-            transient_evicted: Vec::new(),
+            positions: Vec::new(),
         };
-        history.push_search_position(pos.clone_for_search());
+        history.reset(pos);
         history
     }
 
@@ -59,12 +65,10 @@ impl PositionHistory {
         let mut history = Self {
             game_start: positions[0].clone_for_search(),
             game_moves: Vec::new(),
-            entries: Vec::with_capacity(PX0_HISTORY_LEN),
-            key_counts: HashMap::new(),
-            transient_evicted: Vec::new(),
+            positions: Vec::new(),
         };
         for pos in positions {
-            history.push_position(pos.clone_for_search());
+            history.append_position(pos.clone_for_search());
         }
         Ok(history)
     }
@@ -73,7 +77,7 @@ impl PositionHistory {
         &self.game_start
     }
 
-    pub fn game_moves(&self) -> &[xiangqi_core::Move] {
+    pub fn game_moves(&self) -> &[Move] {
         &self.game_moves
     }
 
@@ -82,27 +86,25 @@ impl PositionHistory {
     }
 
     pub fn current(&self) -> &Position {
-        &self
-            .entries
-            .last()
-            .expect("position history must always contain current position")
-            .position
+        &self.positions.last().expect("position history non-empty").position
     }
 
-    pub(crate) fn entries(&self) -> &[HistoryEntry] {
-        &self.entries
-    }
-
+    /// px0 `GetPositions()`：完整链；NN 编码取 [`Self::nn_input_window`]。
     pub fn positions(&self) -> impl DoubleEndedIterator<Item = &Position> + ExactSizeIterator + '_ {
-        self.entries.iter().map(|entry| &entry.position)
+        self.positions.iter().map(|entry| &entry.position)
+    }
+
+    pub(crate) fn nn_input_window(&self) -> &[HistoryEntry] {
+        let start = self.positions.len().saturating_sub(PX0_HISTORY_LEN);
+        &self.positions[start..]
     }
 
     pub fn debug_entries(&self) -> Vec<HistoryDebugEntry> {
-        self.entries
+        self.positions
             .iter()
             .map(|entry| HistoryDebugEntry {
                 fen: entry.position.fen(),
-                repeated: entry.repeated,
+                repeated: entry.is_repeated(),
                 side_to_move: if entry.position.side_to_move == xiangqi_core::types::Color::Black {
                     'b'
                 } else {
@@ -114,35 +116,48 @@ impl PositionHistory {
     }
 
     pub fn current_is_repeated(&self) -> bool {
-        self.entries.last().map(|entry| entry.repeated).unwrap_or(false)
+        self.positions.last().is_some_and(|entry| entry.is_repeated())
+    }
+
+    pub fn repetitions(&self) -> i32 {
+        self.positions.last().map(|entry| entry.repetitions).unwrap_or(0)
+    }
+
+    pub fn plies_since_prev_repetition(&self) -> i32 {
+        self.positions
+            .last()
+            .map(|entry| entry.plies_since_prev_repetition)
+            .unwrap_or(0)
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.positions.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.positions.is_empty()
     }
 
     pub fn same_input_window(&self, other: &Self) -> bool {
-        if self.entries.len() != other.entries.len() {
+        let a = self.nn_input_window();
+        let b = other.nn_input_window();
+        if a.len() != b.len() {
             return false;
         }
         if self.current().state.rule60 != other.current().state.rule60 {
             return false;
         }
-        self.entries.iter().zip(other.entries.iter()).all(|(lhs, rhs)| {
-            lhs.repeated == rhs.repeated && lhs.position.nn_input_key() == rhs.position.nn_input_key()
+        a.iter().zip(b.iter()).all(|(lhs, rhs)| {
+            lhs.is_repeated() == rhs.is_repeated() && lhs.position.nn_input_key() == rhs.position.nn_input_key()
         })
     }
 
     pub fn input_cache_key(&self) -> u64 {
         let mut key =
-            0x9E37_79B9_7F4A_7C15u64 ^ ((self.entries.len() as u64) << 56) ^ self.current().state.rule60 as u64;
-        for entry in &self.entries {
+            0x9E37_79B9_7F4A_7C15u64 ^ ((self.positions.len() as u64) << 56) ^ self.current().state.rule60 as u64;
+        for entry in self.nn_input_window() {
             key = key.rotate_left(9) ^ entry.position.nn_input_key().wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            if entry.repeated {
+            if entry.is_repeated() {
                 key ^= 0xA5A5_A5A5_A5A5_A5A5;
             }
         }
@@ -152,109 +167,189 @@ impl PositionHistory {
     pub fn reset_from_position(&mut self, pos: Position) {
         self.game_start = pos.clone_for_search();
         self.game_moves.clear();
-        self.entries.clear();
-        self.key_counts.clear();
-        self.transient_evicted.clear();
-        self.push_search_position(pos.clone_for_search());
+        self.reset(pos);
     }
 
-    pub fn push_move(&mut self, mv: xiangqi_core::Move) {
+    pub fn push_move(&mut self, mv: Move) {
         self.game_moves.push(mv);
-        let mut next = self.current().clone_for_search();
-        next.do_move(mv);
-        self.push_persistent_position(next);
+        self.append_move(mv);
     }
 
     pub fn push_position(&mut self, pos: Position) {
-        self.push_persistent_position(pos.clone_for_search());
+        self.append_position(pos.clone_for_search());
     }
 
+    /// px0 搜索/worker 临时路径：`Append` 但不写入 `game_moves`。
+    #[allow(dead_code)] // S2 will use this for lc0 SearchWorker path extension.
+    pub(crate) fn push_search_position(&mut self, pos: Position) {
+        self.append_position(pos);
+    }
+
+    pub fn append_move(&mut self, mv: Move) {
+        let mut next = self.current().clone_for_search();
+        next.do_move(mv);
+        self.append_position(next);
+    }
+
+    /// px0 `PositionHistory::Pop`。
     pub fn pop_position(&mut self) {
-        if self.entries.len() <= 1 {
+        if self.positions.len() <= 1 {
             return;
         }
-        let entry = self.entries.pop().expect("history not empty");
-        let key = entry.position.nn_input_key();
-        let count = self.key_counts.get_mut(&key).expect("history key must exist");
-        *count -= 1;
-        if *count == 0 {
-            self.key_counts.remove(&key);
-        }
-        if let Some(evicted) = self.transient_evicted.pop().flatten() {
-            self.entries.insert(0, evicted);
+        self.positions.pop();
+    }
+
+    /// px0 `PositionHistory::Trim`（`position.h:120-122`）。
+    pub fn trim(&mut self, size: usize) {
+        if size < self.positions.len() {
+            self.positions.truncate(size);
         }
     }
 
-    pub(crate) fn push_search_position(&mut self, pos: Position) {
-        self.push_position_impl(pos, true);
+    /// px0 `ExtendNode`：`Trim(played_len)` + 路径 `Append`（`search.cc:1903-1906`）。
+    #[allow(dead_code)] // S2 will use this for batched leaf history encoding.
+    pub(crate) fn with_search_path(&self, path_moves: &[Move]) -> Self {
+        let mut history = self.clone_for_search();
+        let played_len = history.len();
+        history.trim(played_len);
+        for &mv in path_moves {
+            history.append_move(mv);
+        }
+        history
     }
 
-    fn push_persistent_position(&mut self, pos: Position) {
-        self.push_position_impl(pos, false);
+    pub fn rule60_draw(&self) -> bool {
+        self.current().state.rule60 >= RULE60_DRAW
     }
 
-    fn push_position_impl(&mut self, pos: Position, track_evicted: bool) {
-        let key = pos.nn_input_key();
-        let repeated = self.key_counts.contains_key(&key);
-        *self.key_counts.entry(key).or_insert(0) += 1;
-        self.entries.push(HistoryEntry {
-            position: pos,
-            repeated,
-        });
-        if self.entries.len() > PX0_HISTORY_LEN {
-            let evicted = self.entries.remove(0);
-            if track_evicted {
-                self.transient_evicted.push(Some(evicted));
+    /// px0 `PositionHistory::RuleJudge`（position.cc:126-169）。
+    pub fn rule_judge(&self) -> GameResult {
+        let len = self.positions.len();
+        assert!(len >= 3, "RuleJudge requires at least 3 positions");
+        let last = &self.positions[len - 1];
+        if last.position.state.rule60 < 4 {
+            return GameResult::Undecided;
+        }
+
+        let mut check_them = is_under_check(&last.position);
+        let mut check_us = is_under_check(&self.positions[len - 2].position);
+        let mut chase_them = them_chased(&last.position) & !us_chased(&self.positions[len - 2].position);
+        let mut chase_us =
+            them_chased(&self.positions[len - 2].position) & !us_chased(&self.positions[len - 3].position);
+
+        let last_key = last.position.nn_input_key();
+        let mut idx = len as i32 - 3;
+        while idx >= 0 {
+            let pos = &self.positions[idx as usize];
+            if is_under_check(&pos.position) {
+                chase_them = 0;
+                chase_us = 0;
+            } else {
+                check_them = false;
             }
-        } else if track_evicted {
-            self.transient_evicted.push(None);
+
+            if pos.position.nn_input_key() == last_key && pos.repetitions == 0 {
+                return if check_them || check_us {
+                    if !check_us {
+                        GameResult::BlackWon
+                    } else if !check_them {
+                        GameResult::WhiteWon
+                    } else {
+                        GameResult::Draw
+                    }
+                } else if chase_them != 0 || chase_us != 0 {
+                    if chase_us == 0 {
+                        GameResult::BlackWon
+                    } else if chase_them == 0 {
+                        GameResult::WhiteWon
+                    } else {
+                        GameResult::Draw
+                    }
+                } else {
+                    GameResult::Draw
+                };
+            }
+
+            if idx > 0 {
+                if is_under_check(&self.positions[(idx - 1) as usize].position) {
+                    chase_them = 0;
+                    chase_us = 0;
+                } else {
+                    check_us = false;
+                }
+                chase_them &= them_chased(&pos.position) & !us_chased(&self.positions[(idx - 1) as usize].position);
+                if idx - 2 >= 0 {
+                    chase_us &= them_chased(&self.positions[(idx - 1) as usize].position)
+                        & !us_chased(&self.positions[(idx - 2) as usize].position);
+                }
+            }
+            idx -= 2;
         }
+
+        panic!("Judging non-repetition move sequence");
+    }
+
+    /// px0 `ExtendNode` twofold 非和分支（search.cc:1940-1957）。
+    pub fn twofold_forced_terminal(&self, result: GameResult) -> Option<i32> {
+        if result == GameResult::Draw {
+            return None;
+        }
+        let len = self.positions.len();
+        if len < 2 {
+            return None;
+        }
+        let last_key = self.positions[len - 1].position.nn_input_key();
+        let mut idx = len - 1;
+        let mut idx2 = idx as i32;
+        loop {
+            if idx2 <= 0 {
+                return None;
+            }
+            idx2 -= 1;
+            if self.positions[idx2 as usize].position.nn_input_key() == last_key {
+                break;
+            }
+        }
+        if idx2 > 0
+            && self.positions[idx - 1].position.nn_input_key()
+                == self.positions[(idx2 as usize) - 1].position.nn_input_key()
+        {
+            idx -= 1;
+            idx2 += 1;
+            while (idx2 as usize) != idx && self.positions[idx2 as usize].repetitions == 0 {
+                idx2 += 1;
+            }
+            if idx2 as usize == idx && self.current().state.rule60 < RULE60_DRAW {
+                return Some(self.plies_since_prev_repetition());
+            }
+        }
+        None
     }
 
     pub fn clone_for_search(&self) -> Self {
         Self {
             game_start: self.game_start.clone_for_search(),
             game_moves: self.game_moves.clone(),
-            entries: self.entries.clone(),
-            key_counts: self.key_counts.clone(),
-            transient_evicted: Vec::new(),
+            positions: self.positions.clone(),
         }
     }
 
-    /// 仅复制 NN 编码所需状态；不复制 `game_moves` 等持久对局字段。
-    pub(crate) fn clone_nn_input_state(&self) -> Self {
-        Self {
-            game_start: self.game_start.clone_for_search(),
-            game_moves: Vec::new(),
-            entries: self.entries.clone(),
-            key_counts: self.key_counts.clone(),
-            transient_evicted: Vec::new(),
-        }
+    fn reset(&mut self, pos: Position) {
+        self.positions.clear();
+        self.positions.push(HistoryEntry {
+            position: pos,
+            repetitions: 0,
+            plies_since_prev_repetition: 0,
+        });
     }
 
-    /// 在搜索根 history 上叠加 selection 路径，仅在 expand 时物化 NN 输入 history。
-    pub(crate) fn extended_with_search_path(&self, suffix: &[Position]) -> Self {
-        let mut history = self.clone_nn_input_state();
-        for pos in suffix {
-            history.push_search_position(pos.clone_for_search());
-        }
-        history
-    }
-
-    pub(crate) fn key_counts(&self) -> &HashMap<u64, usize> {
-        &self.key_counts
-    }
-
-    /// selection 热路径：沿路径增量维护重复检测，避免每次 pick 复制整张 `key_counts`。
-    pub(crate) fn push_search_path_position(
-        base_key_counts: &HashMap<u64, usize>,
-        path_key_counts: &mut HashMap<u64, usize>,
-        pos: &Position,
-    ) -> bool {
-        let key = pos.nn_input_key();
-        let repeated = base_key_counts.contains_key(&key) || path_key_counts.contains_key(&key);
-        *path_key_counts.entry(key).or_insert(0) += 1;
-        repeated
+    fn append_position(&mut self, pos: Position) {
+        let (repetitions, plies_since_prev_repetition) = compute_last_move_repetitions(&self.positions, &pos);
+        self.positions.push(HistoryEntry {
+            position: pos,
+            repetitions,
+            plies_since_prev_repetition,
+        });
     }
 }
 
@@ -264,13 +359,38 @@ impl Default for PositionHistory {
     }
 }
 
+/// px0 `PositionHistory::ComputeLastMoveRepetitions`（`position.cc:171-186`）。
+fn compute_last_move_repetitions(existing: &[HistoryEntry], last: &Position) -> (i32, i32) {
+    if last.state.rule60 < 4 {
+        return (0, 0);
+    }
+    let size = existing.len() + 1;
+    if size < 5 {
+        return (0, 0);
+    }
+    let mut idx = (size - 5) as i32;
+    while idx >= 0 {
+        let pos = &existing[idx as usize].position;
+        if pos.nn_input_key() == last.nn_input_key() {
+            let cycle_length = (size - 1 - idx as usize) as i32;
+            let repetitions = 1 + existing[idx as usize].repetitions;
+            return (repetitions, cycle_length);
+        }
+        if pos.state.rule60 < 2 {
+            return (0, 0);
+        }
+        idx -= 2;
+    }
+    (0, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use xiangqi_core::{legal_moves_uci, uci_to_move};
 
     #[test]
-    fn history_window_is_capped() {
+    fn full_history_is_not_truncated() {
         let mut history = PositionHistory::new_startpos();
         for _ in 0..9 {
             let u = legal_moves_uci(history.current())
@@ -280,11 +400,11 @@ mod tests {
             let mv = uci_to_move(history.current(), &u).expect("legal move");
             history.push_move(mv);
         }
-        assert_eq!(history.len(), PX0_HISTORY_LEN);
+        assert_eq!(history.len(), 10);
     }
 
     #[test]
-    fn search_push_pop_restores_window() {
+    fn search_push_pop_restores_chain() {
         let mut history = PositionHistory::new_startpos();
         for _ in 0..7 {
             let u = legal_moves_uci(history.current())
@@ -332,39 +452,22 @@ mod tests {
     }
 
     #[test]
-    fn push_search_path_position_matches_full_clone_semantics() {
-        let mut base = PositionHistory::new_startpos();
-        for _ in 0..3 {
-            let u = legal_moves_uci(base.current())
-                .into_iter()
-                .next()
-                .expect("legal move uci");
-            let mv = uci_to_move(base.current(), &u).expect("legal move");
-            base.push_move(mv);
+    fn opening_search_path_has_zero_repetitions() {
+        let played = PositionHistory::new_startpos();
+        let mut moves = Vec::new();
+        let mut pos = played.current().clone_for_search();
+        for u in ["e3e4", "c9e7", "b2e2", "h9g7", "b0c2", "b9c7", "a0b0", "a9b9", "b0b6"] {
+            let mv = uci_to_move(&pos, u).expect("legal");
+            moves.push(mv);
+            pos.do_move(mv);
         }
-        let mut cloned = base.clone_for_search();
-        let mut overlay = HashMap::new();
-
-        for _ in 0..2 {
-            let u = legal_moves_uci(base.current())
-                .into_iter()
-                .next()
-                .expect("legal move uci");
-            let mv = uci_to_move(base.current(), &u).expect("legal move");
-            let mut next = base.current().clone_for_search();
-            next.do_move(mv);
-            let from_clone = {
-                cloned.push_search_position(next.clone_for_search());
-                cloned.current_is_repeated()
-            };
-            let from_overlay =
-                PositionHistory::push_search_path_position(base.key_counts(), &mut overlay, &next);
-            assert_eq!(from_clone, from_overlay);
-        }
+        let history = played.with_search_path(&moves);
+        assert_eq!(history.repetitions(), 0);
+        assert_eq!(history.plies_since_prev_repetition(), 0);
     }
 
     #[test]
-    fn extended_with_search_path_skips_game_moves_but_keeps_nn_input() {
+    fn with_search_path_matches_manual_extend() {
         let mut base = PositionHistory::new_startpos();
         for _ in 0..4 {
             let u = legal_moves_uci(base.current())
@@ -374,27 +477,15 @@ mod tests {
             let mv = uci_to_move(base.current(), &u).expect("legal move");
             base.push_move(mv);
         }
-        assert!(!base.game_moves().is_empty());
-
         let u = legal_moves_uci(base.current())
             .into_iter()
             .next()
             .expect("legal move uci");
         let mv = uci_to_move(base.current(), &u).expect("legal move");
-        let mut suffix_pos = base.current().clone_for_search();
-        suffix_pos.do_move(mv);
-        let suffix = vec![suffix_pos.clone_for_search()];
 
-        let full = {
-            let mut history = base.clone_for_search();
-            for pos in &suffix {
-                history.push_search_position(pos.clone_for_search());
-            }
-            history
-        };
-        let lean = base.extended_with_search_path(&suffix);
-
-        assert!(lean.game_moves().is_empty());
+        let lean = base.with_search_path(std::slice::from_ref(&mv));
+        let mut full = base.clone_for_search();
+        full.append_move(mv);
         assert_eq!(lean.input_cache_key(), full.input_cache_key());
         assert!(lean.same_input_window(&full));
     }
