@@ -25,6 +25,9 @@
 - 仓库内已移除 `XRSH` 正式训练/标注链路
 - 不再把本地慢速搜索标注当主数据生产方式
 - 不再把 `15 planes + move_vocab + scalar value` 当长期正式 I/O
+- 当前引擎与搜索基建的**唯一主参考**是：
+  - `C:\Users\Administrator\projects\lc0`
+  - `C:\Users\Administrator\projects\lczero-training`
 
 ## 3. 当前代码边界
 
@@ -51,7 +54,28 @@
 - 搜索 / benchmark / UCI 的统计口径必须一致
 - `position ... moves ...` 不允许再退化成“只保留最终局面”
 
-## 5. 文档规则
+## 5. 参考纪律
+
+- 引擎基建、搜索语义、UCI 行为、训练数据主链路，默认必须先对照：
+  - `C:\Users\Administrator\projects\lc0`
+  - `C:\Users\Administrator\projects\lczero-training`
+- 目标是**一比一还原主线语义**，禁止先凭主观理解自创实现，再用补丁修语义。
+- 禁止“名字像 lc0，行为不是 lc0”的接口。
+- 禁止在未确认参考实现前，对搜索主循环、预算、统计、batch、stop、tree reuse 做主观改造。
+- 如果中国象棋与国际象棋存在规则差异，必须先确认差异点，再做最小必要偏离；不能借“规则不同”提前扩大发挥空间。
+- 任何后续修改，必须在变更说明、`NextStep.md`、`TODO.md` 或 review 记录中，附上对应参考代码的：
+  - 文件路径
+  - 行号
+  - 本仓库对应文件
+- 现代 `lc0` 的主参考落点不是旧 `lczero` 的 `UCI.cpp / UCIOption.cpp` 扁平文件，而是优先对照：
+  - `C:\Users\Administrator\projects\lc0\src\engine_loop.cc`
+  - `C:\Users\Administrator\projects\lc0\src\engine.cc`
+  - `C:\Users\Administrator\projects\lc0\src\chess\uciloop.cc`
+  - `C:\Users\Administrator\projects\lc0\src\search\classic\params.cc`
+  - `C:\Users\Administrator\projects\lc0\src\search\classic\search.cc`
+- 如果暂时找不到参考代码位置，不要直接实现；先把缺口记录到计划文档。
+
+## 6. 文档规则
 
 稳定文档只保留：
 

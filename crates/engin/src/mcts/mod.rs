@@ -1,11 +1,10 @@
 //! MCTS 主线骨架。
 //!
 //! 这里定义当前项目搜索主线需要的稳定接口与基础数据结构。
-//! P2 边界：继续对齐 px0 classic + KataGo 并发细节，不引入 DAG/TT/MultiPV/新 time manager。
+//! lc0 classic 搜索基建；并发按 lc0 单写者树锁 + 本批 CancelCollisions。
 
 mod backend;
 mod config;
-mod coordinator;
 mod engine;
 mod node;
 mod policy_value;
@@ -25,7 +24,7 @@ pub use policy_value::{
 };
 pub use tree::MctsTree;
 
-/// px0 风格搜索统计：UCI nodes = total_playouts + initial_visits。
+/// lc0 风格搜索统计：UCI nodes = total_playouts + initial_visits（search.cc:276,941）。
 pub struct SearchStats {
     initial_visits: AtomicU32,
     total_playouts: AtomicU32,
@@ -93,7 +92,7 @@ impl SearchStats {
         self.retry_without_playout.load(Ordering::Relaxed)
     }
 
-    /// px0 风格 nps：仅首批 NN 后开始计时的 playouts/s；未开始时返回 0。
+    /// lc0 风格 nps：仅首批 NN 后开始计时的 playouts/s（search.cc:278-285）；未开始时返回 0。
     pub fn playouts_per_second(playouts: u32, nps_elapsed_ms: u64) -> u64 {
         if nps_elapsed_ms > 0 {
             (playouts as u128 * 1000 / u128::from(nps_elapsed_ms)) as u64
@@ -102,7 +101,7 @@ impl SearchStats {
         }
     }
 
-    /// px0：首次 NN batch 后才开始计 nps。
+    /// lc0：首次 NN batch 后才开始计 nps（search.cc:915-917）。
     pub fn mark_first_batch(&self) {
         if !self.nns_started.swap(true, Ordering::Relaxed) {
             if let Ok(mut start) = self.nps_start.write() {
@@ -115,62 +114,36 @@ impl SearchStats {
         self.retry_without_playout.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_minibatch_depth(&self, iteration: &worker::SearchIteration) {
-        let mut cum = 0u64;
-        let mut max_d = 0u32;
-        for pending in &iteration.pending {
-            let depth = pending.path.len() as u32;
-            cum += u64::from(depth) * u64::from(pending.multivisit);
-            max_d = max_d.max(depth);
-        }
-        if cum > 0 {
-            self.cum_depth.fetch_add(cum, Ordering::Relaxed);
-        }
-        if max_d > 0 {
-            self.max_depth.fetch_max(max_d, Ordering::Relaxed);
+    pub(crate) fn record_backup(&self, pending: &worker::PendingNode) {
+        self.total_playouts
+            .fetch_add(pending.multivisit, Ordering::Relaxed);
+        let depth = worker::playout_depth(pending);
+        self.max_depth.fetch_max(depth, Ordering::Relaxed);
+        self.cum_depth.fetch_add(
+            u64::from(depth) * u64::from(pending.multivisit),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn commit_minibatch(&self, iteration: &worker::SearchIteration) {
+        if iteration.seldepth > 0 {
+            self.max_depth.fetch_max(iteration.seldepth, Ordering::Relaxed);
         }
     }
 
-    pub(crate) fn add_minibatch(&self, iteration: &worker::SearchIteration) {
-        let playouts = iteration.playouts;
-        if playouts == 0 {
-            return;
-        }
-        self.total_playouts.fetch_add(playouts, Ordering::Relaxed);
-        self.record_minibatch_depth(iteration);
-    }
-
-    /// 并行路径：CAS 提交 playout，避免超预算。
-    pub(crate) fn try_add_minibatch(&self, budget: &MctsBudget, iteration: &worker::SearchIteration) -> bool {
-        let playouts = iteration.playouts;
+    /// 并行路径：backup 前检查预算（playout 在 `do_backup_single` 内提交）。
+    pub(crate) fn try_commit_minibatch(&self, budget: &MctsBudget, iteration: &worker::SearchIteration) -> bool {
+        let playouts = worker::pending_playouts(iteration);
         if playouts == 0 {
             return true;
         }
-        loop {
-            let committed = self.total_playouts.load(Ordering::Acquire);
-            if worker::remaining_playout_budget(budget, committed, 0, self.initial_visits(), playouts) < playouts {
-                return false;
-            }
-            match self.total_playouts.compare_exchange(
-                committed,
-                committed.saturating_add(playouts),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.record_minibatch_depth(iteration);
-                    return true;
-                }
-                Err(_) => continue,
-            }
-        }
-    }
-
-    pub(crate) fn rollback_minibatch(&self, iteration: &worker::SearchIteration) {
-        let playouts = iteration.playouts;
-        if playouts > 0 {
-            self.total_playouts.fetch_sub(playouts, Ordering::Relaxed);
-        }
+        worker::remaining_playout_budget(
+            budget,
+            self.total_playouts(),
+            0,
+            self.initial_visits(),
+            playouts,
+        ) >= playouts
     }
 }
 

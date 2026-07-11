@@ -193,41 +193,42 @@ cargo run --release -p engin -- --bench --playouts 64 --onnx data\x7.onnx --requ
 
 固定搜索对照建议直接这样跑：
 
-`MctsBatchCap=16`
+`MinibatchSize=16`
 
 ```powershell
 cargo run --release -p engin -- --bench `
   --onnx data\x7.onnx `
   --require-onnx `
   --movetime 2000 `
-  --search-batch-size 16
+  --minibatch-size 16
 ```
 
-`MctsBatchCap=32`
+`MinibatchSize=32`
 
 ```powershell
 cargo run --release -p engin -- --bench `
   --onnx data\x7.onnx `
   --require-onnx `
   --movetime 2000 `
-  --search-batch-size 32
+  --minibatch-size 32
 ```
 
-`MctsBatchCap=64`
+`MinibatchSize=64`
 
 ```powershell
 cargo run --release -p engin -- --bench `
   --onnx data\x7.onnx `
   --require-onnx `
   --movetime 2000 `
-  --search-batch-size 64
+  --minibatch-size 64
 ```
 
 说明：
 
-- `nps` 这里按 `playouts / sec`
-- `nodes` 是树节点总量
-- `search_batch_size` 会写进输出 JSON，便于后续对照
+- `nps` 这里按 `playouts / sec`（仅 completed playout，不含 collision / 未 backup 的 reservation）
+- UCI `nodes` 报告 `本轮 playouts + 复用树 initial_visits`（px0 `VisitsStopper` 口径）
+- `go nodes N`：总 visits（含复用树）达到 N 时停止
+- `minibatch_size` 会写进输出 JSON，便于后续对照
 - `eval_cache.hits/misses` 使用 lookup 口径（可直接比较）
 - `eval_cache.miss_keys` 是去重后真实未命中 key 数（更接近实际 NN 负载）
 - `retry_without_playout`：预算未耗尽时 gather 返回 0 playout 的重试次数
@@ -280,18 +281,19 @@ cargo run --release -p engin
 
 - `PolicyFile`
 - `MctsPlayouts`
-- `MctsCpuct`
-- `MctsFpuReduction`
-- `MctsBatchCap`
-- `MctsWorkers`
+- `CPuct`
+- `FpuValue`
+- `MinibatchSize`
+- `NNCacheSize`
+- `Threads`
 
 说明：
 
-- 不再兼容 `Playouts / Visits / Cpuct / FpuReduction / SearchBatchSize / Threads`
-- 当前默认 `MctsWorkers=8`
-- 默认 `MctsBatchCap=2048`
-- `MctsBatchCap` 是 batch 上限，不是固定目标值
-- 目前建议优先测试的 `MctsBatchCap` 档位是 `64 / 128 / 256 / 512 / 1024 / 2048 / 4096 / 8192`
+- 不再兼容 `Playouts / Visits / MctsCpuct / MctsFpuReduction / MctsBatchCap / MctsWorkers`
+- 当前默认 `Threads=0`
+- 当前默认 `MinibatchSize=0`
+- `Threads=0` 表示按 backend attrs 自动推导
+- `MinibatchSize=0` 表示按 backend `recommended_batch_size`
 
 ## 14. 质量检查
 

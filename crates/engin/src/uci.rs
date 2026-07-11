@@ -15,13 +15,12 @@ use crate::mcts::{
     MctsBudget, MctsConfig, MctsEngine, MctsSearchProgress, MctsTree, OnnxPolicyValueEval, SharedPolicy,
     SearchStats,
 };
-use crate::policy_onnx::PolicySessionPool;
+use crate::policy_onnx::{resolved_search_threads, PolicySessionPool};
 
 static UCI_STDOUT_LOCK: Mutex<()> = Mutex::new(());
 const UCI_INFO_INTERVAL: Duration = Duration::from_millis(200);
 const AUTO_THREADS: usize = 0;
-const DEFAULT_THREADS: usize = 8;
-const MAX_THREADS: usize = 1024;
+const MAX_THREADS: usize = 128;
 
 fn q_to_cp(q: f32) -> i32 {
     let wl = q.clamp(-0.999, 0.999) as f64;
@@ -59,7 +58,11 @@ fn uci_info_line(view: UciInfoView<'_>) -> String {
         let cp = q_to_cp(best_value);
         format!("score cp {cp}")
     };
-    let mut line = format!("info depth {depth} seldepth {seldepth} {score} nodes {nodes} nps {nps} time {elapsed_ms}");
+    // lc0 `StringUciResponder::OutputThinkingInfo` (uciloop.cc:305-329)
+    let depth = depth.max(1);
+    let mut line = format!(
+        "info depth {depth} seldepth {seldepth} time {elapsed_ms} nodes {nodes} {score} nps {nps}"
+    );
     if !pv.is_empty() {
         line.push_str(" pv ");
         line.push_str(
@@ -107,36 +110,146 @@ fn uci_out_line(line: &str) {
 #[derive(Debug, Clone, Default)]
 struct GoParams {
     infinite: bool,
+    ponder: bool,
     depth: Option<u32>,
     movetime: Option<u64>,
     nodes: Option<u64>,
+    mate: Option<u32>,
+    wtime: Option<u64>,
+    btime: Option<u64>,
+    winc: Option<u64>,
+    binc: Option<u64>,
+    movestogo: Option<u32>,
+    searchmoves: Vec<String>,
 }
 
-fn parse_go(args: &str) -> GoParams {
-    let mut p = GoParams::default();
-    let mut it = args.split_whitespace();
-    while let Some(tok) = it.next() {
+#[derive(Debug, Clone, Default)]
+struct GoParseOutcome {
+    params: GoParams,
+    warnings: Vec<String>,
+}
+
+const GO_KEYWORDS: &[&str] = &[
+    "infinite",
+    "ponder",
+    "searchmoves",
+    "wtime",
+    "btime",
+    "winc",
+    "binc",
+    "movestogo",
+    "depth",
+    "mate",
+    "nodes",
+    "movetime",
+];
+
+fn is_go_keyword(token: &str) -> bool {
+    GO_KEYWORDS.contains(&token)
+}
+
+fn parse_go(args: &str) -> GoParseOutcome {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    let mut params = GoParams::default();
+    let mut warnings = Vec::new();
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let tok = tokens[i];
         match tok {
-            "infinite" => p.infinite = true,
+            "infinite" => {
+                params.infinite = true;
+                i += 1;
+            }
+            "ponder" => {
+                params.ponder = true;
+                warnings.push("unsupported go option: ponder".into());
+                i += 1;
+            }
+            "searchmoves" => {
+                warnings.push("unsupported go option: searchmoves".into());
+                i += 1;
+                while i < tokens.len() && !is_go_keyword(tokens[i]) {
+                    params.searchmoves.push(tokens[i].to_string());
+                    i += 1;
+                }
+            }
+            "wtime" | "btime" | "winc" | "binc" | "movestogo" | "mate" => {
+                warnings.push(format!("unsupported go option: {tok}"));
+                i += 1;
+                if i < tokens.len() && !is_go_keyword(tokens[i]) {
+                    match tok {
+                        "wtime" => params.wtime = tokens[i].parse().ok(),
+                        "btime" => params.btime = tokens[i].parse().ok(),
+                        "winc" => params.winc = tokens[i].parse().ok(),
+                        "binc" => params.binc = tokens[i].parse().ok(),
+                        "movestogo" => params.movestogo = tokens[i].parse().ok(),
+                        "mate" => params.mate = tokens[i].parse().ok(),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
             "depth" => {
-                if let Some(n) = it.next().and_then(|s| s.parse().ok()) {
-                    p.depth = Some(n);
+                i += 1;
+                if i < tokens.len() {
+                    if let Ok(n) = tokens[i].parse::<u32>() {
+                        params.depth = Some(n);
+                    } else {
+                        warnings.push(format!("invalid go depth value: {}", tokens[i]));
+                    }
+                    i += 1;
                 }
             }
             "movetime" => {
-                if let Some(n) = it.next().and_then(|s| s.parse().ok()) {
-                    p.movetime = Some(n);
+                i += 1;
+                if i < tokens.len() {
+                    if let Ok(n) = tokens[i].parse::<u64>() {
+                        params.movetime = Some(n);
+                    } else {
+                        warnings.push(format!("invalid go movetime value: {}", tokens[i]));
+                    }
+                    i += 1;
                 }
             }
             "nodes" => {
-                if let Some(n) = it.next().and_then(|s| s.parse().ok()) {
-                    p.nodes = Some(n);
+                i += 1;
+                if i < tokens.len() {
+                    if let Ok(n) = tokens[i].parse::<u64>() {
+                        params.nodes = Some(n);
+                    } else {
+                        warnings.push(format!("invalid go nodes value: {}", tokens[i]));
+                    }
+                    i += 1;
                 }
             }
-            _ => {}
+            other => {
+                warnings.push(format!("unknown go token: {other}"));
+                i += 1;
+            }
         }
     }
-    p
+
+    GoParseOutcome { params, warnings }
+}
+
+fn params_has_supported_limit(params: &GoParams) -> bool {
+    params.infinite
+        || params.movetime.is_some()
+        || params.nodes.is_some()
+        || params.depth.is_some()
+}
+
+fn params_has_unsupported_only(params: &GoParams) -> bool {
+    !params_has_supported_limit(params)
+        && (params.ponder
+            || params.mate.is_some()
+            || params.wtime.is_some()
+            || params.btime.is_some()
+            || params.winc.is_some()
+            || params.binc.is_some()
+            || params.movestogo.is_some()
+            || !params.searchmoves.is_empty())
 }
 
 fn parse_setoption(line: &str) -> Option<(String, Option<String>)> {
@@ -252,10 +365,10 @@ impl Engine {
             policy: policy.clone(),
             policy_path,
             config: MctsConfig::default(),
-            threads: DEFAULT_THREADS,
+            threads: AUTO_THREADS,
             search_engine: Arc::new(Mutex::new(MctsEngine::new(
                 MctsConfig::default(),
-                OnnxPolicyValueEval::new(policy),
+                OnnxPolicyValueEval::new(policy, MctsConfig::default().nn_cache_size),
             ))),
             default_playouts: 256,
             search_stop: None,
@@ -275,6 +388,22 @@ impl Engine {
         if let Some(h) = self.search_join.take() {
             let _ = h.join();
         }
+    }
+
+    /// lc0 `Engine::NewGame` (engine.cc:226-229) + `SetPosition(startpos)`.
+    fn new_game(&mut self) {
+        self.stop_and_join();
+        {
+            let mut mcts = self
+                .search_engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            mcts.evaluator.clear_cache();
+            mcts.tree.clear();
+            mcts.root_id = None;
+            mcts.root_history = None;
+        }
+        self.history = PositionHistory::new_startpos();
     }
 
     fn reload_policy(&mut self) -> Result<(), String> {
@@ -307,7 +436,7 @@ impl Engine {
         drop(engine);
         let mut fresh = MctsEngine::new(
             self.config,
-            OnnxPolicyValueEval::new(self.policy.clone()),
+            OnnxPolicyValueEval::new(self.policy.clone(), self.config.nn_cache_size),
         );
         if preserve_tree {
             fresh.tree = preserved.0;
@@ -317,20 +446,14 @@ impl Engine {
         self.search_engine = Arc::new(Mutex::new(fresh));
     }
 
-    fn auto_threads(&self) -> usize {
-        let cpu_cap = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(4, 16))
-            .unwrap_or(16);
-        match self.policy.as_ref().map(|pool| pool.provider_chain()) {
-            Some(chain) if chain.contains("CUDA") || chain.contains("DirectML") => cpu_cap,
-            _ => 1,
-        }
-    }
-
     fn resolved_threads(&self) -> usize {
-        match self.threads {
-            AUTO_THREADS => self.auto_threads(),
-            n => n.clamp(1, MAX_THREADS),
+        if self.threads == AUTO_THREADS {
+            self.policy
+                .as_ref()
+                .map(|pool| resolved_search_threads(0, &pool.backend_attributes()))
+                .unwrap_or(1)
+        } else {
+            self.threads.clamp(1, MAX_THREADS)
         }
     }
 
@@ -344,10 +467,11 @@ impl Engine {
             .unwrap_or_else(|| "<empty>".to_string());
         self.emit(&format!("option name PolicyFile type string default {policy_default}"));
         self.emit("option name MctsPlayouts type spin default 256 min 1 max 1000000");
-        self.emit("option name MctsCpuct type string default 1.0");
-        self.emit("option name MctsFpuReduction type string default 0.22");
-        self.emit("option name MctsBatchCap type spin default 2048 min 1 max 8192");
-        self.emit("option name MctsWorkers type spin default 8 min 1 max 1024");
+        self.emit("option name CPuct type string default 1.745");
+        self.emit("option name FpuValue type string default 0.330");
+        self.emit("option name MinibatchSize type spin default 0 min 0 max 1024");
+        self.emit("option name NNCacheSize type spin default 200000 min 0 max 10000000");
+        self.emit("option name Threads type spin default 0 min 0 max 128");
         self.emit(&format!(
             "info string policy {}",
             if self.policy.is_some() { "loaded" } else { "not_loaded" }
@@ -374,37 +498,46 @@ impl Engine {
                     }
                 }
             }
-            "MctsCpuct" => {
+            "CPuct" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<f32>() {
-                        self.config.cpuct = n.clamp(0.01, 100.0);
+                        let cpuct = n.clamp(0.01, 100.0);
+                        self.config.cpuct = cpuct;
+                        self.config.cpuct_root = cpuct;
                         self.rebuild_search_engine(true);
                     }
                 }
             }
-            "MctsFpuReduction" => {
+            "FpuValue" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<f32>() {
-                        self.config.fpu_reduction = n.clamp(0.0, 2.0);
-                        self.config.fpu_reduction_root = n.clamp(0.0, 4.0);
+                        let fpu = n.clamp(0.0, 2.0);
+                        self.config.fpu_reduction = fpu;
+                        self.config.fpu_reduction_root = fpu;
                         self.rebuild_search_engine(true);
                     }
                 }
             }
-            "MctsBatchCap" => {
+            "MinibatchSize" => {
                 if let Some(ref v) = value {
-                    if let Ok(n) = v.trim().parse::<usize>() {
-                        self.config.search_batch_size = n.clamp(1, 8192);
+                    if let Ok(n) = v.trim().parse::<i32>() {
+                        self.config.minibatch_size = n.clamp(0, 1024);
                         self.rebuild_search_engine(true);
                     }
                 }
             }
-            "MctsWorkers" => {
+            "NNCacheSize" => {
                 if let Some(ref v) = value {
                     if let Ok(n) = v.trim().parse::<usize>() {
-                        if n >= 1 {
-                            self.threads = n.min(MAX_THREADS);
-                        }
+                        self.config.nn_cache_size = n.min(10_000_000);
+                        self.rebuild_search_engine(false);
+                    }
+                }
+            }
+            "Threads" => {
+                if let Some(ref v) = value {
+                    if let Ok(n) = v.trim().parse::<usize>() {
+                        self.threads = n.min(MAX_THREADS);
                     }
                 }
             }
@@ -413,47 +546,55 @@ impl Engine {
         Ok(())
     }
 
+    /// lc0 `PopulateCommonUciStoppers`（stoppers/common.cc:118-165）：多个 stopper 并行，先触发先停。
     fn budget_from_go(&self, params: &GoParams) -> Result<MctsBudget, String> {
-        if let Some(ms) = params.movetime {
-            return Ok(MctsBudget::from_movetime_ms(ms));
+        if params_has_unsupported_only(params) {
+            return Err(
+                "go 未含可执行的搜索限制（wtime/btime/winc/binc/movestogo/mate/ponder/searchmoves 尚未实现）"
+                    .into(),
+            );
         }
 
-        if let Some(nodes) = params.nodes {
-            return Ok(MctsBudget {
-                max_playouts: None,
-                max_nodes: Some(nodes.min(u64::from(u32::MAX)) as u32),
-                max_depth: None,
-                deadline: None,
-                stop: None,
-            });
-        }
+        // lc0: movetime stopper 在 infinite/ponder/mate 模式下不启用（common.cc:123,148）。
+        let skip_movetime = params.infinite || params.ponder || params.mate.is_some();
 
-        if params.infinite {
-            return Ok(MctsBudget {
-                max_playouts: None,
-                max_nodes: None,
-                max_depth: None,
-                deadline: None,
-                stop: None,
-            });
-        }
-
-        if let Some(depth) = params.depth {
-            return Ok(MctsBudget::from_depth(depth));
-        }
-
-        Ok(MctsBudget {
-            max_playouts: Some(self.default_playouts.max(1)),
+        let mut budget = MctsBudget {
+            max_playouts: None,
             max_nodes: None,
             max_depth: None,
             deadline: None,
             stop: None,
-        })
+        };
+
+        if let Some(ms) = params.movetime {
+            if !skip_movetime {
+                budget.deadline = Some(Instant::now() + Duration::from_millis(ms));
+            }
+        }
+
+        if let Some(nodes) = params.nodes {
+            // lc0 `VisitsStopper`（common.cc:133-145）
+            budget.max_nodes = Some(nodes.min(u64::from(u32::MAX)) as u32);
+        }
+
+        if let Some(depth) = params.depth {
+            budget.max_depth = Some(depth);
+        }
+
+        if !params.infinite && !params_has_supported_limit(params) {
+            budget.max_playouts = Some(self.default_playouts.max(1));
+        }
+
+        Ok(budget)
     }
 
-    fn spawn_go(&mut self, params: GoParams) {
+    fn spawn_go(&mut self, outcome: GoParseOutcome) {
+        for warning in &outcome.warnings {
+            self.emit(&format!("info string {warning}"));
+        }
+
         let history = self.history.clone_for_search();
-        let mut budget = match self.budget_from_go(&params) {
+        let mut budget = match self.budget_from_go(&outcome.params) {
             Ok(budget) => budget,
             Err(err) => {
                 self.emit(&format!("info string {err}"));
@@ -536,10 +677,10 @@ impl Engine {
         match line {
             "uci" => self.send_uci_ident(),
             "isready" => {
-                self.stop_and_join();
+                // lc0 `UciLoop::DispatchCommand` isready (uciloop.cc:188-190): EnsureReady only.
                 self.emit("readyok");
             }
-            "ucinewgame" => self.stop_and_join(),
+            "ucinewgame" => self.new_game(),
             "stop" => {
                 self.stop_and_join();
             }
@@ -554,6 +695,7 @@ impl Engine {
                 }
             }
             _ if line.starts_with("position") => {
+                // lc0 `Engine::SetPosition` (engine.cc:215-224): stop search, store position; tree on go.
                 self.stop_and_join();
                 match parse_position_history(line) {
                     Ok(history) => self.history = history,
@@ -672,12 +814,142 @@ mod tests {
     }
 
     #[test]
+    fn uci_info_line_depth_at_least_one() {
+        let line = uci_info_line(UciInfoView {
+            best_value: 0.0,
+            best_mate: None,
+            depth: 0,
+            seldepth: 1,
+            playouts: 1,
+            nodes: 1,
+            elapsed_ms: 10,
+            nps_elapsed_ms: 10,
+            pv: &[],
+        });
+        assert!(line.contains("depth 1"));
+        assert!(!line.contains("depth 0"));
+    }
+
+    #[test]
+    fn uci_info_line_lc0_field_order() {
+        let line = uci_info_line(UciInfoView {
+            best_value: 0.1,
+            best_mate: None,
+            depth: 2,
+            seldepth: 3,
+            playouts: 8,
+            nodes: 8,
+            elapsed_ms: 100,
+            nps_elapsed_ms: 100,
+            pv: &[],
+        });
+        let depth_pos = line.find("depth ").expect("depth");
+        let time_pos = line.find("time ").expect("time");
+        let nodes_pos = line.find("nodes ").expect("nodes");
+        let nps_pos = line.find("nps ").expect("nps");
+        assert!(depth_pos < time_pos);
+        assert!(time_pos < nodes_pos);
+        assert!(nodes_pos < nps_pos);
+    }
+
+    #[test]
+    fn ucinewgame_clears_search_tree_and_history() {
+        let mut engine = Engine::new();
+        engine.handle_line("setoption name Threads value 1");
+        engine.handle_line("position startpos moves h2e2");
+        engine.handle_line("go nodes 16");
+        std::thread::sleep(Duration::from_millis(200));
+        engine.stop_and_join();
+
+        {
+            let mcts = engine.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(mcts.tree.len() > 0, "search should materialize tree nodes");
+        }
+        assert!(engine.history.len() > 1);
+
+        engine.handle_line("ucinewgame");
+
+        let mcts = engine.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(mcts.tree.len(), 0);
+        assert!(mcts.root_id.is_none());
+        assert!(mcts.root_history.is_none());
+        assert_eq!(engine.history.len(), 1);
+        assert_eq!(engine.history.current().fen(), START_FEN);
+    }
+
+    #[test]
     fn go_infinite_means_no_fixed_visit_cap() {
         let engine = Engine::new();
-        let budget = engine.budget_from_go(&parse_go("infinite")).expect("budget");
+        let budget = engine
+            .budget_from_go(&parse_go("infinite").params)
+            .expect("budget");
         assert!(budget.max_playouts.is_none());
         assert!(budget.max_nodes.is_none());
         assert!(budget.deadline.is_none());
+    }
+
+    #[test]
+    fn go_movetime_and_nodes_combine_limits() {
+        let engine = Engine::new();
+        let budget = engine
+            .budget_from_go(&parse_go("movetime 1000 nodes 500").params)
+            .expect("budget");
+        assert!(budget.deadline.is_some());
+        assert_eq!(budget.max_nodes, Some(500));
+        assert!(budget.max_depth.is_none());
+        assert!(budget.max_playouts.is_none());
+    }
+
+    #[test]
+    fn go_depth_and_nodes_combine_limits() {
+        let engine = Engine::new();
+        let budget = engine
+            .budget_from_go(&parse_go("depth 8 nodes 2000").params)
+            .expect("budget");
+        assert_eq!(budget.max_depth, Some(8));
+        assert_eq!(budget.max_nodes, Some(2000));
+        assert!(budget.deadline.is_none());
+        assert!(budget.max_playouts.is_none());
+    }
+
+    #[test]
+    fn go_wtime_only_is_rejected() {
+        let engine = Engine::new();
+        let err = engine
+            .budget_from_go(&parse_go("wtime 60000 btime 60000").params)
+            .expect_err("must reject unsupported-only go");
+        assert!(err.contains("未含可执行"));
+    }
+
+    #[test]
+    fn go_wtime_with_nodes_warns_and_applies_nodes() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |line: &str| {
+                lines.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+            }) as EngineOutput
+        };
+        let mut engine = Engine::new_with_output(sink);
+        engine.handle_line("setoption name Threads value 1");
+        engine.handle_line("position startpos");
+        engine.handle_line("go wtime 60000 nodes 8");
+        std::thread::sleep(Duration::from_millis(200));
+        engine.stop_and_join();
+
+        let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+        assert!(out.contains("unsupported go option: wtime"));
+        assert!(out.contains("bestmove"));
+    }
+
+    #[test]
+    fn parse_go_unknown_token_emits_warning() {
+        let outcome = parse_go("nodes 16 not_a_uci_flag");
+        assert_eq!(outcome.params.nodes, Some(16));
+        assert!(outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("unknown go token")));
     }
 
     #[test]
@@ -715,9 +987,11 @@ mod tests {
     }
 
     #[test]
-    fn go_nodes_maps_to_node_budget() {
+    fn go_nodes_maps_to_visits_budget() {
         let engine = Engine::new();
-        let budget = engine.budget_from_go(&parse_go("nodes 1234")).expect("budget");
+        let budget = engine
+            .budget_from_go(&parse_go("nodes 1234").params)
+            .expect("budget");
         assert_eq!(budget.max_nodes, Some(1234));
         assert!(budget.max_playouts.is_none());
     }
@@ -726,7 +1000,7 @@ mod tests {
     fn mcts_playouts_updates_playouts_budget() {
         let mut engine = Engine::new();
         engine.handle_line("setoption name MctsPlayouts value 512");
-        let budget = engine.budget_from_go(&parse_go("")).expect("budget");
+        let budget = engine.budget_from_go(&parse_go("").params).expect("budget");
         assert_eq!(budget.max_playouts, Some(512));
     }
 
@@ -749,16 +1023,15 @@ mod tests {
         assert!(s.contains("readyok"));
         assert!(s.contains("bestmove"));
         assert!(s.contains("MctsPlayouts"));
-        assert!(s.contains("MctsCpuct"));
-        assert!(s.contains("MctsFpuReduction"));
-        assert!(s.contains("MctsBatchCap"));
-        assert!(s.contains("MctsWorkers"));
+        assert!(s.contains("CPuct"));
+        assert!(s.contains("FpuValue"));
+        assert!(s.contains("MinibatchSize"));
+        assert!(s.contains("NNCacheSize"));
+        assert!(s.contains("Threads"));
         assert!(!s.contains("option name Playouts "));
         assert!(!s.contains("option name Visits "));
-        assert!(!s.contains("option name Cpuct "));
-        assert!(!s.contains("option name FpuReduction "));
-        assert!(!s.contains("option name SearchBatchSize "));
-        assert!(!s.contains("option name Threads "));
+        assert!(!s.contains("option name MctsCpuct "));
+        assert!(!s.contains("option name MctsWorkers "));
     }
 
     #[test]
@@ -771,7 +1044,7 @@ mod tests {
             }) as EngineOutput
         };
         let mut engine = Engine::new_with_output(sink);
-        engine.handle_line("setoption name MctsWorkers value 1");
+        engine.handle_line("setoption name Threads value 1");
         engine.handle_line("position startpos");
         engine.handle_line("go depth 2");
         std::thread::sleep(Duration::from_millis(200));
@@ -813,7 +1086,7 @@ mod tests {
             }) as EngineOutput
         };
         let mut engine = Engine::new_with_output(sink);
-        engine.handle_line("setoption name MctsWorkers value 1");
+        engine.handle_line("setoption name Threads value 1");
         engine.handle_line("position startpos");
         engine.handle_line("go infinite");
         std::thread::sleep(UCI_INFO_INTERVAL + Duration::from_millis(50));
@@ -835,7 +1108,7 @@ mod tests {
             }) as EngineOutput
         };
         let mut engine = Engine::new_with_output(sink);
-        engine.handle_line("setoption name MctsWorkers value 1");
+        engine.handle_line("setoption name Threads value 1");
         engine.handle_line("position startpos");
         engine.handle_line("go infinite");
         std::thread::sleep(Duration::from_millis(50));
@@ -863,7 +1136,7 @@ mod tests {
         let mut engine = Engine::new_with_output(sink);
         engine.policy = None;
         engine.rebuild_search_engine(true);
-        engine.handle_line("setoption name MctsWorkers value 2");
+        engine.handle_line("setoption name Threads value 2");
         engine.handle_line("position startpos");
         engine.handle_line("go nodes 16");
         std::thread::sleep(Duration::from_millis(150));
@@ -877,7 +1150,7 @@ mod tests {
     #[test]
     fn policy_reload_discards_search_tree() {
         let mut engine = Engine::new();
-        engine.handle_line("setoption name MctsWorkers value 1");
+        engine.handle_line("setoption name Threads value 1");
         engine.handle_line("position startpos");
         engine.handle_line("go nodes 16");
         std::thread::sleep(Duration::from_millis(200));
@@ -898,10 +1171,11 @@ mod tests {
     }
 
     #[test]
-    fn mcts_workers_rejects_zero_and_keeps_default() {
+    fn threads_zero_means_auto() {
         let mut engine = Engine::new();
-        assert_eq!(engine.threads, DEFAULT_THREADS);
-        engine.handle_line("setoption name MctsWorkers value 0");
-        assert_eq!(engine.threads, DEFAULT_THREADS);
+        assert_eq!(engine.threads, AUTO_THREADS);
+        engine.handle_line("setoption name Threads value 0");
+        assert_eq!(engine.threads, AUTO_THREADS);
+        assert!(engine.resolved_threads() >= 1);
     }
 }

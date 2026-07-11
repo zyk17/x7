@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +7,7 @@ use xiangqi_core::Color;
 use xiangqi_core::Position;
 
 use crate::history::PositionHistory;
-use crate::policy_onnx::{PolicyOnnx, PolicySessionPool};
+use crate::policy_onnx::{BackendAttributes, PolicyOnnx, PolicySessionPool};
 use crate::move_vocab::move_vocab_index;
 
 pub type SharedPolicy = Option<Arc<PolicySessionPool>>;
@@ -118,6 +118,15 @@ pub trait PolicyValueEval {
         }
         Ok(out)
     }
+
+    /// lc0 `AddInput` cache 路径；默认无缓存。
+    fn evaluate_cached(&mut self, _input: PolicyValueInput<'_>) -> Option<PolicyValueOutput> {
+        None
+    }
+
+    fn backend_attributes(&self) -> Option<BackendAttributes> {
+        None
+    }
 }
 
 /// 复用现有 `PolicyOnnx` 的最小 MCTS 评估桥。
@@ -136,25 +145,89 @@ pub(crate) struct CachedEval {
 }
 
 pub(crate) struct EvalCache {
-    shards: Vec<Mutex<HashMap<u64, CachedEval>>>,
+    shards: Vec<Mutex<CacheShard>>,
+    capacity: usize,
     lookup_hits: AtomicU64,
     lookup_misses: AtomicU64,
     miss_keys: AtomicU64,
 }
 
+struct CacheShard {
+    map: HashMap<u64, CachedEval>,
+    order: VecDeque<u64>,
+    capacity: usize,
+}
+
+impl CacheShard {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn touch(&mut self, key: u64) {
+        if let Some(pos) = self.order.iter().position(|&k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+    }
+
+    fn get(&mut self, key: u64) -> Option<CachedEval> {
+        if self.map.contains_key(&key) {
+            self.touch(key);
+            self.map.get(&key).cloned()
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: u64, value: CachedEval) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key, value);
+            self.touch(key);
+            return;
+        }
+        while self.map.len() >= self.capacity {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&old);
+        }
+        self.map.insert(key, value);
+        self.order.push_back(key);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
 impl EvalCache {
-    fn new(shards: usize) -> Self {
-        let shard_count = shards.max(1).next_power_of_two();
-        let mut maps = Vec::with_capacity(shard_count);
-        for _ in 0..shard_count {
-            maps.push(Mutex::new(HashMap::new()));
+    fn new(capacity: usize) -> Self {
+        const SHARD_COUNT: usize = 16;
+        let shard_capacity = if capacity == 0 {
+            0
+        } else {
+            (capacity / SHARD_COUNT).max(1)
+        };
+        let mut shards = Vec::with_capacity(SHARD_COUNT);
+        for _ in 0..SHARD_COUNT {
+            shards.push(Mutex::new(CacheShard::new(shard_capacity)));
         }
         Self {
-            shards: maps,
+            shards,
+            capacity,
             lookup_hits: AtomicU64::new(0),
             lookup_misses: AtomicU64::new(0),
             miss_keys: AtomicU64::new(0),
         }
+    }
+
+    fn enabled(&self) -> bool {
+        self.capacity > 0
     }
 
     fn shard_index(&self, key: u64) -> usize {
@@ -162,8 +235,11 @@ impl EvalCache {
     }
 
     fn get(&self, key: u64) -> Option<CachedEval> {
-        let shard = self.shards[self.shard_index(key)].lock().ok()?;
-        let out = shard.get(&key).cloned();
+        if !self.enabled() {
+            return None;
+        }
+        let mut shard = self.shards[self.shard_index(key)].lock().ok()?;
+        let out = shard.get(key);
         if out.is_some() {
             self.lookup_hits.fetch_add(1, Ordering::Relaxed);
         }
@@ -183,6 +259,9 @@ impl EvalCache {
     }
 
     fn insert(&self, key: u64, value: CachedEval) {
+        if !self.enabled() {
+            return;
+        }
         if let Ok(mut shard) = self.shards[self.shard_index(key)].lock() {
             shard.insert(key, value);
         }
@@ -224,19 +303,24 @@ pub struct EvalCacheStats {
 }
 
 impl OnnxPolicyValueEval {
-    pub fn new(policy: SharedPolicy) -> Self {
+    pub fn new(policy: SharedPolicy, nn_cache_size: usize) -> Self {
         Self {
             session: policy.as_ref().map(|pool| pool.primary()),
             policy,
-            cache: Arc::new(EvalCache::new(16)),
+            cache: Arc::new(EvalCache::new(nn_cache_size)),
             scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
             scratch_batch: ndarray::Array4::<f32>::zeros((0, crate::fen_tensor::PX0_INPUT_SHAPE.1, 10, 9)),
         }
     }
 
-    pub(crate) fn with_shared_cache(policy: SharedPolicy, cache: SharedEvalCache) -> Self {
+    pub(crate) fn with_dedicated_session(
+        policy: SharedPolicy,
+        session: Option<Arc<Mutex<PolicyOnnx>>>,
+        cache: SharedEvalCache,
+    ) -> Self {
+        let session = session.or_else(|| policy.as_ref().map(|pool| pool.primary()));
         Self {
-            session: policy.as_ref().map(|pool| pool.primary()),
+            session,
             policy,
             cache,
             scratch_board: ndarray::Array4::<f32>::zeros(crate::fen_tensor::PX0_INPUT_SHAPE),
@@ -379,6 +463,15 @@ impl PolicyValueEval for OnnxPolicyValueEval {
 
     fn evaluate_many_arcs(&mut self, tasks: &[Arc<PolicyValueTask>]) -> Result<Vec<PolicyValueOutput>, Self::Error> {
         self.evaluate_many_impl(tasks)
+    }
+
+    fn evaluate_cached(&mut self, input: PolicyValueInput<'_>) -> Option<PolicyValueOutput> {
+        let key = input.history.input_cache_key();
+        self.cache.get(key).map(|cached| output_from_cached(&cached, input.position, input.legal_moves))
+    }
+
+    fn backend_attributes(&self) -> Option<BackendAttributes> {
+        self.policy.as_ref().map(|pool| pool.backend_attributes())
     }
 }
 

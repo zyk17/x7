@@ -105,7 +105,10 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
         }
     };
 
-    let mut engine = MctsEngine::new(session.config, OnnxPolicyValueEval::new(session.policy.clone()));
+    let mut engine = MctsEngine::new(
+        session.config,
+        OnnxPolicyValueEval::new(session.policy.clone(), session.config.nn_cache_size),
+    );
 
     let search_result = if session.threads > 1 {
         engine
@@ -142,6 +145,7 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                 "depth": result.depth,
                 "seldepth": result.seldepth,
                 "time_ms": elapsed_ms,
+                "nps_elapsed_ms": result.nps_elapsed_ms,
                 "nps": nps,
                 "root_moves": result.moves.iter().map(|stat: &MctsMoveStat| {
                     json!({
@@ -159,7 +163,8 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                     "fpu_reduction": session.config.fpu_reduction,
                     "fpu_reduction_root": session.config.fpu_reduction_root,
                     "root_temperature": session.config.root_temperature,
-                    "search_batch_size": session.config.search_batch_size,
+                    "minibatch_size": session.config.minibatch_size,
+                    "nn_cache_size": session.config.nn_cache_size,
                 },
                 "budget": {
                     "max_playouts": session.budget.max_playouts,
@@ -198,4 +203,43 @@ pub fn write_benchmark_ndjson<W: Write, S: AsRef<str>>(
         writeln!(w, "{}", serde_json::to_string(&v).map_err(io::Error::other)?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcts::{MctsBudget, MctsConfig, SearchStats, SharedPolicy};
+    use xiangqi_core::START_FEN;
+
+    #[test]
+    fn bench_json_stats_internally_consistent() {
+        let policy: SharedPolicy = None;
+        let meta = BenchJsonMeta::default();
+        let session = BenchSessionParams {
+            budget: MctsBudget {
+                max_playouts: Some(24),
+                max_nodes: None,
+                max_depth: None,
+                deadline: None,
+                stop: None,
+            },
+            config: MctsConfig::default(),
+            policy: &policy,
+            meta: &meta,
+            threads: 1,
+        };
+        let v = bench_one_json(START_FEN, &session);
+        assert!(v.get("error").is_none(), "bench should succeed: {v}");
+
+        let playouts = v["playouts"].as_u64().expect("playouts") as u32;
+        let nodes = v["nodes"].as_u64().expect("nodes") as usize;
+        let nps = v["nps"].as_u64().expect("nps");
+        let nps_elapsed_ms = v["nps_elapsed_ms"].as_u64().expect("nps_elapsed_ms");
+
+        assert!(nodes >= playouts as usize);
+        assert_eq!(
+            SearchStats::playouts_per_second(playouts, nps_elapsed_ms),
+            nps
+        );
+    }
 }

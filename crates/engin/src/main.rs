@@ -10,7 +10,7 @@ use engin::benchmark::{
     default_benchmark_fen_strings, resolve_data_file, write_benchmark_ndjson, BenchJsonMeta, BenchSessionParams,
 };
 use engin::mcts::{MctsBudget, MctsConfig, SharedPolicy};
-use engin::{run_uci_stdio, PolicyOnnx, PolicySessionPool, START_FEN};
+use engin::{policy_onnx::resolved_search_threads, run_uci_stdio, PolicyOnnx, PolicySessionPool, START_FEN};
 
 fn default_policy_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx")
@@ -21,7 +21,7 @@ fn print_usage() {
         "用法:\n  engin                         UCI 模式（stdin/stdout）\n  \
          engin --onnx-smoke [ONNX] [FEN]  冒烟；缺省 ONNX=data/x7.onnx、FEN=起始局面\n  \
          engin --bench [选项]            MCTS 基准（NDJSON）\n  \
-         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --search-batch-size N  --onnx PATH  --fen FEN  --data-dir PATH  --require-onnx"
+         --bench 选项: --playouts N  --nodes N  --movetime MS  --cpuct F  --minibatch-size N  --onnx PATH  --fen FEN  --data-dir PATH  --require-onnx  --threads N"
     );
 }
 
@@ -49,11 +49,11 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
     let mut data_dir: Option<PathBuf> = None;
     let mut require_onnx = false;
     let mut fens = Vec::new();
-    let mut threads = 1usize;
+    let mut threads = 0usize;
     let mut i = 0usize;
     while i < rest.len() {
         match rest[i].as_str() {
-            "--playouts" | "--visits" if i + 1 < rest.len() => {
+            "--playouts" if i + 1 < rest.len() => {
                 if let Ok(n) = rest[i + 1].parse::<u32>() {
                     budget.max_playouts = Some(n.max(1));
                 }
@@ -67,7 +67,7 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
             }
             "--movetime" if i + 1 < rest.len() => {
                 if let Ok(n) = rest[i + 1].parse::<u64>() {
-                    budget = MctsBudget::from_movetime_ms(n.max(1));
+                    budget.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(n.max(1)));
                 }
                 i += 2;
             }
@@ -77,9 +77,9 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
                 }
                 i += 2;
             }
-            "--search-batch-size" if i + 1 < rest.len() => {
-                if let Ok(n) = rest[i + 1].parse::<usize>() {
-                    config.search_batch_size = n.clamp(1, 8192);
+            "--minibatch-size" if i + 1 < rest.len() => {
+                if let Ok(n) = rest[i + 1].parse::<i32>() {
+                    config.minibatch_size = n.clamp(0, 1024);
                 }
                 i += 2;
             }
@@ -97,7 +97,7 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
             }
             "--threads" if i + 1 < rest.len() => {
                 if let Ok(n) = rest[i + 1].parse::<usize>() {
-                    threads = n.max(1);
+                    threads = n.min(128);
                 }
                 i += 2;
             }
@@ -170,12 +170,21 @@ fn run_bench_cli(rest: &[String]) -> io::Result<()> {
         }
     }
 
+    let resolved_threads = if cli.threads == 0 {
+        policy
+            .as_ref()
+            .map(|pool| resolved_search_threads(0, &pool.backend_attributes()))
+            .unwrap_or(1)
+    } else {
+        cli.threads.max(1)
+    };
+
     let session = BenchSessionParams {
         budget: cli.budget,
         config: cli.config,
         policy: &policy,
         meta: &meta,
-        threads: cli.threads,
+        threads: resolved_threads,
     };
     let default_fens;
     let fens: &[String] = if cli.fens.is_empty() {

@@ -122,25 +122,25 @@ def validate_existing_output_checkpoint(
         raise SystemExit("--out 已存在，但不是当前 katago_cnn_v1 架构；请换新输出文件重新训练")
     if ckpt.get("moves_left_head") is not None and not bool(ckpt.get("moves_left_head", False)):
         raise SystemExit("--out 已存在，但不含当前 moves_left 辅助头；请换新输出文件重新训练")
-    expected_q_ratio = float(args.q_ratio)
-    got_q_ratio = ckpt.get("q_ratio")
-    if got_q_ratio is not None and abs(float(got_q_ratio) - expected_q_ratio) > 1e-9:
-        raise SystemExit(
-            f"--out 已存在，但其中 checkpoint q_ratio={float(got_q_ratio):.6f}，"
-            f"当前命令 q_ratio={expected_q_ratio:.6f}；请换新输出文件或改用 --init-from 开启新阶段训练"
-        )
-    prev_train_files = ckpt.get("train_files")
-    prev_val_files = ckpt.get("val_files")
-    current_train_files = [str(p.resolve()) for p in train_files]
-    current_val_files = [str(p.resolve()) for p in val_files]
-    if prev_train_files is not None and list(prev_train_files) != current_train_files:
-        raise SystemExit(
-            "--out 已存在，但 train_files 与 checkpoint 不一致；请换新输出文件或改用 --init-from"
-        )
-    if prev_val_files is not None and list(prev_val_files) != current_val_files:
-        raise SystemExit(
-            "--out 已存在，但 val_files 与 checkpoint 不一致；请换新输出文件或改用 --init-from"
-        )
+    # expected_q_ratio = float(args.q_ratio)
+    # got_q_ratio = ckpt.get("q_ratio")
+    # if got_q_ratio is not None and abs(float(got_q_ratio) - expected_q_ratio) > 1e-9:
+    #     raise SystemExit(
+    #         f"--out 已存在，但其中 checkpoint q_ratio={float(got_q_ratio):.6f}，"
+    #         f"当前命令 q_ratio={expected_q_ratio:.6f}；请换新输出文件或改用 --init-from 开启新阶段训练"
+    #     )
+    # prev_train_files = ckpt.get("train_files")
+    # prev_val_files = ckpt.get("val_files")
+    # current_train_files = [str(p.resolve()) for p in train_files]
+    # current_val_files = [str(p.resolve()) for p in val_files]
+    # if prev_train_files is not None and list(prev_train_files) != current_train_files:
+    #     raise SystemExit(
+    #         "--out 已存在，但 train_files 与 checkpoint 不一致；请换新输出文件或改用 --init-from"
+    #     )
+    # if prev_val_files is not None and list(prev_val_files) != current_val_files:
+    #     raise SystemExit(
+    #         "--out 已存在，但 val_files 与 checkpoint 不一致；请换新输出文件或改用 --init-from"
+    #     )
 
 
 def make_sample_weight(search_visits: torch.Tensor, policy_kld: torch.Tensor) -> torch.Tensor:

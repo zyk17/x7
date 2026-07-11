@@ -1,6 +1,6 @@
 # 77xiangqi_engine
 
-一个围绕 `MCTS + 小型 policy/value 网络` 的象棋工程。
+一个围绕 `MCTS + policy/value 网络` 的象棋工程。
 
 当前项目已经收口到一条明确主线：
 
@@ -8,7 +8,8 @@
 - 训练主线只有 `px0 / lc0` 风格外部数据
 - 网络只保留 `policy + value`
 - 当前 value 主语义改为 `WDL + qMix`
-- 线上推理输入主线改为 `px0 classical` 的真实 history 编码
+- 引擎基建当前主对齐对象改为 `lc0 classic`
+- 线上推理输入主线保持真实 history 编码
 - 仓库内已移除 `XRSH` 正式训练/标注链路
 
 ## 当前真实状态
@@ -41,6 +42,7 @@
 - 当前训练会额外使用 `best_q / visits / policy_kld / plies_left`
 - 搜索核心已切成单线程 `iteration -> minibatch gather -> batched NN -> backup`
 - 当前搜索语义包含 `in_flight / collision / multivisit`
+- 当前已支持最小 `shared-tree` 多线程搜索
 - `position startpos moves ...` / `position fen ... moves ...` 会在引擎内保留真实历史
 - 只给最终 `FEN` 的第三方 GUI 仍可用，但属于 fallback 路径，强度可能下降
 
@@ -49,21 +51,35 @@
 当前主 UCI 只公开这些日常需要的选项：
 
 - `PolicyFile`：ONNX 路径
-- `MctsPlayouts`：默认 playout 预算
-- `MctsCpuct`：主探索强度
-- `MctsFpuReduction`：未访问边的 first-play urgency 扣减
-- `MctsBatchCap`：单轮 gather / evaluator 的 batch 上限，不是固定目标值
-- `MctsWorkers`：shared-tree worker 数
+- `MctsPlayouts`：默认 playout 预算（`go` 无 `nodes/movetime` 时）
+- `CPuct`：PUCT 探索强度（lc0 默认 `1.745`）
+- `FpuValue`：未访问边 first-play urgency（lc0 默认 `0.330`）
+- `MinibatchSize`：gather batch；`0` = backend `recommended_batch_size`（ONNX CPU/CUDA 默认 `256`，DML 默认 `64`；上限 `1024`）
+- `NNCacheSize`：NN 评估 LRU 缓存容量（默认 `200000`）
+- `Threads`：搜索线程；`0` = `suggested_num_search_threads + !runs_on_cpu`
 
 说明：
 
-- 不再兼容 `Playouts / Visits / Cpuct / FpuReduction / SearchBatchSize / Threads`
-- 这样可以避免和 `Pikafish / Stockfish` 风格 GUI 选项名冲突
-- 当前默认 `MctsWorkers=8`
-- 当前默认 `MctsBatchCap=2048`
-- 当前 `MctsBatchCap` 公开上限为 `8192`
-- 当前 `MctsWorkers` 公开上限为 `1024`
-- 当前搜索会按 root 访问数逐步放大 gather 大小，并在 evaluator 侧按动态目标 batch + 短等待 flush 提交
+- 其余 lc0 搜索参数已内化，不再以 `Mcts*` 前缀公开
+- 内化能力含：OOO eval、NN prefetch、7 步搜索流水线、独立 watchdog
+- `Threads=0` 时 GPU backend 通常解析为 `2`，CPU 为物理核数
+- `MinibatchSize=0` 时使用 backend `recommended_batch_size`（上限 `1024`）
+
+## 当前与 lc0 仍有差距的点
+
+当前主线已经对齐到：
+
+- `position / go / stop / ucinewgame`
+- `nodes / nps / depth / seldepth / pv`
+- `Threads=0 / MinibatchSize=0`
+- `shared-tree + batched eval + subtree reuse`
+
+但还没有完全抄到位的主要是：
+
+1. 完整 `go wtime/btime/winc/binc/movestogo` time manager
+2. `ponder / searchmoves / mate` 的完整 UCI 语义
+3. 更接近 lc0 的 task workers / node-lock 并行细节
+4. 更完整的 engine 集成测试与长时回归基线
 
 ## 数据路线
 
@@ -104,5 +120,7 @@ nn/
   scripts/train
   scripts/export
 ```
+
+当前后续计划见 [NextStep.md](/C:/projects/77xiangqi_engine/NextStep.md) 和 [TODO.md](/C:/projects/77xiangqi_engine/TODO.md)。
 
 架构边界见 [ARCHITECTURE.md](/C:/projects/77xiangqi_engine/ARCHITECTURE.md)。

@@ -38,7 +38,7 @@ pub fn terminal_score(pos: &Position) -> Option<i32> {
     use xiangqi_core::movegen::{ExtMove, GenType};
     use xiangqi_core::types::{Move, MAX_MOVES};
 
-    let mut buf = [ExtMove {
+    let mut buf = vec![ExtMove {
         mv: Move::none(),
         value: 0,
     }; MAX_MOVES];

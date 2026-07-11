@@ -1,18 +1,17 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::history::PositionHistory;
 
 use super::backend::BackendComputation;
-use super::coordinator::{
-    acquire_searcher_slot, ensure_tree_quiescent, init_pending_searchers, release_searcher_slot,
-    SharedCollisions, SharedMctsTree,
-};
 use super::worker::{
-    apply_minibatch, budget_exhausted, gather_minibatch, progress_from_tree, result_from_tree,
-    total_in_flight_in_tree, worker_batch_limit, GatherParams, PendingKind, SelectionScratch,
+    acquire_searcher_slot, budget_exhausted, do_backup_update, ensure_tree_quiescent,
+    fetch_minibatch_results, gather_has_work, gather_minibatch, init_pending_searchers,
+    maybe_prefetch_into_cache, progress_from_tree, release_searcher_slot, result_from_tree,
+    total_in_flight_in_tree, worker_batch_limit, GatherParams, SelectionScratch, SharedCollisions,
+    SharedMctsTree,
 };
 use super::{
     MctsBudget, MctsConfig, MctsNodeId, MctsSearchProgress, MctsSearchResult, MctsTree, OnnxPolicyValueEval,
@@ -37,11 +36,6 @@ fn is_unbounded_search(budget: &MctsBudget) -> bool {
         && budget.max_nodes.is_none()
         && budget.max_depth.is_none()
         && budget.deadline.is_none()
-}
-
-#[inline]
-fn should_yield_backend_pressure(threads: usize, backend_waiting: i32, threshold: i32) -> bool {
-    threads > 1 && backend_waiting > threshold
 }
 
 #[inline]
@@ -97,9 +91,34 @@ fn apply_empty_iteration(
     action
 }
 
+fn search_stopped(budget: &MctsBudget) -> bool {
+    budget
+        .stop
+        .as_ref()
+        .is_some_and(|stop| stop.load(Ordering::SeqCst))
+}
+
+fn apply_nps_limit(config: MctsConfig, stats: &SearchStats, budget: &MctsBudget) {
+    if config.nps_limit == 0 {
+        return;
+    }
+    while !budget_exhausted(budget, stats.total_playouts(), 0, stats.initial_visits(), Some(stats)) {
+        let elapsed = stats.nps_elapsed_ms();
+        if elapsed == 0 {
+            break;
+        }
+        let nps = SearchStats::playouts_per_second(stats.total_playouts(), elapsed);
+        if nps <= config.nps_limit {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 pub(crate) struct SearchSession<'a, E> {
     pub tree: &'a mut MctsTree,
     pub config: MctsConfig,
+    pub batch_limit: usize,
     pub root_id: MctsNodeId,
     pub root_history: PositionHistory,
     pub budget: MctsBudget,
@@ -120,7 +139,7 @@ where
     where
         F: FnMut(&MctsSearchProgress),
     {
-        let batch_limit = self.config.search_batch_size.max(1);
+        let batch_limit = self.batch_limit;
         let mut next_report_at = if info_interval.is_zero() {
             None
         } else {
@@ -128,6 +147,7 @@ where
         };
         let mut retry_without_playout = 0u32;
 
+        let shared_collisions = SharedCollisions::default();
         while !budget_exhausted(
             &self.budget,
             self.stats.total_playouts(),
@@ -135,7 +155,7 @@ where
             self.stats.initial_visits(),
             Some(self.stats.as_ref()),
         ) {
-            if execute_one_iteration(self, batch_limit)? {
+            if execute_one_iteration(self, batch_limit, &shared_collisions)? {
                 retry_without_playout = 0;
             } else {
                 match apply_empty_iteration(
@@ -159,25 +179,40 @@ where
             if let Some(deadline) = next_report_at {
                 let now = std::time::Instant::now();
                 if now >= deadline && self.stats.total_playouts() > 0 {
-                    on_progress(&progress_from_tree(self.tree, self.root_id, self.stats.as_ref()));
+                    on_progress(&progress_from_tree(
+                        self.tree,
+                        self.root_id,
+                        self.stats.as_ref(),
+                        self.config,
+                    ));
                     next_report_at = Some(now + info_interval);
                 }
             }
         }
 
+        shared_collisions.cancel_all(self.tree);
         debug_assert_eq!(total_in_flight_in_tree(self.tree), 0);
-        Ok(result_from_tree(self.tree, self.root_id, self.stats.as_ref()))
+        Ok(result_from_tree(
+            self.tree,
+            self.root_id,
+            self.stats.as_ref(),
+            self.config,
+        ))
     }
 }
 
-/// px0 `SearchWorker::ExecuteOneIteration` 七步。
+/// lc0 `SearchWorker::ExecuteOneIteration`（search.cc:1209-1230, 1507-1573, 2018-2377）。
 pub(crate) fn execute_one_iteration<E>(
     session: &mut SearchSession<'_, E>,
     batch_limit: usize,
+    shared_collisions: &SharedCollisions,
 ) -> Result<bool, E::Error>
 where
     E: PolicyValueEval,
 {
+    let stop = search_stopped(&session.budget);
+    let mut backend = BackendComputation::new(session.eval);
+
     let gather_params = GatherParams {
         config: session.config,
         budget: &session.budget,
@@ -196,28 +231,39 @@ where
         backend_waiting: 0,
     };
 
-    let iteration = gather_minibatch(
+    let mut iteration = gather_minibatch(
         session.tree,
         &session.root_history,
         &gather_params,
         &mut session.selection_scratch,
+        Some(&mut backend),
+        stop,
     );
-    if iteration.playouts == 0 {
+    // 1 gather (search.cc:1303-1439)
+    if iteration.pending.is_empty() {
+        return Ok(false);
+    }
+    if !gather_has_work(&iteration, backend.used_batch_size()) {
+        super::worker::cancel_minibatch(session.tree, iteration);
+        shared_collisions.cancel_all(session.tree);
         return Ok(false);
     }
 
-    let needs_eval = iteration
-        .pending
-        .iter()
-        .any(|pending| matches!(pending.kind, PendingKind::Expand { .. }));
+    // 2 collect collisions (search.cc:1507+)
+    shared_collisions.collect(&iteration.pending);
 
-    let outputs = if needs_eval {
-        let mut backend = BackendComputation::new(session.eval);
-        for pending in &iteration.pending {
-            if let PendingKind::Expand { task } = &pending.kind {
-                backend.add_input(task);
-            }
-        }
+    // 3 prefetch (search.cc:2018-2050)
+    maybe_prefetch_into_cache(
+        session.tree,
+        session.root_id,
+        &session.root_history,
+        session.config,
+        &mut backend,
+        stop,
+    );
+
+    // 4 NN compute
+    let outputs = if backend.used_batch_size() > 0 {
         match backend.compute_blocking() {
             Ok(outputs) => {
                 session.stats.mark_first_batch();
@@ -225,6 +271,7 @@ where
             }
             Err(err) => {
                 super::worker::cancel_minibatch(session.tree, iteration);
+                shared_collisions.cancel_all(session.tree);
                 return Err(err);
             }
         }
@@ -232,10 +279,24 @@ where
         Vec::new()
     };
 
-    session.stats.add_minibatch(&iteration);
-    let shared = SharedCollisions::default();
-    shared.collect(&iteration);
-    apply_minibatch(session.tree, iteration, &outputs, Some(&shared));
+    // 5 fetch (search.cc:2151+)
+    fetch_minibatch_results(
+        session.tree,
+        session.eval,
+        &mut iteration,
+        &outputs,
+        session.config,
+        session.root_id,
+    );
+    // 6 backup + 7 counters (search.cc:2217-2377)
+    session.stats.commit_minibatch(&iteration);
+    do_backup_update(
+        session.tree,
+        &iteration,
+        Some(session.stats.as_ref()),
+        Some(shared_collisions),
+    );
+    apply_nps_limit(session.config, session.stats.as_ref(), &session.budget);
     Ok(true)
 }
 
@@ -255,6 +316,8 @@ where
 {
     let root_history = history.clone_for_search();
     let shared_policy = evaluator.policy.clone();
+    let backend_attrs = shared_policy.as_ref().map(|pool| pool.backend_attributes());
+    let batch_limit = worker_batch_limit(config, backend_attrs);
     let shared_cache = evaluator.shared_cache();
     let stop = budget
         .stop
@@ -264,9 +327,9 @@ where
     let stats = Arc::new(SearchStats::new(initial_visits));
     let active_workers = Arc::new(std::sync::atomic::AtomicUsize::new(threads));
     let first_error = Arc::new(Mutex::new(None::<String>));
-    let shared_tree: SharedMctsTree = Arc::new(RwLock::new(std::mem::take(tree)));
-    let shared_collisions = Arc::new(SharedCollisions::default());
+    let shared_tree: SharedMctsTree = Arc::new(Mutex::new(std::mem::take(tree)));
     let pending_searchers = init_pending_searchers(config);
+    let shared_collisions = Arc::new(SharedCollisions::default());
     let backend_waiting = Arc::new(AtomicI32::new(0));
     let wait = if info_interval.is_zero() {
         WATCHDOG_MAX_WAIT
@@ -274,30 +337,37 @@ where
         info_interval.clamp(WATCHDOG_MIN_WAIT, WATCHDOG_MAX_WAIT)
     };
 
+    let worker_sessions = match shared_policy.as_ref() {
+        Some(pool) => Some(pool.resize_sessions(threads).map_err(|e| e.to_string())?),
+        None => None,
+    };
     thread::scope(|scope| {
-        let watchdog_stop = Arc::clone(&stop);
-        let watchdog_workers = Arc::clone(&active_workers);
-        let watchdog_tree = Arc::clone(&shared_tree);
-        let watchdog_stats = Arc::clone(&stats);
-        scope.spawn(move || {
-            while watchdog_workers.load(Ordering::Relaxed) > 0 {
-                thread::sleep(wait);
-                if watchdog_stop.load(Ordering::SeqCst) {
-                    continue;
-                }
-                if let Ok(tree_guard) = watchdog_tree.read() {
-                    if watchdog_stats.total_playouts() > 0 {
-                        on_progress(&progress_from_tree(
-                            &*tree_guard,
-                            root_id,
-                            watchdog_stats.as_ref(),
-                        ));
+        scope.spawn({
+            let stop = Arc::clone(&stop);
+            let active_workers = Arc::clone(&active_workers);
+            let shared_tree = Arc::clone(&shared_tree);
+            let stats = Arc::clone(&stats);
+            move || {
+                while active_workers.load(Ordering::Relaxed) > 0 {
+                    thread::sleep(wait);
+                    if stop.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    if let Ok(tree_guard) = shared_tree.lock() {
+                        if stats.total_playouts() > 0 {
+                            on_progress(&progress_from_tree(
+                                &*tree_guard,
+                                root_id,
+                                stats.as_ref(),
+                                config,
+                            ));
+                        }
                     }
                 }
             }
         });
 
-        for _ in 0..threads {
+        for worker_idx in 0..threads {
             let stop = Arc::clone(&stop);
             let stats = Arc::clone(&stats);
             let active_workers = Arc::clone(&active_workers);
@@ -307,11 +377,18 @@ where
             let shared_policy = shared_policy.clone();
             let shared_cache = shared_cache.clone();
             let shared_tree = Arc::clone(&shared_tree);
-            let shared_collisions = Arc::clone(&shared_collisions);
             let backend_waiting = Arc::clone(&backend_waiting);
             let pending_searchers = pending_searchers.clone();
+            let shared_collisions = Arc::clone(&shared_collisions);
+            let worker_session = worker_sessions
+                .as_ref()
+                .and_then(|sessions| sessions.get(worker_idx).cloned());
             scope.spawn(move || {
-                let mut eval = OnnxPolicyValueEval::with_shared_cache(shared_policy, shared_cache);
+                let mut eval = OnnxPolicyValueEval::with_dedicated_session(
+                    shared_policy,
+                    worker_session,
+                    shared_cache,
+                );
                 let mut retry_without_playout = 0u32;
                 let mut selection_scratch = SelectionScratch::default();
                 loop {
@@ -319,125 +396,130 @@ where
                         break;
                     }
 
-                    if should_yield_backend_pressure(
-                        threads,
-                        backend_waiting.load(Ordering::Relaxed),
-                        config.thread_idling_threshold,
-                    ) {
-                        thread::yield_now();
-                        continue;
-                    }
-
                     if let Some(pending) = pending_searchers.as_ref() {
-                        acquire_searcher_slot(pending);
+                        acquire_searcher_slot(pending, config.search_spin_backoff);
                     }
 
-                    let batch_limit = worker_batch_limit(config, threads);
-                    let iteration = {
-                        let mut tree_guard = shared_tree.write().unwrap_or_else(|e| e.into_inner());
-                        if budget_exhausted(
-                            &budget,
-                            stats.total_playouts(),
-                            0,
-                            stats.initial_visits(),
-                            Some(stats.as_ref()),
-                        ) {
+                let mut backend = BackendComputation::new(&mut eval);
+                let iteration = {
+                    let mut tree_guard = shared_tree.lock().unwrap_or_else(|e| e.into_inner());
+                    if budget_exhausted(
+                        &budget,
+                        stats.total_playouts(),
+                        0,
+                        stats.initial_visits(),
+                        Some(stats.as_ref()),
+                    ) {
+                        None
+                    } else {
+                        let gather_params = GatherParams {
+                            config,
+                            budget: &budget,
+                            base_playouts: stats.total_playouts(),
+                            in_flight_playouts: 0,
+                            initial_visits: stats.initial_visits(),
+                            batch_limit,
+                            stats: Some(stats.as_ref()),
+                            root_id,
+                            root_visits: tree_guard.get(root_id).map(|root| root.visits).unwrap_or(0),
+                            thread_count: threads,
+                            backend_waiting: backend_waiting.load(Ordering::Relaxed),
+                        };
+                        let iteration = gather_minibatch(
+                            &mut tree_guard,
+                            &root_history,
+                            &gather_params,
+                            &mut selection_scratch,
+                            Some(&mut backend),
+                            stop.load(Ordering::SeqCst),
+                        );
+                        if iteration.pending.is_empty() {
+                            None
+                        } else if !gather_has_work(&iteration, backend.used_batch_size()) {
+                            super::worker::cancel_minibatch(&mut tree_guard, iteration);
+                            shared_collisions.cancel_all(&mut tree_guard);
                             None
                         } else {
-                            let gather_params = GatherParams {
-                                config,
-                                budget: &budget,
-                                base_playouts: stats.total_playouts(),
-                                in_flight_playouts: 0,
-                                initial_visits: stats.initial_visits(),
-                                batch_limit,
-                                stats: Some(stats.as_ref()),
-                                root_id,
-                                root_visits: tree_guard.get(root_id).map(|root| root.visits).unwrap_or(0),
-                                thread_count: threads,
-                                backend_waiting: backend_waiting.load(Ordering::Relaxed),
-                            };
-                            let iteration = gather_minibatch(
-                                &mut tree_guard,
-                                &root_history,
-                                &gather_params,
-                                &mut selection_scratch,
-                            );
-                            if iteration.playouts == 0 {
-                                None
-                            } else {
-                                shared_collisions.collect(&iteration);
-                                Some(iteration)
-                            }
-                        }
-                    };
-
-                    if let Some(pending) = pending_searchers.as_ref() {
-                        release_searcher_slot(pending);
-                    }
-
-                    let Some(iteration) = iteration else {
-                        match apply_empty_iteration(&budget, config, stats.as_ref(), &mut retry_without_playout) {
-                            EmptyIterationAction::Break => break,
-                            EmptyIterationAction::Continue => continue,
-                            EmptyIterationAction::Yield => {
-                                thread::yield_now();
-                                continue;
-                            }
-                            EmptyIterationAction::Sleep => {
-                                thread::sleep(RETRY_SLEEP);
-                                continue;
-                            }
-                        }
-                    };
-                    retry_without_playout = 0;
-
-                    if !stats.try_add_minibatch(&budget, &iteration) {
-                        let mut tree_guard = shared_tree.write().unwrap_or_else(|e| e.into_inner());
-                        super::worker::cancel_minibatch(&mut tree_guard, iteration);
-                        break;
-                    }
-
-                    let mut backend = BackendComputation::new(&mut eval);
-                    let mut needs_eval = false;
-                    for pending in &iteration.pending {
-                        if let PendingKind::Expand { task } = &pending.kind {
-                            backend.add_input(task);
-                            needs_eval = true;
+                            shared_collisions.collect(&iteration.pending);
+                            Some(iteration)
                         }
                     }
+                };
 
-                    backend_waiting.fetch_add(1, Ordering::Relaxed);
-                    let outputs = if needs_eval {
-                        match backend.compute_blocking() {
-                            Ok(outputs) => {
-                                stats.mark_first_batch();
-                                outputs
-                            }
-                            Err(err) => {
-                                backend_waiting.fetch_sub(1, Ordering::Relaxed);
-                                let mut tree_guard = shared_tree.write().unwrap_or_else(|e| e.into_inner());
-                                stats.rollback_minibatch(&iteration);
-                                super::worker::cancel_minibatch(&mut tree_guard, iteration);
-                                *first_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
-                                stop.store(true, Ordering::SeqCst);
-                                break;
-                            }
+                if let Some(pending) = pending_searchers.as_ref() {
+                    release_searcher_slot(pending);
+                }
+
+                let Some(mut iteration) = iteration else {
+                    match apply_empty_iteration(&budget, config, stats.as_ref(), &mut retry_without_playout) {
+                        EmptyIterationAction::Break => break,
+                        EmptyIterationAction::Continue => continue,
+                        EmptyIterationAction::Yield => {
+                            thread::yield_now();
+                            continue;
                         }
-                    } else {
-                        Vec::new()
-                    };
-                    backend_waiting.fetch_sub(1, Ordering::Relaxed);
-
-                    {
-                        let mut tree_guard = shared_tree.write().unwrap_or_else(|e| e.into_inner());
-                        apply_minibatch(
-                            &mut tree_guard,
-                            iteration,
-                            &outputs,
-                            Some(shared_collisions.as_ref()),
-                        );
+                        EmptyIterationAction::Sleep => {
+                            thread::sleep(RETRY_SLEEP);
+                            continue;
+                        }
                     }
+                };
+                retry_without_playout = 0;
+
+                {
+                    let tree_guard = shared_tree.lock().unwrap_or_else(|e| e.into_inner());
+                    maybe_prefetch_into_cache(
+                        &*tree_guard,
+                        root_id,
+                        &root_history,
+                        config,
+                        &mut backend,
+                        stop.load(Ordering::SeqCst),
+                    );
+                }
+                backend_waiting.fetch_add(1, Ordering::Relaxed);
+                let outputs = if backend.used_batch_size() > 0 {
+                    match backend.compute_blocking() {
+                        Ok(outputs) => {
+                            stats.mark_first_batch();
+                            outputs
+                        }
+                        Err(err) => {
+                            backend_waiting.fetch_sub(1, Ordering::Relaxed);
+                            let mut tree_guard = shared_tree.lock().unwrap_or_else(|e| e.into_inner());
+                            super::worker::cancel_minibatch(&mut tree_guard, iteration);
+                            shared_collisions.cancel_all(&mut tree_guard);
+                            *first_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
+                            stop.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                backend_waiting.fetch_sub(1, Ordering::Relaxed);
+
+                let mut tree_guard = shared_tree.lock().unwrap_or_else(|e| e.into_inner());
+                fetch_minibatch_results(
+                    &mut tree_guard,
+                    &mut eval,
+                    &mut iteration,
+                    &outputs,
+                    config,
+                    root_id,
+                );
+                if !stats.try_commit_minibatch(&budget, &iteration) {
+                    super::worker::cancel_minibatch(&mut tree_guard, iteration);
+                    shared_collisions.cancel_all(&mut tree_guard);
+                    break;
+                }
+                do_backup_update(
+                    &mut tree_guard,
+                    &iteration,
+                    Some(stats.as_ref()),
+                    Some(&shared_collisions),
+                );
+                apply_nps_limit(config, stats.as_ref(), &budget);
                 }
                 active_workers.fetch_sub(1, Ordering::Relaxed);
             });
@@ -450,29 +532,23 @@ where
 
     let shared_tree =
         Arc::try_unwrap(shared_tree).map_err(|_| "parallel search tree still shared".to_string())?;
-    let restored = shared_tree
+    let mut restored = shared_tree
         .into_inner()
         .map_err(|_| "parallel search tree lock poisoned".to_string())?;
+    shared_collisions.cancel_all(&mut restored);
     ensure_tree_quiescent(&restored)?;
     *tree = restored;
-    Ok(result_from_tree(tree, root_id, stats.as_ref()))
+    Ok(result_from_tree(tree, root_id, stats.as_ref(), config))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_empty_iteration, empty_iteration_action, should_sleep_retry, should_yield_backend_pressure,
-        should_yield_retry, EmptyIterationAction, MctsBudget,
+        apply_empty_iteration, empty_iteration_action, should_sleep_retry, should_yield_retry,
+        EmptyIterationAction, MctsBudget,
     };
     use crate::mcts::{MctsConfig, SearchStats};
     use std::time::Duration;
-
-    #[test]
-    fn backend_pressure_yield_only_for_parallel() {
-        assert!(!should_yield_backend_pressure(1, 10, 1));
-        assert!(!should_yield_backend_pressure(4, 1, 1));
-        assert!(should_yield_backend_pressure(4, 2, 1));
-    }
 
     #[test]
     fn retry_yield_honors_min_interval() {

@@ -70,7 +70,7 @@ impl MctsTree {
         self.gamebegin_key = start_key;
     }
 
-    /// px0 `NodeTree::MakeMove`：断兄弟引用，不在热路径做全量压缩。
+    /// lc0 `NodeTree::MakeMove`：断兄弟引用，不在热路径做全量压缩。
     pub fn make_move(&mut self, head_id: MctsNodeId, mv: Move, child_state_key: u64) -> Option<MctsNodeId> {
         let edge_idx = self.get(head_id)?.children.iter().position(|edge| edge.mv == mv)?;
         let child_id = {
@@ -91,7 +91,7 @@ impl MctsTree {
         Some(new_head)
     }
 
-    /// px0 `ResetToPosition`：从 gamebegin 重放全路径。
+    /// lc0 `NodeTree::ResetToPosition`（classic/wrapper.cc:107-111）。
     pub fn reset_to_position(
         &mut self,
         game_start_key: u64,
@@ -133,7 +133,7 @@ impl MctsTree {
         Some(node_id)
     }
 
-    /// px0 `TrimTreeAtHead`：回退到祖先局面时清空当前根子树统计。
+    /// lc0 `TrimTreeAtHead`：回退到祖先局面时清空当前根子树统计。
     pub fn trim_tree_at_head(&mut self, root_id: MctsNodeId) {
         if let Some(node) = self.get_mut(root_id) {
             for edge in &mut node.children {
@@ -174,6 +174,19 @@ impl MctsTree {
         for idx in self.collect_reachable() {
             f(MctsNodeId(idx));
         }
+    }
+
+    /// lc0 `Edge_Iterator::GetOrSpawnNode`：pick 下潜时懒创建占位子节点。
+    pub(crate) fn get_or_spawn_child(
+        &mut self,
+        parent_id: MctsNodeId,
+        edge_idx: usize,
+        state_key: u64,
+    ) -> Option<MctsNodeId> {
+        if let Some(child_id) = self.get(parent_id)?.children.get(edge_idx)?.child {
+            return Some(child_id);
+        }
+        self.create_single_child_node(parent_id, edge_idx, state_key)
     }
 
     fn create_single_child_node(

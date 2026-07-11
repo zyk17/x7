@@ -1,6 +1,6 @@
 use xiangqi_core::types::Move;
 
-/// 终局类型，对齐 px0 `Node::Terminal`。
+/// 终局类型，对齐 lc0 classic `Node::Terminal`。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TerminalKind {
     #[default]
@@ -13,7 +13,7 @@ pub enum TerminalKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MctsNodeId(pub usize);
 
-/// px0：`wl/d/m` 增量均值 + `n_in_flight` 在边上跟踪虚拟损失。
+/// lc0 classic：`wl/d/m` 增量均值 + `n_in_flight` 在边上跟踪虚拟损失。
 #[derive(Clone, Debug)]
 pub struct EdgeStats {
     pub mv: Move,
@@ -47,7 +47,7 @@ impl EdgeStats {
         self.visits.saturating_add(self.in_flight)
     }
 
-    /// px0 `GetQ(draw_score=0)`；`q = wl + draw_score * d`。
+    /// lc0 classic `GetQ(draw_score=0)`；`q = wl + draw_score * d`。
     #[inline]
     pub fn mean_q(&self) -> f32 {
         self.wl
@@ -58,7 +58,7 @@ impl EdgeStats {
         self.wl + draw_score * self.d
     }
 
-    /// px0 `Node::TryStartScoreUpdate`（边级 virtual loss）。
+    /// lc0 classic `Node::TryStartScoreUpdate`（边级 virtual loss）。
     #[inline]
     pub fn try_start_score_update(&mut self) -> bool {
         if self.visits == 0 && self.in_flight > 0 {
@@ -77,7 +77,7 @@ impl EdgeStats {
         }
     }
 
-    /// px0 `RevertTerminalVisits`（边级 twofold 深度修正）。
+    /// lc0 classic `RevertTerminalVisits`（边级 twofold 深度修正）。
     #[inline]
     pub fn revert_terminal_visits(&mut self, wl: f32, d: f32, m: f32, multivisit: u32) {
         let n_new = self.visits.saturating_sub(multivisit);
@@ -111,7 +111,7 @@ impl EdgeStats {
     }
 }
 
-/// MCTS 节点：统计语义对齐 px0 `Node`。
+/// MCTS 节点：统计语义对齐 lc0 classic `Node`。
 #[derive(Clone, Debug)]
 pub struct MctsNode {
     pub state_key: u64,
@@ -164,7 +164,7 @@ impl MctsNode {
         self.terminal_kind == TerminalKind::TwoFold
     }
 
-    /// px0 `Node::TryStartScoreUpdate`。
+    /// lc0 classic `Node::TryStartScoreUpdate`。
     #[inline]
     pub fn try_start_score_update(&mut self) -> bool {
         if self.visits == 0 && self.in_flight > 0 {
@@ -174,7 +174,19 @@ impl MctsNode {
         true
     }
 
-    /// px0 `GetChildrenVisits()`。
+    /// lc0 classic `Node::GetNStarted()`。
+    #[inline]
+    pub fn n_started(&self) -> u32 {
+        self.visits.saturating_add(self.in_flight)
+    }
+
+    /// lc0 `Node::IncrementNInFlight`：`PickNodesToExtend` 批量 virtual loss。
+    #[inline]
+    pub fn increment_n_in_flight(&mut self, multivisit: u32) {
+        self.in_flight = self.in_flight.saturating_add(multivisit);
+    }
+
+    /// lc0 classic `GetChildrenVisits()`。
     #[inline]
     pub fn children_visits(&self) -> u32 {
         if self.visits > 0 {
@@ -199,7 +211,7 @@ impl MctsNode {
         );
     }
 
-    /// px0 `MakeNotTerminal()`：复用子树作新根时从子节点重算统计。
+    /// lc0 classic `MakeNotTerminal()`：复用子树作新根时从子节点重算统计。
     pub fn make_not_terminal(&mut self) {
         self.terminal_kind = TerminalKind::NonTerminal;
         self.terminal_value = None;
@@ -230,7 +242,7 @@ impl MctsNode {
         self.m = 0.0;
     }
 
-    /// px0 `RevertTerminalVisits`（twofold 深度修正用）。
+    /// lc0 classic `RevertTerminalVisits`（twofold 深度修正用）。
     pub fn revert_terminal_visits(&mut self, wl: f32, d: f32, m: f32, multivisit: u32) {
         let n_new = self.visits.saturating_sub(multivisit);
         if n_new == 0 {
@@ -252,7 +264,7 @@ impl MctsNode {
     }
 }
 
-/// px0 `Node::FinalizeScoreUpdate`。
+/// lc0 classic `Node::FinalizeScoreUpdate`。
 pub(crate) fn finalize_wdl_stats(
     visits: &mut u32,
     in_flight: &mut u32,
@@ -276,12 +288,12 @@ pub(crate) fn finalize_wdl_stats(
     *in_flight = in_flight.saturating_sub(multivisit);
 }
 
-/// px0 `Node::CancelScoreUpdate`。
+/// lc0 classic `Node::CancelScoreUpdate`。
 pub(crate) fn cancel_score_update(in_flight: &mut u32, multivisit: u32) {
     *in_flight = in_flight.saturating_sub(multivisit);
 }
 
-/// px0 终局赋值。
+/// lc0 classic 终局赋值。
 pub(crate) fn terminal_wdl(value: f32) -> (f32, f32, f32) {
     if value.abs() < f32::EPSILON {
         (0.0, 1.0, 0.0)

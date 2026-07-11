@@ -41,7 +41,10 @@ fn parse_position_history_matches_stepwise_do_move() {
 fn mcts_returns_legal_bestmove_without_onnx() {
     let pos = Position::from_fen(START_FEN).unwrap();
     let policy: SharedPolicy = None;
-    let mut engine = MctsEngine::new(MctsConfig::default(), OnnxPolicyValueEval::new(policy.clone()));
+    let mut engine = MctsEngine::new(
+        MctsConfig::default(),
+        OnnxPolicyValueEval::new(policy.clone(), MctsConfig::default().nn_cache_size),
+    );
     let result = engine
         .search_root(
             &pos,
@@ -66,7 +69,10 @@ fn mcts_bestmove_resolves_check_without_onnx() {
     let pos = Position::from_fen(fen).unwrap();
     assert!(pos.checkers() != 0, "test position must be in check");
     let policy: SharedPolicy = None;
-    let mut engine = MctsEngine::new(MctsConfig::default(), OnnxPolicyValueEval::new(policy.clone()));
+    let mut engine = MctsEngine::new(
+        MctsConfig::default(),
+        OnnxPolicyValueEval::new(policy.clone(), MctsConfig::default().nn_cache_size),
+    );
     let result = engine
         .search_root(
             &pos,
@@ -125,14 +131,14 @@ fn default_benchmark_fens_all_parse() {
 
 #[test]
 fn uci_setoption_then_go() {
-    let input = b"uci\nisready\nsetoption name MctsPlayouts value 64\nsetoption name MctsCpuct value 1.5\nposition startpos\ngo nodes 2\nquit\n";
+    let input = b"uci\nisready\nsetoption name MctsPlayouts value 64\nsetoption name CPuct value 1.5\nposition startpos\ngo nodes 2\nquit\n";
     let mut out = Vec::new();
     engin::uci::run_uci_for_test(Cursor::new(&input[..]), &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("bestmove"));
     assert!(s.contains("MctsPlayouts"));
-    assert!(s.contains("MctsCpuct"));
-    assert!(s.contains("MctsFpuReduction"));
-    assert!(s.contains("MctsBatchCap"));
-    assert!(s.contains("MctsWorkers"));
+    assert!(s.contains("CPuct"));
+    assert!(s.contains("FpuValue"));
+    assert!(s.contains("MinibatchSize"));
+    assert!(s.contains("Threads"));
 }

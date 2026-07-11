@@ -2,11 +2,11 @@
 
 ## 1. 目标
 
-这是一个围绕 `MCTS + 小型 policy/value` 的象棋项目。
+这是一个围绕 `MCTS + policy/value` 的象棋项目。
 
 当前阶段只有两个核心目标：
 
-1. 稳定维护一条可用的搜索与推理主链路
+1. 稳定维护一条可用、且尽量对齐 `lc0 classic` 的搜索与推理主链路
 2. 用 `px0` 风格数据持续训练一个小而正确的 baseline
 
 ## 2. 当前主路线
@@ -17,6 +17,7 @@
 - 训练数据：`px0 / lc0` 风格外部 chunk
 - 模型：小型纯 CNN trunk + `policy/value`
 - value 监督：`WDL + qMix`
+- 引擎基建参考：`lc0 classic`
 
 当前不再把下面这些当主线：
 
@@ -64,9 +65,13 @@
 - 不再扩 Alpha-Beta 主线
 - 当前明确先不做：
   `MultiPV`、复杂 ONNX backend / evaluator 池
-- 对外 UCI 选项保持收敛：
-  只公开 `PolicyFile / MctsPlayouts / MctsCpuct / MctsFpuReduction / MctsBatchCap / MctsWorkers`
-  不再兼容旧的 `Playouts / Visits / Cpuct / FpuReduction / SearchBatchSize / Threads`
+- 对外 UCI 选项对齐 lc0 classic（仅日常项）：
+  `PolicyFile / MctsPlayouts / CPuct / FpuValue / MinibatchSize / NNCacheSize / Threads`
+- 搜索流水线已内化 lc0 classic 能力（不扩 UCI）：
+  `OutOfOrderEval`、`MaybePrefetchIntoCache`、`FetchMinibatchResults`/`DoBackupUpdate` 拆分、
+  独立 watchdog 进度线程、`NpsLimit`（默认关）
+- 当前尚未完全对齐 lc0 的部分：
+  `time manager`、`ponder/searchmoves/mate`、更细的 task workers / node-lock 并行语义
 
 ### `crates/xiangqi_dataset`
 
@@ -170,7 +175,7 @@
 当前最值得继续投入的是前两项：
 
 1. `xiangqi_core` 与参考实现对拍
-2. `engin` 搜索语义继续向 `lc0 / px0` 靠拢
+2. `engin` 搜索语义继续向 `lc0 classic` 靠拢
 
 ### `engin` 当前输入约束
 
@@ -197,18 +202,24 @@
 
 ### `engin` 当前 P2 方向
 
-- 框架继续对齐 `px0 classic`
-- worker 并发行为参考 `KataGo`
-- 重点吸收：
-  - 高失败重试容忍（单/并行语义一致；`retry_without_playout` 可观测）
-  - 无预算上限时空转 `yield` + 周期性 `sleep` 退让
-  - virtual loss / in-flight 分流
-  - gather / backend / backup 的持续流水线
-  - root 附近“宽而不乱”的访问分配
-- 当前明确不吸收：
-  - `KataGo graphHash`
-  - `useGraphSearch`
-  - ownership / score utility / pattern bonus 等扩展系统
+- 框架继续对齐 `lc0 classic`
+- 短期先不吸收 `KataGo` 结构优化
+- 重点是把：
+  - UCI 语义
+  - batch / backend 语义
+  - tree reuse
+  - 统计口径
+  - 默认参数行为
+  收成更像 `lc0` 的一条线
+
+### `engin` 现在还差什么
+
+按优先级看，剩余差距主要是：
+
+1. `go wtime / btime / winc / binc / movestogo` 的真正 time manager
+2. `ponder / searchmoves / mate` 的完整 UCI 生命周期
+3. 比当前最小 shared-tree 更接近 lc0 的 task workers / node-lock 并行细节
+4. 更系统的 integration / bench 回归护栏
 
 ## 7. 删除原则
 
