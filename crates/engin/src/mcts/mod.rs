@@ -3,6 +3,7 @@
 //! 这里定义当前项目搜索主线需要的稳定接口与基础数据结构。
 //! lc0 classic 搜索基建；并发按 lc0 单写者树锁 + 本批 CancelCollisions。
 
+mod iteration_stats;
 mod backend;
 mod config;
 mod engine;
@@ -18,6 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Instant;
 
+pub use iteration_stats::{
+    maybe_trigger_stop, populate_common_iteration_stats, IterationStats, StoppersHints, TimeUsageHint,
+};
 pub use config::{MctsBudget, MctsConfig};
 pub use stoppers::{allocate_think_time_ms, UciTimeParams, LC0_DEFAULT_MOVE_OVERHEAD_MS};
 pub use engine::{MctsEngine, MctsMoveStat, MctsSearchProgress, MctsSearchResult, PvLineInfo};
@@ -31,11 +35,13 @@ pub use tree::MctsTree;
 pub struct SearchStats {
     initial_visits: AtomicU32,
     total_playouts: AtomicU32,
+    total_batches: AtomicU64,
     cum_depth: AtomicU64,
     max_depth: AtomicU32,
     nps_start: RwLock<Option<Instant>>,
     nns_started: AtomicBool,
     retry_without_playout: AtomicU64,
+    search_started: Instant,
 }
 
 impl SearchStats {
@@ -43,12 +49,25 @@ impl SearchStats {
         Self {
             initial_visits: AtomicU32::new(initial_visits),
             total_playouts: AtomicU32::new(0),
+            total_batches: AtomicU64::new(0),
             cum_depth: AtomicU64::new(0),
             max_depth: AtomicU32::new(0),
             nps_start: RwLock::new(None),
             nns_started: AtomicBool::new(false),
             retry_without_playout: AtomicU64::new(0),
+            search_started: Instant::now(),
         }
+    }
+
+    pub fn total_batches(&self) -> u64 {
+        self.total_batches.load(Ordering::Relaxed)
+    }
+
+    pub fn time_since_start_ms(&self) -> i64 {
+        self.search_started
+            .elapsed()
+            .as_millis()
+            .min(i64::MAX as u128) as i64
     }
 
     pub fn total_playouts(&self) -> u32 {
@@ -132,6 +151,7 @@ impl SearchStats {
         if iteration.seldepth > 0 {
             self.max_depth.fetch_max(iteration.seldepth, Ordering::Relaxed);
         }
+        self.total_batches.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 并行路径：backup 前检查预算（playout 在 `do_backup_single` 内提交）。
@@ -140,13 +160,18 @@ impl SearchStats {
         if playouts == 0 {
             return true;
         }
-        worker::remaining_playout_budget(
+        if worker::remaining_playout_budget(
             budget,
             self.total_playouts(),
             0,
             self.initial_visits(),
             playouts,
-        ) >= playouts
+        ) < playouts
+        {
+            return false;
+        }
+        self.total_batches.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 

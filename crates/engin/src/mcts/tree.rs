@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 
-use super::node::{MctsNode, MctsNodeId, TerminalKind};
+use super::node::{EdgeStats, MctsNode, MctsNodeId, TerminalKind};
 use xiangqi_core::types::Move;
 
 /// 延后 GC：死节点数或占比超阈值才做物理压缩。
@@ -70,9 +70,17 @@ impl MctsTree {
         self.gamebegin_key = start_key;
     }
 
-    /// lc0 `NodeTree::MakeMove`：断兄弟引用，不在热路径做全量压缩。
+    /// lc0 `NodeTree::MakeMove`：断兄弟引用；无子边时 `CreateSingleChildNode`（node.cc:465-480）。
     pub fn make_move(&mut self, head_id: MctsNodeId, mv: Move, child_state_key: u64) -> Option<MctsNodeId> {
-        let edge_idx = self.get(head_id)?.children.iter().position(|edge| edge.mv == mv)?;
+        let edge_idx = match self.get(head_id)?.children.iter().position(|edge| edge.mv == mv) {
+            Some(idx) => idx,
+            None => {
+                if self.get(head_id)?.children.is_empty() {
+                    return self.create_single_child_edge(head_id, mv, child_state_key);
+                }
+                return None;
+            }
+        };
         let child_id = {
             let head = self.get_mut(head_id)?;
             release_siblings_except(head, edge_idx);
@@ -91,7 +99,41 @@ impl MctsTree {
         Some(new_head)
     }
 
-    /// lc0 `NodeTree::ResetToPosition`（classic/wrapper.cc:107-111）。
+    /// lc0 `Node::CreateSingleChildNode`（node.cc:196-203）：当前节点无边时单步建子。
+    fn create_single_child_edge(
+        &mut self,
+        head_id: MctsNodeId,
+        mv: Move,
+        child_state_key: u64,
+    ) -> Option<MctsNodeId> {
+        let child_id = self.add_node(MctsNode {
+            state_key: child_state_key,
+            visits: 0,
+            in_flight: 0,
+            wl: 0.0,
+            d: 0.0,
+            m: 0.0,
+            expanded: false,
+            terminal_kind: TerminalKind::NonTerminal,
+            terminal_value: None,
+            children: Vec::new(),
+        });
+        let head = self.get_mut(head_id)?;
+        head.children.push(EdgeStats {
+            mv,
+            prior: 0.0,
+            visits: 0,
+            in_flight: 0,
+            wl: 0.0,
+            d: 0.0,
+            m: 0.0,
+            child: Some(child_id),
+        });
+        head.expanded = true;
+        Some(child_id)
+    }
+
+    /// lc0 `NodeTree::ResetToPosition`（node.cc:493-519）。
     pub fn reset_to_position(
         &mut self,
         game_start_key: u64,
@@ -107,14 +149,13 @@ impl MctsTree {
         let mut seen_old = old_head == Some(current);
         for (idx, &mv) in moves.iter().enumerate() {
             let child_key = position_keys.get(idx).copied().unwrap_or(0);
-            if let Some(next) = self.make_move(current, mv, child_key) {
-                current = next;
-                if old_head == Some(current) {
-                    seen_old = true;
-                }
-            } else {
+            let Some(next) = self.make_move(current, mv, child_key) else {
                 seen_old = false;
                 break;
+            };
+            current = next;
+            if old_head == Some(current) {
+                seen_old = true;
             }
         }
         if !seen_old {
@@ -346,6 +387,64 @@ mod tests {
         assert_eq!(tree.reachable_len(), 2);
         assert!(tree.get(kept).is_some());
         assert!(tree.get(MctsNodeId(2)).is_some(), "orphan slot still present");
+    }
+
+    #[test]
+    fn reset_to_position_trims_when_walking_to_ancestor() {
+        let mut tree = MctsTree::new();
+        let leaf = tree.add_node(MctsNode {
+            state_key: 2,
+            visits: 4,
+            ..Default::default()
+        });
+        let mid = tree.add_node(MctsNode {
+            state_key: 1,
+            visits: 8,
+            expanded: true,
+            children: vec![EdgeStats {
+                mv: Move::make(Square::SQ_A1, Square::SQ_A2),
+                child: Some(leaf),
+                visits: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let root = tree.add_node(MctsNode {
+            state_key: 0,
+            expanded: true,
+            children: vec![EdgeStats {
+                mv: Move::make(Square::SQ_A0, Square::SQ_A1),
+                child: Some(mid),
+                visits: 8,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        tree.set_gamebegin(root, 0);
+
+        let (head, seen_old) = tree.reset_to_position(
+            0,
+            &[Move::make(Square::SQ_A0, Square::SQ_A1)],
+            &[1],
+            Some(leaf),
+        );
+        assert!(!seen_old);
+        assert_eq!(head, mid);
+        let node = tree.get(head).expect("head");
+        assert_eq!(node.visits, 0, "trim clears stale stats on ancestor head");
+        assert!(node.children.iter().all(|e| e.child.is_none()));
+    }
+
+    #[test]
+    fn make_move_creates_single_child_when_unexpanded() {
+        let mut tree = MctsTree::new();
+        let root = tree.add_node(MctsNode::default());
+        tree.set_gamebegin(root, 0);
+        let child = tree
+            .make_move(root, Move::make(Square::SQ_A0, Square::SQ_A1), 99)
+            .expect("spawn");
+        assert_eq!(tree.get(root).unwrap().children.len(), 1);
+        assert_eq!(tree.get(child).unwrap().state_key, 99);
     }
 
     #[test]

@@ -84,14 +84,14 @@ fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsS
     if progress.playouts == 0 {
         return;
     }
-    let common = |best_value: f32, best_mate: Option<i32>, pv: &[Move], multipv: Option<u32>| {
+    let common = |best_value: f32, best_mate: Option<i32>, pv: &[Move], multipv: Option<u32>, nodes: usize| {
         uci_info_line(UciInfoView {
             best_value,
             best_mate,
             depth: progress.depth,
             seldepth: progress.seldepth,
             playouts: progress.playouts,
-            nodes: progress.nodes,
+            nodes,
             elapsed_ms,
             nps_elapsed_ms: progress.nps_elapsed_ms,
             pv,
@@ -101,11 +101,17 @@ fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsS
 
     if progress.multi_pv > 1 && !progress.pv_lines.is_empty() {
         for line in &progress.pv_lines {
+            let nodes = if progress.per_pv_counters {
+                line.visits as usize
+            } else {
+                progress.nodes
+            };
             output(&common(
                 line.best_value,
                 line.best_mate,
                 &line.pv,
                 Some(line.multipv),
+                nodes,
             ));
         }
     } else {
@@ -114,6 +120,7 @@ fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsS
             progress.best_mate,
             &progress.pv,
             None,
+            progress.nodes,
         ));
     }
     if progress.retry_without_playout > 0 {
@@ -515,6 +522,7 @@ impl Engine {
         self.emit("option name NNCacheSize type spin default 200000 min 0 max 10000000");
         self.emit("option name Threads type spin default 0 min 0 max 128");
         self.emit("option name MultiPV type spin default 1 min 1 max 500");
+        self.emit("option name PerPVCounters type check default false");
         self.emit(&format!(
             "info string policy {}",
             if self.policy.is_some() { "loaded" } else { "not_loaded" }
@@ -589,6 +597,11 @@ impl Engine {
                     if let Ok(n) = v.trim().parse::<u32>() {
                         self.config.multi_pv = n.clamp(1, 500);
                     }
+                }
+            }
+            "PerPVCounters" => {
+                if let Some(ref v) = value {
+                    self.config.per_pv_counters = matches!(v.trim(), "true" | "1");
                 }
             }
             _ => {}
@@ -753,6 +766,7 @@ impl Engine {
                             nps_elapsed_ms: result.nps_elapsed_ms,
                             retry_without_playout: result.retry_without_playout,
                             moves: result.moves,
+                            per_pv_counters: result.per_pv_counters,
                         },
                         elapsed_ms,
                     );
@@ -887,6 +901,17 @@ pub fn run_uci_for_test<R: BufRead, W: Write>(reader: R, writer: &mut W) -> io::
     }
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+impl Engine {
+    /// 等待当前 `go` 搜索线程自然结束（不置 stop）；仅测试用。
+    fn join_search(&mut self) {
+        if let Some(h) = self.search_join.take() {
+            let _ = h.join();
+        }
+        self.search_stop = None;
+    }
 }
 
 #[cfg(test)]
@@ -1258,6 +1283,82 @@ mod tests {
     }
 
     #[test]
+    fn per_pv_counters_option_emitted() {
+        let mut engine = Engine::new();
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |line: &str| {
+                lines.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+            }) as EngineOutput
+        };
+        engine.output = sink;
+        engine.send_uci_ident();
+        let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+        assert!(out.contains("option name PerPVCounters type check default false"));
+    }
+
+    #[test]
+    fn per_pv_counters_shows_line_nodes() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |line: &str| {
+                lines.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+            }) as EngineOutput
+        };
+        let mut engine = Engine::new_with_output(sink);
+        engine.policy = None;
+        engine.rebuild_search_engine(true);
+        engine.handle_line("setoption name Threads value 1");
+        engine.handle_line("setoption name MultiPV value 2");
+        engine.handle_line("setoption name PerPVCounters value true");
+        engine.handle_line("position startpos");
+        engine.handle_line("go nodes 64");
+        std::thread::sleep(Duration::from_millis(300));
+        engine.stop_and_join();
+
+        let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+        assert!(out.contains("multipv 1"));
+        assert!(out.contains("multipv 2"));
+        assert!(out.contains("nodes "));
+        assert!(out.contains("bestmove"));
+    }
+
+    #[test]
+    fn uci_nodes_matches_playouts_plus_initial_visits() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |line: &str| {
+                lines.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+            }) as EngineOutput
+        };
+        let mut engine = Engine::new_with_output(sink);
+        engine.policy = None;
+        engine.rebuild_search_engine(true);
+        engine.handle_line("setoption name Threads value 1");
+        engine.handle_line("position startpos");
+        engine.handle_line("go nodes 32");
+        std::thread::sleep(Duration::from_millis(300));
+        engine.stop_and_join();
+
+        let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+        let info = out
+            .lines()
+            .filter(|l| l.starts_with("info depth"))
+            .last()
+            .expect("info line");
+        let nodes = info
+            .split_whitespace()
+            .skip_while(|p| *p != "nodes")
+            .nth(1)
+            .and_then(|n| n.parse::<u32>().ok())
+            .expect("nodes field");
+        assert!(nodes > 0 && nodes <= 32, "nodes={nodes}");
+    }
+
+    #[test]
     fn multipv_one_omits_multipv_field() {
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = {
@@ -1310,12 +1411,11 @@ mod tests {
         engine.handle_line("setoption name Threads value 2");
         engine.handle_line("position startpos");
         engine.handle_line("go nodes 16");
-        std::thread::sleep(Duration::from_millis(150));
-        engine.stop_and_join();
+        engine.join_search();
 
         let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
-        assert!(out.contains("bestmove"));
-        assert!(!out.ends_with("bestmove (none)"));
+        assert!(out.contains("bestmove"), "output:\n{out}");
+        assert!(!out.ends_with("bestmove (none)"), "output:\n{out}");
     }
 
     #[test]

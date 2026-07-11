@@ -44,6 +44,7 @@ pub struct MctsSearchResult {
     /// 预算未耗尽时 gather 返回 0 playout 的重试次数。
     pub retry_without_playout: u64,
     pub moves: Vec<MctsMoveStat>,
+    pub per_pv_counters: bool,
 }
 
 /// 单条 UCI 主变线（lc0 `SendUciInfo` 每条 `ThinkingInfo`）。
@@ -52,6 +53,7 @@ pub struct PvLineInfo {
     pub multipv: u32,
     pub best_value: f32,
     pub best_mate: Option<i32>,
+    pub visits: u32,
     pub pv: Vec<Move>,
 }
 
@@ -74,6 +76,8 @@ pub struct MctsSearchProgress {
     pub nps_elapsed_ms: u64,
     pub retry_without_playout: u64,
     pub moves: Vec<MctsMoveStat>,
+    /// lc0 `PerPVCounters`：UCI 每条 PV 单独 nodes。
+    pub per_pv_counters: bool,
 }
 
 /// MCTS 引擎最小实现。
@@ -190,29 +194,67 @@ where
 
         let old_head = self.root_id;
         let position_keys = position_keys_for_history(history);
-        let (new_root, _) = self.tree.reset_to_position(
+        let (new_root, _seen_old) = self.tree.reset_to_position(
             start_key,
             history.game_moves(),
             &position_keys,
             old_head,
         );
-        let expected_key = history.current().key();
-        if self.tree.get(new_root).is_none_or(|node| {
-            node.state_key != expected_key
-                || (!node.is_terminal() && node.children.is_empty())
-        }) {
-            let Some(fresh_root) = self.initialize_root_at(history.current(), history)? else {
-                return Ok(None);
-            };
-            self.root_id = Some(fresh_root);
-        } else {
-            self.root_id = Some(new_root);
+        if self.root_needs_expansion(new_root) {
+            self.expand_root_at(new_root, history.current(), history)?;
         }
+        self.root_id = Some(self.tree.compact_if_bloated(new_root));
         self.root_history = Some(history.clone_for_search());
-        if let Some(root_id) = self.root_id {
-            self.root_id = Some(self.tree.compact_if_bloated(root_id));
-        }
         Ok(self.root_id)
+    }
+
+    fn root_needs_expansion(&self, root_id: MctsNodeId) -> bool {
+        self.tree.get(root_id).is_some_and(|node| {
+            !node.is_terminal() && node.children.is_empty()
+        })
+    }
+
+    /// 在已有节点上补全根展开，避免 `initialize_root_at` 另建孤立根（lc0 始终沿 `NodeTree` 走子）。
+    fn expand_root_at(
+        &mut self,
+        root_id: MctsNodeId,
+        pos: &Position,
+        history: &PositionHistory,
+    ) -> Result<(), E::Error> {
+        if !self.root_needs_expansion(root_id) {
+            return Ok(());
+        }
+        let mut buf = [ExtMove {
+            mv: Move::none(),
+            value: 0,
+        }; MAX_MOVES];
+        let n = generate(pos, GenType::Legal, &mut buf);
+        if n == 0 {
+            return Ok(());
+        }
+        let legal: Vec<Move> = buf[..n].iter().map(|e| e.mv).collect();
+        let out = self.evaluator.evaluate(PolicyValueInput {
+            position: pos,
+            history,
+            legal_moves: &legal,
+        })?;
+        let node = self.tree.get_mut(root_id).expect("expand root");
+        node.state_key = pos.key();
+        node.expanded = true;
+        node.children = Vec::with_capacity(legal.len());
+        for (i, mv) in legal.iter().copied().enumerate() {
+            node.children.push(EdgeStats {
+                mv,
+                prior: out.priors.get(i).copied().unwrap_or(0.0),
+                visits: 0,
+                in_flight: 0,
+                wl: 0.0,
+                d: 0.0,
+                m: 0.0,
+                child: None,
+            });
+        }
+        Ok(())
     }
 
     fn initialize_root_at(
@@ -377,6 +419,39 @@ mod tests {
             )
             .expect("search ok");
         assert!(result.best_move.is_some());
+    }
+
+    #[test]
+    fn position_moves_reuses_subtree_visits() {
+        let mut engine = MctsEngine::new(MctsConfig::default(), StubEval);
+        let start = PositionHistory::new_startpos();
+        let budget = MctsBudget {
+            max_playouts: Some(32),
+            ..Default::default()
+        };
+        let first = engine
+            .search_root_history(&start, budget.clone())
+            .expect("first search");
+        let best = first.best_move.expect("best move");
+        let root_id = engine.root_id.expect("root");
+        let child_id = engine
+            .tree
+            .get(root_id)
+            .and_then(|root| root.children.iter().find(|e| e.mv == best))
+            .and_then(|edge| edge.child)
+            .expect("expanded child");
+        let visits_before = engine.tree.get(child_id).expect("child").visits;
+        assert!(visits_before > 0);
+
+        let mut after_move = PositionHistory::new_startpos();
+        after_move.push_move(best);
+        engine.search_root_history(&after_move, budget).expect("second search");
+        let new_root = engine.root_id.expect("new root");
+        assert_eq!(new_root, child_id);
+        assert!(
+            engine.tree.get(new_root).expect("reused root").visits >= visits_before,
+            "reuse should keep prior visits on subtree root"
+        );
     }
 
     #[test]

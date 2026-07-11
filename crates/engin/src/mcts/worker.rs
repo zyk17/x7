@@ -13,7 +13,8 @@ use crate::policy_onnx::BackendAttributes;
 use super::backend::{BackendComputation, SharedBackendComputation};
 use super::node::{cancel_score_update, terminal_wdl, MctsNode, TerminalKind};
 use super::task_workers::{
-    plan_processing_task_ranges, ProcessingDispatch, TaskWorkerGatherCtx,
+    plan_processing_task_ranges, PickTaskEnqueue, PickingDispatch, ProcessingDispatch,
+    TaskWorkerGatherCtx,
 };
 use super::{
     EdgeStats, MctsBudget, MctsConfig, MctsMoveStat, MctsNodeId, MctsSearchProgress, MctsSearchResult,
@@ -135,6 +136,24 @@ pub(crate) struct GatherParams<'a> {
     pub task_workers: usize,
     /// GPU 并行路径专用；单线程 search 为 `None`。
     pub onnx_task_ctx: Option<Arc<TaskWorkerGatherCtx<OnnxPolicyValueEval>>>,
+    /// 并行 gather 时与 `onnx_task_ctx` 同用；供 picking/processing wait 前释放树锁。
+    pub tree_shared: Option<Arc<Mutex<MctsTree>>>,
+    pub stats_arc: Option<Arc<SearchStats>>,
+}
+
+/// gather 阶段树访问：单线程 `&mut` 或并行 `Arc<Mutex<_>>`。
+pub(crate) enum TreeGatherAccess<'a> {
+    Local(&'a mut MctsTree),
+    Shared(&'a Arc<Mutex<MctsTree>>),
+}
+
+impl<'a> TreeGatherAccess<'a> {
+    pub(crate) fn with_tree<R>(&mut self, f: impl FnOnce(&mut MctsTree) -> R) -> R {
+        match self {
+            Self::Local(tree) => f(tree),
+            Self::Shared(arc) => f(&mut arc.lock().unwrap_or_else(|e| e.into_inner())),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -271,7 +290,7 @@ where
 
 /// lc0 `GatherMinibatch`（search.cc:1268-1421）。
 pub(crate) fn gather_minibatch<'b, E>(
-    tree: &mut MctsTree,
+    tree: &mut TreeGatherAccess<'_>,
     root_history: &PositionHistory,
     params: &GatherParams<'_>,
     scratch: &mut SelectionScratch,
@@ -329,7 +348,6 @@ where
             0,
             params.initial_visits,
             params.stats,
-            None,
         ) {
             break;
         }
@@ -354,19 +372,40 @@ where
 
         picked.clear();
         let new_start = iteration.pending.len();
-        let completed = pick_nodes_to_extend(
-            tree,
-            params.root_id,
-            root_history,
-            params.config,
-            params.stats,
-            params.budget,
-            scheduled_playouts,
-            pick_limit,
-            &mut picked,
-            scratch,
-            &mut pick_workspace,
-        );
+        let completed = if params.onnx_task_ctx.is_some() {
+            pick_nodes_to_extend_parallel(
+                params,
+                params.root_id,
+                root_history,
+                scheduled_playouts,
+                pick_limit,
+                &mut picked,
+                scratch,
+                &mut pick_workspace,
+            )
+        } else {
+            tree.with_tree(|tree| {
+                pick_nodes_to_extend_task(
+                    tree,
+                    params.root_id,
+                    root_history,
+                    params.root_id,
+                    0,
+                    &[],
+                    params.config,
+                    params.stats,
+                    params.budget,
+                    scheduled_playouts,
+                    pick_limit,
+                    &mut picked,
+                    scratch,
+                    &mut pick_workspace,
+                    None::<&dyn PickTaskEnqueue>,
+                    pick_limit,
+                    &mut 0,
+                )
+            })
+        };
         if completed <= 0 && picked.is_empty() {
             break;
         }
@@ -383,7 +422,7 @@ where
             .iter()
             .filter(|pending| !is_collision_kind(&pending.kind))
             .count();
-        run_process_picked_phase(
+        let needs_process_wait = run_process_picked_phase(
             tree,
             root_history,
             params,
@@ -394,6 +433,12 @@ where
             non_collisions_picked,
             processing,
         );
+        if needs_process_wait {
+            if let Some(ctx) = params.onnx_task_ctx.as_ref() {
+                ctx.pool.wait_for_tasks();
+                ctx.pool.clear_processing_dispatch();
+            }
+        }
 
         let mut some_ooo = false;
         for pending in iteration.pending.iter().skip(new_start) {
@@ -403,13 +448,15 @@ where
             }
         }
         if some_ooo {
-            apply_out_of_order_backups(
-                tree,
-                &mut iteration,
-                params.stats,
-                new_start,
-                &mut minibatch_size,
-            );
+            tree.with_tree(|tree| {
+                apply_out_of_order_backups(
+                    tree,
+                    &mut iteration,
+                    params.stats,
+                    new_start,
+                    &mut minibatch_size,
+                );
+            });
         }
 
         for idx in new_start..iteration.pending.len() {
@@ -423,7 +470,9 @@ where
                     let extra = (max_count.min(collisions_left as u32)).saturating_sub(multivisit);
                     if extra > 0 {
                         multivisit = multivisit.saturating_add(extra);
-                        increment_collision_ancestors(tree, &pending.path, extra);
+                        tree.with_tree(|tree| {
+                            increment_collision_ancestors(tree, &pending.path, extra);
+                        });
                         iteration.pending[idx].multivisit = multivisit;
                     }
                 }
@@ -455,13 +504,21 @@ pub(crate) fn gather_minibatch_with_local<E>(
 where
     E: super::PolicyValueEval,
 {
+    let mut access = TreeGatherAccess::Local(tree);
     let mut processing = ProcessingBackend::Local(backend);
-    let iteration = gather_minibatch(tree, root_history, params, scratch, &mut processing, stop);
+    let iteration = gather_minibatch(
+        &mut access,
+        root_history,
+        params,
+        scratch,
+        &mut processing,
+        stop,
+    );
     (iteration, processing.used_batch_size())
 }
 
 pub(crate) fn gather_minibatch_with_shared<'b, E>(
-    tree: &mut MctsTree,
+    tree: &Arc<Mutex<MctsTree>>,
     root_history: &PositionHistory,
     params: &GatherParams<'_>,
     scratch: &mut SelectionScratch,
@@ -471,8 +528,16 @@ pub(crate) fn gather_minibatch_with_shared<'b, E>(
 where
     E: super::PolicyValueEval,
 {
+    let mut access = TreeGatherAccess::Shared(tree);
     let mut processing = ProcessingBackend::Shared(backend);
-    let iteration = gather_minibatch(tree, root_history, params, scratch, &mut processing, stop);
+    let iteration = gather_minibatch(
+        &mut access,
+        root_history,
+        params,
+        scratch,
+        &mut processing,
+        stop,
+    );
     (iteration, processing.used_batch_size())
 }
 
@@ -502,8 +567,9 @@ pub(crate) fn apply_out_of_order_backups(
 }
 
 /// lc0 `ProcessPickedTask` 分发（search.cc:1353-1384,1445-1484）。
+/// 返回 `true` 表示已入队 worker tasks，调用方需在释放树锁后 `wait_for_tasks`。
 fn run_process_picked_phase<E>(
-    tree: &mut MctsTree,
+    tree: &mut TreeGatherAccess<'_>,
     root_history: &PositionHistory,
     params: &GatherParams<'_>,
     root_id: MctsNodeId,
@@ -512,7 +578,8 @@ fn run_process_picked_phase<E>(
     pending_len: usize,
     _non_collisions: usize,
     processing: &mut ProcessingBackend<'_, E>,
-) where
+) -> bool
+where
     E: super::PolicyValueEval,
 {
     let (worker_ranges, main_start) = plan_processing_task_ranges(
@@ -524,71 +591,105 @@ fn run_process_picked_phase<E>(
     );
 
     if worker_ranges.is_empty() {
-        process_picked_range(
-            tree,
-            root_history,
-            params.config,
-            root_id,
-            iteration,
-            new_start,
-            pending_len,
-            processing,
-        );
-        return;
-    }
-
-    let Some(ctx) = params.onnx_task_ctx.as_deref() else {
-        for range in &worker_ranges {
+        tree.with_tree(|tree| {
             process_picked_range(
                 tree,
                 root_history,
                 params.config,
                 root_id,
                 iteration,
-                range.start,
-                range.end,
+                new_start,
+                pending_len,
                 processing,
             );
-        }
-        process_picked_range(
-            tree,
-            root_history,
-            params.config,
-            root_id,
-            iteration,
-            main_start,
-            pending_len,
-            processing,
-        );
-        return;
+        });
+        return false;
+    }
+
+    let Some(ctx) = params.onnx_task_ctx.as_deref() else {
+        tree.with_tree(|tree| {
+            for range in &worker_ranges {
+                process_picked_range(
+                    tree,
+                    root_history,
+                    params.config,
+                    root_id,
+                    iteration,
+                    range.start,
+                    range.end,
+                    processing,
+                );
+            }
+            process_picked_range(
+                tree,
+                root_history,
+                params.config,
+                root_id,
+                iteration,
+                main_start,
+                pending_len,
+                processing,
+            );
+        });
+        return false;
+    };
+
+    let Some(tree_shared) = params.tree_shared.as_ref() else {
+        tree.with_tree(|tree| {
+            for range in &worker_ranges {
+                process_picked_range(
+                    tree,
+                    root_history,
+                    params.config,
+                    root_id,
+                    iteration,
+                    range.start,
+                    range.end,
+                    processing,
+                );
+            }
+            process_picked_range(
+                tree,
+                root_history,
+                params.config,
+                root_id,
+                iteration,
+                main_start,
+                pending_len,
+                processing,
+            );
+        });
+        return false;
     };
 
     // lc0: ResetTasks → enqueue worker ranges → main ProcessPickedTask → WaitForTasks
     let iteration_arc = Arc::new(Mutex::new(std::mem::take(iteration)));
-    let dispatch = ProcessingDispatch {
-        tree: Arc::clone(&ctx.tree_shared),
+    ctx.pool.reset_tasks();
+    for range in &worker_ranges {
+        ctx.pool.enqueue_processing(range.start, range.end);
+    }
+    ctx.pool.set_processing_dispatch(ProcessingDispatch {
+        tree: Arc::clone(tree_shared),
         iteration: Arc::clone(&iteration_arc),
         root_history: root_history.clone_for_search(),
         config: params.config,
         root_id,
         backend: Arc::clone(&ctx.backend_shared),
-    };
-    ctx.pool.reset_tasks();
-    for range in &worker_ranges {
-        ctx.pool.enqueue_processing(range.start, range.end);
-    }
-    ctx.pool.set_dispatch(ProcessingDispatch {
-        tree: dispatch.tree.clone(),
-        iteration: dispatch.iteration.clone(),
-        root_history: dispatch.root_history.clone_for_search(),
-        config: dispatch.config,
-        root_id: dispatch.root_id,
-        backend: dispatch.backend.clone(),
     });
     ctx.pool.wake_workers();
-    process_picked_range_shared(&dispatch, main_start, pending_len);
-    ctx.pool.wait_for_tasks();
-    ctx.pool.clear_dispatch();
+    tree.with_tree(|tree| {
+        let mut iteration_guard = iteration_arc.lock().unwrap_or_else(|e| e.into_inner());
+        process_picked_range(
+            tree,
+            root_history,
+            params.config,
+            root_id,
+            &mut iteration_guard,
+            main_start,
+            pending_len,
+            processing,
+        );
+    });
     *iteration = match Arc::try_unwrap(iteration_arc) {
         Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
         Err(arc) => {
@@ -596,6 +697,65 @@ fn run_process_picked_phase<E>(
             std::mem::take(&mut *guard)
         }
     };
+    true
+}
+
+fn pick_nodes_to_extend_parallel(
+    params: &GatherParams<'_>,
+    root_id: MctsNodeId,
+    root_history: &PositionHistory,
+    session_playouts: u32,
+    collision_limit: i32,
+    receiver: &mut Vec<PendingNode>,
+    scratch: &mut SelectionScratch,
+    workspace: &mut PickWorkspace,
+) -> i32 {
+    let Some(ctx) = params.onnx_task_ctx.as_ref() else {
+        return 0;
+    };
+    let Some(tree_shared) = params.tree_shared.as_ref() else {
+        return 0;
+    };
+    ctx.pool.reset_tasks();
+    ctx.pool.set_picking_dispatch(PickingDispatch {
+        tree: Arc::clone(tree_shared),
+        root_id,
+        root_history: root_history.clone_for_search(),
+        config: params.config,
+        budget: params.budget.clone(),
+        session_playouts,
+        stats: params.stats_arc.clone(),
+    });
+    ctx.pool.wake_workers();
+    workspace.reset();
+    scratch.reset();
+    let mut passed_off = 0i32;
+    let completed = {
+        let mut tree = tree_shared.lock().unwrap_or_else(|e| e.into_inner());
+        pick_nodes_to_extend_task(
+            &mut tree,
+            root_id,
+            root_history,
+            root_id,
+            0,
+            &[],
+            params.config,
+            params.stats,
+            params.budget,
+            session_playouts,
+            collision_limit,
+            receiver,
+            scratch,
+            workspace,
+            Some(ctx.pool.inner.as_ref() as &dyn PickTaskEnqueue),
+            collision_limit,
+            &mut passed_off,
+        )
+    };
+    ctx.pool.wait_for_tasks();
+    ctx.pool.merge_gathering_results(receiver);
+    ctx.pool.clear_picking_dispatch();
+    completed
 }
 
 /// task worker 线程入口（lc0 `ProcessPickedTask`）。
@@ -1223,6 +1383,7 @@ pub(crate) fn progress_from_tree(
                 q: edge.mean_q(),
             })
             .collect(),
+        per_pv_counters: config.per_pv_counters,
     }
 }
 
@@ -1250,6 +1411,7 @@ pub(crate) fn result_from_tree(
         nps_elapsed_ms: progress.nps_elapsed_ms,
         retry_without_playout: progress.retry_without_playout,
         moves: progress.moves,
+        per_pv_counters: progress.per_pv_counters,
     }
 }
 
@@ -1461,11 +1623,16 @@ fn multi_pv_lines_from_tree(tree: &MctsTree, root_id: MctsNodeId, config: MctsCo
         .into_iter()
         .enumerate()
         .map(|(idx, (edge_idx, _, _))| {
+            let visits = tree
+                .get(root_id)
+                .map(|root| pick_edge_visits(tree, &root.children[edge_idx]))
+                .unwrap_or(0);
             let (pv, best_value, best_mate) = pv_line_from_root_edge(tree, root_id, edge_idx);
             PvLineInfo {
                 multipv: (idx + 1) as u32,
                 best_value,
                 best_mate,
+                visits,
                 pv,
             }
         })
@@ -1549,15 +1716,7 @@ pub(crate) fn budget_exhausted(
     in_flight_playouts: u32,
     initial_visits: u32,
     stats: Option<&SearchStats>,
-    best_mate: Option<i32>,
 ) -> bool {
-    if let Some(target) = budget.max_mate {
-        if let Some(mate) = best_mate {
-            if mate > 0 && mate as u32 <= target {
-                return true;
-            }
-        }
-    }
     if let Some(target_depth) = budget.max_depth {
         if let Some(stats) = stats {
             if stats.total_playouts() > 0 && stats.max_depth() >= target_depth {
@@ -1737,6 +1896,21 @@ pub(crate) fn ensure_tree_quiescent(tree: &MctsTree) -> Result<(), String> {
         return Err(format!("search ended with {in_flight} in-flight updates"));
     }
     Ok(())
+}
+
+/// 外部 stop / 提前 join 时清掉残留 virtual loss，避免 `ensure_tree_quiescent` 误杀 partial bestmove。
+pub(crate) fn clear_in_flight_in_tree(tree: &mut MctsTree) {
+    let mut ids = Vec::new();
+    tree.for_each_reachable(|id| ids.push(id));
+    for id in ids {
+        let Some(node) = tree.get_mut(id) else {
+            continue;
+        };
+        node.in_flight = 0;
+        for edge in &mut node.children {
+            edge.in_flight = 0;
+        }
+    }
 }
 
 // --- lc0 MaybePrefetchIntoCache (was prefetch.rs) ---
@@ -2025,14 +2199,14 @@ where
 const MAX_VTP_EDGES: usize = 256;
 
 pub(crate) struct PickWorkspace {
-    visits_to_perform: Vec<Vec<i32>>,
-    vtp_last_filled: Vec<i32>,
-    vtp_buffer: Vec<Vec<i32>>,
-    current_path: Vec<i32>,
+    pub visits_to_perform: Vec<Vec<i32>>,
+    pub vtp_last_filled: Vec<i32>,
+    pub vtp_buffer: Vec<Vec<i32>>,
+    pub current_path: Vec<i32>,
 }
 
 impl PickWorkspace {
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.visits_to_perform.clear();
         self.vtp_last_filled.clear();
         self.vtp_buffer.clear();
@@ -2051,11 +2225,14 @@ impl Default for PickWorkspace {
     }
 }
 
-/// lc0 `SearchWorker::PickNodesToExtend` → `PickNodesToExtendTask`。
-pub(crate) fn pick_nodes_to_extend(
+/// lc0 `SearchWorker::PickNodesToExtendTask`（search.cc:1573-1919）。
+pub(crate) fn pick_nodes_to_extend_task(
     tree: &mut MctsTree,
     root_id: MctsNodeId,
     root_history: &PositionHistory,
+    start_node_id: MctsNodeId,
+    base_depth: usize,
+    moves_to_base: &[PathStep],
     config: MctsConfig,
     stats: Option<&SearchStats>,
     budget: &MctsBudget,
@@ -2064,12 +2241,21 @@ pub(crate) fn pick_nodes_to_extend(
     receiver: &mut Vec<PendingNode>,
     scratch: &mut SelectionScratch,
     workspace: &mut PickWorkspace,
+    enqueue: Option<&dyn PickTaskEnqueue>,
+    top_collision_limit: i32,
+    passed_off: &mut i32,
 ) -> i32 {
     if collision_limit <= 0 {
         return 0;
     }
-    workspace.reset();
-    scratch.reset();
+    workspace.visits_to_perform.clear();
+    workspace.vtp_last_filled.clear();
+    workspace.current_path.clear();
+    if moves_to_base.is_empty() {
+        scratch.reset();
+    } else {
+        scratch.path_positions.clear();
+    }
 
     let remaining_playouts = remaining_playout_budget(
         budget,
@@ -2089,15 +2275,30 @@ pub(crate) fn pick_nodes_to_extend(
         })
         .unwrap_or(0);
 
-    let mut node_id = root_id;
-    let mut pos = root_history.current().clone_for_search();
+    let mut node_id = start_node_id;
+    let mut path: Vec<PathStep> = moves_to_base.to_vec();
     let base_key_counts = root_history.key_counts();
-    let mut path = Vec::<PathStep>::new();
+    let mut pos = if moves_to_base.is_empty() {
+        root_history.current().clone_for_search()
+    } else {
+        let mut pos = root_history.current().clone_for_search();
+        for step in moves_to_base {
+            let Some(mv) = tree
+                .get(step.node_id)
+                .and_then(|n| n.children.get(step.edge_idx).map(|e| e.mv))
+            else {
+                break;
+            };
+            pos.do_move(mv);
+            scratch.path_positions.push(pos.clone_for_search());
+        }
+        pos
+    };
     let mut completed_visits = 0i32;
     let mut max_limit = i32::MAX;
 
     let mut best_root_idx = 0usize;
-    let mut is_root_node = true;
+    let mut is_root_node = node_id == root_id && path.is_empty();
     workspace.current_path.push(-1);
     while let Some(&path_tail) = workspace.current_path.last() {
         if path_tail == -1 {
@@ -2489,6 +2690,78 @@ pub(crate) fn pick_nodes_to_extend(
             }
 
             is_root_node = false;
+
+            if let Some(enqueue) = enqueue {
+                let level = workspace.visits_to_perform.len().saturating_sub(1);
+                if level < workspace.visits_to_perform.len() {
+                    let vtp_last = workspace.vtp_last_filled[level];
+                    let num_edges = tree
+                        .get(node_id)
+                        .map(|n| n.children.len().min(MAX_VTP_EDGES))
+                        .unwrap_or(0);
+                    for idx in 0..=vtp_last as usize {
+                        if idx >= num_edges {
+                            break;
+                        }
+                        let child_limit = workspace.visits_to_perform[level][idx];
+                        if child_limit <= config.minimum_work_size_for_picking {
+                            continue;
+                        }
+                        let remaining =
+                            top_collision_limit - *passed_off - completed_visits;
+                        if child_limit >= (remaining * 2 / 3) {
+                            continue;
+                        }
+                        if child_limit + *passed_off + completed_visits
+                            >= top_collision_limit
+                                - config.minimum_remaining_work_size_for_picking
+                        {
+                            continue;
+                        }
+                        let child_id = {
+                            let edge_mv = tree
+                                .get(node_id)
+                                .and_then(|n| n.children.get(idx).map(|e| e.mv));
+                            let existing = tree
+                                .get(node_id)
+                                .and_then(|n| n.children.get(idx).and_then(|e| e.child));
+                            if let Some(id) = existing {
+                                Some(id)
+                            } else if let Some(mv) = edge_mv {
+                                let mut next_pos = pos.clone_for_search();
+                                next_pos.do_move(mv);
+                                tree.get_or_spawn_child(node_id, idx, next_pos.key())
+                            } else {
+                                None
+                            }
+                        };
+                        let Some(child_id) = child_id else {
+                            continue;
+                        };
+                        let Some(child) = tree.get(child_id) else {
+                            continue;
+                        };
+                        if child.visits == 0 || child.is_terminal() {
+                            continue;
+                        }
+                        let mut path_to_child = path.clone();
+                        path_to_child.push(PathStep {
+                            node_id,
+                            edge_idx: idx,
+                        });
+                        let child_base_depth = path.len() + base_depth;
+                        if enqueue.try_enqueue_gathering(
+                            child_id,
+                            child_base_depth,
+                            path_to_child,
+                            child_limit,
+                        ) {
+                            workspace.visits_to_perform[level][idx] = 0;
+                            *passed_off += child_limit;
+                        }
+                    }
+                }
+            }
             // lc0：UCT 分配完成后 current_path.back() 仍为 -1，进入子节点选择。
         }
         let min_idx = workspace.current_path.last().copied().unwrap_or(-1);
@@ -2765,7 +3038,7 @@ fn pending_from_node(
     None
 }
 
-fn pick_edge_visits(tree: &MctsTree, edge: &EdgeStats) -> u32 {
+pub(crate) fn pick_edge_visits(tree: &MctsTree, edge: &EdgeStats) -> u32 {
     edge.child
         .and_then(|id| tree.get(id))
         .map(|child| child.visits)
@@ -2822,10 +3095,10 @@ mod tests {
             deadline: Some(deadline),
             stop: None,
         };
-        assert!(!budget_exhausted(&budget, 0, 0, 0, None, None));
-        assert!(budget_exhausted(&budget, 3, 1, 0, None, None));
+        assert!(!budget_exhausted(&budget, 0, 0, 0, None));
+        assert!(budget_exhausted(&budget, 3, 1, 0, None));
         std::thread::sleep(Duration::from_millis(60));
-        assert!(budget_exhausted(&budget, 0, 0, 0, None, None));
+        assert!(budget_exhausted(&budget, 0, 0, 0, None));
     }
 
     #[test]

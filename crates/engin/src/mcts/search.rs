@@ -6,9 +6,10 @@ use std::time::Duration;
 use crate::history::PositionHistory;
 
 use super::backend::{BackendComputation, SharedBackendComputation};
+use super::iteration_stats::{maybe_trigger_stop, populate_common_iteration_stats, StoppersHints};
 use super::task_workers::TaskWorkerGatherCtx;
 use super::worker::{
-    acquire_searcher_slot, budget_exhausted, do_backup_update, ensure_tree_quiescent,
+    acquire_searcher_slot, budget_exhausted, clear_in_flight_in_tree, do_backup_update, ensure_tree_quiescent,
     fetch_minibatch_results, gather_has_work, gather_minibatch_with_local, gather_minibatch_with_shared,
     init_pending_searchers, maybe_prefetch_into_cache, maybe_prefetch_processing_backend, progress_from_tree,
     release_searcher_slot, result_from_tree,
@@ -62,7 +63,6 @@ fn empty_iteration_action(
         0,
         stats.initial_visits(),
         Some(stats),
-        None,
     ) {
         return EmptyIterationAction::Break;
     }
@@ -105,7 +105,7 @@ fn apply_nps_limit(config: MctsConfig, stats: &SearchStats, budget: &MctsBudget)
     if config.nps_limit == 0 {
         return;
     }
-    while !budget_exhausted(budget, stats.total_playouts(), 0, stats.initial_visits(), Some(stats), None) {
+    while !budget_exhausted(budget, stats.total_playouts(), 0, stats.initial_visits(), Some(stats)) {
         let elapsed = stats.nps_elapsed_ms();
         if elapsed == 0 {
             break;
@@ -151,15 +151,9 @@ where
         let mut retry_without_playout = 0u32;
 
         let shared_collisions = SharedCollisions::default();
-        let mut best_mate = None;
-        while !budget_exhausted(
-            &self.budget,
-            self.stats.total_playouts(),
-            0,
-            self.stats.initial_visits(),
-            Some(self.stats.as_ref()),
-            best_mate,
-        ) {
+        let mut stop_hints = StoppersHints::default();
+        // lc0 SearchWorker::RunBlocking (search.h:254-261): do { ExecuteOneIteration } while active.
+        loop {
             if execute_one_iteration(self, batch_limit, &shared_collisions)? {
                 retry_without_playout = 0;
             } else {
@@ -181,14 +175,20 @@ where
                     }
                 }
             }
-            if self.budget.max_mate.is_some() {
-                best_mate = progress_from_tree(
-                    self.tree,
-                    self.root_id,
-                    self.stats.as_ref(),
-                    self.config,
-                )
-                .best_mate;
+            let iteration = populate_common_iteration_stats(
+                self.tree,
+                self.root_id,
+                self.config,
+                self.stats.as_ref(),
+            );
+            if maybe_trigger_stop(
+                &self.budget,
+                self.config,
+                &iteration,
+                self.stats.as_ref(),
+                &mut stop_hints,
+            ) {
+                break;
             }
             if let Some(deadline) = next_report_at {
                 let now = std::time::Instant::now();
@@ -245,6 +245,8 @@ where
         backend_waiting: 0,
         task_workers: 0,
         onnx_task_ctx: None,
+        tree_shared: None,
+        stats_arc: None,
     };
 
     let (mut iteration, used_batch) = gather_minibatch_with_local(
@@ -316,6 +318,8 @@ where
     Ok(true)
 }
 
+/// lc0 `Search::RunBlocking` + `SearchWorker::RunBlocking` + `WatchdogThread`
+///（search.cc:911-921,1003-1009, search.h:254-261）。
 pub(crate) fn run_parallel_with_progress<F>(
     tree: &mut MctsTree,
     config: MctsConfig,
@@ -380,16 +384,20 @@ where
                                 config,
                             );
                             on_progress(&progress);
-                            if budget.max_mate.is_some()
-                                && budget_exhausted(
-                                    &budget,
-                                    stats.total_playouts(),
-                                    0,
-                                    stats.initial_visits(),
-                                    Some(stats.as_ref()),
-                                    progress.best_mate,
-                                )
-                            {
+                            let iteration = populate_common_iteration_stats(
+                                &*tree_guard,
+                                root_id,
+                                config,
+                                stats.as_ref(),
+                            );
+                            let mut hints = StoppersHints::default();
+                            if maybe_trigger_stop(
+                                &budget,
+                                config,
+                                &iteration,
+                                stats.as_ref(),
+                                &mut hints,
+                            ) {
                                 stop.store(true, Ordering::SeqCst);
                             }
                         }
@@ -426,7 +434,6 @@ where
                 let task_ctx = if task_workers > 0 {
                     Some(Arc::new(TaskWorkerGatherCtx::new(
                         task_workers,
-                        Arc::clone(&shared_tree),
                         Arc::clone(&backend_shared),
                     )))
                 } else {
@@ -444,17 +451,21 @@ where
                     }
 
                 let iteration = {
-                    let mut tree_guard = shared_tree.lock().unwrap_or_else(|e| e.into_inner());
                     if budget_exhausted(
                         &budget,
                         stats.total_playouts(),
                         0,
                         stats.initial_visits(),
                         Some(stats.as_ref()),
-                        None,
                     ) {
                         None
                     } else {
+                        let root_visits = shared_tree
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(root_id)
+                            .map(|root| root.visits)
+                            .unwrap_or(0);
                         let gather_params = GatherParams {
                             config,
                             budget: &budget,
@@ -464,14 +475,16 @@ where
                             batch_limit,
                             stats: Some(stats.as_ref()),
                             root_id,
-                            root_visits: tree_guard.get(root_id).map(|root| root.visits).unwrap_or(0),
+                            root_visits,
                             thread_count: threads,
                             backend_waiting: backend_waiting.load(Ordering::Relaxed),
                             task_workers,
                             onnx_task_ctx: task_ctx.clone(),
+                            tree_shared: Some(Arc::clone(&shared_tree)),
+                            stats_arc: Some(Arc::clone(&stats)),
                         };
                         let (iteration, used_batch) = gather_minibatch_with_shared(
-                            &mut tree_guard,
+                            &shared_tree,
                             &root_history,
                             &gather_params,
                             &mut selection_scratch,
@@ -481,6 +494,8 @@ where
                         if iteration.pending.is_empty() {
                             None
                         } else if !gather_has_work(&iteration, used_batch) {
+                            let mut tree_guard =
+                                shared_tree.lock().unwrap_or_else(|e| e.into_inner());
                             super::worker::cancel_minibatch(&mut tree_guard, iteration);
                             shared_collisions.cancel_all(&mut tree_guard);
                             None
@@ -570,6 +585,23 @@ where
                     Some(&shared_collisions),
                 );
                 apply_nps_limit(config, stats.as_ref(), &budget);
+                let iteration = populate_common_iteration_stats(
+                    &*tree_guard,
+                    root_id,
+                    config,
+                    stats.as_ref(),
+                );
+                drop(tree_guard);
+                let mut hints = StoppersHints::default();
+                if maybe_trigger_stop(
+                    &budget,
+                    config,
+                    &iteration,
+                    stats.as_ref(),
+                    &mut hints,
+                ) {
+                    stop.store(true, Ordering::SeqCst);
+                }
                 }
                 active_workers.fetch_sub(1, Ordering::Relaxed);
             });
@@ -586,6 +618,12 @@ where
         .into_inner()
         .map_err(|_| "parallel search tree lock poisoned".to_string())?;
     shared_collisions.cancel_all(&mut restored);
+    if stop.load(Ordering::SeqCst) {
+        clear_in_flight_in_tree(&mut restored);
+    }
+    if ensure_tree_quiescent(&restored).is_err() {
+        clear_in_flight_in_tree(&mut restored);
+    }
     ensure_tree_quiescent(&restored)?;
     *tree = restored;
     Ok(result_from_tree(tree, root_id, stats.as_ref(), config))

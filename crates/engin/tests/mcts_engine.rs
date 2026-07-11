@@ -6,6 +6,45 @@ use std::io::Cursor;
 use xiangqi_core::{legal_moves_uci, Position, START_FEN};
 
 #[test]
+fn parallel_threads_two_completes_nodes_budget() {
+    let policy: SharedPolicy = None;
+    let mut engine = MctsEngine::new(
+        MctsConfig::default(),
+        OnnxPolicyValueEval::new(policy, MctsConfig::default().nn_cache_size),
+    );
+    let history = PositionHistory::new_startpos();
+    let result = engine
+        .search_root_history_parallel_with_progress(
+            &history,
+            MctsBudget {
+                max_nodes: Some(16),
+                ..Default::default()
+            },
+            2,
+            std::time::Duration::ZERO,
+            None,
+            |_| {},
+        )
+        .expect("parallel search");
+    assert!(result.best_move.is_some(), "playouts={}", result.playouts);
+    assert!(result.playouts > 0);
+}
+
+#[test]
+fn position_moves_uci_reuses_tree() {
+    let pos0 = Position::from_fen(START_FEN).unwrap();
+    let mv = legal_moves_uci(&pos0).into_iter().next().expect("mv");
+    let input = format!(
+        "uci\nisready\nsetoption name Threads value 1\nposition startpos\ngo nodes 32\nposition startpos moves {mv}\ngo nodes 8\nquit\n"
+    );
+    let mut out = Vec::new();
+    engin::uci::run_uci_for_test(Cursor::new(input.as_bytes()), &mut out).unwrap();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("bestmove"));
+    assert!(!s.ends_with("bestmove (none)"));
+}
+
+#[test]
 fn tree_reuse_across_two_go_nodes() {
     let policy: SharedPolicy = None;
     let mut engine = MctsEngine::new(
@@ -125,6 +164,37 @@ fn fixed_fen_search_stats_in_expected_range() {
     assert!(result.depth >= 1);
     assert!(result.seldepth >= 1);
     assert!(!result.pv.is_empty());
+}
+
+#[test]
+fn threads_uci_one_and_two_both_return_bestmove() {
+    for threads in [1, 2] {
+        let input = format!(
+            "uci\nisready\nsetoption name Threads value {threads}\nposition startpos\ngo nodes 16\nquit\n"
+        );
+        let mut out = Vec::new();
+        engin::uci::run_uci_for_test(Cursor::new(input.as_bytes()), &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("bestmove"), "threads={threads}");
+    }
+}
+
+#[test]
+fn go_mate_without_forced_mate_runs_to_nodes_budget() {
+    let input = b"uci\nisready\nposition startpos\ngo mate 3 nodes 16\nquit\n";
+    let mut out = Vec::new();
+    engin::uci::run_uci_for_test(Cursor::new(&input[..]), &mut out).unwrap();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("bestmove"));
+}
+
+#[test]
+fn go_mate_combined_with_movetime_does_not_error() {
+    let input = b"uci\nisready\nposition startpos\ngo mate 5 movetime 200 nodes 8\nquit\n";
+    let mut out = Vec::new();
+    engin::uci::run_uci_for_test(Cursor::new(&input[..]), &mut out).unwrap();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("bestmove"));
 }
 
 #[test]

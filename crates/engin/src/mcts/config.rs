@@ -73,6 +73,8 @@ pub struct MctsConfig {
     pub max_prefetch: i32,
     pub minimum_work_size_for_processing: i32,
     pub minimum_work_size_for_picking: i32,
+    /// lc0 `MinimumRemainingWorkSizeForPicking`（params.cc:625-626）。
+    pub minimum_remaining_work_size_for_picking: i32,
     pub minimum_work_per_task_for_processing: i32,
     pub search_spin_backoff: bool,
     pub sticky_endgames: bool,
@@ -83,6 +85,8 @@ pub struct MctsConfig {
     pub multi_pv: u32,
     /// lc0 `TaskWorkersPerSearchWorker`（params.cc:622；-1=auto, 0=off）。
     pub task_workers: i32,
+    /// lc0 `PerPVCounters`（params.cc:366-368）：UCI 按 PV 线显示 nodes。
+    pub per_pv_counters: bool,
 }
 
 impl Default for MctsConfig {
@@ -122,6 +126,7 @@ impl Default for MctsConfig {
             max_prefetch: 32,
             minimum_work_size_for_processing: 20,
             minimum_work_size_for_picking: 1,
+            minimum_remaining_work_size_for_picking: 0,
             minimum_work_per_task_for_processing: 8,
             search_spin_backoff: false,
             sticky_endgames: true,
@@ -129,6 +134,7 @@ impl Default for MctsConfig {
             nps_limit: 0,
             multi_pv: 1,
             task_workers: -1,
+            per_pv_counters: false,
         }
     }
 }
