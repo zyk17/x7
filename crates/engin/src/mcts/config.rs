@@ -81,6 +81,8 @@ pub struct MctsConfig {
     pub nps_limit: u64,
     /// lc0 `MultiPV`（params.cc:360-365,585）：UCI 主变线条数。
     pub multi_pv: u32,
+    /// lc0 `TaskWorkersPerSearchWorker`（params.cc:622；-1=auto, 0=off）。
+    pub task_workers: i32,
 }
 
 impl Default for MctsConfig {
@@ -126,6 +128,7 @@ impl Default for MctsConfig {
             two_fold_draws: true,
             nps_limit: 0,
             multi_pv: 1,
+            task_workers: -1,
         }
     }
 }

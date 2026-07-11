@@ -14,17 +14,18 @@
 
 ## 当前未完成 — 搜索主线
 
-### P4.2 并发细节对齐 lc0（未完成）
+### P4.2 并发细节对齐 lc0（进行中）
 
-- [ ] **Task workers** picking/processing 接入（`search.cc:1353-1384`；config 已有 `minimum_work_*` 默认值）
-- [ ] 多线程路径下 task workers 与 gather idle / `backend_waiting` 联动验证
-- [ ] collision / OOO / backup 边界在多线程 + task 路径再对照 `search.cc:2217-2373`
+- [x] `TaskWorkersPerSearchWorker` 解析（`task_workers.rs::resolve_task_workers`）
+- [x] gather processing 区间拆分（`plan_processing_task_ranges` + `run_process_picked_phase`）
+- [x] **Task worker 线程池** 并行 `ProcessPickedTask`（`search.cc:1091-1161,1382-1383` → `SearchWorkerTaskPool`）
+- [ ] picking 阶段 task 拆分（`search.cc:1507+`，GPU 路径 `PickNodesToExtendTask`）
 
-已核对一致、无需重复做：
+**processing task-workers 当前边界（未完成项，不是“小尾巴”）：**
 
-- Watchdog / worker 分工（`search.cc:896-922` ↔ `search.rs`）
-- gather backend idle 早退（`search.cc:1319-1331` ↔ `worker.rs`）
-- `Threads=0` / `MinibatchSize=0` / backend suggested（`policy_onnx.rs`）
+- 只并行 processing；picking 仍是单线程 `PickNodesToExtend` 语义。
+- task worker 路径仍依赖 **共享树 `Mutex`**，未对齐 lc0 完整 SearchWorker task-worker 主线。
+- 共享 backend：`SharedBackendComputation::compute_blocking()` 消费后 **清空 slots**（lc0 每轮 `computation_.reset()`）。
 
 ### lc0 已知未完全对齐项（记录，非当前必修）
 

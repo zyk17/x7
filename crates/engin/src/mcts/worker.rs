@@ -10,11 +10,14 @@ use xiangqi_core::{generate, Position};
 use crate::history::PositionHistory;
 use crate::policy_onnx::BackendAttributes;
 
-use super::backend::BackendComputation;
+use super::backend::{BackendComputation, SharedBackendComputation};
 use super::node::{cancel_score_update, terminal_wdl, MctsNode, TerminalKind};
+use super::task_workers::{
+    plan_processing_task_ranges, ProcessingDispatch, TaskWorkerGatherCtx,
+};
 use super::{
     EdgeStats, MctsBudget, MctsConfig, MctsMoveStat, MctsNodeId, MctsSearchProgress, MctsSearchResult,
-    MctsTree, PolicyValueEval, PolicyValueOutput, PolicyValueTask, PvLineInfo, SearchStats,
+    MctsTree, OnnxPolicyValueEval, PolicyValueEval, PolicyValueOutput, PolicyValueTask, PvLineInfo, SearchStats,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -128,6 +131,10 @@ pub(crate) struct GatherParams<'a> {
     pub root_visits: u32,
     pub thread_count: usize,
     pub backend_waiting: i32,
+    /// lc0 `TaskWorkersPerSearchWorker` 解析值；CPU / auto-on-CPU 时为 0。
+    pub task_workers: usize,
+    /// GPU 并行路径专用；单线程 search 为 `None`。
+    pub onnx_task_ctx: Option<Arc<TaskWorkerGatherCtx<OnnxPolicyValueEval>>>,
 }
 
 #[derive(Default)]
@@ -217,13 +224,58 @@ pub(crate) fn should_break_gather_for_thread_idling(
         && (thread_count as i32 - backend_waiting) > config.thread_idling_threshold
 }
 
+pub(crate) enum ProcessingBackend<'b, E> {
+    Local(&'b mut BackendComputation<E>),
+    Shared(&'b SharedBackendComputation<E>),
+}
+
+impl<'b, E> ProcessingBackend<'b, E>
+where
+    E: PolicyValueEval,
+{
+    pub(crate) fn used_batch_size(&self) -> usize {
+        match self {
+            Self::Local(backend) => backend.used_batch_size(),
+            Self::Shared(backend) => backend.used_batch_size(),
+        }
+    }
+
+    fn add_input(&mut self, task: &Arc<PolicyValueTask>) -> bool {
+        match self {
+            Self::Local(backend) => backend.add_input(task),
+            Self::Shared(backend) => backend.add_input(task),
+        }
+    }
+
+    pub(crate) fn add_prefetch_input(&mut self, task: &Arc<PolicyValueTask>) -> bool {
+        match self {
+            Self::Local(backend) => backend.add_prefetch_input(task),
+            Self::Shared(backend) => backend.add_prefetch_input(task),
+        }
+    }
+
+    fn with_eval_mut<R>(&mut self, f: impl FnOnce(&mut E) -> R) -> R {
+        match self {
+            Self::Local(backend) => f(backend.eval_mut()),
+            Self::Shared(backend) => backend.with_eval_mut(f),
+        }
+    }
+
+    pub(crate) fn compute_blocking(&mut self) -> Result<Vec<PolicyValueOutput>, E::Error> {
+        match self {
+            Self::Local(backend) => backend.compute_blocking(),
+            Self::Shared(backend) => backend.compute_blocking(),
+        }
+    }
+}
+
 /// lc0 `GatherMinibatch`（search.cc:1268-1421）。
-pub(crate) fn gather_minibatch<E>(
+pub(crate) fn gather_minibatch<'b, E>(
     tree: &mut MctsTree,
     root_history: &PositionHistory,
     params: &GatherParams<'_>,
     scratch: &mut SelectionScratch,
-    mut backend: Option<&mut BackendComputation<'_, E>>,
+    processing: &mut ProcessingBackend<'b, E>,
     stop: bool,
 ) -> SearchIteration
 where
@@ -251,12 +303,13 @@ where
         calculate_collisions_left(i64::from(params.root_visits).min(remaining_n), params.config);
 
     while minibatch_size < params.batch_limit && (iteration.number_out_of_order as usize) < max_ooo {
-        let used_batch_size = backend.as_mut().map(|b| b.used_batch_size()).unwrap_or(0);
+        let used_batch_size = processing.used_batch_size();
         let scheduled_playouts = session_playouts
             .saturating_add(pending_playouts(&iteration))
             .saturating_add(params.in_flight_playouts);
 
-        if backend.is_some() && minibatch_size > 0 && used_batch_size == 0 {
+        if minibatch_size > 0 && used_batch_size == 0
+        {
             break;
         }
 
@@ -326,15 +379,20 @@ where
         }
 
         let minibatch_len = iteration.pending.len();
-        process_picked_range(
+        let non_collisions_picked = picked
+            .iter()
+            .filter(|pending| !is_collision_kind(&pending.kind))
+            .count();
+        run_process_picked_phase(
             tree,
             root_history,
-            params.config,
+            params,
             params.root_id,
             &mut iteration,
             new_start,
             minibatch_len,
-            &mut backend,
+            non_collisions_picked,
+            processing,
         );
 
         let mut some_ooo = false;
@@ -386,6 +444,38 @@ where
     iteration
 }
 
+pub(crate) fn gather_minibatch_with_local<E>(
+    tree: &mut MctsTree,
+    root_history: &PositionHistory,
+    params: &GatherParams<'_>,
+    scratch: &mut SelectionScratch,
+    backend: &mut BackendComputation<E>,
+    stop: bool,
+) -> (SearchIteration, usize)
+where
+    E: super::PolicyValueEval,
+{
+    let mut processing = ProcessingBackend::Local(backend);
+    let iteration = gather_minibatch(tree, root_history, params, scratch, &mut processing, stop);
+    (iteration, processing.used_batch_size())
+}
+
+pub(crate) fn gather_minibatch_with_shared<'b, E>(
+    tree: &mut MctsTree,
+    root_history: &PositionHistory,
+    params: &GatherParams<'_>,
+    scratch: &mut SelectionScratch,
+    backend: &'b SharedBackendComputation<E>,
+    stop: bool,
+) -> (SearchIteration, usize)
+where
+    E: super::PolicyValueEval,
+{
+    let mut processing = ProcessingBackend::Shared(backend);
+    let iteration = gather_minibatch(tree, root_history, params, scratch, &mut processing, stop);
+    (iteration, processing.used_batch_size())
+}
+
 /// lc0 gather 内 OOO 收尾：碰撞撤销 + 提前 backup。
 pub(crate) fn apply_out_of_order_backups(
     tree: &mut MctsTree,
@@ -411,6 +501,126 @@ pub(crate) fn apply_out_of_order_backups(
     }
 }
 
+/// lc0 `ProcessPickedTask` 分发（search.cc:1353-1384,1445-1484）。
+fn run_process_picked_phase<E>(
+    tree: &mut MctsTree,
+    root_history: &PositionHistory,
+    params: &GatherParams<'_>,
+    root_id: MctsNodeId,
+    iteration: &mut SearchIteration,
+    new_start: usize,
+    pending_len: usize,
+    _non_collisions: usize,
+    processing: &mut ProcessingBackend<'_, E>,
+) where
+    E: super::PolicyValueEval,
+{
+    let (worker_ranges, main_start) = plan_processing_task_ranges(
+        new_start,
+        pending_len,
+        &iteration.pending,
+        params.config,
+        params.task_workers,
+    );
+
+    if worker_ranges.is_empty() {
+        process_picked_range(
+            tree,
+            root_history,
+            params.config,
+            root_id,
+            iteration,
+            new_start,
+            pending_len,
+            processing,
+        );
+        return;
+    }
+
+    let Some(ctx) = params.onnx_task_ctx.as_deref() else {
+        for range in &worker_ranges {
+            process_picked_range(
+                tree,
+                root_history,
+                params.config,
+                root_id,
+                iteration,
+                range.start,
+                range.end,
+                processing,
+            );
+        }
+        process_picked_range(
+            tree,
+            root_history,
+            params.config,
+            root_id,
+            iteration,
+            main_start,
+            pending_len,
+            processing,
+        );
+        return;
+    };
+
+    // lc0: ResetTasks → enqueue worker ranges → main ProcessPickedTask → WaitForTasks
+    let iteration_arc = Arc::new(Mutex::new(std::mem::take(iteration)));
+    let dispatch = ProcessingDispatch {
+        tree: Arc::clone(&ctx.tree_shared),
+        iteration: Arc::clone(&iteration_arc),
+        root_history: root_history.clone_for_search(),
+        config: params.config,
+        root_id,
+        backend: Arc::clone(&ctx.backend_shared),
+    };
+    ctx.pool.reset_tasks();
+    for range in &worker_ranges {
+        ctx.pool.enqueue_processing(range.start, range.end);
+    }
+    ctx.pool.set_dispatch(ProcessingDispatch {
+        tree: dispatch.tree.clone(),
+        iteration: dispatch.iteration.clone(),
+        root_history: dispatch.root_history.clone_for_search(),
+        config: dispatch.config,
+        root_id: dispatch.root_id,
+        backend: dispatch.backend.clone(),
+    });
+    ctx.pool.wake_workers();
+    process_picked_range_shared(&dispatch, main_start, pending_len);
+    ctx.pool.wait_for_tasks();
+    ctx.pool.clear_dispatch();
+    *iteration = match Arc::try_unwrap(iteration_arc) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+        Err(arc) => {
+            let mut guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        }
+    };
+}
+
+/// task worker 线程入口（lc0 `ProcessPickedTask`）。
+pub(crate) fn process_picked_range_shared<E>(
+    dispatch: &ProcessingDispatch<E>,
+    start: usize,
+    end: usize,
+) where
+    E: super::PolicyValueEval + Send + Sync + 'static,
+{
+    let mut tree = dispatch.tree.lock().unwrap_or_else(|e| e.into_inner());
+    let mut iteration = dispatch.iteration.lock().unwrap_or_else(|e| e.into_inner());
+    let mut backend = ProcessingBackend::Shared(&*dispatch.backend);
+    process_picked_range(
+        &mut tree,
+        &dispatch.root_history,
+        dispatch.config,
+        dispatch.root_id,
+        &mut iteration,
+        start,
+        end,
+        &mut backend,
+    );
+}
+
 fn process_picked_range<E>(
     tree: &mut MctsTree,
     root_history: &PositionHistory,
@@ -419,7 +629,7 @@ fn process_picked_range<E>(
     iteration: &mut SearchIteration,
     start: usize,
     end: usize,
-    backend: &mut Option<&mut BackendComputation<'_, E>>,
+    backend: &mut ProcessingBackend<'_, E>,
 ) where
     E: super::PolicyValueEval,
 {
@@ -434,49 +644,18 @@ fn process_picked_range<E>(
                 if let Some(task) = extend_node(tree, root_history, config, pending) {
                     pending.nn_queried = true;
                     pending.task = Some(Arc::clone(&task));
-                    if let Some(backend) = backend.as_mut() {
-                        pending.is_cache_hit = backend.add_input(&task);
-                    }
+                    pending.is_cache_hit = backend.add_input(&task);
                 }
             }
             _ => {}
         }
 
         if config.out_of_order_eval && pending.can_eval_out_of_order(tree) {
-            if let Some(backend) = backend.as_mut() {
-                fetch_single_node(tree, backend.eval_mut(), config, root_id, pending);
-            } else {
-                seed_terminal_eval(pending);
-            }
+            backend.with_eval_mut(|eval| {
+                fetch_single_node(tree, eval, config, root_id, pending);
+            });
             pending.ooo_completed = true;
         }
-    }
-}
-
-fn seed_terminal_eval(pending: &mut PendingNode) {
-    if pending.eval.is_some() {
-        return;
-    }
-    match pending.kind {
-        PendingKind::ExistingTerminal { wl, d, m, .. } => {
-            pending.eval = Some(PolicyValueOutput {
-                wl,
-                d,
-                m,
-                value: wl,
-                priors: Vec::new(),
-            });
-        }
-        PendingKind::NewTerminal { wl, d, m, .. } => {
-            pending.eval = Some(PolicyValueOutput {
-                wl,
-                d,
-                m,
-                value: wl,
-                priors: Vec::new(),
-            });
-        }
-        _ => {}
     }
 }
 
@@ -1568,7 +1747,44 @@ pub(crate) fn maybe_prefetch_into_cache<E>(
     root_id: MctsNodeId,
     root_history: &PositionHistory,
     config: MctsConfig,
-    backend: &mut BackendComputation<'_, E>,
+    backend: &mut BackendComputation<E>,
+    stop: bool,
+) where
+    E: PolicyValueEval,
+{
+    if stop {
+        return;
+    }
+    let used = backend.used_batch_size();
+    if used == 0 || used >= config.max_prefetch as usize {
+        return;
+    }
+    let budget = config.max_prefetch as usize - used;
+    if budget == 0 {
+        return;
+    }
+    let positions = Vec::new();
+    let node_path = vec![root_id];
+    let _ = prefetch_into_cache_local(
+        tree,
+        root_id,
+        root_history,
+        &positions,
+        &node_path,
+        config,
+        backend,
+        budget,
+        false,
+        stop,
+    );
+}
+
+pub(crate) fn maybe_prefetch_processing_backend<E>(
+    tree: &MctsTree,
+    root_id: MctsNodeId,
+    root_history: &PositionHistory,
+    config: MctsConfig,
+    backend: &mut ProcessingBackend<'_, E>,
     stop: bool,
 ) where
     E: PolicyValueEval,
@@ -1600,20 +1816,66 @@ pub(crate) fn maybe_prefetch_into_cache<E>(
     );
 }
 
-fn prefetch_into_cache<E>(
+trait PrefetchBackend<E: PolicyValueEval> {
+    fn add_prefetch_input(&mut self, task: &Arc<PolicyValueTask>) -> bool;
+}
+
+impl<E: PolicyValueEval> PrefetchBackend<E> for BackendComputation<E> {
+    fn add_prefetch_input(&mut self, task: &Arc<PolicyValueTask>) -> bool {
+        BackendComputation::add_prefetch_input(self, task)
+    }
+}
+
+impl<'b, E: PolicyValueEval> PrefetchBackend<E> for ProcessingBackend<'b, E> {
+    fn add_prefetch_input(&mut self, task: &Arc<PolicyValueTask>) -> bool {
+        ProcessingBackend::add_prefetch_input(self, task)
+    }
+}
+
+fn prefetch_into_cache_local<E>(
     tree: &MctsTree,
     node_id: MctsNodeId,
     root_history: &PositionHistory,
     path_positions: &[Position],
     path_nodes: &[MctsNodeId],
     config: MctsConfig,
-    backend: &mut BackendComputation<'_, E>,
+    backend: &mut BackendComputation<E>,
+    budget: usize,
+    is_odd_depth: bool,
+    stop: bool,
+) -> usize
+where
+    E: PolicyValueEval,
+{
+    prefetch_into_cache(
+        tree,
+        node_id,
+        root_history,
+        path_positions,
+        path_nodes,
+        config,
+        backend,
+        budget,
+        is_odd_depth,
+        stop,
+    )
+}
+
+fn prefetch_into_cache<E, B>(
+    tree: &MctsTree,
+    node_id: MctsNodeId,
+    root_history: &PositionHistory,
+    path_positions: &[Position],
+    path_nodes: &[MctsNodeId],
+    config: MctsConfig,
+    backend: &mut B,
     mut budget: usize,
     is_odd_depth: bool,
     stop: bool,
 ) -> usize
 where
     E: PolicyValueEval,
+    B: PrefetchBackend<E>,
 {
     if budget == 0 || stop {
         return 0;
@@ -1721,15 +1983,16 @@ where
     spent
 }
 
-fn prefetch_leaf<E>(
+fn prefetch_leaf<E, B>(
     root_history: &PositionHistory,
     path_positions: &[Position],
-    backend: &mut BackendComputation<'_, E>,
+    backend: &mut B,
     budget: usize,
     stop: bool,
 ) -> usize
 where
     E: PolicyValueEval,
+    B: PrefetchBackend<E>,
 {
     if budget == 0 || stop {
         return 0;
@@ -1758,8 +2021,6 @@ where
         0
     }
 }
-
-// --- lc0 PickNodesToExtend (was pick.rs) ---
 
 const MAX_VTP_EDGES: usize = 256;
 

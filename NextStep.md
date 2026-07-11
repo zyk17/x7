@@ -39,21 +39,20 @@
 - **未做**：`PerPVCounters`（每条线独立 `nodes`）
 - 参考：`lc0 search.cc:261-373,727-824`；`uciloop.cc:305-329`
 
-### P4.2 并发对齐 lc0 — 未完成
-
-已审计、部分主路径一致，但 **整体不能标完成**：
+### P4.2 并发对齐 lc0 — 进行中
 
 | 项 | 状态 | lc0 参考 | 本仓库 |
 |----|------|----------|--------|
-| Watchdog + N workers | 一致 | `search.cc:896-922` | `search.rs::run_parallel_with_progress` |
-| `Threads=0` → backend suggested | 一致 | backend attrs | `policy_onnx.rs::resolved_search_threads` |
-| gather backend idle 早退 | 一致 | `search.cc:1319-1331` | `worker.rs::should_break_gather_for_thread_idling` |
-| `backend_waiting` 计数 | 一致 | `search.cc:1328-1329` | `search.rs:507-527` |
-| collision / OOO backup | 主路径一致 | `search.cc:1392-1421,2217-2373` | `worker.rs::apply_out_of_order_backups`, `do_backup_update` |
-| **Task workers** picking/processing | **缺失** | `search.cc:1353-1384` | config 有 `minimum_work_*` 默认值，**未接 task 队列** |
-| `go mate` stop 口径 | **未完全对齐** | iteration `mate_depth` | 看当前 best PV 的 `best_mate`（`search.rs` / `worker.rs::budget_exhausted`） |
+| processing 区间拆分 | **已接线** | `search.cc:1353-1378` | `task_workers.rs::plan_processing_task_ranges` + `worker.rs::run_process_picked_phase` |
+| `TaskWorkersPerSearchWorker` 解析 | **已接线** | `search.h:216-226` | `task_workers.rs::resolve_task_workers` |
+| **Task worker 线程池** | **已接入（processing 子集）** | `search.cc:1091-1161,1382-1383` | `task_workers.rs::SearchWorkerTaskPool` + `RunTasks` / `WaitForTasks` |
+| picking 阶段 task 拆分 | **未接入** | `search.cc:1507+` | 尚无 `PickNodesToExtendTask` 并行 picking |
 
-**下一批搜索抄写应从这里继续**，而不是回到模型。
+**当前 processing task-workers 约束（勿误判为 lc0 SearchWorker 已对齐）：**
+
+- 仅并行 **`ProcessPickedTask`**（processing 区间）；**未**并行 **`PickNodesToExtendTask`**（picking 仍单线程顺序走）。
+- 并行 processing 仍持 **`Arc<Mutex<MctsTree>>` 大锁** 做树更新，不是 lc0 完整 task-worker 树访问模型。
+- 共享 `computation_` 等价物 `SharedBackendComputation` 在 **`compute_blocking()` 后清空 slots**（一轮一 computation；对照 `search.cc:1255-1263` `InitializeIteration` reset）。
 
 ### P4.3 回归护栏 — 部分完成
 
@@ -70,8 +69,8 @@
 
 ## 下一步（固定顺序）
 
-1. **继续 P4.2**：task workers picking/processing（`search.cc:1353-1384`）
-2. **`go mate`** 改为 lc0 `mate_depth` 迭代 stopper 口径（`search.cc` PopulateCommonIterationStats / MateStopper）
+1. **picking 阶段 task 拆分**：`PickNodesToExtendTask`（`search.cc:1507+`）
+2. **`go mate`** 改为 lc0 `mate_depth` 迭代 stopper 口径
 3. 并发收口后再扩 P4.3 多线程回归
 4. 模型训练保持可用即可，非当前搜索主线
 

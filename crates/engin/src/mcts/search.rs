@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use crate::history::PositionHistory;
 
-use super::backend::BackendComputation;
+use super::backend::{BackendComputation, SharedBackendComputation};
+use super::task_workers::TaskWorkerGatherCtx;
 use super::worker::{
     acquire_searcher_slot, budget_exhausted, do_backup_update, ensure_tree_quiescent,
-    fetch_minibatch_results, gather_has_work, gather_minibatch, init_pending_searchers,
-    maybe_prefetch_into_cache, progress_from_tree, release_searcher_slot, result_from_tree,
-    total_in_flight_in_tree, worker_batch_limit, GatherParams, SelectionScratch, SharedCollisions,
-    SharedMctsTree,
+    fetch_minibatch_results, gather_has_work, gather_minibatch_with_local, gather_minibatch_with_shared,
+    init_pending_searchers, maybe_prefetch_into_cache, maybe_prefetch_processing_backend, progress_from_tree,
+    release_searcher_slot, result_from_tree,
+    total_in_flight_in_tree, worker_batch_limit, GatherParams, ProcessingBackend, SelectionScratch,
+    SharedCollisions, SharedMctsTree,
 };
 use super::{
     MctsBudget, MctsConfig, MctsNodeId, MctsSearchProgress, MctsSearchResult, MctsTree, OnnxPolicyValueEval,
@@ -241,21 +243,23 @@ where
             .unwrap_or(0),
         thread_count: 1,
         backend_waiting: 0,
+        task_workers: 0,
+        onnx_task_ctx: None,
     };
 
-    let mut iteration = gather_minibatch(
+    let (mut iteration, used_batch) = gather_minibatch_with_local(
         session.tree,
         &session.root_history,
         &gather_params,
         &mut session.selection_scratch,
-        Some(&mut backend),
+        &mut backend,
         stop,
     );
     // 1 gather (search.cc:1303-1439)
     if iteration.pending.is_empty() {
         return Ok(false);
     }
-    if !gather_has_work(&iteration, backend.used_batch_size()) {
+    if !gather_has_work(&iteration, used_batch) {
         super::worker::cancel_minibatch(session.tree, iteration);
         shared_collisions.cancel_all(session.tree);
         return Ok(false);
@@ -330,6 +334,7 @@ where
     let shared_policy = evaluator.policy.clone();
     let backend_attrs = shared_policy.as_ref().map(|pool| pool.backend_attributes());
     let batch_limit = worker_batch_limit(config, backend_attrs);
+    let task_workers = super::task_workers::resolve_task_workers(config, threads, backend_attrs.as_ref());
     let shared_cache = evaluator.shared_cache();
     let stop = budget
         .stop
@@ -410,11 +415,23 @@ where
                 .as_ref()
                 .and_then(|sessions| sessions.get(worker_idx).cloned());
             scope.spawn(move || {
-                let mut eval = OnnxPolicyValueEval::with_dedicated_session(
+                let eval = OnnxPolicyValueEval::with_dedicated_session(
                     shared_policy,
                     worker_session,
                     shared_cache,
                 );
+                let eval_shared = Arc::new(Mutex::new(eval));
+                let backend_shared =
+                    Arc::new(SharedBackendComputation::new(Arc::clone(&eval_shared)));
+                let task_ctx = if task_workers > 0 {
+                    Some(Arc::new(TaskWorkerGatherCtx::new(
+                        task_workers,
+                        Arc::clone(&shared_tree),
+                        Arc::clone(&backend_shared),
+                    )))
+                } else {
+                    None
+                };
                 let mut retry_without_playout = 0u32;
                 let mut selection_scratch = SelectionScratch::default();
                 loop {
@@ -426,7 +443,6 @@ where
                         acquire_searcher_slot(pending, config.search_spin_backoff);
                     }
 
-                let mut backend = BackendComputation::new(&mut eval);
                 let iteration = {
                     let mut tree_guard = shared_tree.lock().unwrap_or_else(|e| e.into_inner());
                     if budget_exhausted(
@@ -451,24 +467,26 @@ where
                             root_visits: tree_guard.get(root_id).map(|root| root.visits).unwrap_or(0),
                             thread_count: threads,
                             backend_waiting: backend_waiting.load(Ordering::Relaxed),
+                            task_workers,
+                            onnx_task_ctx: task_ctx.clone(),
                         };
-                        let iteration = gather_minibatch(
+                        let (iteration, used_batch) = gather_minibatch_with_shared(
                             &mut tree_guard,
                             &root_history,
                             &gather_params,
                             &mut selection_scratch,
-                            Some(&mut backend),
+                            &backend_shared,
                             stop.load(Ordering::SeqCst),
                         );
                         if iteration.pending.is_empty() {
                             None
-                        } else if !gather_has_work(&iteration, backend.used_batch_size()) {
+                        } else if !gather_has_work(&iteration, used_batch) {
                             super::worker::cancel_minibatch(&mut tree_guard, iteration);
                             shared_collisions.cancel_all(&mut tree_guard);
                             None
                         } else {
                             shared_collisions.collect(&iteration.pending);
-                            Some(iteration)
+                            Some((iteration, used_batch))
                         }
                     }
                 };
@@ -477,7 +495,7 @@ where
                     release_searcher_slot(pending);
                 }
 
-                let Some(mut iteration) = iteration else {
+                let Some((mut iteration, used_batch)) = iteration else {
                     match apply_empty_iteration(&budget, config, stats.as_ref(), &mut retry_without_playout) {
                         EmptyIterationAction::Break => break,
                         EmptyIterationAction::Continue => continue,
@@ -495,19 +513,21 @@ where
 
                 {
                     let tree_guard = shared_tree.lock().unwrap_or_else(|e| e.into_inner());
-                    maybe_prefetch_into_cache(
+                    let mut processing = ProcessingBackend::Shared(backend_shared.as_ref());
+                    maybe_prefetch_processing_backend(
                         &*tree_guard,
                         root_id,
                         &root_history,
                         config,
-                        &mut backend,
+                        &mut processing,
                         stop.load(Ordering::SeqCst),
                     );
                 }
                 backend_waiting.fetch_add(1, Ordering::Relaxed);
                 // lc0 `backend_waiting_counter_` during NN compute (search.cc:1328-1329)
-                let outputs = if backend.used_batch_size() > 0 {
-                    match backend.compute_blocking() {
+                let mut compute_backend = ProcessingBackend::Shared(backend_shared.as_ref());
+                let outputs = if used_batch > 0 || compute_backend.used_batch_size() > 0 {
+                    match compute_backend.compute_blocking() {
                         Ok(outputs) => {
                             stats.mark_first_batch();
                             outputs
@@ -528,14 +548,16 @@ where
                 backend_waiting.fetch_sub(1, Ordering::Relaxed);
 
                 let mut tree_guard = shared_tree.lock().unwrap_or_else(|e| e.into_inner());
+                let mut eval_guard = eval_shared.lock().unwrap_or_else(|e| e.into_inner());
                 fetch_minibatch_results(
                     &mut tree_guard,
-                    &mut eval,
+                    &mut *eval_guard,
                     &mut iteration,
                     &outputs,
                     config,
                     root_id,
                 );
+                drop(eval_guard);
                 if !stats.try_commit_minibatch(&budget, &iteration) {
                     super::worker::cancel_minibatch(&mut tree_guard, iteration);
                     shared_collisions.cancel_all(&mut tree_guard);

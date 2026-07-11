@@ -10,6 +10,7 @@ mod node;
 mod policy_value;
 mod search;
 mod stoppers;
+mod task_workers;
 mod tree;
 mod worker;
 
