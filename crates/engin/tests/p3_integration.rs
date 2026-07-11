@@ -52,6 +52,7 @@ fn mcts_returns_legal_bestmove_without_onnx() {
                 max_playouts: Some(64),
                 max_nodes: None,
                 max_depth: None,
+                max_mate: None,
                 deadline: None,
                 stop: None,
             },
@@ -80,6 +81,7 @@ fn mcts_bestmove_resolves_check_without_onnx() {
                 max_playouts: Some(32),
                 max_nodes: None,
                 max_depth: None,
+                max_mate: None,
                 deadline: None,
                 stop: None,
             },
@@ -101,6 +103,7 @@ fn bench_json_has_expected_keys() {
             max_playouts: Some(32),
             max_nodes: None,
             max_depth: None,
+            max_mate: None,
             deadline: None,
             stop: None,
         },
@@ -114,6 +117,11 @@ fn bench_json_has_expected_keys() {
     assert!(v.get("bench_config").is_some());
     assert!(v.get("mcts_config").is_some());
     assert!(v.get("playouts").is_some());
+    assert!(v.get("nodes").is_some());
+    assert!(v.get("nps").is_some());
+    assert!(v.pointer("/mcts_config/minibatch_size").is_some());
+    assert!(v.pointer("/mcts_config/multi_pv").is_some());
+    assert!(v.get("eval_cache").is_some());
     assert!(v.get("root_visits").is_some());
     assert!(v.get("best_value").is_some());
 }

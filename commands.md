@@ -187,11 +187,21 @@ cargo run --release -p engin --bin onnx_eval -- `
 
 ## 12. 引擎 bench
 
+bench CLI（与 [`main.rs`](crates/engin/src/main.rs) 一致）：
+
+- `--playouts N` — playout 上限
+- `--nodes N` — UCI nodes 口径上限（含复用树 initial_visits）
+- `--movetime MS` — 思考时间上限（毫秒）
+- `--cpuct F` — PUCT 强度
+- `--minibatch-size N` — gather batch（`0` = backend auto）
+- `--threads N` — 搜索线程（`0` = auto）
+- `--onnx PATH` / `--require-onnx` / `--fen FEN` / `--data-dir PATH`
+
 ```powershell
 cargo run --release -p engin -- --bench --playouts 64 --onnx data\x7.onnx --require-onnx
 ```
 
-固定搜索对照建议直接这样跑：
+固定 batch 对照：
 
 `MinibatchSize=16`
 
@@ -226,7 +236,7 @@ cargo run --release -p engin -- --bench `
 说明：
 
 - `nps` 这里按 `playouts / sec`（仅 completed playout，不含 collision / 未 backup 的 reservation）
-- UCI `nodes` 报告 `本轮 playouts + 复用树 initial_visits`（px0 `VisitsStopper` 口径）
+- UCI `nodes` 报告 `本轮 playouts + 复用树 initial_visits`（lc0 `VisitsStopper` 口径）
 - `go nodes N`：总 visits（含复用树）达到 N 时停止
 - `minibatch_size` 会写进输出 JSON，便于后续对照
 - `eval_cache.hits/misses` 使用 lookup 口径（可直接比较）
@@ -286,14 +296,32 @@ cargo run --release -p engin
 - `MinibatchSize`
 - `NNCacheSize`
 - `Threads`
+- `MultiPV`
 
 说明：
 
-- 不再兼容 `Playouts / Visits / MctsCpuct / MctsFpuReduction / MctsBatchCap / MctsWorkers`
-- 当前默认 `Threads=0`
-- 当前默认 `MinibatchSize=0`
+- 不再兼容旧别名：`Playouts / Visits / MctsCpuct / MctsFpuReduction / MctsBatchCap / MctsWorkers / SearchBatchSize`
+- 当前默认 `Threads=0`、`MinibatchSize=0`
 - `Threads=0` 表示按 backend attrs 自动推导
 - `MinibatchSize=0` 表示按 backend `recommended_batch_size`
+- `MultiPV=1` 为默认；`>1` 时每条 `info` 带 `multipv N`，共用 `depth/seldepth/time/nodes/nps`
+- 当前不含 lc0 `PerPVCounters`（每条线独立 `nodes`）；默认与 lc0 `PerPVCounters=false` 一致
+
+`setoption` 示例：
+
+```powershell
+@'
+uci
+setoption name CPuct value 1.745
+setoption name Threads value 4
+setoption name MultiPV value 2
+setoption name PolicyFile value C:/projects/77xiangqi_engine/data/x7.onnx
+isready
+position startpos
+go nodes 64
+quit
+'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+```
 
 ## 14. 质量检查
 

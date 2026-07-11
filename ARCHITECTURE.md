@@ -63,15 +63,15 @@
 - 当前树统计正式包含：
   `visits + in_flight`、`collision`、`multivisit`
 - 不再扩 Alpha-Beta 主线
-- 当前明确先不做：
-  `MultiPV`、复杂 ONNX backend / evaluator 池
-- 对外 UCI 选项对齐 lc0 classic（仅日常项）：
-  `PolicyFile / MctsPlayouts / CPuct / FpuValue / MinibatchSize / NNCacheSize / Threads`
+- 对外 UCI 选项对齐 lc0 classic（日常项）：
+  `PolicyFile / MctsPlayouts / CPuct / FpuValue / MinibatchSize / NNCacheSize / Threads / MultiPV`
+- **`MultiPV` 范围**：仅主选项 + 默认 `SendUciInfo` 形态（多条 `multipv`、共用总 `nodes`）；**不含** `PerPVCounters`
 - 搜索流水线已内化 lc0 classic 能力（不扩 UCI）：
   `OutOfOrderEval`、`MaybePrefetchIntoCache`、`FetchMinibatchResults`/`DoBackupUpdate` 拆分、
   独立 watchdog 进度线程、`NpsLimit`（默认关）
 - 当前尚未完全对齐 lc0 的部分：
-  `time manager`、`ponder/searchmoves/mate`、更细的 task workers / node-lock 并行语义
+  **task workers** picking/processing、**`go mate`**（当前为 best PV `best_mate`，非 iteration `mate_depth`）、
+  更细的 node-lock 并行语义
 
 ### `crates/xiangqi_dataset`
 
@@ -214,12 +214,25 @@
 
 ### `engin` 现在还差什么
 
-按优先级看，剩余差距主要是：
+UCI / budget / stopper / MultiPV 主路径已接通，但 **搜索基建未完全对齐 lc0**。
 
-1. `go wtime / btime / winc / binc / movestogo` 的真正 time manager
-2. `ponder / searchmoves / mate` 的完整 UCI 生命周期
-3. 比当前最小 shared-tree 更接近 lc0 的 task workers / node-lock 并行细节
-4. 更系统的 integration / bench 回归护栏
+按当前优先级，剩余差距主要是：
+
+1. **Task workers** picking/processing（`search.cc:1353-1384`）— config 有默认值，代码未接线
+2. **`go mate`** stopper：当前看 best PV 的 `best_mate`；lc0 用 iteration `mate_depth`
+3. 多线程路径 integration / bench 回归（task workers 引入后）
+4. 搜索吞吐、稳定性、树形行为继续收口
+
+**已完成、勿误判为“全对齐”：**
+
+- P4.1 `MultiPV`（不含 `PerPVCounters`）
+- 最小 shared-tree + watchdog + gather idle + collision/OOO 主路径
+
+这里的关键判断是：
+
+- 短期不把重点放在模型
+- 中残局 value 问题不作为当前主攻方向
+- 当前最值得继续投入的是搜索
 
 ## 7. 删除原则
 

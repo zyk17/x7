@@ -9,6 +9,7 @@ mod engine;
 mod node;
 mod policy_value;
 mod search;
+mod stoppers;
 mod tree;
 mod worker;
 
@@ -17,7 +18,8 @@ use std::sync::RwLock;
 use std::time::Instant;
 
 pub use config::{MctsBudget, MctsConfig};
-pub use engine::{MctsEngine, MctsMoveStat, MctsSearchProgress, MctsSearchResult};
+pub use stoppers::{allocate_think_time_ms, UciTimeParams, LC0_DEFAULT_MOVE_OVERHEAD_MS};
+pub use engine::{MctsEngine, MctsMoveStat, MctsSearchProgress, MctsSearchResult, PvLineInfo};
 pub use node::{EdgeStats, MctsNode, MctsNodeId, TerminalKind};
 pub use policy_value::{
     OnnxPolicyValueEval, PolicyValueEval, PolicyValueInput, PolicyValueOutput, PolicyValueTask, SharedPolicy,

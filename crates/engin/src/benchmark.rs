@@ -117,6 +117,7 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                 session.budget.clone(),
                 session.threads,
                 std::time::Duration::ZERO,
+                None,
                 |_| {},
             )
             .map_err(|e| e.to_string())
@@ -165,6 +166,7 @@ pub fn bench_one_json(fen: &str, session: &BenchSessionParams<'_>) -> serde_json
                     "root_temperature": session.config.root_temperature,
                     "minibatch_size": session.config.minibatch_size,
                     "nn_cache_size": session.config.nn_cache_size,
+                    "multi_pv": session.config.multi_pv,
                 },
                 "budget": {
                     "max_playouts": session.budget.max_playouts,
@@ -220,6 +222,7 @@ mod tests {
                 max_playouts: Some(24),
                 max_nodes: None,
                 max_depth: None,
+                max_mate: None,
                 deadline: None,
                 stop: None,
             },

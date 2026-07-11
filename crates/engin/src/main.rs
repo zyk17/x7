@@ -41,6 +41,7 @@ fn parse_bench_cli(rest: &[String]) -> BenchCli {
         max_playouts: Some(256),
         max_nodes: None,
         max_depth: None,
+        max_mate: None,
         deadline: None,
         stop: None,
     };

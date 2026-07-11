@@ -57,29 +57,33 @@
 - `MinibatchSize`：gather batch；`0` = backend `recommended_batch_size`（ONNX CPU/CUDA 默认 `256`，DML 默认 `64`；上限 `1024`）
 - `NNCacheSize`：NN 评估 LRU 缓存容量（默认 `200000`）
 - `Threads`：搜索线程；`0` = `suggested_num_search_threads + !runs_on_cpu`
+- `MultiPV`：UCI 主变线条数（default `1`，max `500`）
 
 说明：
 
+- **`MultiPV` 当前只覆盖 lc0 主选项与 `SendUciInfo` 默认输出形态**；不含 `PerPVCounters`（每条线独立 `nodes`）
+- `MultiPV>1` 时，每条 `info` 共用总 `nodes`（与 lc0 默认、`PerPVCounters=false` 一致）
 - 其余 lc0 搜索参数已内化，不再以 `Mcts*` 前缀公开
 - 内化能力含：OOO eval、NN prefetch、7 步搜索流水线、独立 watchdog
 - `Threads=0` 时 GPU backend 通常解析为 `2`，CPU 为物理核数
 - `MinibatchSize=0` 时使用 backend `recommended_batch_size`（上限 `1024`）
 
-## 当前与 lc0 仍有差距的点
+## 当前阶段重点
 
-当前主线已经对齐到：
+当前短期重点不是继续折腾模型。
 
-- `position / go / stop / ucinewgame`
-- `nodes / nps / depth / seldepth / pv`
-- `Threads=0 / MinibatchSize=0`
-- `shared-tree + batched eval + subtree reuse`
+当前判断是：
 
-但还没有完全抄到位的主要是：
+- policy 已经可用
+- 中残局 value 问题短期内不会靠小修小补立刻解决
+- 现阶段最值得投入的是继续把搜索做对、做稳、做深
 
-1. 完整 `go wtime/btime/winc/binc/movestogo` time manager
-2. `ponder / searchmoves / mate` 的完整 UCI 语义
-3. 更接近 lc0 的 task workers / node-lock 并行细节
-4. 更完整的 engine 集成测试与长时回归基线
+因此当前主线优先级是：
+
+1. 继续收紧搜索语义
+2. 继续提高搜索稳定性与并行细节
+3. 继续补搜索侧回归护栏
+4. 模型训练保持可用即可，不作为当前主攻方向
 
 ## 数据路线
 

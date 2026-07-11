@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use xiangqi_core::{uci_to_move, Position, START_FEN};
+use xiangqi_core::{uci_to_move, Color, Move, Position, START_FEN};
 
 use crate::benchmark::resolve_data_file;
 use crate::history::PositionHistory;
 use crate::mcts::{
-    MctsBudget, MctsConfig, MctsEngine, MctsSearchProgress, MctsTree, OnnxPolicyValueEval, SharedPolicy,
-    SearchStats,
+    allocate_think_time_ms, MctsBudget, MctsConfig, MctsEngine, MctsSearchProgress, MctsTree,
+    OnnxPolicyValueEval, SharedPolicy, SearchStats, UciTimeParams, LC0_DEFAULT_MOVE_OVERHEAD_MS,
 };
 use crate::policy_onnx::{resolved_search_threads, PolicySessionPool};
 
@@ -37,6 +37,7 @@ struct UciInfoView<'a> {
     elapsed_ms: u64,
     nps_elapsed_ms: u64,
     pv: &'a [xiangqi_core::Move],
+    multipv: Option<u32>,
 }
 
 fn uci_info_line(view: UciInfoView<'_>) -> String {
@@ -50,6 +51,7 @@ fn uci_info_line(view: UciInfoView<'_>) -> String {
         elapsed_ms,
         nps_elapsed_ms,
         pv,
+        multipv,
     } = view;
     let nps = SearchStats::playouts_per_second(playouts, nps_elapsed_ms);
     let score = if let Some(mate) = best_mate {
@@ -63,6 +65,9 @@ fn uci_info_line(view: UciInfoView<'_>) -> String {
     let mut line = format!(
         "info depth {depth} seldepth {seldepth} time {elapsed_ms} nodes {nodes} {score} nps {nps}"
     );
+    if let Some(n) = multipv {
+        line.push_str(&format!(" multipv {n}"));
+    }
     if !pv.is_empty() {
         line.push_str(" pv ");
         line.push_str(
@@ -75,22 +80,42 @@ fn uci_info_line(view: UciInfoView<'_>) -> String {
     line
 }
 
-
 fn emit_mcts_progress(output: &Arc<dyn Fn(&str) + Send + Sync>, progress: &MctsSearchProgress, elapsed_ms: u64) {
     if progress.playouts == 0 {
         return;
     }
-    output(&uci_info_line(UciInfoView {
-        best_value: progress.best_value,
-        best_mate: progress.best_mate,
-        depth: progress.depth,
-        seldepth: progress.seldepth,
-        playouts: progress.playouts,
-        nodes: progress.nodes,
-        elapsed_ms,
-        nps_elapsed_ms: progress.nps_elapsed_ms,
-        pv: &progress.pv,
-    }));
+    let common = |best_value: f32, best_mate: Option<i32>, pv: &[Move], multipv: Option<u32>| {
+        uci_info_line(UciInfoView {
+            best_value,
+            best_mate,
+            depth: progress.depth,
+            seldepth: progress.seldepth,
+            playouts: progress.playouts,
+            nodes: progress.nodes,
+            elapsed_ms,
+            nps_elapsed_ms: progress.nps_elapsed_ms,
+            pv,
+            multipv,
+        })
+    };
+
+    if progress.multi_pv > 1 && !progress.pv_lines.is_empty() {
+        for line in &progress.pv_lines {
+            output(&common(
+                line.best_value,
+                line.best_mate,
+                &line.pv,
+                Some(line.multipv),
+            ));
+        }
+    } else {
+        output(&common(
+            progress.best_value,
+            progress.best_mate,
+            &progress.pv,
+            None,
+        ));
+    }
     if progress.retry_without_playout > 0 {
         output(&format!(
             "info string retry_without_playout {}",
@@ -163,11 +188,9 @@ fn parse_go(args: &str) -> GoParseOutcome {
             }
             "ponder" => {
                 params.ponder = true;
-                warnings.push("unsupported go option: ponder".into());
                 i += 1;
             }
             "searchmoves" => {
-                warnings.push("unsupported go option: searchmoves".into());
                 i += 1;
                 while i < tokens.len() && !is_go_keyword(tokens[i]) {
                     params.searchmoves.push(tokens[i].to_string());
@@ -175,7 +198,6 @@ fn parse_go(args: &str) -> GoParseOutcome {
                 }
             }
             "wtime" | "btime" | "winc" | "binc" | "movestogo" | "mate" => {
-                warnings.push(format!("unsupported go option: {tok}"));
                 i += 1;
                 if i < tokens.len() && !is_go_keyword(tokens[i]) {
                     match tok {
@@ -233,23 +255,41 @@ fn parse_go(args: &str) -> GoParseOutcome {
     GoParseOutcome { params, warnings }
 }
 
-fn params_has_supported_limit(params: &GoParams) -> bool {
-    params.infinite
-        || params.movetime.is_some()
-        || params.nodes.is_some()
-        || params.depth.is_some()
+fn time_params_from_go(params: &GoParams) -> UciTimeParams {
+    UciTimeParams {
+        infinite: params.infinite,
+        ponder: params.ponder,
+        movetime: params.movetime,
+        wtime: params.wtime,
+        btime: params.btime,
+        winc: params.winc,
+        binc: params.binc,
+        movestogo: params.movestogo,
+    }
 }
 
-fn params_has_unsupported_only(params: &GoParams) -> bool {
-    !params_has_supported_limit(params)
-        && (params.ponder
-            || params.mate.is_some()
-            || params.wtime.is_some()
-            || params.btime.is_some()
-            || params.winc.is_some()
-            || params.binc.is_some()
-            || params.movestogo.is_some()
-            || !params.searchmoves.is_empty())
+fn history_for_go(history: &PositionHistory, ponder: bool) -> PositionHistory {
+    if !ponder || history.game_moves().is_empty() {
+        return history.clone_for_search();
+    }
+    let mut h = PositionHistory::from_position(history.game_start().clone_for_search());
+    for &mv in history.game_moves().iter().take(history.game_moves().len().saturating_sub(1)) {
+        h.push_move(mv);
+    }
+    h
+}
+
+fn resolve_searchmoves(history: &PositionHistory, uci_moves: &[String]) -> Result<Vec<Move>, String> {
+    if uci_moves.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(uci_moves.len());
+    for uci in uci_moves {
+        let mv = uci_to_move(history.current(), uci)
+            .ok_or_else(|| format!("非法 searchmove: {uci}"))?;
+        out.push(mv);
+    }
+    Ok(out)
 }
 
 fn parse_setoption(line: &str) -> Option<(String, Option<String>)> {
@@ -346,6 +386,7 @@ struct Engine {
     default_playouts: u32,
     search_stop: Option<Arc<AtomicBool>>,
     search_join: Option<JoinHandle<()>>,
+    last_go: Option<GoParseOutcome>,
     output: EngineOutput,
 }
 
@@ -373,6 +414,7 @@ impl Engine {
             default_playouts: 256,
             search_stop: None,
             search_join: None,
+            last_go: None,
             output,
         }
     }
@@ -472,6 +514,7 @@ impl Engine {
         self.emit("option name MinibatchSize type spin default 0 min 0 max 1024");
         self.emit("option name NNCacheSize type spin default 200000 min 0 max 10000000");
         self.emit("option name Threads type spin default 0 min 0 max 128");
+        self.emit("option name MultiPV type spin default 1 min 1 max 500");
         self.emit(&format!(
             "info string policy {}",
             if self.policy.is_some() { "loaded" } else { "not_loaded" }
@@ -541,6 +584,13 @@ impl Engine {
                     }
                 }
             }
+            "MultiPV" => {
+                if let Some(ref v) = value {
+                    if let Ok(n) = v.trim().parse::<u32>() {
+                        self.config.multi_pv = n.clamp(1, 500);
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -548,27 +598,31 @@ impl Engine {
 
     /// lc0 `PopulateCommonUciStoppers`（stoppers/common.cc:118-165）：多个 stopper 并行，先触发先停。
     fn budget_from_go(&self, params: &GoParams) -> Result<MctsBudget, String> {
-        if params_has_unsupported_only(params) {
-            return Err(
-                "go 未含可执行的搜索限制（wtime/btime/winc/binc/movestogo/mate/ponder/searchmoves 尚未实现）"
-                    .into(),
-            );
-        }
-
-        // lc0: movetime stopper 在 infinite/ponder/mate 模式下不启用（common.cc:123,148）。
-        let skip_movetime = params.infinite || params.ponder || params.mate.is_some();
+        // lc0: movetime / clock stopper 在 infinite/ponder/mate 模式下不启用（common.cc:123,148）。
+        let skip_timed_stopper = params.infinite || params.ponder || params.mate.is_some();
 
         let mut budget = MctsBudget {
             max_playouts: None,
             max_nodes: None,
             max_depth: None,
+            max_mate: None,
             deadline: None,
             stop: None,
         };
 
         if let Some(ms) = params.movetime {
-            if !skip_movetime {
-                budget.deadline = Some(Instant::now() + Duration::from_millis(ms));
+            if !skip_timed_stopper {
+                budget.deadline =
+                    Some(Instant::now() + Duration::from_millis(ms.saturating_sub(LC0_DEFAULT_MOVE_OVERHEAD_MS as u64)));
+            }
+        } else if !skip_timed_stopper {
+            let pos = self.history.current();
+            let is_black = pos.side_to_move == Color::Black;
+            let time_params = time_params_from_go(params);
+            if time_params.has_clock() {
+                if let Some(ms) = allocate_think_time_ms(&time_params, is_black, pos.game_ply) {
+                    budget.deadline = Some(Instant::now() + Duration::from_millis(ms));
+                }
             }
         }
 
@@ -581,7 +635,18 @@ impl Engine {
             budget.max_depth = Some(depth);
         }
 
-        if !params.infinite && !params_has_supported_limit(params) {
+        if let Some(mate) = params.mate {
+            budget.max_mate = Some(mate.max(1));
+        }
+
+        if !params.infinite
+            && !params.ponder
+            && budget.max_playouts.is_none()
+            && budget.max_nodes.is_none()
+            && budget.max_depth.is_none()
+            && budget.max_mate.is_none()
+            && budget.deadline.is_none()
+        {
             budget.max_playouts = Some(self.default_playouts.max(1));
         }
 
@@ -592,8 +657,23 @@ impl Engine {
         for warning in &outcome.warnings {
             self.emit(&format!("info string {warning}"));
         }
+        self.last_go = Some(outcome.clone());
 
-        let history = self.history.clone_for_search();
+        let searchmoves = match resolve_searchmoves(&self.history, &outcome.params.searchmoves) {
+            Ok(moves) => moves,
+            Err(err) => {
+                self.emit(&format!("info string {err}"));
+                self.emit("bestmove (none)");
+                return;
+            }
+        };
+        if !outcome.params.searchmoves.is_empty() && searchmoves.is_empty() {
+            self.emit("info string searchmoves 无合法着法");
+            self.emit("bestmove (none)");
+            return;
+        }
+
+        let history = history_for_go(&self.history, outcome.params.ponder);
         let mut budget = match self.budget_from_go(&outcome.params) {
             Ok(budget) => budget,
             Err(err) => {
@@ -620,47 +700,72 @@ impl Engine {
             let mut engine = search_engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.config = config;
 
+            let root_moves = if searchmoves.is_empty() {
+                None
+            } else {
+                Some(searchmoves.as_slice())
+            };
+
             let search_result = if threads > 1 {
                 engine.search_root_history_parallel_with_progress(
                     &history,
                     budget,
                     threads,
                     UCI_INFO_INTERVAL,
+                    root_moves,
                     |progress| {
                         let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                         emit_mcts_progress(&output, progress, elapsed_ms);
                     },
                 )
             } else {
-                engine.search_root_history_with_progress(&history, budget, UCI_INFO_INTERVAL, |progress| {
-                    let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                    emit_mcts_progress(&output, progress, elapsed_ms);
-                })
+                engine.search_root_history_with_progress(
+                    &history,
+                    budget,
+                    UCI_INFO_INTERVAL,
+                    root_moves,
+                    |progress| {
+                        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        emit_mcts_progress(&output, progress, elapsed_ms);
+                    },
+                )
             };
 
             match search_result {
                 Ok(result) => {
                     let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                    output(&uci_info_line(UciInfoView {
-                        best_value: result.best_value,
-                        best_mate: result.best_mate,
-                        depth: result.depth,
-                        seldepth: result.seldepth,
-                        playouts: result.playouts,
-                        nodes: result.nodes,
+                    emit_mcts_progress(
+                        &output,
+                        &MctsSearchProgress {
+                            best_move: result.best_move,
+                            pv: result.pv,
+                            pv_lines: result.pv_lines,
+                            multi_pv: result.multi_pv,
+                            playouts: result.playouts,
+                            root_visits: result.root_visits,
+                            nodes: result.nodes,
+                            tree_nodes: result.tree_nodes,
+                            depth: result.depth,
+                            seldepth: result.seldepth,
+                            root_value: result.root_value,
+                            best_value: result.best_value,
+                            best_mate: result.best_mate,
+                            nps_elapsed_ms: result.nps_elapsed_ms,
+                            retry_without_playout: result.retry_without_playout,
+                            moves: result.moves,
+                        },
                         elapsed_ms,
-                        nps_elapsed_ms: result.nps_elapsed_ms,
-                        pv: &result.pv,
-                    }));
-                    if result.retry_without_playout > 0 {
-                        output(&format!(
-                            "info string retry_without_playout {}",
-                            result.retry_without_playout
-                        ));
-                    }
+                    );
                     if let Some(best_move) = result.best_move {
                         let best_uci = xiangqi_core::move_to_uci(best_move);
-                        output(&format!("bestmove {best_uci}"));
+                        if let Some(pm) = engine.ponder_move_for(best_move) {
+                            output(&format!(
+                                "bestmove {best_uci} ponder {}",
+                                xiangqi_core::move_to_uci(pm)
+                            ));
+                        } else {
+                            output(&format!("bestmove {best_uci}"));
+                        }
                     } else {
                         output("bestmove (none)");
                     }
@@ -671,6 +776,19 @@ impl Engine {
                 }
             }
         }));
+    }
+
+    /// lc0 `Engine::PonderHit`（engine.cc:249-256）。
+    fn handle_ponderhit(&mut self) {
+        let Some(mut last) = self.last_go.clone() else {
+            return;
+        };
+        if !last.params.ponder {
+            return;
+        }
+        self.stop_and_join();
+        last.params.ponder = false;
+        self.spawn_go(last);
     }
 
     fn handle_line(&mut self, line: &str) -> bool {
@@ -684,6 +802,7 @@ impl Engine {
             "stop" => {
                 self.stop_and_join();
             }
+            "ponderhit" => self.handle_ponderhit(),
             "quit" => {
                 self.stop_and_join();
                 return false;
@@ -825,6 +944,7 @@ mod tests {
             elapsed_ms: 10,
             nps_elapsed_ms: 10,
             pv: &[],
+            multipv: None,
         });
         assert!(line.contains("depth 1"));
         assert!(!line.contains("depth 0"));
@@ -842,6 +962,7 @@ mod tests {
             elapsed_ms: 100,
             nps_elapsed_ms: 100,
             pv: &[],
+            multipv: None,
         });
         let depth_pos = line.find("depth ").expect("depth");
         let time_pos = line.find("time ").expect("time");
@@ -913,33 +1034,41 @@ mod tests {
     }
 
     #[test]
-    fn go_wtime_only_is_rejected() {
+    fn go_wtime_allocates_think_time() {
         let engine = Engine::new();
-        let err = engine
+        let budget = engine
             .budget_from_go(&parse_go("wtime 60000 btime 60000").params)
-            .expect_err("must reject unsupported-only go");
-        assert!(err.contains("未含可执行"));
+            .expect("wtime/btime should produce budget");
+        assert!(budget.deadline.is_some());
+        assert!(budget.max_playouts.is_none());
     }
 
     #[test]
-    fn go_wtime_with_nodes_warns_and_applies_nodes() {
-        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = {
-            let lines = Arc::clone(&lines);
-            Arc::new(move |line: &str| {
-                lines.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
-            }) as EngineOutput
-        };
-        let mut engine = Engine::new_with_output(sink);
-        engine.handle_line("setoption name Threads value 1");
-        engine.handle_line("position startpos");
-        engine.handle_line("go wtime 60000 nodes 8");
-        std::thread::sleep(Duration::from_millis(200));
-        engine.stop_and_join();
+    fn go_wtime_with_nodes_combines_limits() {
+        let engine = Engine::new();
+        let budget = engine
+            .budget_from_go(&parse_go("wtime 60000 btime 60000 nodes 8").params)
+            .expect("budget");
+        assert!(budget.deadline.is_some());
+        assert_eq!(budget.max_nodes, Some(8));
+    }
 
-        let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
-        assert!(out.contains("unsupported go option: wtime"));
-        assert!(out.contains("bestmove"));
+    #[test]
+    fn go_wtime_side_to_move_uses_matching_clock() {
+        let mut engine = Engine::new();
+        engine.history = PositionHistory::new_startpos();
+        let white_budget = engine
+            .budget_from_go(&parse_go("wtime 10000 btime 90000").params)
+            .expect("budget");
+        // 切换到黑方
+        let pos0 = Position::from_fen(START_FEN).unwrap();
+        let mv = legal_moves_uci(&pos0).into_iter().next().expect("mv");
+        engine.handle_line(&format!("position startpos moves {mv}"));
+        let black_budget = engine
+            .budget_from_go(&parse_go("wtime 10000 btime 90000").params)
+            .expect("budget");
+        assert!(white_budget.deadline.is_some());
+        assert!(black_budget.deadline.is_some());
     }
 
     #[test]
@@ -964,6 +1093,7 @@ mod tests {
             elapsed_ms: 50,
             nps_elapsed_ms: 50,
             pv: &[],
+            multipv: None,
         });
         assert!(line.contains("score mate 3"));
         assert!(!line.contains("score cp"));
@@ -981,6 +1111,7 @@ mod tests {
             elapsed_ms: 200,
             nps_elapsed_ms: 0,
             pv: &[],
+            multipv: None,
         });
         assert!(line.contains("nps 0"));
         assert!(line.contains("time 200"));
@@ -1113,15 +1244,55 @@ mod tests {
         engine.handle_line("go infinite");
         std::thread::sleep(Duration::from_millis(50));
         engine.handle_line("stop");
-        engine.handle_line("position startpos moves h2e2");
+        engine.handle_line("position startpos");
         engine.handle_line("setoption name MultiPV value 2");
-        engine.handle_line("go nodes 16");
-        std::thread::sleep(Duration::from_millis(200));
+        engine.handle_line("go nodes 128");
+        std::thread::sleep(Duration::from_millis(400));
         engine.stop_and_join();
 
         let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
         assert!(out.contains("bestmove"));
         assert!(!out.ends_with("bestmove (none)"));
+        assert!(out.contains("multipv 1"));
+        assert!(out.contains("multipv 2"));
+    }
+
+    #[test]
+    fn multipv_one_omits_multipv_field() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |line: &str| {
+                lines.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+            }) as EngineOutput
+        };
+        let mut engine = Engine::new_with_output(sink);
+        engine.handle_line("setoption name Threads value 1");
+        engine.handle_line("position startpos");
+        engine.handle_line("go nodes 16");
+        std::thread::sleep(Duration::from_millis(200));
+        engine.stop_and_join();
+
+        let out = lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+        assert!(out.contains("info depth"));
+        assert!(!out.contains("multipv"));
+    }
+
+    #[test]
+    fn uci_info_line_includes_multipv_when_set() {
+        let line = uci_info_line(UciInfoView {
+            best_value: 0.0,
+            best_mate: None,
+            depth: 4,
+            seldepth: 4,
+            playouts: 32,
+            nodes: 32,
+            elapsed_ms: 100,
+            nps_elapsed_ms: 100,
+            pv: &[],
+            multipv: Some(2),
+        });
+        assert!(line.contains("multipv 2"));
     }
 
     #[test]

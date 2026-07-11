@@ -14,7 +14,7 @@ use super::backend::BackendComputation;
 use super::node::{cancel_score_update, terminal_wdl, MctsNode, TerminalKind};
 use super::{
     EdgeStats, MctsBudget, MctsConfig, MctsMoveStat, MctsNodeId, MctsSearchProgress, MctsSearchResult,
-    MctsTree, PolicyValueEval, PolicyValueOutput, PolicyValueTask, SearchStats,
+    MctsTree, PolicyValueEval, PolicyValueOutput, PolicyValueTask, PvLineInfo, SearchStats,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -276,6 +276,7 @@ where
             0,
             params.initial_visits,
             params.stats,
+            None,
         ) {
             break;
         }
@@ -1011,9 +1012,17 @@ pub(crate) fn progress_from_tree(
 ) -> MctsSearchProgress {
     let root = tree.get(root_id).expect("root must exist");
     let summary = pv_summary_from_tree(tree, root_id, config);
+    let multi_pv = config.multi_pv.clamp(1, 500);
+    let pv_lines = if multi_pv > 1 {
+        multi_pv_lines_from_tree(tree, root_id, config)
+    } else {
+        Vec::new()
+    };
     MctsSearchProgress {
         best_move: summary.best_move,
         pv: summary.pv,
+        pv_lines,
+        multi_pv,
         playouts: stats.total_playouts(),
         root_visits: root.visits,
         nodes: stats.uci_nodes(),
@@ -1048,6 +1057,8 @@ pub(crate) fn result_from_tree(
     MctsSearchResult {
         best_move: progress.best_move,
         pv: progress.pv,
+        pv_lines: progress.pv_lines,
+        multi_pv: progress.multi_pv,
         playouts: progress.playouts,
         root_visits: progress.root_visits,
         nodes: progress.nodes,
@@ -1154,41 +1165,132 @@ fn edge_cmp(
     b.m.partial_cmp(&a.m).unwrap_or(std::cmp::Ordering::Equal)
 }
 
-fn get_best_children(tree: &MctsTree, parent_id: MctsNodeId) -> Vec<(usize, MctsNodeId, Move)> {
-    // lc0 `GetBestChildNoTemperature` / visits-first tie-break (search.cc:827-830).
+fn get_best_children_no_temperature(
+    tree: &MctsTree,
+    parent_id: MctsNodeId,
+    count: usize,
+    root_id: MctsNodeId,
+    root_move_filter: Option<&[Move]>,
+) -> Vec<(usize, MctsNodeId, Move)> {
+    // lc0 `GetBestChildrenNoTemperature` (search.cc:727-824)
     let Some(parent) = tree.get(parent_id) else {
         return Vec::new();
     };
     if parent.n_started() == 0 {
         return Vec::new();
     }
-    let mut best_idx = None::<usize>;
-    for (idx, edge) in parent.children.iter().enumerate() {
-        if edge_get_n(tree, edge) == 0 && edge.child.is_none() {
-            continue;
-        }
-        let Some(current) = best_idx else {
-            best_idx = Some(idx);
-            continue;
-        };
-        let current_edge = &parent.children[current];
-        let cmp = edge_cmp(
-            tree,
-            edge,
-            edge.child.and_then(|id| tree.get(id)),
-            current_edge,
-            current_edge.child.and_then(|id| tree.get(id)),
-        );
-        if cmp == std::cmp::Ordering::Greater {
-            best_idx = Some(idx);
+
+    let mut indices: Vec<usize> = (0..parent.children.len()).collect();
+    if parent_id == root_id {
+        if let Some(filter) = root_move_filter {
+            indices.retain(|&idx| filter.contains(&parent.children[idx].mv));
         }
     }
-    let Some(edge_idx) = best_idx else {
+    if indices.is_empty() {
         return Vec::new();
+    }
+
+    let take = count.min(indices.len());
+    indices.sort_unstable_by(|&a, &b| {
+        let a_edge = &parent.children[a];
+        let b_edge = &parent.children[b];
+        edge_cmp(
+            tree,
+            a_edge,
+            a_edge.child.and_then(|id| tree.get(id)),
+            b_edge,
+            b_edge.child.and_then(|id| tree.get(id)),
+        )
+        .reverse()
+    });
+    indices.truncate(take);
+
+    indices
+        .into_iter()
+        .map(|idx| {
+            let edge = &parent.children[idx];
+            let child_id = edge.child.unwrap_or(parent_id);
+            (idx, child_id, edge.mv)
+        })
+        .collect()
+}
+
+fn get_best_children(tree: &MctsTree, parent_id: MctsNodeId) -> Vec<(usize, MctsNodeId, Move)> {
+    get_best_children_no_temperature(tree, parent_id, 1, parent_id, None)
+}
+
+fn score_for_root_edge(tree: &MctsTree, root_id: MctsNodeId, edge_idx: usize) -> (f32, Option<i32>) {
+    let Some(root) = tree.get(root_id) else {
+        return (0.0, None);
     };
-    let edge = &parent.children[edge_idx];
-    let child_id = edge.child.unwrap_or(parent_id);
-    vec![(edge_idx, child_id, edge.mv)]
+    let edge = &root.children[edge_idx];
+    let mut best_value = edge.mean_q();
+    let mut best_mate = None;
+    if edge_get_n(tree, edge) > 0 {
+        if let Some(child_id) = edge.child {
+            if let Some(child) = tree.get(child_id) {
+                if child.is_terminal() {
+                    best_value = edge.mean_q();
+                    if edge.wl.abs() > f32::EPSILON {
+                        let mate = (edge.get_m(0.0).round() as i32) / 2 + 1;
+                        best_mate = Some(if edge.wl > 0.0 { mate } else { -mate });
+                    }
+                }
+            }
+        }
+    }
+    (best_value, best_mate)
+}
+
+fn pv_line_from_root_edge(
+    tree: &MctsTree,
+    root_id: MctsNodeId,
+    edge_idx: usize,
+) -> (Vec<Move>, f32, Option<i32>) {
+    // lc0 `SendUciInfo` PV walk (search.cc:367-371)
+    let Some(root) = tree.get(root_id) else {
+        return (Vec::new(), 0.0, None);
+    };
+    let edge = &root.children[edge_idx];
+    let (best_value, best_mate) = score_for_root_edge(tree, root_id, edge_idx);
+    let mut pv = vec![edge.mv];
+    let mut node_id = edge.child.unwrap_or(root_id);
+
+    loop {
+        if tree.get(node_id).is_some_and(|child| child.is_terminal()) {
+            break;
+        }
+        let children = get_best_children_no_temperature(tree, node_id, 1, root_id, None);
+        if children.is_empty() {
+            break;
+        }
+        let (_, child_id, mv) = children[0];
+        pv.push(mv);
+        if child_id == node_id {
+            break;
+        }
+        node_id = child_id;
+    }
+
+    (pv, best_value, best_mate)
+}
+
+fn multi_pv_lines_from_tree(tree: &MctsTree, root_id: MctsNodeId, config: MctsConfig) -> Vec<PvLineInfo> {
+    let max_pv = config.multi_pv.clamp(1, 500) as usize;
+    let root_edges = get_best_children_no_temperature(tree, root_id, max_pv, root_id, None);
+    root_edges
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (edge_idx, _, _))| {
+            let (pv, best_value, best_mate) = pv_line_from_root_edge(tree, root_id, edge_idx);
+            PvLineInfo {
+                multipv: (idx + 1) as u32,
+                best_value,
+                best_mate,
+                pv,
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn pv_summary_from_tree(tree: &MctsTree, root_id: MctsNodeId, _config: MctsConfig) -> PvSummary {
@@ -1268,7 +1370,15 @@ pub(crate) fn budget_exhausted(
     in_flight_playouts: u32,
     initial_visits: u32,
     stats: Option<&SearchStats>,
+    best_mate: Option<i32>,
 ) -> bool {
+    if let Some(target) = budget.max_mate {
+        if let Some(mate) = best_mate {
+            if mate > 0 && mate as u32 <= target {
+                return true;
+            }
+        }
+    }
     if let Some(target_depth) = budget.max_depth {
         if let Some(stats) = stats {
             if stats.total_playouts() > 0 && stats.max_depth() >= target_depth {
@@ -1304,7 +1414,24 @@ pub(crate) fn budget_exhausted(
 }
 
 
-// --- lc0 SharedCollisions / tree lock (was coordinator.rs) ---
+pub(crate) fn ponder_move_from_tree(
+    tree: &MctsTree,
+    root_id: MctsNodeId,
+    best_move: Move,
+) -> Option<Move> {
+    let root = tree.get(root_id)?;
+    let edge = root.children.iter().find(|e| e.mv == best_move)?;
+    let child_id = edge.child?;
+    let child = tree.get(child_id)?;
+    if child.children.is_empty() {
+        return None;
+    }
+    child
+        .children
+        .iter()
+        .max_by_key(|e| e.visits.saturating_add(e.in_flight))
+        .map(|e| e.mv)
+}
 
 /// lc0 风格：搜索树单写者互斥。
 pub(crate) type SharedMctsTree = Arc<Mutex<MctsTree>>;
@@ -2430,13 +2557,14 @@ mod tests {
             max_playouts: None,
             max_nodes: Some(4),
             max_depth: None,
+            max_mate: None,
             deadline: Some(deadline),
             stop: None,
         };
-        assert!(!budget_exhausted(&budget, 0, 0, 0, None));
-        assert!(budget_exhausted(&budget, 3, 1, 0, None));
+        assert!(!budget_exhausted(&budget, 0, 0, 0, None, None));
+        assert!(budget_exhausted(&budget, 3, 1, 0, None, None));
         std::thread::sleep(Duration::from_millis(60));
-        assert!(budget_exhausted(&budget, 0, 0, 0, None));
+        assert!(budget_exhausted(&budget, 0, 0, 0, None, None));
     }
 
     #[test]

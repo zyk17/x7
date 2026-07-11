@@ -60,6 +60,7 @@ fn empty_iteration_action(
         0,
         stats.initial_visits(),
         Some(stats),
+        None,
     ) {
         return EmptyIterationAction::Break;
     }
@@ -102,7 +103,7 @@ fn apply_nps_limit(config: MctsConfig, stats: &SearchStats, budget: &MctsBudget)
     if config.nps_limit == 0 {
         return;
     }
-    while !budget_exhausted(budget, stats.total_playouts(), 0, stats.initial_visits(), Some(stats)) {
+    while !budget_exhausted(budget, stats.total_playouts(), 0, stats.initial_visits(), Some(stats), None) {
         let elapsed = stats.nps_elapsed_ms();
         if elapsed == 0 {
             break;
@@ -148,12 +149,14 @@ where
         let mut retry_without_playout = 0u32;
 
         let shared_collisions = SharedCollisions::default();
+        let mut best_mate = None;
         while !budget_exhausted(
             &self.budget,
             self.stats.total_playouts(),
             0,
             self.stats.initial_visits(),
             Some(self.stats.as_ref()),
+            best_mate,
         ) {
             if execute_one_iteration(self, batch_limit, &shared_collisions)? {
                 retry_without_playout = 0;
@@ -175,6 +178,15 @@ where
                         continue;
                     }
                 }
+            }
+            if self.budget.max_mate.is_some() {
+                best_mate = progress_from_tree(
+                    self.tree,
+                    self.root_id,
+                    self.stats.as_ref(),
+                    self.config,
+                )
+                .best_mate;
             }
             if let Some(deadline) = next_report_at {
                 let now = std::time::Instant::now();
@@ -347,6 +359,7 @@ where
             let active_workers = Arc::clone(&active_workers);
             let shared_tree = Arc::clone(&shared_tree);
             let stats = Arc::clone(&stats);
+            let budget = budget.clone();
             move || {
                 while active_workers.load(Ordering::Relaxed) > 0 {
                     thread::sleep(wait);
@@ -355,12 +368,25 @@ where
                     }
                     if let Ok(tree_guard) = shared_tree.lock() {
                         if stats.total_playouts() > 0 {
-                            on_progress(&progress_from_tree(
+                            let progress = progress_from_tree(
                                 &*tree_guard,
                                 root_id,
                                 stats.as_ref(),
                                 config,
-                            ));
+                            );
+                            on_progress(&progress);
+                            if budget.max_mate.is_some()
+                                && budget_exhausted(
+                                    &budget,
+                                    stats.total_playouts(),
+                                    0,
+                                    stats.initial_visits(),
+                                    Some(stats.as_ref()),
+                                    progress.best_mate,
+                                )
+                            {
+                                stop.store(true, Ordering::SeqCst);
+                            }
                         }
                     }
                 }
@@ -409,6 +435,7 @@ where
                         0,
                         stats.initial_visits(),
                         Some(stats.as_ref()),
+                        None,
                     ) {
                         None
                     } else {
@@ -478,6 +505,7 @@ where
                     );
                 }
                 backend_waiting.fetch_add(1, Ordering::Relaxed);
+                // lc0 `backend_waiting_counter_` during NN compute (search.cc:1328-1329)
                 let outputs = if backend.used_batch_size() > 0 {
                     match backend.compute_blocking() {
                         Ok(outputs) => {

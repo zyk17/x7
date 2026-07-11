@@ -10,6 +10,8 @@ pub struct MctsBudget {
     pub max_playouts: Option<u32>,
     pub max_nodes: Option<u32>,
     pub max_depth: Option<u32>,
+    /// lc0 `MateStopper`：`go mate N` 时找到 ≤N 步杀棋则停。
+    pub max_mate: Option<u32>,
     pub deadline: Option<Instant>,
     pub stop: Option<Arc<AtomicBool>>,
 }
@@ -20,6 +22,7 @@ impl MctsBudget {
             max_playouts: None,
             max_nodes: None,
             max_depth: None,
+            max_mate: None,
             deadline: Some(Instant::now() + Duration::from_millis(ms)),
             stop: None,
         }
@@ -76,6 +79,8 @@ pub struct MctsConfig {
     pub two_fold_draws: bool,
     /// 0 = 关闭。
     pub nps_limit: u64,
+    /// lc0 `MultiPV`（params.cc:360-365,585）：UCI 主变线条数。
+    pub multi_pv: u32,
 }
 
 impl Default for MctsConfig {
@@ -120,6 +125,7 @@ impl Default for MctsConfig {
             sticky_endgames: true,
             two_fold_draws: true,
             nps_limit: 0,
+            multi_pv: 1,
         }
     }
 }
@@ -130,6 +136,7 @@ impl MctsBudget {
             max_playouts: None,
             max_nodes: None,
             max_depth: Some(depth),
+            max_mate: None,
             deadline: None,
             stop: None,
         }
@@ -205,6 +212,7 @@ mod tests {
         assert!((c.max_out_of_order_evals_factor - 2.4).abs() < f32::EPSILON);
         assert_eq!(c.max_prefetch, 32);
         assert_eq!(c.max_concurrent_searchers, 1);
+        assert_eq!(c.multi_pv, 1);
     }
 
     #[test]

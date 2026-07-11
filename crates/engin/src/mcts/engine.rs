@@ -29,6 +29,8 @@ pub struct MctsMoveStat {
 pub struct MctsSearchResult {
     pub best_move: Option<Move>,
     pub pv: Vec<Move>,
+    pub pv_lines: Vec<PvLineInfo>,
+    pub multi_pv: u32,
     pub playouts: u32,
     pub root_visits: u32,
     pub nodes: usize,
@@ -44,10 +46,22 @@ pub struct MctsSearchResult {
     pub moves: Vec<MctsMoveStat>,
 }
 
+/// 单条 UCI 主变线（lc0 `SendUciInfo` 每条 `ThinkingInfo`）。
+#[derive(Clone, Debug, Default)]
+pub struct PvLineInfo {
+    pub multipv: u32,
+    pub best_value: f32,
+    pub best_mate: Option<i32>,
+    pub pv: Vec<Move>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MctsSearchProgress {
     pub best_move: Option<Move>,
     pub pv: Vec<Move>,
+    /// `multi_pv > 1` 时填充；`multi_pv == 1` 时为空，沿用上方单线字段。
+    pub pv_lines: Vec<PvLineInfo>,
+    pub multi_pv: u32,
     pub playouts: u32,
     pub root_visits: u32,
     pub nodes: usize,
@@ -85,7 +99,7 @@ impl<E> MctsEngine<E> {
 
 impl<E> MctsEngine<E>
 where
-    E: PolicyValueEval,
+    E: PolicyValueEval<Error = String>,
 {
     pub fn search_root(&mut self, pos: &Position, budget: MctsBudget) -> Result<MctsSearchResult, E::Error> {
         let history = PositionHistory::from_position(pos.clone_for_search());
@@ -103,7 +117,7 @@ where
         F: FnMut(&MctsSearchProgress),
     {
         let history = PositionHistory::from_position(pos.clone_for_search());
-        self.search_root_history_with_progress(&history, budget, info_interval, on_progress)
+        self.search_root_history_with_progress(&history, budget, info_interval, None, on_progress)
     }
 
     pub fn search_root_history(
@@ -111,7 +125,7 @@ where
         history: &PositionHistory,
         budget: MctsBudget,
     ) -> Result<MctsSearchResult, E::Error> {
-        self.search_root_history_with_progress(history, budget, Duration::ZERO, |_| {})
+        self.search_root_history_with_progress(history, budget, Duration::ZERO, None, |_| {})
     }
 
     pub fn search_root_history_with_progress<F>(
@@ -119,6 +133,7 @@ where
         history: &PositionHistory,
         budget: MctsBudget,
         info_interval: Duration,
+        root_moves: Option<&[Move]>,
         on_progress: F,
     ) -> Result<MctsSearchResult, E::Error>
     where
@@ -127,6 +142,11 @@ where
         let Some(root_id) = self.prepare_root(history)? else {
             return Ok(MctsSearchResult::default());
         };
+        if let Some(moves) = root_moves {
+            if !moves.is_empty() {
+                self.filter_root_children(root_id, moves).map_err(|e| e.to_string())?;
+            }
+        }
 
         let initial_visits = self.tree.get(root_id).map(|root| root.visits).unwrap_or(0);
         let batch_limit = self.batch_limit();
@@ -242,6 +262,21 @@ where
         }
         Ok(Some(self.tree.add_node(root)))
     }
+
+    fn filter_root_children(&mut self, root_id: MctsNodeId, allowed: &[Move]) -> Result<(), String> {
+        if let Some(root) = self.tree.get_mut(root_id) {
+            root.children.retain(|edge| allowed.contains(&edge.mv));
+            if root.children.is_empty() {
+                return Err("searchmoves 过滤后无合法根着法".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ponder_move_for(&self, best_move: Move) -> Option<Move> {
+        let root_id = self.root_id?;
+        super::worker::ponder_move_from_tree(&self.tree, root_id, best_move)
+    }
 }
 
 fn position_keys_for_history(history: &PositionHistory) -> Vec<u64> {
@@ -263,6 +298,7 @@ impl MctsEngine<OnnxPolicyValueEval> {
         budget: MctsBudget,
         threads: usize,
         info_interval: Duration,
+        root_moves: Option<&[Move]>,
         on_progress: F,
     ) -> Result<MctsSearchResult, String>
     where
@@ -270,13 +306,19 @@ impl MctsEngine<OnnxPolicyValueEval> {
     {
         if threads <= 1 {
             return self
-                .search_root_history_with_progress(history, budget, info_interval, on_progress)
+                .search_root_history_with_progress(history, budget, info_interval, root_moves, on_progress)
                 .map_err(|e| e.to_string());
         }
 
         let Some(root_id) = self.prepare_root(history).map_err(|e| e.to_string())? else {
             return Ok(MctsSearchResult::default());
         };
+        if let Some(moves) = root_moves {
+            if !moves.is_empty() {
+                self.filter_root_children(root_id, moves)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         self.root_history = Some(history.clone_for_search());
 
         run_parallel_with_progress(
@@ -328,6 +370,7 @@ mod tests {
                     max_playouts: Some(16),
                     max_nodes: None,
                     max_depth: None,
+                    max_mate: None,
                     deadline: None,
                     stop: None,
                 },
@@ -344,6 +387,7 @@ mod tests {
             max_playouts: Some(8),
             max_nodes: None,
             max_depth: None,
+            max_mate: None,
             deadline: None,
             stop: None,
         };

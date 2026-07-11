@@ -605,11 +605,13 @@ mod tests {
                     max_playouts: None,
                     max_nodes: Some(2048),
                     max_depth: None,
+                    max_mate: None,
                     deadline: None,
                     stop: None,
                 },
                 8,
                 Duration::ZERO,
+                None,
                 |_| {},
             )
             .expect("parallel onnx search must finish");
