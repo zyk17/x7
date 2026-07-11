@@ -7,7 +7,4 @@ publish = false
 default-run = "engin"
 
 [dependencies]
-ndarray = "0.17"
-ort = { version = "2.0.0-rc.12", features = ["download-binaries", "cuda", "directml"] }
-serde_json = "1.0.149"
 xiangqi_core = { path = "../xiangqi_core" }

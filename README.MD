@@ -4,18 +4,14 @@
 
 ## 当前状态
 
-旧 MCTS 已删除。它的 root 生命周期、选择、扩展、回传、计数与 lc0 classic 已发生结构性漂移，继续修补不具备可信度。
+旧 Rust 规则核心与 MCTS 已删除。项目当前唯一目标是将 px0 的规则、history、搜索、UCI 与网络调用主线逐函数翻译为 Rust。
 
-当前保留且可用的地基：
+当前工程参考：
 
-- `xiangqi_core`：局面、合法着、do/undo、规则
-- `engin::history`：真实局面历史与 `fen_only` fallback
-- `engin::fen_tensor`：`124 x 10 x 9` 编码
-- `engin::policy_onnx`：ONNX Runtime 推理与 session pool
-- `engin::move_vocab`：`2062` policy 索引映射
-- 最小 UCI：`uci` / `isready` / `position` / `setoption PolicyFile`
+- `C:\Users\Administrator\projects\px0`
+- `C:\Users\Administrator\projects\pxzero-training`
 
-搜索核心正在按 modern lc0 classic 逐函数移植。重建期间 `go` 明确输出 `bestmove 0000`，不返回旧搜索的伪结果。
+当前 P2 UCI 可解析并保存局面/history；P3 搜索尚未接入，因此 `go` 不返回伪 `bestmove`。
 
 ## 正式模型契约
 
@@ -24,13 +20,4 @@
 - value：`WDL[win, draw, loss]`
 - 引擎 value：`q = win - loss`
 
-## 命令
-
-```powershell
-cargo test -p xiangqi_core
-cargo test -p engin
-cargo run --release -p engin -- --onnx-smoke data\x7.onnx
-cargo run --release -p engin
-```
-
-搜索重建顺序、lc0 对照位置见 [NextStep.md](/C:/projects/77xiangqi_engine/NextStep.md) 与 [TODO.md](/C:/projects/77xiangqi_engine/TODO.md)。
+px0 翻译顺序与参考位置见 [NextStep.md](/C:/projects/77xiangqi_engine/NextStep.md) 与 [TODO.md](/C:/projects/77xiangqi_engine/TODO.md)。

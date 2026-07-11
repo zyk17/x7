@@ -1,39 +1,38 @@
-//! 中国象棋核心：局面、规则与合法着生成。
+//! px0 `src/chess` 的 Rust 翻译。
 //!
-//! Zobrist 使用全局 `OnceLock`（种子 `1070372`），与常见皮卡鱼族实现一致以便对拍。
-//!
-//! 以下为与参考实现风格接近处的告警抑制（如 `transmute`、区间判断写法等）。
-#![allow(clippy::missing_transmute_annotations)]
-#![allow(clippy::cast_abs_to_unsigned)]
-#![allow(clippy::manual_range_contains)]
-#![allow(clippy::needless_range_loop)]
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::new_without_default)]
-#![allow(clippy::should_implement_trait)]
-#![allow(clippy::if_same_then_else)]
+//! 旧规则核心已删除。这里只接受可追溯到 px0 文件与行区间的实现。
 
+pub mod bitboard;
 pub mod board;
-pub mod misc;
-pub mod movegen;
-pub mod rule;
+pub mod board_attacks;
+pub mod board_masks;
+pub mod gamestate;
+pub mod hashcat;
+pub mod magic_numbers;
+pub mod position;
 pub mod types;
-pub mod uci_format;
 
-pub use board::{global_zobrist, Position, UndoFrame, Zobrist};
-pub use movegen::{generate, ExtMove, GenType};
-pub use rule::{has_mating_material, is_under_check, them_chased, us_chased, GameResult};
-pub use types::{Color, File, Key, Move, Piece, PieceType, Rank, Square, Value, MAX_MOVES as TYPES_MAX_MOVES};
-pub use uci_format::{move_to_uci, parse_move_uci, square_to_algebraic, uci_to_move, write_move_uci_bytes, START_FEN};
+pub use bitboard::BitBoard;
+pub use board::{board_to_fen, startpos_board, ChessBoard, FenState, STARTPOS_FEN};
+pub use board_attacks::initialize_magic_bitboards;
+pub use gamestate::GameState;
+pub use position::{GameResult, Position, PositionHistory};
+pub use types::{File, Move, MoveList, PieceType, Rank, Square};
 
-/// **合法着** UCI 字符串列表（`a0`～`i9`，与常见皮卡鱼族引擎约定一致；已过滤将帅照面等）。
-pub fn legal_moves_uci(pos: &Position) -> Vec<String> {
-    let mut list = [ExtMove {
-        mv: Move::none(),
-        value: 0,
-    }; types::MAX_MOVES];
-    let n = generate(pos, GenType::Legal, &mut list);
-    list[..n].iter().map(|e| move_to_uci(e.mv)).collect()
+/// px0 C++ 侧通过异常报告无效 FEN 或不可达路径；Rust 侧统一为显式错误。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoreError {
+    InvalidFen(String),
+    PortIncomplete(&'static str),
 }
 
-/// 向后兼容的类型别名（历史上曾用 `BoardState` 指代局面）。
-pub type BoardState = Position;
+impl std::fmt::Display for CoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFen(message) => write!(f, "invalid FEN: {message}"),
+            Self::PortIncomplete(name) => write!(f, "px0 port incomplete: {name}"),
+        }
+    }
+}
+
+impl std::error::Error for CoreError {}

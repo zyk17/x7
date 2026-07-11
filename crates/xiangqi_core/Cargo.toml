@@ -2,7 +2,7 @@
 name = "xiangqi_core"
 version = "0.1.0"
 edition.workspace = true
-description = "中国象棋规则、位棋盘与合法着生成（供数据集与引擎侧工具使用）。"
+description = "中国象棋规则、位棋盘与合法着生成。"
 
 [lib]
 path = "src/lib.rs"

@@ -1,31 +1,40 @@
 # NextStep
 
-## 当前阶段：重建 lc0 classic 搜索核心
+## 当前阶段：P3 单线程 baseline 完成；进入 P4 后端与并发
 
-旧 `crates/engin/src/mcts/` 已整体删除。当前不接受“修旧搜索”或以旧接口为约束的实现。
+P0/P1/P2 **规则与 UCI 外围已通过**。P3 **单线程 `go nodes` 已可用**：`ClassicEngine` + `UniformBackend` + `SearchSession`；`search_trace_test` / `uci_search_test` 通过。
 
-唯一主参考：`C:\Users\Administrator\projects\lc0`。
+P3 的验收范围是单线程、确定性 stub backend 下的 `go nodes` / `go movetime`：PUCT、extend、terminal、backup、tree reuse、绝对 UCI move/ponder 均已覆盖。碰撞/OOO/task workers、完整 stoppers、异步 `StartThreads` 与真实 NN 属 P4。
 
-## 逐函数移植顺序
+当前唯一工程参考：
 
-| 阶段 | lc0 参考 | 本仓库目标 | 完成条件 |
+- `C:\Users\Administrator\projects\px0`
+- `C:\Users\Administrator\projects\pxzero-training`
+
+| 阶段 | px0 参考 | Rust 目标 | 完成条件 |
 |---|---|---|---|
-| S0 | `src/search/classic/search.h:50-203` | 新建最小 `mcts/` 数据结构：`Node`、`Edge`、`Search`、`SearchWorker` | 无 UCI 接线；节点字段可逐项对照 |
-| S1 | `search.cc:921-1047`、`search.h:254-300` | 单线程 `RunBlocking` 及 iteration 7 阶段调度 | 无 ONNX 时能按 budget 结束；root 不预展开 |
-| S2 | `search.cc:1507-1920`、`search.h:407-416` | `PickNodesToExtend` / `PickNodesToExtendTask` | root 与子节点同一路径；in-flight 可回滚 |
-| S3 | `search.cc:1921-2149` | `ExtendNode` | 合法着、象棋终局、rule60、重复规则只在此处接入 |
-| S4 | `search.cc:2151-2216` | `FetchMinibatchResults` | ONNX 在树锁外；无 ONNX fallback 明确可测 |
-| S5 | `search.cc:2217-2373` | `DoBackupUpdateSingleNode` / PV / 计数 | nodes、playouts、visits、in_flight 逐项不变量测试 |
-| S6 | `search.cc:261-396,617-646,896-920` | UCI info、stop、线程生命周期 | `go nodes` / `go movetime` 正确；再恢复 UCI `go` |
-| S7 | `search.cc:1060-1490`、`search.h:209-419` | batch、task workers、OOO eval 与 shared tree | 只在 S0-S6 trace 对齐后开始 |
+| P0 | `src/chess/types.h`、`bitboard.h`、`board.h/.cc` | types、bitboard、ChessBoard、FEN、走子、合法着 | `board_test.cc` 与 legal move-set 对拍 |
+| P1 | `src/chess/position.h/.cc` | Position、PositionHistory、重复、rule60、RuleJudge | `position_test.cc` 逐项移植 |
+| P2 | `src/chess/gamestate.*`、`uciloop.*` | UCI 局面/history 语义 | `position ... moves ...` 与 px0 一致 |
+| P3 | `src/search` | Node、Tree、Search、worker、选择/扩展/回传 | 单线程固定 FEN/budget trace 对照 |
+| P4 | `src/search`、`src/neural` | minibatch、NN cache、prefetch、并发、tree reuse | 同局面统计和 bestmove 对照 |
+| P5 | `src/engine.cc`、`src/chess/uciloop.cc` | UCI options、go/stop/info、默认行为 | UCI transcript 对照 |
+| P6 | `pxzero-training` | 数据字段、训练/导出契约 | 训练与 ONNX I/O 对照 |
 
-## 中国象棋最小偏离点
+每个 Rust 函数必须标注 px0 文件和连续行区间；找不到参考不实现。
 
-| 内容 | 参考 | 本仓库 |
-|---|---|---|
-| 合法着 / do-undo | lc0 `chess/board.*` 的接口位置 | `crates/xiangqi_core/src/board.rs`、`movegen.rs` |
-| history / repetition | lc0 `chess/position_history.*` | `crates/engin/src/history.rs` |
-| 重复裁决、长将长捉、rule60 | 需先核对 px0 象棋规则后接入 | `crates/xiangqi_core/src/rule.rs` |
-| 网络输入 | lc0 NN 输入接口，仅替换为 px0 124 planes | `crates/engin/src/fen_tensor.rs` |
+### P3 已落地
 
-没有找到 lc0 对照位置时，不实现，先记录到 `TODO.md`。
+- `engin/src/search/classic/node.rs`：`Edge` prior、`Node` 统计、`NodeTree`（`node.cc`）
+- `engin/src/search/classic/params.rs`：px0 默认参数子集
+- `engin/src/search/classic/backend.rs`：`UniformBackend` stub
+- `engin/src/search/classic/search.rs`：`SearchSession`、`ClassicSearch`
+- `engin/src/engine.rs`：`ClassicEngine` 接线 UCI `go nodes` / `go movetime`
+- `engin/tests/search_trace_test.rs`、`engin/tests/uci_search_test.rs`
+
+### P4 入口
+
+- `src/neural/*` + 真实 policy/value 推理
+- `search.cc:1268-2331`：碰撞、OOO、task workers、batch gather/backup
+- `classic/stoppers/*`、`search.cc:874-1055`：异步 `StartThreads`、`wait`/`stop`、完整时间管理
+- px0 二进制 fixed-nodes trace 对拍（需同一 backend 策略）
