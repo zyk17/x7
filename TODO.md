@@ -60,8 +60,10 @@
   ONNX batch、WDL 与合法着 softmax（`src/neural/encoder.cc:118-217,229-481`，
    `src/neural/wrapper.cc:49-172`）。主 UCI 在 weights 配置翻译前明确拒绝搜索，
    不再回退到 `UniformBackend`。
-- [ ] 翻译完整 `PickNodesToExtend`、碰撞、out-of-order、task workers（`search.cc:1268-2331`）。
-- [ ] 翻译 `PrefetchIntoCache`、`MaybePrefetchIntoCache` 完整语义（`search.cc:1989-2099`）。
+- [x] 翻译单 worker `PickNodesToExtendTask` 的 workspace/path-backtrack、碰撞访问分配与
+  递归 `PrefetchIntoCache`（`search.cc:1551-1827,1989-2099`）。
+- [ ] 翻译 two-fold tree reuse 修正、task worker split、任务队列与完整 out-of-order
+  （`search.cc:1268-1508,1510-1550,1828-1897,2109-2331`）。
 - [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [ ] 对齐 px0 UCI、bench、info 统计。

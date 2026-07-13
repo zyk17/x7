@@ -28,6 +28,10 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 
 - `engin/src/search/classic/backend.rs`：`UniformBackendComputation` + cache（`backend.h:67-78`）
 - `engin/src/search/classic/worker.rs`：七阶段 + `nodes_budget` + OOO 子集
+- `engin/src/search/classic/node.rs`：`EdgeAndNode` Q/U/NStarted 代理；worker 的
+  单 worker `PickNodesToExtendTask` 显式 workspace/path-backtrack 翻译
+  （`search.cc:1551-1827`，task split 尚未翻译）
+- `engin/src/search/classic/worker.rs`：递归 `PrefetchIntoCache`（`search.cc:1989-2099`）
 - `engin/src/search/classic/search.rs`：异步 `StartThreads`、`ClassicSearch` 取代 `SearchSession` 主路径
 - `engin/src/search/classic/stoppers/*`：Visits/Playouts/TimeLimit/wtime 预算
 - `engin/src/search/classic/uct.rs`：PUCT/FPU 共享辅助
@@ -43,8 +47,7 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 
 ### P4 下一入口
 
-- `search.cc:1485-1897`：完整 `PickNodesToExtendTask`、碰撞放大、task workers
-- `search.cc:1989-2099`：`PrefetchIntoCache` 完整递归
+- `search.cc:1510-1550,1828-1897`：two-fold tree reuse 修正、task worker split 与任务队列
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
 - `engine.cc:153-167`、`neural/shared_params.*`：`WeightsFile` 到真实 ONNX backend 的 UCI 配置
 - px0 二进制 fixed-nodes trace 对拍
