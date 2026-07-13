@@ -62,8 +62,10 @@
    不再回退到 `UniformBackend`。
 - [x] 翻译单 worker `PickNodesToExtendTask` 的 workspace/path-backtrack、碰撞访问分配与
   递归 `PrefetchIntoCache`（`search.cc:1551-1827,1989-2099`）。
-- [ ] 翻译 two-fold tree reuse 修正、task worker split、任务队列与完整 out-of-order
-  （`search.cc:1268-1508,1510-1550,1828-1897,2109-2331`）。
+- [x] 翻译 two-fold terminal 生成与 tree reuse 回退
+  （`search.cc:1510-1550,1899-1959`）。
+- [ ] 翻译 task worker split、任务队列与完整 out-of-order
+  （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [ ] 对齐 px0 UCI、bench、info 统计。

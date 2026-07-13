@@ -47,7 +47,7 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 
 ### P4 下一入口
 
-- `search.cc:1510-1550,1828-1897`：two-fold tree reuse 修正、task worker split 与任务队列
+- `search.cc:1828-1897`、`search.h:367-448`：task worker split 与任务队列
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
 - `engine.cc:153-167`、`neural/shared_params.*`：`WeightsFile` 到真实 ONNX backend 的 UCI 配置
 - px0 二进制 fixed-nodes trace 对拍
