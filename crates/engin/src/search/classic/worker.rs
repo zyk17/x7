@@ -394,7 +394,9 @@ impl<'a> SearchWorker<'a> {
                     .unwrap_or(0)
             })
             .collect();
-        let draw_score = self.params.draw_score;
+        // px0 `search.cc:1675-1679`: root is depth zero for GetDrawScore,
+        // while this traversal starts its path counter at one.
+        let draw_score = self.draw_score(base_depth % 2 == 1);
         let parent_n = self.tree.node(node_idx).n();
         let cpuct = super::uct::compute_cpuct(self.params, parent_n, is_root);
         let puct_mult = cpuct * (self.tree.node(node_idx).children_visits().max(1) as f32).sqrt();
@@ -993,5 +995,23 @@ mod tests {
         assert_eq!(spent, 1);
         assert_eq!(worker.history.len(), worker.played_history_len);
         assert_eq!(worker.computation.as_ref().expect("computation").used_batch_size(), 1);
+    }
+
+    #[test]
+    fn draw_score_flips_with_root_side_and_depth() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let backend = UniformBackend::default();
+        let params = SearchParams {
+            draw_score: 0.25,
+            ..SearchParams::default()
+        };
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+
+        assert!((worker.draw_score(false) - 0.25).abs() < f32::EPSILON);
+        assert!((worker.draw_score(true) + 0.25).abs() < f32::EPSILON);
     }
 }
