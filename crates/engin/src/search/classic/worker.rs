@@ -383,7 +383,15 @@ impl<'a> SearchWorker<'a> {
             self.tree.node_mut(node_idx).increment_n_in_flight(collision_limit);
         }
 
-        let num_edges = self.tree.node(node_idx).num_edges();
+        // px0 copies only the policy prefix that this collision batch can
+        // possibly reach (`search.cc:1657-1671`). Edges are policy-sorted at
+        // initialization, so two unseen candidates suffice to establish the
+        // second-best UCT score.
+        let num_edges = self
+            .tree
+            .node(node_idx)
+            .num_edges()
+            .min(self.tree.node(node_idx).n_started() as usize + collision_limit as usize + 2);
         let mut visits_to_perform = vec![0u32; num_edges];
         let mut n_started: Vec<u32> = (0..num_edges)
             .map(|edge_idx| {
