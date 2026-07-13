@@ -149,6 +149,16 @@ impl Node {
         &self.edges
     }
 
+    /// px0 `Node::SortEdges` (`src/search/classic/node.cc:291-298`).
+    ///
+    /// px0 only sorts immediately after policy initialization, before child
+    /// nodes exist, so the parallel child slots are all empty and need no
+    /// reordering.
+    pub fn sort_edges(&mut self) {
+        assert!(self.children.iter().all(Option::is_none));
+        self.edges.sort_unstable_by_key(|edge| std::cmp::Reverse(edge.p));
+    }
+
     pub fn child(&self, index: usize) -> Option<usize> {
         self.children.get(index).copied().flatten()
     }
@@ -474,6 +484,22 @@ mod tests {
         assert_eq!(node.n(), 2);
         assert!((node.wl() - 0.25).abs() < 1e-6);
         assert_eq!(node.n_in_flight(), 0);
+    }
+
+    #[test]
+    fn sort_edges_orders_policy_before_children_exist() {
+        let a0 = xiangqi_core::Square::parse("a0").expect("a0");
+        let a1 = xiangqi_core::Square::parse("a1").expect("a1");
+        let a2 = xiangqi_core::Square::parse("a2").expect("a2");
+        let mut node = Node::default();
+        node.create_edges(&vec![Move::new(a0, a1), Move::new(a0, a2)]);
+        node.edge_mut(0).set_p(0.1);
+        node.edge_mut(1).set_p(0.9);
+
+        node.sort_edges();
+
+        assert!(node.edge(0).get_p() > node.edge(1).get_p());
+        assert_eq!(node.edge(0).mv, Move::new(a0, a2));
     }
 
     #[test]

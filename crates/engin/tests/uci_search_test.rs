@@ -63,3 +63,20 @@ fn classic_engine_rejects_non_positive_node_budget() {
         .expect_err("zero nodes must fail");
     assert_eq!(error.to_string(), "go nodes must be positive");
 }
+
+#[test]
+fn unavailable_engine_does_not_return_uniform_bestmove() {
+    ensure_init();
+    let mut options = UciOptions::populate_defaults();
+    let mut engine = ClassicEngine::unavailable();
+    let mut responder = VecUciResponder::default();
+    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    uci.process_line("position startpos", "0.0.0").expect("position");
+    uci.process_line("go nodes 8", "0.0.0").expect("go nodes");
+    drop(uci);
+    assert!(responder
+        .responses
+        .iter()
+        .any(|line| line.starts_with("info string cannot search:")));
+    assert!(!responder.responses.iter().any(|line| line.starts_with("bestmove ")));
+}

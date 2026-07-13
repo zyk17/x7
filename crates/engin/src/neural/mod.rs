@@ -132,9 +132,7 @@ mod tests {
     fn startpos_fen_only_has_no_synthetic_history() {
         let history = PositionHistory::from_positions(vec![Position::from_fen(xiangqi_core::STARTPOS_FEN).unwrap()]);
         let planes = encode_position_for_nn(&history, FillEmptyHistory::FenOnly);
-        assert!(planes[..PLANES_PER_BOARD * BOARD_ROWS * BOARD_COLS]
-            .iter()
-            .any(|&v| v == 1.0));
+        assert!(planes[..PLANES_PER_BOARD * BOARD_ROWS * BOARD_COLS].contains(&1.0));
         assert!(
             planes[PLANES_PER_BOARD * BOARD_ROWS * BOARD_COLS..AUX_PLANE_BASE * BOARD_ROWS * BOARD_COLS]
                 .iter()

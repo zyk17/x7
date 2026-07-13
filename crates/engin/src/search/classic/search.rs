@@ -239,6 +239,13 @@ impl ClassicSearch {
         } else {
             how_many
         };
+        // px0 `Search::StartThreads` (`search.cc:1088-1140`) can run several
+        // workers because `SearchWorker` only holds `nodes_mutex_` around tree
+        // mutation. This port still owns `NodeTree` for a whole iteration, so
+        // accepting more than one worker would only advertise fake parallelism.
+        if thread_count != 1 {
+            return Err(EnginError::PortIncomplete("P4 parallel SearchWorker"));
+        }
         self.worker_state.thread_count.store(thread_count, Ordering::Release);
         self.meta.lock().expect("meta lock").search_active = true;
 
@@ -247,21 +254,17 @@ impl ClassicSearch {
         let meta = Arc::clone(&self.meta);
         let backend = Arc::clone(&self.backend);
         let stop = Arc::clone(&self.stop);
-        let iteration_lock = Arc::new(Mutex::new(()));
-
         for _ in 0..thread_count {
             let tree = Arc::clone(&tree);
             let worker_state = Arc::clone(&worker_state);
             let meta = Arc::clone(&meta);
             let backend = Arc::clone(&backend);
             let stop = Arc::clone(&stop);
-            let iteration_lock = Arc::clone(&iteration_lock);
             handles.push(thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     if !meta.lock().expect("meta lock").search_active {
                         break;
                     }
-                    let _iter = iteration_lock.lock().expect("iteration lock");
                     if stop.load(Ordering::Acquire) || !meta.lock().expect("meta lock").search_active {
                         break;
                     }

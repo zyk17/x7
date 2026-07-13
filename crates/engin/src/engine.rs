@@ -2,6 +2,7 @@
 
 use xiangqi_core::{GameState, STARTPOS_FEN};
 
+use crate::search::classic::OnnxBackend;
 use crate::search::classic::{backend::Backend, search::ClassicSearch, UniformBackend};
 use crate::search::SearchBase;
 use crate::uci_loop::{EngineController, GoParams, StringUciResponder};
@@ -11,6 +12,7 @@ use crate::EnginError;
 pub struct ClassicEngine {
     search: ClassicSearch,
     position: Option<GameState>,
+    unavailable_reason: Option<&'static str>,
 }
 
 impl ClassicEngine {
@@ -18,6 +20,24 @@ impl ClassicEngine {
         Self {
             search: ClassicSearch::new(backend),
             position: None,
+            unavailable_reason: None,
+        }
+    }
+
+    /// px0 `Engine::UpdateBackendConfig` (`src/engine.cc:153-167`) creates a
+    /// real backend before search. P4 has no UCI weights configuration yet;
+    /// callers can still create the validated ONNX backend directly.
+    pub fn from_onnx_file(path: impl AsRef<std::path::Path>) -> Result<Self, EnginError> {
+        Ok(Self::with_backend(Box::new(OnnxBackend::from_file(path)?)))
+    }
+
+    /// px0 configures a real backend before search (`src/engine.cc:153-167`).
+    /// Main UCI must not silently search with the UniformBackend test stub.
+    pub fn unavailable() -> Self {
+        Self {
+            search: ClassicSearch::new(Box::new(UniformBackend::default())),
+            position: None,
+            unavailable_reason: Some("P4 weights/backend UCI configuration is not translated yet"),
         }
     }
 
@@ -56,6 +76,10 @@ impl EngineController for ClassicEngine {
     }
 
     fn go(&mut self, params: &GoParams, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
+        if let Some(reason) = self.unavailable_reason {
+            responder.send_raw_response(&format!("info string cannot search: {reason}"));
+            return Ok(());
+        }
         if self.position.is_none() {
             self.new_game()?;
         }

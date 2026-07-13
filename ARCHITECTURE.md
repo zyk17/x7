@@ -19,7 +19,7 @@
 
 `crates/xiangqi_core`：px0 `src/chess` 的 Rust 翻译，是唯一规则真相。
 
-`crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。当前 P2 UCI 已完成，P3 仅有搜索骨架。
+`crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。当前 P2 UCI、P3 单 worker 树与 P4 的 ONNX/worker 子集已存在；完整 collision/task-worker/prefetch/weights 配置仍待逐函数翻译。
 
 `nn/`：pxzero-training 数据/训练/导出契约的 Rust/Python 侧接入；不进入规则或搜索热路径。
 

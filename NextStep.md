@@ -1,10 +1,11 @@
 # NextStep
 
-## 当前阶段：P4 异步搜索与 UCI 已接线；完整碰撞/task workers/ONNX 未闭合
+## 当前阶段：P4 单 worker 搜索与 UCI 生命周期已接线；完整碰撞/task workers/weights 配置未闭合
 
 P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `ClassicSearch`** 已接入 UCI：
 
-- `go nodes` / `go movetime` / `go wtime` / `go infinite`+`stop` 可返回 `bestmove`
+- 测试用 `UniformBackend` 下，`go nodes` / `go movetime` / `go wtime` / `go infinite`+`stop` 可返回 `bestmove`
+- 主 UCI 不再使用 Uniform fallback；尚未翻译 `WeightsFile` 配置时会明确返回不可搜索状态
 - UniformBackend NN cache 子集；固定 nodes 确定性 trace（Rust stub，非 px0 二进制）
 
 当前唯一工程参考：
@@ -45,4 +46,5 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `search.cc:1485-1897`：完整 `PickNodesToExtendTask`、碰撞放大、task workers
 - `search.cc:1989-2099`：`PrefetchIntoCache` 完整递归
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
+- `engine.cc:153-167`、`neural/shared_params.*`：`WeightsFile` 到真实 ONNX backend 的 UCI 配置
 - px0 二进制 fixed-nodes trace 对拍

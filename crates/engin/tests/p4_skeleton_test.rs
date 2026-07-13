@@ -51,8 +51,8 @@ fn worker_single_iteration_increases_root_visits() {
     let backend = UniformBackend::default();
     let params = SearchParams::default();
     let stop = Arc::new(AtomicBool::new(false));
-    let mut search_state = WorkerSearchState::new(stop, i64::MAX);
-    let mut worker = SearchWorker::new(&mut tree, &backend, &params, &mut search_state);
+    let search_state = WorkerSearchState::new(stop, i64::MAX);
+    let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
     worker.execute_one_iteration().expect("one iteration");
     assert_eq!(tree.node(tree.current_head()).n(), 1);
 }
@@ -64,8 +64,8 @@ fn worker_matches_p3_root_visits_for_fixed_budget() {
     let backend = UniformBackend::default();
     let params = SearchParams::default();
     let stop = Arc::new(AtomicBool::new(false));
-    let mut search_state = WorkerSearchState::new(stop, 16);
-    let mut worker = SearchWorker::new(&mut tree, &backend, &params, &mut search_state);
+    let search_state = WorkerSearchState::new(stop, 16);
+    let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
     worker.run_until_root_visits(16).expect("worker search");
     assert_eq!(tree.node(tree.current_head()).n(), 16);
 }
@@ -75,8 +75,10 @@ fn minibatch_visits_do_not_leak_root_in_flight() {
     ensure_init();
     let mut tree = setup_startpos_tree();
     let backend = UniformBackend::default();
-    let mut params = SearchParams::default();
-    params.minibatch_size = 4;
+    let params = SearchParams {
+        minibatch_size: 4,
+        ..SearchParams::default()
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let search_state = WorkerSearchState::new(stop, i64::MAX);
     let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);

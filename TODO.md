@@ -58,7 +58,8 @@
 - [x] 固定 FEN + nodes 确定性 trace（`p4_trace_test`；UniformBackend，非 px0 二进制）。
 - [x] 翻译 `NetworkAsBackendComputation`：真实 history 编码、2062 policy 索引、
   ONNX batch、WDL 与合法着 softmax（`src/neural/encoder.cc:118-217,229-481`，
-  `src/neural/wrapper.cc:49-172`）。
+   `src/neural/wrapper.cc:49-172`）。主 UCI 在 weights 配置翻译前明确拒绝搜索，
+   不再回退到 `UniformBackend`。
 - [ ] 翻译完整 `PickNodesToExtend`、碰撞、out-of-order、task workers（`search.cc:1268-2331`）。
 - [ ] 翻译 `PrefetchIntoCache`、`MaybePrefetchIntoCache` 完整语义（`search.cc:1989-2099`）。
 - [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。

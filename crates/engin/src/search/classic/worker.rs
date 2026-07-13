@@ -317,8 +317,14 @@ impl<'a> SearchWorker<'a> {
                         }
                         self.minibatch.remove(i);
                     } else if self.minibatch[i].ooo_completed {
+                        // px0 backs up completed out-of-order entries while
+                        // reconciling collisions in GatherMinibatch
+                        // (`search.cc:1372-1393`), not in ProcessPickedTask.
+                        let item = self.minibatch[i].clone();
+                        self.do_backup_update_single_node(&item);
                         self.minibatch.remove(i);
                         minibatch_size = minibatch_size.saturating_sub(1);
+                        self.number_out_of_order += 1;
                     }
                 }
             }
@@ -343,14 +349,18 @@ impl<'a> SearchWorker<'a> {
         if self.task_workers > 0 {
             return Err(EnginError::PortIncomplete("P4 PickNodesToExtend task workers"));
         }
-        self.pick_nodes_to_extend_single(collision_limit)
+        // The full px0 routine batches `collision_limit` visits in one tree
+        // walk. Until `PickNodesToExtendTask` is translated, one call may only
+        // reserve one visit. The gather loop deliberately invokes it again to
+        // fill a single-worker minibatch.
+        self.pick_nodes_to_extend_single()
     }
 
     /// px0 `PickNodesToExtendTask` (`search.cc:1551-1897`) 的单条 selection 路径。
     ///
     /// 一次调用只创建一个 visit。`GatherMinibatch` 反复调用本函数填满 batch，
     /// 因此不能把 `collision_limit` 整体计入 root 的 in-flight。
-    fn pick_nodes_to_extend_single(&mut self, _collision_limit: u32) -> Result<(), EnginError> {
+    fn pick_nodes_to_extend_single(&mut self) -> Result<(), EnginError> {
         let root = self.tree.current_head();
         let mut node_idx = root;
         let mut moves_to_visit = MoveList::new();
@@ -464,8 +474,6 @@ impl<'a> SearchWorker<'a> {
             {
                 self.fetch_single_node_result(i)?;
                 self.minibatch[i].ooo_completed = true;
-                self.do_backup_update_single_node(&self.minibatch[i].clone());
-                self.number_out_of_order += 1;
             }
         }
         let computation = self
@@ -636,6 +644,9 @@ impl<'a> SearchWorker<'a> {
             for (edge_idx, policy) in eval.policies.iter().enumerate() {
                 self.tree.node_mut(node_idx).edge_mut(edge_idx).set_p(*policy);
             }
+            // px0 sorts the just-initialized policy before any child node can
+            // be spawned (`node.cc:291-298`, `search.cc:2145-2153`).
+            self.tree.node_mut(node_idx).sort_edges();
         }
         self.minibatch[index].eval = eval;
         Ok(())
@@ -747,11 +758,13 @@ mod tests {
         let root = tree.current_head();
         tree.make_terminal(root, GameResult::Draw, 0.0, Terminal::EndOfGame);
         let backend = UniformBackend::default();
-        let mut params = SearchParams::default();
-        params.out_of_order_eval = true;
+        let params = SearchParams {
+            out_of_order_eval: true,
+            ..SearchParams::default()
+        };
         let stop = Arc::new(AtomicBool::new(false));
-        let mut search_state = WorkerSearchState::new(stop, i64::MAX);
-        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &mut search_state);
+        let search_state = WorkerSearchState::new(stop, i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.initialize_iteration().expect("init");
         // `PickNodesToExtendTask` always reserves the path before handing an
         // item to ProcessPickedTask (`px0 search.cc:1613-1636`).  Keep this
