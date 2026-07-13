@@ -147,6 +147,61 @@ struct TaskWorkspace {
     history: PositionHistory,
 }
 
+/// px0 `SearchWorker::PickTask` (`src/search/classic/search.h:367-393`).
+/// A gathering task owns a disjoint subtree root; a processing task owns a
+/// non-overlapping minibatch range.
+#[derive(Debug)]
+pub struct PickTask {
+    pub kind: PickTaskKind,
+    pub start: Option<usize>,
+    pub base_depth: u16,
+    pub collision_limit: u32,
+    pub moves_to_base: MoveList,
+    pub results: Vec<NodeToProcess>,
+    pub start_idx: usize,
+    pub end_idx: usize,
+    pub complete: bool,
+}
+
+/// px0 `PickTask::PickTaskType` (`src/search/classic/search.h:368-370`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PickTaskKind {
+    Gathering,
+    Processing,
+}
+
+impl PickTask {
+    /// px0 gathering constructor (`src/search/classic/search.h:384-390`).
+    pub fn gathering(start: usize, base_depth: u16, moves_to_base: MoveList, collision_limit: u32) -> Self {
+        Self {
+            kind: PickTaskKind::Gathering,
+            start: Some(start),
+            base_depth,
+            collision_limit,
+            moves_to_base,
+            results: Vec::new(),
+            start_idx: 0,
+            end_idx: 0,
+            complete: false,
+        }
+    }
+
+    /// px0 processing constructor (`src/search/classic/search.h:391-392`).
+    pub fn processing(start_idx: usize, end_idx: usize) -> Self {
+        Self {
+            kind: PickTaskKind::Processing,
+            start: None,
+            base_depth: 0,
+            collision_limit: 0,
+            moves_to_base: Vec::new(),
+            results: Vec::new(),
+            start_idx,
+            end_idx,
+            complete: false,
+        }
+    }
+}
+
 impl Default for TaskWorkspace {
     /// px0 `TaskWorkspace::TaskWorkspace` (`src/search/classic/search.h:357-364`).
     fn default() -> Self {
