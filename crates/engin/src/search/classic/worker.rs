@@ -133,18 +133,35 @@ impl NodeToProcess {
     }
 }
 
-/// px0 `SearchWorker::TaskWorkspace` (`src/search/classic/search.h:348-365`)
-/// 的单 worker 选择缓冲区。
+/// px0 `SearchWorker::TaskWorkspace` (`src/search/classic/search.h:348-365`)。
 ///
 /// px0 的 `cur_iters` 是指针迭代器；arena 索引可在读取时重建，故 Rust 只保留
-/// 跨层分配和路径状态。`history` 属于后续 task-processing 翻译范围。
-#[derive(Default)]
+/// 跨层分配和路径状态。每个 task workspace 都必须拥有独立 history，供
+/// `ProcessPickedTask` 复原根局面后扩展叶子。
 struct TaskWorkspace {
     vtp_buffer: Vec<Vec<u32>>,
     visits_to_perform: Vec<Vec<u32>>,
     vtp_last_filled: Vec<isize>,
     current_path: Vec<isize>,
     moves_to_path: MoveList,
+    history: PositionHistory,
+}
+
+impl Default for TaskWorkspace {
+    /// px0 `TaskWorkspace::TaskWorkspace` (`src/search/classic/search.h:357-364`).
+    fn default() -> Self {
+        const INITIAL_DEPTH: usize = 30;
+        let mut workspace = Self {
+            vtp_buffer: Vec::with_capacity(INITIAL_DEPTH),
+            visits_to_perform: Vec::with_capacity(INITIAL_DEPTH),
+            vtp_last_filled: Vec::with_capacity(INITIAL_DEPTH),
+            current_path: Vec::with_capacity(INITIAL_DEPTH),
+            moves_to_path: MoveList::with_capacity(INITIAL_DEPTH),
+            history: PositionHistory::default(),
+        };
+        workspace.history.reserve(INITIAL_DEPTH);
+        workspace
+    }
 }
 
 /// px0 `SearchWorker` (`src/search/classic/search.h:203-448`)。
