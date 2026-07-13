@@ -44,10 +44,15 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   源码机械提取为 `px0_policy_moves.txt`。
 - `engin/src/neural/onnx.rs`：`OnnxBackend` / batch computation，逐项翻译
   `src/neural/wrapper.cc:49-172`。本地 `data/x7.onnx` 冒烟已通过。
+- `engin/src/neural/backend.rs`、`onnx.rs`：`BackendComputation` 以 task-safe
+  内部状态承载并发 `AddInput`，对应 `src/neural/backend.h:75-87` 与
+  `src/search/classic/search.cc:1423-1462`；NN compute 期间不持有 batch 状态锁。
 
 ### P4 下一入口
 
 - `search.cc:1828-1897`、`search.h:367-448`：task worker split 与任务队列
+- `classic/node.h:127-339`、`search.cc:1494-1508`：稳定 node 存储与 task
+  selection 的树访问边界；当前 `Vec<Node>` + 整轮 `Mutex` 不能直接承载 px0 子树并发
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
 - `engine.cc:153-167`、`neural/shared_params.*`：`WeightsFile` 到真实 ONNX backend 的 UCI 配置
 - px0 二进制 fixed-nodes trace 对拍

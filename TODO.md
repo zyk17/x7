@@ -64,8 +64,14 @@
   递归 `PrefetchIntoCache`（`search.cc:1551-1827,1989-2099`）。
 - [x] 翻译 two-fold terminal 生成与 tree reuse 回退
   （`search.cc:1510-1550,1899-1959`）。
+- [x] 将 `BackendComputation` 收为 task-safe 内部状态，允许并发 `AddInput`，并在
+  ONNX compute 期间释放 batch-state 锁（`src/neural/backend.h:75-87`、
+  `src/search/classic/search.cc:1423-1462`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
+- [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的
+  稳定 node 存储与访问边界（`src/search/classic/node.h:127-339`、
+  `src/search/classic/search.cc:1494-1508`）；不能以串行任务锁替代。
 - [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [ ] 对齐 px0 UCI、bench、info 统计。
