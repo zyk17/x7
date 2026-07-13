@@ -26,11 +26,7 @@ fn fixed_nodes_increases_root_visits() {
 #[test]
 fn fixed_nodes_search_returns_legal_move() {
     ensure_init();
-    let mut search = ClassicSearch::new(Box::new(UniformBackend {
-        wl: 0.2,
-        d: 0.0,
-        m: 0.0,
-    }));
+    let mut search = ClassicSearch::new(Box::new(UniformBackend::with_wdl(0.2, 0.0, 0.0)));
     let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
     search.set_position(&state).expect("set position");
     let (best, visits) = search.run_blocking_nodes(32);

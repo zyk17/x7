@@ -7,9 +7,10 @@
 翻译顺序固定为：
 
 1. `xiangqi_core`：px0 `src/chess` 的棋盘、合法着、FEN、Position、PositionHistory、RuleJudge。
-2. `engin` 外围：`GameState`、UCI controller/loop；P2 已完成。后续接入 SearchBase，再接 history、124-plane 编码、policy 映射与 ONNX。
-3. `engin/mcts`：px0 `src/search` 的单线程主线。
-4. px0 已有的 batch、NN cache、prefetch、tree reuse 与并发。
+2. `engin` 外围：`GameState`、UCI controller/loop、`SearchBase` 与 px0
+   `NetworkAsBackendComputation`。P4 的真实 history、124-plane 编码、policy 映射和 ONNX batch 已接入。
+3. `engin/mcts`：px0 `src/search` 的 worker 主线；完整 collision/task-worker/prefetch 仍待翻译。
+4. px0 已有的 NN cache、prefetch、tree reuse 与并发。
 5. `pxzero-training`：数据、训练与 ONNX 导出契约。
 
 只有 px0 主线翻译完成并有对拍测试后，才允许比较 lc0 或 KataGo，并将明确记录的差异作为独立优化事项。

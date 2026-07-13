@@ -71,7 +71,12 @@ impl EngineController for ClassicEngine {
         self.search.wait_search()
     }
 
-    fn stop(&mut self) -> Result<(), EnginError> {
-        self.search.stop_search()
+    fn stop(&mut self, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
+        self.search.stop_search()?;
+        for output in std::mem::take(&mut self.search.outputs) {
+            responder.output_thinking_info(&[output.info]);
+            responder.output_best_move(&output.bestmove);
+        }
+        Ok(())
     }
 }

@@ -7,4 +7,6 @@ publish = false
 default-run = "engin"
 
 [dependencies]
+ndarray = "0.17"
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 xiangqi_core = { path = "../xiangqi_core" }

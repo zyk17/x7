@@ -43,12 +43,29 @@
 
 ## P4：并发与训练
 
+- [x] 建立 `BackendAttributes`、`EvalPosition`、`BackendComputation` 与 P4
+  `SearchWorker` 七阶段函数骨架（px0 `src/neural/backend.h:45-138`、
+  `src/search/classic/search.h:201-448`、`search.cc:1142-1231,1268-2364`）。
+- [x] `UniformBackendComputation` + 单线程 worker 七阶段流水线
+  （`InitializeIteration` → `GatherMinibatch` → `CollectCollisions` →
+  `RunNNComputation` → `FetchMinibatchResults` → `DoBackupUpdate` →
+  `UpdateCounters`）；`p4_skeleton_test` / `worker::tests` 通过。
+- [x] `ClassicSearch` 异步 `StartThreads` + `SearchWorker` 接线；`go nodes` /
+  `go movetime` / `go wtime` / `go infinite`+`stop` UCI 路径可用（`uci_search_test`、
+  `p4_async_search_test`）。
+- [x] `stoppers/*` 子集：`Visits` / `Playouts` / `TimeLimit` / `wtime` 预算 /
+  `ChainedSearchStopper`；`UniformBackend` NN cache 子集。
+- [x] 固定 FEN + nodes 确定性 trace（`p4_trace_test`；UniformBackend，非 px0 二进制）。
+- [x] 翻译 `NetworkAsBackendComputation`：真实 history 编码、2062 policy 索引、
+  ONNX batch、WDL 与合法着 softmax（`src/neural/encoder.cc:118-217,229-481`，
+  `src/neural/wrapper.cc:49-172`）。
 - [ ] 翻译完整 `PickNodesToExtend`、碰撞、out-of-order、task workers（`search.cc:1268-2331`）。
-- [ ] 翻译 `stoppers/*`、`StartThreads` 异步路径、完整 `wtime`/`infinite`/`stop` 语义。
-- [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace（当前仅 Rust + stub backend）。
-- [ ] 逐函数翻译 px0 minibatch、NN cache、prefetch、tree reuse 与并发路径。
+- [ ] 翻译 `PrefetchIntoCache`、`MaybePrefetchIntoCache` 完整语义（`search.cc:1989-2099`）。
+- [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
+- [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [ ] 对齐 px0 UCI、bench、info 统计。
-- [ ] 按 `pxzero-training` 对齐数据字段、训练和 ONNX 导出。
+- [ ] 将 `OnnxBackend` 接入 P5 的 `WeightsFile` / backend UCI 配置，替换 UCI 主线的 UniformBackend
+  （`src/engine.cc:156-165`、`src/neural/shared_params.*`）。
 
 ## 后续才允许做
 

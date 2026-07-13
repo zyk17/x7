@@ -1,286 +1,75 @@
-//! px0 `src/search/classic/search.h:49-260`、`search.cc:426-808,1900-2258`、`wrapper.cc:53-141`。
+//! px0 `src/search/classic/search.h:49-260`、`search.cc:426-808,874-1055`、`wrapper.cc:53-141`。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use xiangqi_core::{GameResult, GameState, Move, MoveList, PositionHistory};
+use xiangqi_core::{GameState, Move};
 
 use crate::callbacks::{BestMoveInfo, ThinkingInfo};
 use crate::search::SearchBase;
 use crate::uci_loop::GoParams;
 use crate::EnginError;
 
-use super::backend::{Backend, EvalResult};
-use super::node::{NodeTree, Terminal};
+use super::backend::Backend;
+use super::node::NodeTree;
 use super::params::SearchParams;
+use super::stoppers::timemgr::{IterationStats, StoppersHints};
+use super::stoppers::{build_search_stoppers, ChainedSearchStopper, SearchStopper};
+use super::worker::{SearchWorker, WorkerSearchState};
 
-fn compute_cpuct(params: &SearchParams, n: u32, is_root: bool) -> f32 {
-    let init = params.cpuct(is_root);
-    let k = params.cpuct_factor(is_root);
-    let base = params.cpuct_base(is_root);
-    if k == 0.0 {
-        init
-    } else {
-        init + k * ((n as f32 + base) / base).ln()
-    }
+pub fn best_move(tree: &NodeTree, params: &SearchParams) -> (Move, Move) {
+    let root = tree.current_head();
+    let root_is_black = tree.history().is_black_to_move();
+    let best_edge = best_child_edge(tree, root, params);
+    let best = best_edge.map(|idx| tree.node(root).edge(idx).mv).unwrap_or_else(|| {
+        tree.history()
+            .last()
+            .board()
+            .generate_legal_moves()
+            .first()
+            .copied()
+            .unwrap_or(Move::NULL)
+    });
+    let ponder = best_edge
+        .and_then(|idx| {
+            let child = tree.node(root).child(idx)?;
+            best_child_edge(tree, child, params).map(|ponder_idx| tree.node(child).edge(ponder_idx).mv)
+        })
+        .unwrap_or(Move::NULL);
+    (
+        if root_is_black { best.flip() } else { best },
+        if root_is_black { ponder } else { ponder.flip() },
+    )
 }
 
-fn get_fpu(
-    params: &SearchParams,
-    node: &super::node::Node,
-    arena: &super::node::NodeArena,
-    is_root: bool,
-    draw_score: f32,
-) -> f32 {
-    let visited_pol = if is_root {
-        1.0
-    } else {
-        node.visited_policy(arena).max(1.0)
-    };
-    let value = params.fpu_value(is_root);
-    if params.fpu_absolute(is_root) {
-        value
-    } else {
-        -node.q(draw_score) - value * visited_pol.sqrt()
-    }
-}
-
-fn edge_score(
-    parent: &super::node::Node,
-    edge_idx: usize,
-    child: Option<&super::node::Node>,
-    arena: &super::node::NodeArena,
-    params: &SearchParams,
-    is_root: bool,
-    draw_score: f32,
-) -> f32 {
-    let edge = parent.edge(edge_idx);
-    let cpuct = compute_cpuct(params, parent.n(), is_root);
-    let u_coeff = cpuct * (parent.children_visits().max(1) as f32).sqrt();
-    let fpu = get_fpu(params, parent, arena, is_root, draw_score);
-    let q = child
-        .filter(|node| node.n() > 0)
-        .map(|node| node.q(draw_score))
-        .unwrap_or(fpu);
-    q + u_coeff * edge.get_p() / (1.0 + child.map(|node| node.n_started()).unwrap_or(0) as f32)
-}
-
-/// px0 `Search` 单线程子集。
-pub struct SearchSession<'a> {
-    pub tree: &'a mut NodeTree,
-    pub backend: &'a dyn Backend,
-    pub params: &'a SearchParams,
-    pub stop: Arc<AtomicBool>,
-    pub target_nodes: Option<u32>,
-    pub deadline: Option<Instant>,
-}
-
-impl<'a> SearchSession<'a> {
-    /// px0 `SearchWorker::ExecuteOneIteration` 单线程路径。
-    pub fn execute_one_iteration(&mut self) {
-        let root = self.tree.current_head();
-        // px0 starts a score update for every selected node, including root.
-        // Backup below retires this matching in-flight visit.
-        if !self.tree.node_mut(root).try_start_score_update() {
-            return;
-        }
-        let path = self.pick_path(root);
-        let leaf = *path.last().expect("path has root");
-        let history = self.history_at(&path);
-        if self.tree.node(leaf).num_edges() == 0 && !self.tree.node(leaf).is_terminal() {
-            self.extend_node(leaf, root, &history);
-        }
-        if self.tree.node(leaf).is_terminal() {
-            let eval = EvalResult {
-                wl: self.tree.node(leaf).wl(),
-                d: self.tree.node(leaf).d(),
-                m: self.tree.node(leaf).m(),
-                policies: Vec::new(),
-            };
-            self.backup(&path, &eval);
-            return;
-        }
-        let legal_moves: MoveList = self.tree.node(leaf).edges().iter().map(|edge| edge.mv).collect();
-        let eval = self.backend.evaluate(&history, &legal_moves);
-        if self.tree.node(leaf).n() == 0 {
-            for (idx, policy) in eval.policies.iter().enumerate() {
-                self.tree.node_mut(leaf).edge_mut(idx).set_p(*policy);
-            }
-        }
-        self.backup(&path, &eval);
-    }
-
-    pub fn run_until_stopped(&mut self) {
-        let mut ran_iteration = false;
-        loop {
-            if ran_iteration
-                && (self.stop.load(Ordering::Acquire)
-                    || self.deadline.is_some_and(|deadline| Instant::now() >= deadline))
-            {
-                break;
-            }
-            if let Some(target) = self.target_nodes {
-                let root_n = self.tree.node(self.tree.current_head()).n();
-                if ran_iteration && root_n >= target {
-                    break;
-                }
-            }
-            self.execute_one_iteration();
-            ran_iteration = true;
+fn best_child_edge(tree: &NodeTree, parent: usize, params: &SearchParams) -> Option<usize> {
+    let mut best_idx = None;
+    let mut best_n = 0;
+    let mut best_q = f32::NEG_INFINITY;
+    let mut best_p = f32::NEG_INFINITY;
+    for edge_idx in 0..tree.node(parent).num_edges() {
+        let n = tree
+            .node(parent)
+            .child(edge_idx)
+            .map(|child| tree.node(child).n())
+            .unwrap_or(0);
+        let q = tree
+            .node(parent)
+            .child(edge_idx)
+            .map(|child| tree.node(child).q(params.draw_score))
+            .unwrap_or(0.0);
+        let p = tree.node(parent).edge(edge_idx).get_p();
+        let better = n > best_n || (n == best_n && n > 0 && q > best_q) || (n == best_n && n == 0 && p > best_p);
+        if better {
+            best_idx = Some(edge_idx);
+            best_n = n;
+            best_q = q;
+            best_p = p;
         }
     }
-
-    /// px0 `Search::GetBestMove` / `GetBestChildNoTemperature` (`search.cc:643-808`)。
-    pub fn best_move(&self) -> (Move, Move) {
-        let root = self.tree.current_head();
-        let root_is_black = self.tree.history().is_black_to_move();
-        let best_edge = self.best_child_edge(root);
-        let best = best_edge
-            .map(|idx| self.tree.node(root).edge(idx).mv)
-            .unwrap_or(Move::NULL);
-        let ponder = best_edge
-            .and_then(|idx| {
-                let child = self.tree.node(root).child(idx)?;
-                self.best_child_edge(child)
-                    .map(|ponder_idx| self.tree.node(child).edge(ponder_idx).mv)
-            })
-            .unwrap_or(Move::NULL);
-        // Edges are stored from the current player's mirrored perspective.
-        // UCI output is always absolute board coordinates.
-        (
-            if root_is_black { best.flip() } else { best },
-            if root_is_black { ponder } else { ponder.flip() },
-        )
-    }
-
-    fn best_child_edge(&self, parent: usize) -> Option<usize> {
-        let mut best_idx = None;
-        let mut best_n = 0;
-        let mut best_q = f32::NEG_INFINITY;
-        let mut best_p = f32::NEG_INFINITY;
-        for edge_idx in 0..self.tree.node(parent).num_edges() {
-            let n = self
-                .tree
-                .node(parent)
-                .child(edge_idx)
-                .map(|child| self.tree.node(child).n())
-                .unwrap_or(0);
-            let q = self
-                .tree
-                .node(parent)
-                .child(edge_idx)
-                .map(|child| self.tree.node(child).q(self.params.draw_score))
-                .unwrap_or(0.0);
-            let p = self.tree.node(parent).edge(edge_idx).get_p();
-            let better = n > best_n || (n == best_n && n > 0 && q > best_q) || (n == best_n && n == 0 && p > best_p);
-            if better {
-                best_idx = Some(edge_idx);
-                best_n = n;
-                best_q = q;
-                best_p = p;
-            }
-        }
-        best_idx
-    }
-
-    fn pick_path(&mut self, root: usize) -> Vec<usize> {
-        let mut path = vec![root];
-        loop {
-            let node_idx = *path.last().expect("non-empty path");
-            let node = self.tree.node(node_idx);
-            if node.is_terminal() || node.num_edges() == 0 {
-                break;
-            }
-            let is_root = node_idx == root;
-            let mut best_edge = 0usize;
-            let mut best_score = f32::NEG_INFINITY;
-            for edge_idx in 0..node.num_edges() {
-                let child = node.child(edge_idx).map(|idx| self.tree.node(idx));
-                let score = edge_score(
-                    node,
-                    edge_idx,
-                    child,
-                    self.tree.arena(),
-                    self.params,
-                    is_root,
-                    self.params.draw_score,
-                );
-                if score > best_score {
-                    best_score = score;
-                    best_edge = edge_idx;
-                }
-            }
-            let child_idx = match node.child(best_edge) {
-                Some(idx) => idx,
-                None => self.tree.arena_mut().spawn_child(node_idx, best_edge),
-            };
-            if !self.tree.node_mut(child_idx).try_start_score_update() {
-                break;
-            }
-            path.push(child_idx);
-        }
-        path
-    }
-
-    fn history_at(&self, path: &[usize]) -> PositionHistory {
-        let mut history = self.tree.history().clone();
-        for child_idx in path.iter().copied().skip(1) {
-            let parent_idx = self.tree.node(child_idx).parent().expect("non-root has parent");
-            let edge_idx = self.tree.node(child_idx).edge_index() as usize;
-            history.append(self.tree.node(parent_idx).edge(edge_idx).mv);
-        }
-        history
-    }
-
-    /// px0 `SearchWorker::ExtendNode` (`search.cc:1900-1974`) 子集。
-    fn extend_node(&mut self, node_idx: usize, root_idx: usize, history: &PositionHistory) {
-        let board = history.last().board();
-        let legal_moves = board.generate_legal_moves();
-        if legal_moves.is_empty() {
-            self.tree.make_terminal(
-                node_idx,
-                if history.is_black_to_move() {
-                    GameResult::WhiteWon
-                } else {
-                    GameResult::BlackWon
-                },
-                0.0,
-                Terminal::EndOfGame,
-            );
-            return;
-        }
-        if node_idx != root_idx {
-            if history.last().repetitions() >= 2 {
-                self.tree
-                    .make_terminal(node_idx, history.rule_judge(), 0.0, Terminal::EndOfGame);
-                return;
-            }
-            if !board.has_mating_material() || history.last().rule60_ply() >= 120 {
-                self.tree
-                    .make_terminal(node_idx, GameResult::Draw, 0.0, Terminal::EndOfGame);
-                return;
-            }
-        }
-        self.tree.node_mut(node_idx).create_edges(&legal_moves);
-    }
-
-    /// px0 `SearchWorker::DoBackupUpdateSingleNode` (`search.cc:2175-2234`) 子集。
-    fn backup(&mut self, path: &[usize], eval: &EvalResult) {
-        let mut v = eval.wl;
-        let mut d = eval.d;
-        let mut m = eval.m;
-        for &node_idx in path.iter().rev() {
-            if self.tree.node(node_idx).is_terminal() {
-                v = self.tree.node(node_idx).wl();
-                d = self.tree.node(node_idx).d();
-                m = self.tree.node(node_idx).m();
-            }
-            self.tree.node_mut(node_idx).finalize_score_update(v, d, m, 1);
-            v = -v;
-            m += 1.0;
-        }
-    }
+    best_idx
 }
 
 #[derive(Clone, Debug)]
@@ -289,84 +78,198 @@ pub struct SearchOutput {
     pub info: ThinkingInfo,
 }
 
-struct SearchSharedState {
-    tree: NodeTree,
+struct SearchMeta {
     params: SearchParams,
+    move_start: Instant,
+    first_batch: Option<Instant>,
+    stoppers_hints: StoppersHints,
+    search_active: bool,
 }
 
-/// px0 `classic::ClassicSearch` wrapper (`wrapper.cc:53-141`)。
 pub struct ClassicSearch {
-    state: Arc<Mutex<SearchSharedState>>,
+    tree: Arc<Mutex<NodeTree>>,
+    worker_state: Arc<WorkerSearchState>,
+    meta: Arc<Mutex<SearchMeta>>,
     backend: Arc<dyn Backend>,
     stop: Arc<AtomicBool>,
+    stopper: Mutex<Option<ChainedSearchStopper>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    infinite: AtomicBool,
     pub outputs: Vec<SearchOutput>,
 }
 
 impl ClassicSearch {
     pub fn new(backend: Box<dyn Backend>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
         Self {
-            state: Arc::new(Mutex::new(SearchSharedState {
-                tree: NodeTree::default(),
+            tree: Arc::new(Mutex::new(NodeTree::default())),
+            worker_state: Arc::new(WorkerSearchState::new(Arc::clone(&stop), i64::MAX)),
+            meta: Arc::new(Mutex::new(SearchMeta {
                 params: SearchParams::default(),
+                move_start: Instant::now(),
+                first_batch: None,
+                stoppers_hints: StoppersHints::default(),
+                search_active: false,
             })),
             backend: Arc::from(backend),
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
+            stopper: Mutex::new(None),
+            threads: Mutex::new(Vec::new()),
+            infinite: AtomicBool::new(false),
             outputs: Vec::new(),
         }
     }
 
     pub fn total_root_visits(&self) -> u32 {
-        let guard = self.state.lock().expect("tree lock");
-        guard.tree.node(guard.tree.current_head()).n()
+        let tree = self.tree.lock().expect("tree lock");
+        tree.node(tree.current_head()).n()
     }
 
-    /// 测试入口：同步跑完固定 nodes 并返回 trace。
     pub fn run_blocking_nodes(&mut self, nodes: u32) -> (Move, u32) {
-        self.stop.store(false, Ordering::Release);
-        let params = self.state.lock().expect("tree lock").params.clone();
-        let mut guard = self.state.lock().expect("tree lock");
-        let mut session = SearchSession {
-            tree: &mut guard.tree,
-            backend: self.backend.as_ref(),
-            params: &params,
-            stop: Arc::clone(&self.stop),
-            target_nodes: Some(nodes),
-            deadline: None,
+        let params = GoParams {
+            nodes: Some(nodes as i32),
+            ..Default::default()
         };
-        session.run_until_stopped();
-        let (best, _) = session.best_move();
-        let visits = guard.tree.node(guard.tree.current_head()).n();
+        self.start_search(&params).expect("search");
+        self.wait_search().expect("wait");
+        let tree = self.tree.lock().expect("tree lock");
+        let meta = self.meta.lock().expect("meta lock");
+        let (best, _) = best_move(&tree, &meta.params);
+        let visits = tree.node(tree.current_head()).n();
         (best, visits)
     }
 
-    fn run_sync(&mut self, target_nodes: Option<u32>, movetime: Option<Duration>) -> Result<(), EnginError> {
-        self.outputs.clear();
-        self.stop.store(false, Ordering::Release);
-        let params = self.state.lock().expect("tree lock").params.clone();
-        let mut guard = self.state.lock().expect("tree lock");
-        let mut session = SearchSession {
-            tree: &mut guard.tree,
-            backend: self.backend.as_ref(),
-            params: &params,
-            stop: Arc::clone(&self.stop),
-            target_nodes,
-            deadline: movetime.map(|duration| Instant::now() + duration),
+    fn populate_iteration_stats(
+        meta: &SearchMeta,
+        worker_state: &WorkerSearchState,
+        tree: &NodeTree,
+    ) -> IterationStats {
+        let root_visits = tree.node(tree.current_head()).n() as i64;
+        IterationStats {
+            time_since_movestart: meta.move_start.elapsed().as_millis() as i64,
+            time_since_first_batch: meta.first_batch.map(|t| t.elapsed().as_millis() as i64).unwrap_or(0),
+            total_nodes: root_visits,
+            nodes_since_movestart: root_visits,
+            batches_since_movestart: worker_state.total_batches.load(Ordering::Acquire) as i64,
+            average_depth: {
+                let playouts = worker_state.total_playouts.load(Ordering::Acquire);
+                worker_state
+                    .cum_depth
+                    .load(Ordering::Acquire)
+                    .checked_div(playouts)
+                    .unwrap_or(0) as i32
+            },
+        }
+    }
+
+    fn maybe_trigger_stop(&mut self) -> Result<bool, EnginError> {
+        let stats = {
+            let tree = self.tree.lock().expect("tree lock");
+            let meta = self.meta.lock().expect("meta lock");
+            Self::populate_iteration_stats(&meta, &self.worker_state, &tree)
         };
-        session.run_until_stopped();
-        let (best, ponder) = session.best_move();
-        let root_n = guard.tree.node(guard.tree.current_head()).n();
-        if !best.is_null() {
-            let mut bestmove = BestMoveInfo::new(best);
-            bestmove.ponder = ponder;
-            self.outputs.push(SearchOutput {
-                bestmove,
-                info: ThinkingInfo {
-                    depth: 1,
-                    nodes: root_n as i64,
-                    multipv: 1,
-                    ..ThinkingInfo::default()
-                },
-            });
+        let mut stopper_guard = self.stopper.lock().expect("stopper lock");
+        let Some(stopper) = stopper_guard.as_mut() else {
+            return Ok(false);
+        };
+        let mut hints = self.meta.lock().expect("meta lock").stoppers_hints.clone();
+        if stopper.should_stop(&stats, &mut hints) {
+            self.meta.lock().expect("meta lock").stoppers_hints = hints;
+            self.stop.store(true, Ordering::Release);
+            return Ok(true);
+        }
+        self.meta.lock().expect("meta lock").stoppers_hints = hints;
+        Ok(false)
+    }
+
+    fn emit_outputs(&mut self) -> Result<(), EnginError> {
+        let tree = self.tree.lock().expect("tree lock");
+        let meta = self.meta.lock().expect("meta lock");
+        let (best, ponder) = best_move(&tree, &meta.params);
+        let root_n = tree.node(tree.current_head()).n();
+        if best.is_null() {
+            return Ok(());
+        }
+        let elapsed = meta.move_start.elapsed();
+        let mut bestmove = BestMoveInfo::new(best);
+        bestmove.ponder = ponder;
+        self.outputs.push(SearchOutput {
+            bestmove,
+            info: ThinkingInfo {
+                depth: self.worker_state.max_depth.load(Ordering::Acquire) as i32,
+                nodes: root_n as i64,
+                time: elapsed.as_millis() as i64,
+                multipv: 1,
+                ..ThinkingInfo::default()
+            },
+        });
+        Ok(())
+    }
+
+    fn run_one_iteration(
+        tree: &Arc<Mutex<NodeTree>>,
+        worker_state: &Arc<WorkerSearchState>,
+        meta: &Arc<Mutex<SearchMeta>>,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<(), EnginError> {
+        let remaining = meta
+            .lock()
+            .expect("meta lock")
+            .stoppers_hints
+            .estimated_remaining_playouts();
+        worker_state.set_remaining_playouts(if remaining > 0 { remaining } else { i64::MAX });
+        let params = meta.lock().expect("meta lock").params.clone();
+        let mut tree_guard = tree.lock().expect("tree lock");
+        let mut worker = SearchWorker::new(&mut tree_guard, backend.as_ref(), &params, worker_state.as_ref());
+        worker.execute_one_iteration()?;
+        let mut meta_guard = meta.lock().expect("meta lock");
+        if meta_guard.first_batch.is_none() && worker_state.total_batches.load(Ordering::Acquire) > 0 {
+            meta_guard.first_batch = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    fn start_threads(&mut self, how_many: usize) -> Result<(), EnginError> {
+        let mut handles = self.threads.lock().expect("threads lock");
+        if !handles.is_empty() {
+            return Ok(());
+        }
+        let thread_count = if how_many == 0 {
+            self.backend.attributes().suggested_num_search_threads.max(1)
+        } else {
+            how_many
+        };
+        self.worker_state.thread_count.store(thread_count, Ordering::Release);
+        self.meta.lock().expect("meta lock").search_active = true;
+
+        let tree = Arc::clone(&self.tree);
+        let worker_state = Arc::clone(&self.worker_state);
+        let meta = Arc::clone(&self.meta);
+        let backend = Arc::clone(&self.backend);
+        let stop = Arc::clone(&self.stop);
+        let iteration_lock = Arc::new(Mutex::new(()));
+
+        for _ in 0..thread_count {
+            let tree = Arc::clone(&tree);
+            let worker_state = Arc::clone(&worker_state);
+            let meta = Arc::clone(&meta);
+            let backend = Arc::clone(&backend);
+            let stop = Arc::clone(&stop);
+            let iteration_lock = Arc::clone(&iteration_lock);
+            handles.push(thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    if !meta.lock().expect("meta lock").search_active {
+                        break;
+                    }
+                    let _iter = iteration_lock.lock().expect("iteration lock");
+                    if stop.load(Ordering::Acquire) || !meta.lock().expect("meta lock").search_active {
+                        break;
+                    }
+                    if ClassicSearch::run_one_iteration(&tree, &worker_state, &meta, &backend).is_err() {
+                        break;
+                    }
+                }
+            }));
         }
         Ok(())
     }
@@ -374,54 +277,121 @@ impl ClassicSearch {
 
 impl SearchBase for ClassicSearch {
     fn new_game(&mut self) -> Result<(), EnginError> {
-        let mut guard = self.state.lock().expect("tree lock");
-        guard.tree = NodeTree::default();
+        self.wait_search()?;
+        *self.tree.lock().expect("tree lock") = NodeTree::default();
+        self.worker_state = Arc::new(WorkerSearchState::new(Arc::clone(&self.stop), i64::MAX));
         self.outputs.clear();
         Ok(())
     }
 
     fn set_position(&mut self, state: &GameState) -> Result<(), EnginError> {
-        let mut guard = self.state.lock().expect("tree lock");
-        guard.tree.reset_to_position(&state.startpos, &state.moves);
+        self.tree
+            .lock()
+            .expect("tree lock")
+            .reset_to_position(&state.startpos, &state.moves);
         Ok(())
     }
 
-    /// P3：单线程 `go nodes` / `go movetime`；完整 stopper 语义后续翻译。
     fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError> {
-        if params.infinite {
-            return Err(EnginError::PortIncomplete("infinite search stopper"));
+        self.outputs.clear();
+        self.stop.store(false, Ordering::Release);
+        self.infinite.store(params.infinite, Ordering::Release);
+
+        let nodes = params.nodes.filter(|&n| n > 0);
+        if params.nodes.is_some() && nodes.is_none() {
+            return Err(EnginError::Uci("go nodes must be positive".into()));
         }
-        let target_nodes = match params.nodes {
-            Some(nodes) if nodes > 0 => Some(nodes as u32),
-            Some(_) => return Err(EnginError::Uci("go nodes must be positive".into())),
-            None => None,
-        };
-        let movetime = match params.movetime {
-            Some(movetime) if movetime >= 0 => Some(Duration::from_millis(movetime as u64)),
-            Some(_) => return Err(EnginError::Uci("go movetime must be non-negative".into())),
-            None => None,
-        };
-        if target_nodes.is_some() || movetime.is_some() {
-            return self.run_sync(target_nodes, movetime);
+        if let Some(movetime) = params.movetime {
+            if movetime < 0 {
+                return Err(EnginError::Uci("go movetime must be non-negative".into()));
+            }
         }
-        Err(EnginError::PortIncomplete("time-based search stopper"))
+
+        let has_budget = nodes.is_some()
+            || params.movetime.is_some()
+            || params.infinite
+            || params.wtime.is_some()
+            || params.btime.is_some();
+        if !has_budget {
+            return Err(EnginError::PortIncomplete("time-based search stopper"));
+        }
+
+        {
+            let tree = self.tree.lock().expect("tree lock");
+            let mut meta = self.meta.lock().expect("meta lock");
+            meta.move_start = Instant::now();
+            meta.first_batch = None;
+            meta.stoppers_hints.reset();
+            self.worker_state.total_playouts.store(0, Ordering::Release);
+            self.worker_state.total_batches.store(0, Ordering::Release);
+            self.worker_state.network_evaluations.store(0, Ordering::Release);
+            self.worker_state.cum_depth.store(0, Ordering::Release);
+            self.worker_state.max_depth.store(0, Ordering::Release);
+            self.worker_state
+                .shared_collisions
+                .lock()
+                .expect("collisions lock")
+                .clear();
+            if let Some(limit) = nodes {
+                self.worker_state.set_nodes_budget(limit as u32);
+                meta.stoppers_hints.update_estimated_remaining_playouts(limit as i64);
+                self.worker_state.set_remaining_playouts(limit as i64);
+            } else {
+                self.worker_state.set_nodes_budget(0);
+            }
+            let chain = build_search_stoppers(params, tree.history(), false);
+            *self.stopper.lock().expect("stopper lock") = Some(chain);
+            if nodes.is_none() {
+                if let Some(ms) = params.movetime {
+                    meta.stoppers_hints.update_estimated_remaining_time_ms(ms);
+                }
+            }
+        }
+
+        self.start_threads(0)?;
+
+        if !params.infinite {
+            self.wait_search()?;
+            self.emit_outputs()?;
+        }
+        Ok(())
     }
 
     fn start_clock(&mut self) -> Result<(), EnginError> {
+        self.meta.lock().expect("meta lock").move_start = Instant::now();
         Ok(())
     }
 
     fn wait_search(&mut self) -> Result<(), EnginError> {
+        loop {
+            if self.maybe_trigger_stop()? || self.stop.load(Ordering::Acquire) {
+                break;
+            }
+            if !self.meta.lock().expect("meta lock").search_active {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        self.stop.store(true, Ordering::Release);
+        self.meta.lock().expect("meta lock").search_active = false;
+        let handles: Vec<_> = self.threads.lock().expect("threads lock").drain(..).collect();
+        for handle in handles {
+            let _ = handle.join();
+        }
         Ok(())
     }
 
     fn stop_search(&mut self) -> Result<(), EnginError> {
         self.stop.store(true, Ordering::Release);
+        self.wait_search()?;
+        if self.infinite.load(Ordering::Acquire) {
+            self.emit_outputs()?;
+        }
         Ok(())
     }
 
     fn abort_search(&mut self) -> Result<(), EnginError> {
         self.stop.store(true, Ordering::Release);
-        Ok(())
+        self.wait_search()
     }
 }

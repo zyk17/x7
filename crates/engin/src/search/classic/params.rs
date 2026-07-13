@@ -20,6 +20,18 @@ pub struct SearchParams {
     pub solid_tree_threshold: u32,
     pub temperature: f32,
     pub max_concurrent_searchers: i32,
+    pub max_collision_visits: i32,
+    pub max_collision_visits_scaling_start: i32,
+    pub max_collision_visits_scaling_end: i32,
+    pub max_collision_visits_scaling_power: f32,
+    pub out_of_order_eval: bool,
+    pub max_out_of_order_evals_factor: f32,
+    pub task_workers_per_search_worker: i32,
+    pub max_prefetch_batch: i32,
+}
+
+fn mix(high: i32, low: i32, ratio: f32) -> i32 {
+    (low as f32 + (high - low) as f32 * ratio).round() as i32
 }
 
 impl Default for SearchParams {
@@ -43,6 +55,14 @@ impl Default for SearchParams {
             solid_tree_threshold: 100,
             temperature: 0.0,
             max_concurrent_searchers: 1,
+            max_collision_visits: 80_000,
+            max_collision_visits_scaling_start: 28,
+            max_collision_visits_scaling_end: 100_000,
+            max_collision_visits_scaling_power: 1.25,
+            out_of_order_eval: true,
+            max_out_of_order_evals_factor: 2.4,
+            task_workers_per_search_worker: -1,
+            max_prefetch_batch: 32,
         }
     }
 }
@@ -78,5 +98,22 @@ impl SearchParams {
         } else {
             self.fpu_value
         }
+    }
+
+    /// px0 `CalculateCollisionsLeft` (`search.cc:1251-1265`)。
+    pub fn collisions_left(&self, nodes: i64) -> i32 {
+        if nodes >= self.max_collision_visits_scaling_end as i64 {
+            return self.max_collision_visits;
+        }
+        if nodes <= self.max_collision_visits_scaling_start as i64 {
+            return 1;
+        }
+        let ratio = ((nodes - self.max_collision_visits_scaling_start as i64) as f32)
+            / ((self.max_collision_visits_scaling_end - self.max_collision_visits_scaling_start) as f32);
+        mix(
+            self.max_collision_visits,
+            1,
+            ratio.powf(self.max_collision_visits_scaling_power),
+        )
     }
 }

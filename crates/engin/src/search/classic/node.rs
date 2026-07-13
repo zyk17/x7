@@ -183,6 +183,19 @@ impl Node {
         self.n_in_flight -= multivisit;
     }
 
+    /// px0 `Node::IncrementNInFlight` (`node.cc:346`)。
+    pub fn increment_n_in_flight(&mut self, count: u32) {
+        self.n_in_flight += count;
+    }
+
+    /// px0 `Node::CopyPolicy` (`node.cc:378-384`)。
+    pub fn copy_policy(&self, max_needed: usize, out: &mut [f32]) {
+        let count = max_needed.min(self.edges.len());
+        for (idx, policy) in out.iter_mut().enumerate().take(count) {
+            *policy = self.edges[idx].get_p();
+        }
+    }
+
     /// px0 `Node::FinalizeScoreUpdate` (`node.cc:356-366`)。
     pub fn finalize_score_update(&mut self, v: f32, d: f32, m: f32, multivisit: u32) {
         self.wl += multivisit as f32 * (v - self.wl) / (self.n + multivisit) as f32;

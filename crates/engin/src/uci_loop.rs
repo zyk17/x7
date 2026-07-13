@@ -95,7 +95,7 @@ pub trait EngineController {
     fn go(&mut self, params: &GoParams, responder: &mut dyn StringUciResponder) -> Result<(), EnginError>;
     fn ponder_hit(&mut self) -> Result<(), EnginError>;
     fn wait(&mut self) -> Result<(), EnginError>;
-    fn stop(&mut self) -> Result<(), EnginError>;
+    fn stop(&mut self, responder: &mut dyn StringUciResponder) -> Result<(), EnginError>;
 }
 
 /// px0 `UciLoop` (`uciloop.h:101-118`)。
@@ -205,7 +205,7 @@ impl<'a> UciLoop<'a> {
                 self.engine.go(&go_params, self.responder)?;
             }
             "wait" => self.engine.wait()?,
-            "stop" => self.engine.stop()?,
+            "stop" => self.engine.stop(self.responder)?,
             "ponderhit" => self.engine.ponder_hit()?,
             "xyzzy" => self.responder.send_raw_response("Nothing happens."),
             "quit" => return Ok(false),
@@ -628,7 +628,7 @@ impl EngineController for RecordingEngine {
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<(), EnginError> {
+    fn stop(&mut self, _responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
         Ok(())
     }
 }

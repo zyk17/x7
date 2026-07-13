@@ -153,6 +153,11 @@ pub struct PositionHistory {
 }
 
 impl PositionHistory {
+    /// px0 `PositionHistory::GetPositions()` 快照 (`position.h:158`)。
+    pub fn from_positions(positions: Vec<Position>) -> Self {
+        Self { positions }
+    }
+
     /// px0 `PositionHistory::Starting` (`position.h:112-113`).
     pub fn starting(&self) -> &Position {
         self.positions.first().expect("PositionHistory is empty")

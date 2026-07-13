@@ -11,7 +11,9 @@
 - `C:\Users\Administrator\projects\px0`
 - `C:\Users\Administrator\projects\pxzero-training`
 
-当前 P2 UCI 可解析并保存局面/history；P3 搜索尚未接入，因此 `go` 不返回伪 `bestmove`。
+当前 P4 已有 px0 classic worker、真实 `124x10x9` ONNX backend 与 UCI 搜索接线；
+完整 collision/task-worker/prefetch 及权重 UCI 配置仍未完成。默认二进制尚不加载权重，
+不能把 UniformBackend 的测试结果当作模型搜索结果。
 
 ## 正式模型契约
 

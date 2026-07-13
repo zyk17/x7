@@ -1,10 +1,11 @@
 # NextStep
 
-## 当前阶段：P3 单线程 baseline 完成；进入 P4 后端与并发
+## 当前阶段：P4 异步搜索与 UCI 已接线；完整碰撞/task workers/ONNX 未闭合
 
-P0/P1/P2 **规则与 UCI 外围已通过**。P3 **单线程 `go nodes` 已可用**：`ClassicEngine` + `UniformBackend` + `SearchSession`；`search_trace_test` / `uci_search_test` 通过。
+P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `ClassicSearch`** 已接入 UCI：
 
-P3 的验收范围是单线程、确定性 stub backend 下的 `go nodes` / `go movetime`：PUCT、extend、terminal、backup、tree reuse、绝对 UCI move/ponder 均已覆盖。碰撞/OOO/task workers、完整 stoppers、异步 `StartThreads` 与真实 NN 属 P4。
+- `go nodes` / `go movetime` / `go wtime` / `go infinite`+`stop` 可返回 `bestmove`
+- UniformBackend NN cache 子集；固定 nodes 确定性 trace（Rust stub，非 px0 二进制）
 
 当前唯一工程参考：
 
@@ -23,18 +24,26 @@ P3 的验收范围是单线程、确定性 stub backend 下的 `go nodes` / `go 
 
 每个 Rust 函数必须标注 px0 文件和连续行区间；找不到参考不实现。
 
-### P3 已落地
+### P4 已落地
 
-- `engin/src/search/classic/node.rs`：`Edge` prior、`Node` 统计、`NodeTree`（`node.cc`）
-- `engin/src/search/classic/params.rs`：px0 默认参数子集
-- `engin/src/search/classic/backend.rs`：`UniformBackend` stub
-- `engin/src/search/classic/search.rs`：`SearchSession`、`ClassicSearch`
-- `engin/src/engine.rs`：`ClassicEngine` 接线 UCI `go nodes` / `go movetime`
-- `engin/tests/search_trace_test.rs`、`engin/tests/uci_search_test.rs`
+- `engin/src/search/classic/backend.rs`：`UniformBackendComputation` + cache（`backend.h:67-78`）
+- `engin/src/search/classic/worker.rs`：七阶段 + `nodes_budget` + OOO 子集
+- `engin/src/search/classic/search.rs`：异步 `StartThreads`、`ClassicSearch` 取代 `SearchSession` 主路径
+- `engin/src/search/classic/stoppers/*`：Visits/Playouts/TimeLimit/wtime 预算
+- `engin/src/search/classic/uct.rs`：PUCT/FPU 共享辅助
+- `engin/tests/p4_*` + `uci_search_test` + `search_trace_test` 全绿
 
-### P4 入口
+### P4 已完成的真实网络入口
 
-- `src/neural/*` + 真实 policy/value 推理
-- `search.cc:1268-2331`：碰撞、OOO、task workers、batch gather/backup
-- `classic/stoppers/*`、`search.cc:874-1055`：异步 `StartThreads`、`wait`/`stop`、完整时间管理
-- px0 二进制 fixed-nodes trace 对拍（需同一 backend 策略）
+- `engin/src/neural/mod.rs`：真实 `PositionHistory -> 124x10x9`，对应
+  `src/neural/encoder.cc:118-217`；`encoder.cc:229-481` 的 2062 policy 表由
+  源码机械提取为 `px0_policy_moves.txt`。
+- `engin/src/neural/onnx.rs`：`OnnxBackend` / batch computation，逐项翻译
+  `src/neural/wrapper.cc:49-172`。本地 `data/x7.onnx` 冒烟已通过。
+
+### P4 下一入口
+
+- `search.cc:1485-1897`：完整 `PickNodesToExtendTask`、碰撞放大、task workers
+- `search.cc:1989-2099`：`PrefetchIntoCache` 完整递归
+- `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
+- px0 二进制 fixed-nodes trace 对拍

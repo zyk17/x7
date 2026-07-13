@@ -3,6 +3,7 @@
 pub mod callbacks;
 pub mod engine;
 pub mod error;
+pub mod neural;
 pub mod search;
 pub mod uci_loop;
 
