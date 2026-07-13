@@ -316,7 +316,10 @@ impl<'a> SearchWorker<'a> {
                     picked_visits += 1;
                 }
             }
-            self.process_picked_task(new_start, self.minibatch.len())?;
+            let mut workspace = std::mem::take(&mut self.picking_workspace);
+            let process_result = self.process_picked_task(new_start, self.minibatch.len(), &mut workspace);
+            self.picking_workspace = workspace;
+            process_result?;
 
             // px0 consumes collision budget and can increase multivisit here.
             // That translation is still pending; do not spin on a collision
@@ -642,8 +645,14 @@ impl<'a> SearchWorker<'a> {
         self.tree.make_not_terminal(child_idx);
     }
 
-    /// px0 `SearchWorker::ProcessPickedTask` (`search.cc:1423-1462`)。
-    fn process_picked_task(&mut self, start_idx: usize, end_idx: usize) -> Result<(), EnginError> {
+    /// px0 `SearchWorker::ProcessPickedTask` (`src/search/classic/search.cc:1423-1462`)。
+    fn process_picked_task(
+        &mut self,
+        start_idx: usize,
+        end_idx: usize,
+        workspace: &mut TaskWorkspace,
+    ) -> Result<(), EnginError> {
+        workspace.history = self.tree.history().clone();
         let mut nn_inputs = Vec::new();
         for i in start_idx..end_idx {
             let node_idx = self.minibatch[i].node_idx;
@@ -651,9 +660,9 @@ impl<'a> SearchWorker<'a> {
             let moves_to_visit = self.minibatch[i].moves_to_visit.clone();
             let is_terminal = self.tree.node(node_idx).is_terminal();
             if self.minibatch[i].is_extendable(is_terminal) {
-                self.extend_node(node_idx, depth, &moves_to_visit)?;
+                self.extend_node(node_idx, depth, &moves_to_visit, &mut workspace.history)?;
                 if !self.tree.node(node_idx).is_terminal() {
-                    nn_inputs.push((i, self.history.positions().to_vec(), {
+                    nn_inputs.push((i, workspace.history.positions().to_vec(), {
                         self.tree
                             .node(node_idx)
                             .edges()
@@ -684,18 +693,24 @@ impl<'a> SearchWorker<'a> {
     }
 
     /// px0 `SearchWorker::ExtendNode` (`src/search/classic/search.cc:1899-1974`)。
-    fn extend_node(&mut self, node_idx: usize, depth: u16, moves_to_node: &[Move]) -> Result<(), EnginError> {
+    fn extend_node(
+        &mut self,
+        node_idx: usize,
+        depth: u16,
+        moves_to_node: &[Move],
+        history: &mut PositionHistory,
+    ) -> Result<(), EnginError> {
         let root = self.tree.current_head();
-        self.history.trim(self.played_history_len);
+        history.trim(self.played_history_len);
         for mv in moves_to_node {
-            self.history.append(*mv);
+            history.append(*mv);
         }
-        let board = self.history.last().board();
+        let board = history.last().board();
         let legal_moves = board.generate_legal_moves();
         if legal_moves.is_empty() {
             self.tree.make_terminal(
                 node_idx,
-                if self.history.is_black_to_move() {
+                if history.is_black_to_move() {
                     GameResult::WhiteWon
                 } else {
                     GameResult::BlackWon
@@ -706,52 +721,52 @@ impl<'a> SearchWorker<'a> {
             return Ok(());
         }
         if node_idx != root {
-            if self.history.last().repetitions() >= 2 {
+            if history.last().repetitions() >= 2 {
                 self.tree
-                    .make_terminal(node_idx, self.history.rule_judge(), 0.0, Terminal::EndOfGame);
+                    .make_terminal(node_idx, history.rule_judge(), 0.0, Terminal::EndOfGame);
                 return Ok(());
             }
             // px0 `search.cc:1930-1959`: an initial repetition can be a
             // forced two-fold result only after the complete cycle is inside
             // the searched line. The special terminal can later be reverted
             // when tree reuse moves the root into that cycle.
-            if self.history.last().repetitions() == 1
+            if history.last().repetitions() == 1
                 && depth.saturating_sub(1) >= 4
                 && self.params.two_fold_draws
-                && u32::from(depth.saturating_sub(1)) >= self.history.last().cycle_length()
+                && u32::from(depth.saturating_sub(1)) >= history.last().cycle_length()
             {
-                let cycle_length = self.history.last().cycle_length();
-                let result = self.history.rule_judge();
+                let cycle_length = history.last().cycle_length();
+                let result = history.rule_judge();
                 if result == GameResult::Draw {
                     self.tree
                         .make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
                     return Ok(());
                 }
 
-                let mut idx = self.history.len() - 1;
+                let mut idx = history.len() - 1;
                 let mut idx2 = idx;
                 while idx2 > 0 {
                     idx2 -= 1;
-                    if self.history.get(idx2).board() == self.history.last().board() {
+                    if history.get(idx2).board() == history.last().board() {
                         break;
                     }
                 }
-                if idx2 > 0 && self.history.get(idx - 1).board() == self.history.get(idx2 - 1).board() {
+                if idx2 > 0 && history.get(idx - 1).board() == history.get(idx2 - 1).board() {
                     idx -= 1;
                     while idx2 != idx {
                         idx2 += 1;
-                        if self.history.get(idx2).repetitions() > 0 {
+                        if history.get(idx2).repetitions() > 0 {
                             break;
                         }
                     }
-                    if idx2 == idx && self.history.last().rule60_ply() < 120 {
+                    if idx2 == idx && history.last().rule60_ply() < 120 {
                         self.tree
                             .make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
                         return Ok(());
                     }
                 }
             }
-            if !board.has_mating_material() || self.history.last().rule60_ply() >= 120 {
+            if !board.has_mating_material() || history.last().rule60_ply() >= 120 {
                 self.tree
                     .make_terminal(node_idx, GameResult::Draw, 0.0, Terminal::EndOfGame);
                 return Ok(());
@@ -1104,7 +1119,8 @@ mod tests {
         // focused OOO test on that post-selection contract.
         assert!(worker.tree.node_mut(root).try_start_score_update());
         worker.minibatch.push(NodeToProcess::visit(root, 1));
-        worker.process_picked_task(0, 1).expect("ooo terminal");
+        let mut workspace = TaskWorkspace::default();
+        worker.process_picked_task(0, 1, &mut workspace).expect("ooo terminal");
         assert!(worker.minibatch[0].ooo_completed);
     }
 
@@ -1301,7 +1317,9 @@ mod tests {
         let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
 
-        worker.extend_node(child, 5, &moves).expect("extend twofold leaf");
+        worker
+            .extend_node(child, 5, &moves, &mut history)
+            .expect("extend twofold leaf");
 
         assert!(worker.tree.node(child).is_twofold_terminal());
         assert!((worker.tree.node(child).m() - 4.0).abs() < f32::EPSILON);
