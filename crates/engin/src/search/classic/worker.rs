@@ -524,6 +524,12 @@ impl<'a> SearchWorker<'a> {
                         .node(current_idx)
                         .child(best_idx)
                         .unwrap_or_else(|| self.tree.arena_mut().spawn_child(current_idx, best_idx));
+                    // px0 `search.cc:1791-1794`: a tree-reused two-fold
+                    // terminal may have been reached before the new root.
+                    self.ensure_node_twofold_correct_for_depth(
+                        child_idx,
+                        workspace.current_path.len() as u16 + base_depth,
+                    );
                     if self.tree.node_mut(child_idx).try_start_score_update() {
                         n_started[best_idx] += 1;
                         let remaining_visits = new_visits - 1;
@@ -589,6 +595,34 @@ impl<'a> SearchWorker<'a> {
         }
         self.picking_workspace = workspace;
         Ok(())
+    }
+
+    /// px0 `SearchWorker::EnsureNodeTwoFoldCorrectForDepth`
+    /// (`src/search/classic/search.cc:1510-1550`)。
+    fn ensure_node_twofold_correct_for_depth(&mut self, child_idx: usize, depth: u16) {
+        let child = self.tree.node(child_idx);
+        if !child.is_twofold_terminal() || depth as f32 >= child.m() {
+            return;
+        }
+
+        let wl = child.wl();
+        let d = child.d();
+        let m = child.m();
+        let terminal_visits = child.n();
+        let mut node_idx = Some(child_idx);
+        let mut depth_counter = 0u16;
+        while let Some(current_idx) = node_idx {
+            let parent = self.tree.node(current_idx).parent();
+            self.tree
+                .node_mut(current_idx)
+                .revert_terminal_visits(wl, d, m + depth_counter as f32, terminal_visits);
+            depth_counter += 1;
+            if depth_counter > depth {
+                break;
+            }
+            node_idx = parent;
+        }
+        self.tree.make_not_terminal(child_idx);
     }
 
     /// px0 `SearchWorker::ProcessPickedTask` (`search.cc:1423-1462`)。
@@ -1156,5 +1190,32 @@ mod tests {
             .expect("leaf visit");
         assert_eq!(visit.moves_to_visit, vec![first, second]);
         assert_eq!(visit.depth, 3);
+    }
+
+    #[test]
+    fn reused_twofold_terminal_is_reverted_before_selection() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let mv = tree.history().last().board().generate_legal_moves()[0];
+        tree.node_mut(root).create_single_child_node(mv);
+        let child = tree.arena_mut().spawn_child(root, 0);
+        tree.make_terminal(child, GameResult::Draw, 3.0, Terminal::TwoFold);
+        assert!(tree.node_mut(child).try_start_score_update());
+        tree.node_mut(child).finalize_score_update(0.0, 1.0, 3.0, 1);
+        assert!(tree.node_mut(root).try_start_score_update());
+        tree.node_mut(root).finalize_score_update(0.0, 1.0, 4.0, 1);
+
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+        worker.ensure_node_twofold_correct_for_depth(child, 1);
+
+        assert!(!worker.tree.node(child).is_terminal());
+        assert_eq!(worker.tree.node(child).n(), 0);
+        assert_eq!(worker.tree.node(root).n(), 0);
     }
 }
