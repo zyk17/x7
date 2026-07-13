@@ -64,12 +64,16 @@ pub enum AddInputResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvalTicket(pub usize);
 
-/// px0 `BackendComputation` (`src/neural/backend.h:67-78`)。
-pub trait BackendComputation {
+/// px0 `BackendComputation` (`src/neural/backend.h:75-87`)。
+///
+/// `SearchWorker::ProcessPickedTask` may call `AddInput` from several px0 task
+/// workers (`search.cc:1423-1462`). Rust implementations therefore own their
+/// mutable batch state behind an internal lock instead of requiring `&mut self`.
+pub trait BackendComputation: Send + Sync {
     fn used_batch_size(&self) -> usize;
-    fn add_input(&mut self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError>;
-    fn compute_blocking(&mut self) -> Result<(), EnginError>;
-    fn take_result(&mut self, ticket: EvalTicket) -> Result<EvalResult, EnginError>;
+    fn add_input(&self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError>;
+    fn compute_blocking(&self) -> Result<(), EnginError>;
+    fn take_result(&self, ticket: EvalTicket) -> Result<EvalResult, EnginError>;
 }
 
 /// px0 `Backend` 评估边界（P3 单线程 + P4 batch）。
@@ -91,6 +95,10 @@ pub trait Backend: Send + Sync {
 /// px0 `UniformBackend` 的 P4 batch 实现（测试/对拍用）。
 struct UniformBackendComputation {
     backend: UniformBackend,
+    state: Mutex<UniformComputationState>,
+}
+
+struct UniformComputationState {
     pending: Vec<(EvalTicket, EvalPosition)>,
     results: HashMap<usize, EvalResult>,
     next_ticket: usize,
@@ -100,43 +108,54 @@ impl UniformBackendComputation {
     fn new(backend: UniformBackend) -> Self {
         Self {
             backend,
-            pending: Vec::new(),
-            results: HashMap::new(),
-            next_ticket: 0,
+            state: Mutex::new(UniformComputationState {
+                pending: Vec::new(),
+                results: HashMap::new(),
+                next_ticket: 0,
+            }),
         }
     }
 }
 
 impl BackendComputation for UniformBackendComputation {
     fn used_batch_size(&self) -> usize {
-        self.pending.len()
+        self.state.lock().expect("uniform computation lock").pending.len()
     }
 
-    fn add_input(&mut self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError> {
+    fn add_input(&self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError> {
+        let mut state = self.state.lock().expect("uniform computation lock");
+        let ticket = EvalTicket(state.next_ticket);
+        state.next_ticket += 1;
         if let Some(cached) = self.backend.cached_evaluation(&position) {
-            let ticket = EvalTicket(self.next_ticket);
-            self.next_ticket += 1;
-            self.results.insert(ticket.0, cached);
+            state.results.insert(ticket.0, cached);
             return Ok((AddInputResult::FetchedImmediately, ticket));
         }
-        let ticket = EvalTicket(self.next_ticket);
-        self.next_ticket += 1;
-        self.pending.push((ticket, position));
+        state.pending.push((ticket, position));
         Ok((AddInputResult::EnqueuedForEval, ticket))
     }
 
-    fn compute_blocking(&mut self) -> Result<(), EnginError> {
-        for (ticket, position) in self.pending.drain(..) {
+    fn compute_blocking(&self) -> Result<(), EnginError> {
+        let pending = std::mem::take(&mut self.state.lock().expect("uniform computation lock").pending);
+        let mut results = Vec::with_capacity(pending.len());
+        for (ticket, position) in pending {
             let history = PositionHistory::from_positions(position.positions.clone());
             let eval = self.backend.evaluate(&history, &position.legal_moves);
             self.backend.store_cache(&position, eval.clone());
-            self.results.insert(ticket.0, eval);
+            results.push((ticket, eval));
         }
+        self.state
+            .lock()
+            .expect("uniform computation lock")
+            .results
+            .extend(results.into_iter().map(|(ticket, result)| (ticket.0, result)));
         Ok(())
     }
 
-    fn take_result(&mut self, ticket: EvalTicket) -> Result<EvalResult, EnginError> {
-        self.results
+    fn take_result(&self, ticket: EvalTicket) -> Result<EvalResult, EnginError> {
+        self.state
+            .lock()
+            .expect("uniform computation lock")
+            .results
             .remove(&ticket.0)
             .ok_or(EnginError::PortIncomplete("UniformBackendComputation missing result"))
     }
@@ -226,5 +245,40 @@ impl UniformBackend {
                 num_moves: position.legal_moves.len(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn computation_accepts_concurrent_task_inputs() {
+        let backend = UniformBackend::default();
+        let computation: Arc<dyn BackendComputation> = Arc::from(backend.create_computation().expect("computation"));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let computation = Arc::clone(&computation);
+                thread::spawn(move || {
+                    computation
+                        .add_input(EvalPosition {
+                            positions: Vec::new(),
+                            legal_moves: Vec::new(),
+                        })
+                        .expect("add input")
+                        .1
+                })
+            })
+            .collect();
+        let tickets: Vec<_> = handles.into_iter().map(|handle| handle.join().expect("task")).collect();
+
+        assert_eq!(computation.used_batch_size(), 2);
+        computation.compute_blocking().expect("compute");
+        for ticket in tickets {
+            assert!(computation.take_result(ticket).is_ok());
+        }
     }
 }

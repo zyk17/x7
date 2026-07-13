@@ -52,7 +52,7 @@ impl OnnxBackend {
 
 impl Backend for OnnxBackend {
     fn evaluate(&self, history: &xiangqi_core::PositionHistory, legal_moves: &[xiangqi_core::Move]) -> EvalResult {
-        let mut computation = self.create_computation().expect("create ONNX computation");
+        let computation = self.create_computation().expect("create ONNX computation");
         let (_, ticket) = computation
             .add_input(EvalPosition {
                 positions: history.positions().to_vec(),
@@ -75,6 +75,10 @@ impl Backend for OnnxBackend {
 /// px0 `NetworkAsBackendComputation` (`wrapper.cc:100-172`)。
 struct OnnxBackendComputation {
     session: Arc<Mutex<Session>>,
+    state: Mutex<OnnxComputationState>,
+}
+
+struct OnnxComputationState {
     entries: Vec<(EvalTicket, EvalPosition)>,
     results: HashMap<usize, EvalResult>,
     next_ticket: usize,
@@ -84,32 +88,36 @@ impl OnnxBackendComputation {
     fn new(session: Arc<Mutex<Session>>) -> Self {
         Self {
             session,
-            entries: Vec::new(),
-            results: HashMap::new(),
-            next_ticket: 0,
+            state: Mutex::new(OnnxComputationState {
+                entries: Vec::new(),
+                results: HashMap::new(),
+                next_ticket: 0,
+            }),
         }
     }
 }
 
 impl BackendComputation for OnnxBackendComputation {
     fn used_batch_size(&self) -> usize {
-        self.entries.len()
+        self.state.lock().expect("ONNX computation lock").entries.len()
     }
 
-    fn add_input(&mut self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError> {
-        let ticket = EvalTicket(self.next_ticket);
-        self.next_ticket += 1;
-        self.entries.push((ticket, position));
+    fn add_input(&self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError> {
+        let mut state = self.state.lock().expect("ONNX computation lock");
+        let ticket = EvalTicket(state.next_ticket);
+        state.next_ticket += 1;
+        state.entries.push((ticket, position));
         Ok((AddInputResult::EnqueuedForEval, ticket))
     }
 
-    fn compute_blocking(&mut self) -> Result<(), EnginError> {
-        if self.entries.is_empty() {
+    fn compute_blocking(&self) -> Result<(), EnginError> {
+        let entries = std::mem::take(&mut self.state.lock().expect("ONNX computation lock").entries);
+        if entries.is_empty() {
             return Ok(());
         }
-        let batch = self.entries.len();
+        let batch = entries.len();
         let mut input = Vec::with_capacity(batch * INPUT_PLANES * BOARD_ROWS * BOARD_COLS);
-        for (_, entry) in &self.entries {
+        for (_, entry) in &entries {
             let history = xiangqi_core::PositionHistory::from_positions(entry.positions.clone());
             input.extend(encode_position_for_nn(&history, FillEmptyHistory::FenOnly));
         }
@@ -121,11 +129,12 @@ impl BackendComputation for OnnxBackendComputation {
         let logits = tensor_output(&outputs, "logits", batch, POLICY_SIZE)?;
         let wdl = tensor_output(&outputs, "value", batch, 3)?;
 
-        for (index, (ticket, entry)) in self.entries.drain(..).enumerate() {
+        let mut results = HashMap::with_capacity(entries.len());
+        for (index, (ticket, entry)) in entries.into_iter().enumerate() {
             let values = &logits[index * POLICY_SIZE..(index + 1) * POLICY_SIZE];
             let policies = softmax_legal_policy(values, &entry.legal_moves)?;
             let value = &wdl[index * 3..(index + 1) * 3];
-            self.results.insert(
+            results.insert(
                 ticket.0,
                 EvalResult {
                     wl: value[0] - value[2],
@@ -135,11 +144,19 @@ impl BackendComputation for OnnxBackendComputation {
                 },
             );
         }
+        self.state
+            .lock()
+            .expect("ONNX computation lock")
+            .results
+            .extend(results);
         Ok(())
     }
 
-    fn take_result(&mut self, ticket: EvalTicket) -> Result<EvalResult, EnginError> {
-        self.results
+    fn take_result(&self, ticket: EvalTicket) -> Result<EvalResult, EnginError> {
+        self.state
+            .lock()
+            .expect("ONNX computation lock")
+            .results
             .remove(&ticket.0)
             .ok_or(EnginError::PortIncomplete("OnnxBackendComputation missing result"))
     }
