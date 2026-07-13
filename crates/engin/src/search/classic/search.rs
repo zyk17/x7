@@ -364,10 +364,13 @@ impl SearchBase for ClassicSearch {
 
     fn wait_search(&mut self) -> Result<(), EnginError> {
         loop {
-            if self.maybe_trigger_stop()? || self.stop.load(Ordering::Acquire) {
+            // px0 `Engine::EnsureSearchStopped()` is also called before the
+            // first position exists (`engine.cc:146-151,187-197`).  Do not
+            // ask a stopper for root statistics unless a worker is active.
+            if self.stop.load(Ordering::Acquire) || !self.meta.lock().expect("meta lock").search_active {
                 break;
             }
-            if !self.meta.lock().expect("meta lock").search_active {
+            if self.maybe_trigger_stop()? {
                 break;
             }
             thread::sleep(Duration::from_millis(1));

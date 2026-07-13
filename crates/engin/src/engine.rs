@@ -45,6 +45,10 @@ impl EngineController for ClassicEngine {
     }
 
     fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), EnginError> {
+        // px0 `Engine::SetPosition` first calls `EnsureSearchStopped()`
+        // (`src/engine.cc:187-197`).  The old worker owns mutable tree state;
+        // replacing it before all worker threads joined is a UCI race.
+        self.search.abort_search()?;
         let state = GameState::from_fen_moves(fen, moves)?;
         self.search.set_position(&state)?;
         self.position = Some(state);

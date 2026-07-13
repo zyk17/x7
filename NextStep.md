@@ -19,7 +19,6 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 | P2 | `src/chess/gamestate.*`、`uciloop.*` | UCI 局面/history 语义 | `position ... moves ...` 与 px0 一致 |
 | P3 | `src/search` | Node、Tree、Search、worker、选择/扩展/回传 | 单线程固定 FEN/budget trace 对照 |
 | P4 | `src/search`、`src/neural` | minibatch、NN cache、prefetch、并发、tree reuse | 同局面统计和 bestmove 对照 |
-| P5 | `src/engine.cc`、`src/chess/uciloop.cc` | UCI options、go/stop/info、默认行为 | UCI transcript 对照 |
 | P6 | `pxzero-training` | 数据字段、训练/导出契约 | 训练与 ONNX I/O 对照 |
 
 每个 Rust 函数必须标注 px0 文件和连续行区间；找不到参考不实现。

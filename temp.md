@@ -6,7 +6,7 @@
 - 2062 move table：由 px0 `encoder.cc:229-481` 机械提取，SHA256
   `884BEA3BBD05A119E7E8A2965993FAAAA564FD46440BD249E9D728336CC89924`
 - `OnnxBackend`：px0 `wrapper.cc:49-172`，本地 `data/x7.onnx` 冒烟通过
-- P4 尚未完成：树锁阶段拆分、完整 selection/collision/task worker/prefetch、P5 UCI 权重配置均未完成
+- P4 尚未完成：树锁阶段拆分、完整 selection/collision/task worker/prefetch、UCI 权重配置均未完成
 
 2026-07-12：P4 异步搜索 + UCI 接线完成。
 

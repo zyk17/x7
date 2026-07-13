@@ -64,7 +64,7 @@
 - [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [ ] 对齐 px0 UCI、bench、info 统计。
-- [ ] 将 `OnnxBackend` 接入 P5 的 `WeightsFile` / backend UCI 配置，替换 UCI 主线的 UniformBackend
+- [ ] 将 `OnnxBackend` 接入 `WeightsFile` / backend UCI 配置，替换 UCI 主线的 UniformBackend
   （`src/engine.cc:156-165`、`src/neural/shared_params.*`）。
 
 ## 后续才允许做
