@@ -15,18 +15,14 @@ pub fn compute_cpuct(params: &SearchParams, n: u32, is_root: bool) -> f32 {
     }
 }
 
-/// px0 `GetFpu` (`search.cc`)。
+/// px0 `GetFpu` (`src/search/classic/search.cc:408-424`)。
 pub fn get_fpu(params: &SearchParams, node: &Node, arena: &NodeArena, is_root: bool, draw_score: f32) -> f32 {
-    let visited_pol = if is_root {
-        1.0
-    } else {
-        node.visited_policy(arena).max(1.0)
-    };
+    let visited_pol = node.visited_policy(arena);
     let value = params.fpu_value(is_root);
     if params.fpu_absolute(is_root) {
         value
     } else {
-        -node.q(draw_score) - value * visited_pol.sqrt()
+        -node.q(-draw_score) - value * visited_pol.sqrt()
     }
 }
 
@@ -49,4 +45,40 @@ pub fn edge_score(
         .map(|node| node.q(draw_score))
         .unwrap_or(fpu);
     q + u_coeff * edge.get_p() / (1.0 + child.map(|node| node.n_started()).unwrap_or(0) as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xiangqi_core::{Move, Square};
+
+    #[test]
+    fn get_fpu_matches_px0_draw_score_and_visited_policy() {
+        let params = SearchParams {
+            fpu_value: 0.5,
+            ..SearchParams::default()
+        };
+
+        let a0 = Square::parse("a0").expect("a0");
+        let a1 = Square::parse("a1").expect("a1");
+        let mut arena = NodeArena::default();
+        let root = arena.alloc(Node::default());
+        let root_node = arena.get_mut(root).expect("root");
+        root_node.create_single_child_node(Move::new(a0, a1));
+        root_node.edge_mut(0).set_p(0.25);
+        assert!(root_node.try_start_score_update());
+        root_node.finalize_score_update(0.2, 0.4, 0.0, 1);
+
+        let child = arena.spawn_child(root, 0);
+        let child_node = arena.get_mut(child).expect("child");
+        assert!(child_node.try_start_score_update());
+        child_node.finalize_score_update(0.0, 0.0, 0.0, 1);
+
+        let actual = get_fpu(&params, arena.get(root).expect("root"), &arena, true, 0.1);
+        let visited_policy = arena.get(root).expect("root").visited_policy(&arena);
+        let expected = -arena.get(root).expect("root").q(-0.1) - 0.5 * visited_policy.sqrt();
+
+        assert!((actual - expected).abs() < 1e-6, "actual={actual} expected={expected}");
+        assert!((actual + 0.41).abs() < 0.02, "actual={actual}");
+    }
 }
