@@ -590,6 +590,11 @@ impl<'a> SearchWorker<'a> {
         }
         let budget = self.params.max_prefetch_batch as usize - used;
         let root = self.tree.current_head();
+        // px0 resets the workspace history before walking prefetch candidates
+        // (`search.cc:1997-2004`). ProcessPickedTask leaves this workspace at
+        // its last expanded leaf, so using it directly would encode the wrong
+        // position for a root-relative cache probe.
+        self.history.trim(self.played_history_len);
         self.prefetch_into_cache(root, budget, false)?;
         Ok(())
     }
@@ -845,5 +850,34 @@ mod tests {
 
         assert_eq!(tree.node(root).n_in_flight(), 0);
         assert_eq!(state.shared_collisions.lock().expect("collisions lock").len(), 0);
+    }
+
+    #[test]
+    fn prefetch_resets_workspace_history_to_root() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+        worker.initialize_iteration().expect("init");
+
+        let root_moves = worker.history.last().board().generate_legal_moves();
+        worker.history.append(root_moves[0]);
+        worker
+            .computation
+            .as_mut()
+            .expect("computation")
+            .add_input(EvalPosition {
+                positions: worker.history.positions().to_vec(),
+                legal_moves: worker.history.last().board().generate_legal_moves(),
+            })
+            .expect("seed computation");
+
+        worker.maybe_prefetch_into_cache().expect("prefetch");
+
+        assert_eq!(worker.history.len(), worker.played_history_len);
     }
 }
