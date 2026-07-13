@@ -208,6 +208,7 @@ impl PickTask {
 pub struct PickTaskQueue {
     tasks: Mutex<Vec<PickTask>>,
     task_count: AtomicUsize,
+    tasks_taken: AtomicUsize,
     completed_tasks: AtomicUsize,
     task_added: Condvar,
 }
@@ -216,6 +217,7 @@ impl PickTaskQueue {
     /// px0 `SearchWorker::ResetTasks` (`src/search/classic/search.cc:1466-1473`).
     pub fn reset(&self) {
         self.task_count.store(0, Ordering::Release);
+        self.tasks_taken.store(0, Ordering::Release);
         self.completed_tasks.store(0, Ordering::Release);
         self.tasks.lock().expect("pick task queue lock").clear();
     }
@@ -225,6 +227,55 @@ impl PickTaskQueue {
         self.tasks.lock().expect("pick task queue lock").push(task);
         self.task_count.fetch_add(1, Ordering::AcqRel);
         self.task_added.notify_all();
+    }
+
+    /// px0 task claim (`src/search/classic/search.cc:1076-1093`).
+    pub fn take(&self) -> Option<(usize, PickTask)> {
+        let index = loop {
+            let taken = self.tasks_taken.load(Ordering::Acquire);
+            if taken >= self.task_count.load(Ordering::Acquire) {
+                return None;
+            }
+            if self
+                .tasks_taken
+                .compare_exchange_weak(taken, taken + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break taken;
+            }
+        };
+        self.tasks.lock().expect("pick task queue lock").get(index).map(|task| {
+            (
+                index,
+                PickTask {
+                    kind: task.kind,
+                    start: task.start,
+                    base_depth: task.base_depth,
+                    collision_limit: task.collision_limit,
+                    moves_to_base: task.moves_to_base.clone(),
+                    results: Vec::new(),
+                    start_idx: task.start_idx,
+                    end_idx: task.end_idx,
+                    complete: false,
+                },
+            )
+        })
+    }
+
+    /// px0 completion accounting (`src/search/classic/search.cc:1136-1137`).
+    pub fn complete(&self, index: usize, results: Vec<NodeToProcess>) {
+        if let Some(task) = self.tasks.lock().expect("pick task queue lock").get_mut(index) {
+            task.results = results;
+            task.complete = true;
+            self.completed_tasks.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// px0 `SearchWorker::WaitForTasks` (`src/search/classic/search.cc:1475-1483`).
+    pub fn wait(&self) {
+        while self.completed_tasks.load(Ordering::Acquire) < self.task_count.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
     }
 }
 
