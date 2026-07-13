@@ -373,25 +373,29 @@ impl Node {
     }
 }
 
-/// 节点存储区。
+/// px0 `Node` 的稳定分配存储（`src/search/classic/node.h:282-300`）。
+///
+/// px0 用 `unique_ptr<Node>` 保存 child；Rust 保留 arena 索引作为 parent/child
+/// 链接，但每个 Node 使用 Box 单独分配，避免 arena 扩容时改变节点地址。
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::vec_box)] // px0 child nodes retain stable heap addresses across arena growth.
 pub struct NodeArena {
-    nodes: Vec<Node>,
+    nodes: Vec<Box<Node>>,
 }
 
 impl NodeArena {
     pub fn alloc(&mut self, node: Node) -> usize {
         let idx = self.nodes.len();
-        self.nodes.push(node);
+        self.nodes.push(Box::new(node));
         idx
     }
 
     pub fn get(&self, idx: usize) -> Option<&Node> {
-        self.nodes.get(idx)
+        self.nodes.get(idx).map(Box::as_ref)
     }
 
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Node> {
-        self.nodes.get_mut(idx)
+        self.nodes.get_mut(idx).map(Box::as_mut)
     }
 
     pub fn spawn_child(&mut self, parent_idx: usize, edge_idx: usize) -> usize {
