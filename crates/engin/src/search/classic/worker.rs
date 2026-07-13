@@ -5,7 +5,7 @@
 //! 与 UCI 接线仍属开放项。
 
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use xiangqi_core::{GameResult, Move, MoveList, PositionHistory};
 
@@ -199,6 +199,32 @@ impl PickTask {
             end_idx,
             complete: false,
         }
+    }
+}
+
+/// px0 task queue state (`src/search/classic/search.h:435-445`,
+/// `search.cc:1464-1483`). Task execution is wired separately.
+#[derive(Default)]
+pub struct PickTaskQueue {
+    tasks: Mutex<Vec<PickTask>>,
+    task_count: AtomicUsize,
+    completed_tasks: AtomicUsize,
+    task_added: Condvar,
+}
+
+impl PickTaskQueue {
+    /// px0 `SearchWorker::ResetTasks` (`src/search/classic/search.cc:1466-1473`).
+    pub fn reset(&self) {
+        self.task_count.store(0, Ordering::Release);
+        self.completed_tasks.store(0, Ordering::Release);
+        self.tasks.lock().expect("pick task queue lock").clear();
+    }
+
+    /// px0 task enqueue (`src/search/classic/search.cc:1843-1856`).
+    pub fn push(&self, task: PickTask) {
+        self.tasks.lock().expect("pick task queue lock").push(task);
+        self.task_count.fetch_add(1, Ordering::AcqRel);
+        self.task_added.notify_all();
     }
 }
 
