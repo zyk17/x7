@@ -40,6 +40,54 @@ impl Edge {
     }
 }
 
+/// px0 `EdgeAndNode` (`src/search/classic/node.h:356-410`)。
+///
+/// C++ 版本把一条 edge 与其可选 child node 组合为只读代理。Rust 的树使用
+/// arena 索引保存 child，因此此类型只在读取统计时短暂借用二者。
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeAndNode<'a> {
+    edge: &'a Edge,
+    node: Option<&'a Node>,
+}
+
+impl<'a> EdgeAndNode<'a> {
+    pub const fn new(edge: &'a Edge, node: Option<&'a Node>) -> Self {
+        Self { edge, node }
+    }
+
+    /// px0 `EdgeAndNode::GetQ` (`node.h:375-377`)。
+    pub fn q(self, default_q: f32, draw_score: f32) -> f32 {
+        self.node
+            .filter(|node| node.n() > 0)
+            .map(|node| node.q(draw_score))
+            .unwrap_or(default_q)
+    }
+
+    /// px0 `EdgeAndNode::GetNStarted` (`node.h:387-390`)。
+    pub fn n_started(self) -> u32 {
+        self.node.map_or(0, Node::n_started)
+    }
+
+    /// px0 `EdgeAndNode::GetP` (`node.h:400-401`)。
+    pub fn p(self) -> f32 {
+        self.edge.get_p()
+    }
+
+    /// px0 `EdgeAndNode::GetMove` (`node.h:402-404`)。
+    pub const fn mv(self) -> Move {
+        self.edge.mv
+    }
+
+    /// px0 `EdgeAndNode::GetU` (`node.h:406-410`)。
+    pub fn u(self, numerator: f32) -> f32 {
+        numerator * self.p() / (1 + self.n_started()) as f32
+    }
+
+    pub const fn child(self) -> Option<&'a Node> {
+        self.node
+    }
+}
+
 /// px0 `Node` 统计与树结构（单线程：children 与 edges 平行索引）。
 #[derive(Clone, Debug)]
 pub struct Node {
@@ -361,6 +409,15 @@ impl NodeTree {
         self.arena.get_mut(idx).expect("valid node index")
     }
 
+    /// px0 `EdgeAndNode(Edge*, Node*)` (`node.h:358-410`) 的 arena 适配。
+    pub fn edge_and_node(&self, node_idx: usize, edge_idx: usize) -> EdgeAndNode<'_> {
+        let node = self.node(node_idx);
+        EdgeAndNode::new(
+            node.edge(edge_idx),
+            node.child(edge_idx).and_then(|idx| self.arena.get(idx)),
+        )
+    }
+
     /// px0 `Node::MakeTerminal` (`node.cc:300-317`) 与 `GetOwnEdge`
     /// (`node.h:244-248`) 的 arena 适配。
     pub fn make_terminal(&mut self, node_idx: usize, result: GameResult, plies_left: f32, terminal: Terminal) {
@@ -470,6 +527,38 @@ mod tests {
             let decoded = edge.get_p();
             assert!((decoded - p).abs() < 0.02, "p={p} decoded={decoded}");
         }
+    }
+
+    #[test]
+    fn edge_and_node_matches_px0_q_u_proxy() {
+        let a0 = xiangqi_core::Square::parse("a0").expect("a0");
+        let a1 = xiangqi_core::Square::parse("a1").expect("a1");
+        let mut arena = NodeArena::default();
+        let root = arena.alloc(Node::default());
+        arena
+            .get_mut(root)
+            .expect("root")
+            .create_single_child_node(Move::new(a0, a1));
+        arena.get_mut(root).expect("root").edge_mut(0).set_p(0.5);
+
+        let unvisited = EdgeAndNode::new(
+            arena.get(root).expect("root").edge(0),
+            arena.get(root).expect("root").child(0).and_then(|idx| arena.get(idx)),
+        );
+        assert!((unvisited.q(0.25, 0.0) - 0.25).abs() < f32::EPSILON);
+        assert!((unvisited.u(4.0) - 2.0).abs() < 0.02);
+
+        let child = arena.spawn_child(root, 0);
+        let child_node = arena.get_mut(child).expect("child");
+        assert!(child_node.try_start_score_update());
+        child_node.finalize_score_update(0.75, 0.0, 0.0, 1);
+        let visited = EdgeAndNode::new(
+            arena.get(root).expect("root").edge(0),
+            arena.get(root).expect("root").child(0).and_then(|idx| arena.get(idx)),
+        );
+        assert!((visited.q(0.25, 0.0) - 0.75).abs() < f32::EPSILON);
+        assert_eq!(visited.n_started(), 1);
+        assert!((visited.u(4.0) - 1.0).abs() < 0.02);
     }
 
     #[test]
