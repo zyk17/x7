@@ -185,6 +185,11 @@ impl Node {
         !matches!(self.terminal, Terminal::NonTerminal)
     }
 
+    /// px0 `Node::IsTwoFoldTerminal` (`src/search/classic/node.h:147-149`)。
+    pub const fn is_twofold_terminal(&self) -> bool {
+        matches!(self.terminal, Terminal::TwoFold)
+    }
+
     pub fn edge(&self, index: usize) -> &Edge {
         &self.edges[index]
     }
@@ -261,6 +266,27 @@ impl Node {
         self.m += multivisit as f32 * (m - self.m) / (self.n + multivisit) as f32;
         self.n += multivisit;
         self.n_in_flight -= multivisit;
+    }
+
+    /// px0 `Node::RevertTerminalVisits` (`src/search/classic/node.cc:375-392`)。
+    ///
+    /// Tree reuse can move the root inside a previously assumed two-fold
+    /// repetition. In that case those inherited terminal visits are no longer
+    /// valid and must be removed before the node is extended again.
+    pub fn revert_terminal_visits(&mut self, v: f32, d: f32, m: f32, multivisit: u32) {
+        let new_n = self.n as i64 - multivisit as i64;
+        if new_n <= 0 {
+            self.wl = 0.0;
+            self.d = 1.0;
+            self.m = 0.0;
+            self.n = 0;
+            return;
+        }
+        let new_n = new_n as f32;
+        self.wl -= multivisit as f32 * (v - self.wl) / new_n;
+        self.d -= multivisit as f32 * (d - self.d) / new_n;
+        self.m -= multivisit as f32 * (m - self.m) / new_n;
+        self.n = new_n as u32;
     }
 
     /// px0 `Node::MakeTerminal` (`node.cc:300-317`)。
@@ -432,7 +458,7 @@ impl NodeTree {
     }
 
     /// px0 `Node::MakeNotTerminal` (`node.cc:319-341`) 的 arena 适配。
-    fn make_not_terminal(&mut self, node_idx: usize) {
+    pub fn make_not_terminal(&mut self, node_idx: usize) {
         let child_indices: Vec<usize> = self.node(node_idx).children.iter().copied().flatten().collect();
         let child_stats = child_indices
             .into_iter()
@@ -573,6 +599,36 @@ mod tests {
         assert_eq!(node.n(), 2);
         assert!((node.wl() - 0.25).abs() < 1e-6);
         assert_eq!(node.n_in_flight(), 0);
+    }
+
+    #[test]
+    fn revert_terminal_visits_matches_px0_zero_reset() {
+        let mut node = Node::default();
+        assert!(node.try_start_score_update());
+        node.finalize_score_update(0.5, 0.25, 4.0, 1);
+
+        node.revert_terminal_visits(0.5, 0.25, 4.0, 1);
+
+        assert_eq!(node.n(), 0);
+        assert!((node.wl() - 0.0).abs() < f32::EPSILON);
+        assert!((node.d() - 1.0).abs() < f32::EPSILON);
+        assert!((node.m() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn revert_terminal_visits_restores_prior_average() {
+        let mut node = Node::default();
+        assert!(node.try_start_score_update());
+        node.finalize_score_update(0.2, 0.4, 3.0, 1);
+        assert!(node.try_start_score_update());
+        node.finalize_score_update(1.0, 0.0, 1.0, 1);
+
+        node.revert_terminal_visits(1.0, 0.0, 1.0, 1);
+
+        assert_eq!(node.n(), 1);
+        assert!((node.wl() - 0.2).abs() < 1e-6);
+        assert!((node.d() - 0.4).abs() < 1e-6);
+        assert!((node.m() - 3.0).abs() < 1e-6);
     }
 
     #[test]
