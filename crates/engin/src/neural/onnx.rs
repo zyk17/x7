@@ -12,7 +12,7 @@ use ndarray::Array4;
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::search::classic::{
+use crate::neural::backend::{
     AddInputResult, Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, EvalTicket,
 };
 use crate::EnginError;

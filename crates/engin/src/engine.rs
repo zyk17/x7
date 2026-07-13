@@ -2,8 +2,9 @@
 
 use xiangqi_core::{GameState, STARTPOS_FEN};
 
-use crate::search::classic::OnnxBackend;
-use crate::search::classic::{backend::Backend, search::ClassicSearch, UniformBackend};
+use crate::neural::backend::{Backend, UniformBackend};
+use crate::neural::onnx::OnnxBackend;
+use crate::search::classic::ClassicSearch;
 use crate::search::SearchBase;
 use crate::uci_loop::{EngineController, GoParams, StringUciResponder};
 use crate::EnginError;

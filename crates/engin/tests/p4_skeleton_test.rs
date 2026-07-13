@@ -4,9 +4,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Once;
 
-use engin::search::classic::{
-    Backend, NodeToProcess, NodeTree, SearchParams, SearchWorker, UniformBackend, WorkerSearchState,
-};
+use engin::neural::backend::{Backend, UniformBackend};
+use engin::search::classic::{NodeToProcess, NodeTree, SearchParams, SearchWorker, WorkerSearchState};
 use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
 static INIT: Once = Once::new();

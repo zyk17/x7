@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use xiangqi_core::{GameState, Move};
 
 use crate::callbacks::{BestMoveInfo, ThinkingInfo};
+use crate::neural::backend::Backend;
 use crate::search::SearchBase;
 use crate::uci_loop::GoParams;
 use crate::EnginError;
 
-use super::backend::Backend;
 use super::node::NodeTree;
 use super::params::SearchParams;
 use super::stoppers::timemgr::{IterationStats, StoppersHints};

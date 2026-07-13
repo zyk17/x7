@@ -9,12 +9,11 @@ use std::sync::{Arc, Mutex};
 
 use xiangqi_core::{GameResult, Move, MoveList, PositionHistory};
 
+use crate::neural::backend::{AddInputResult, Backend, BackendComputation, EvalPosition, EvalResult, EvalTicket};
 use crate::EnginError;
 
-use super::backend::{AddInputResult, Backend, BackendComputation, EvalPosition, EvalResult, EvalTicket};
 use super::node::{NodeTree, Terminal};
 use super::params::SearchParams;
-use super::uct::edge_score;
 
 /// px0 `Search` 中与 worker 相关的计数子集 (`search.h:49-200`)。
 #[derive(Debug)]
@@ -349,103 +348,139 @@ impl<'a> SearchWorker<'a> {
         if self.task_workers > 0 {
             return Err(EnginError::PortIncomplete("P4 PickNodesToExtend task workers"));
         }
-        // The full px0 routine batches `collision_limit` visits in one tree
-        // walk. Until `PickNodesToExtendTask` is translated, one call may only
-        // reserve one visit. The gather loop deliberately invokes it again to
-        // fill a single-worker minibatch.
-        self.pick_nodes_to_extend_single()
+        self.pick_nodes_to_extend_task(self.tree.current_head(), 0, collision_limit, &MoveList::new(), true)
     }
 
-    /// px0 `PickNodesToExtendTask` (`search.cc:1551-1897`) 的单条 selection 路径。
-    ///
-    /// 一次调用只创建一个 visit。`GatherMinibatch` 反复调用本函数填满 batch，
-    /// 因此不能把 `collision_limit` 整体计入 root 的 in-flight。
-    fn pick_nodes_to_extend_single(&mut self) -> Result<(), EnginError> {
-        let root = self.tree.current_head();
-        let mut node_idx = root;
-        let mut moves_to_visit = MoveList::new();
-        let mut depth = 0u16;
-        let mut is_root = true;
-        let mut reserved = Vec::new();
-
-        loop {
-            let n = self.tree.node(node_idx).n();
-            let terminal = self.tree.node(node_idx).is_terminal();
-            if n == 0 || terminal {
-                if is_root && self.tree.node_mut(node_idx).try_start_score_update() {
-                    reserved.push(node_idx);
-                    let mut item = NodeToProcess::visit(node_idx, depth + 1);
-                    item.moves_to_visit = moves_to_visit;
-                    self.minibatch.push(item);
-                } else {
-                    self.minibatch.push(NodeToProcess::collision(node_idx, depth + 1, 1, 0));
-                }
-                return Ok(());
-            }
-
-            if is_root {
-                if !self.tree.node_mut(node_idx).try_start_score_update() {
-                    self.minibatch.push(NodeToProcess::collision(node_idx, depth + 1, 1, 0));
-                    return Ok(());
-                }
-                reserved.push(node_idx);
-            }
-
-            let best_edge = self.select_best_edge(node_idx, is_root)?;
-            let mv = self.tree.node(node_idx).edge(best_edge).mv;
-            let child_idx = match self.tree.node(node_idx).child(best_edge) {
-                Some(idx) => idx,
-                None => self.tree.arena_mut().spawn_child(node_idx, best_edge),
-            };
-            if !self.tree.node_mut(child_idx).try_start_score_update() {
-                for reserved_node in reserved.into_iter().rev() {
-                    self.tree.node_mut(reserved_node).cancel_score_update(1);
-                }
-                self.minibatch
-                    .push(NodeToProcess::collision(child_idx, depth + 2, 1, 0));
-                return Ok(());
-            }
-            reserved.push(child_idx);
-
-            let child_n = self.tree.node(child_idx).n();
-            let child_terminal = self.tree.node(child_idx).is_terminal();
-            if child_n == 0 || child_terminal {
-                let mut item = NodeToProcess::visit(child_idx, depth + 2);
-                item.moves_to_visit = moves_to_visit;
-                item.moves_to_visit.push(mv);
+    /// px0 `PickNodesToExtendTask` (`search.cc:1551-1897`) 的单 worker
+    /// 翻译。px0 以一次树遍历把 `collision_limit` 分配到多个子节点；这里
+    /// 保留同一 in-flight、multivisit 与 collision 语义，但不拆分 task workers。
+    fn pick_nodes_to_extend_task(
+        &mut self,
+        node_idx: usize,
+        base_depth: u16,
+        collision_limit: u32,
+        moves_to_base: &[Move],
+        is_root: bool,
+    ) -> Result<(), EnginError> {
+        let depth = base_depth + 1;
+        let node_is_leaf = self.tree.node(node_idx).n() == 0 || self.tree.node(node_idx).is_terminal();
+        if node_is_leaf {
+            let mut remaining = collision_limit;
+            if is_root && self.tree.node_mut(node_idx).try_start_score_update() {
+                let mut item = NodeToProcess::visit(node_idx, depth);
+                item.moves_to_visit = moves_to_base.to_vec();
                 self.minibatch.push(item);
-                return Ok(());
+                remaining -= 1;
             }
-
-            moves_to_visit.push(mv);
-            node_idx = child_idx;
-            is_root = false;
-            depth += 1;
+            if remaining > 0 {
+                self.minibatch
+                    .push(NodeToProcess::collision(node_idx, depth, remaining, 0));
+            }
+            return Ok(());
         }
-    }
 
-    fn select_best_edge(&self, parent_idx: usize, is_root: bool) -> Result<usize, EnginError> {
+        if is_root {
+            self.tree.node_mut(node_idx).increment_n_in_flight(collision_limit);
+        }
+
+        let num_edges = self.tree.node(node_idx).num_edges();
+        let mut visits_to_perform = vec![0u32; num_edges];
+        let mut n_started: Vec<u32> = (0..num_edges)
+            .map(|edge_idx| {
+                self.tree
+                    .node(node_idx)
+                    .child(edge_idx)
+                    .map(|child_idx| self.tree.node(child_idx).n_started())
+                    .unwrap_or(0)
+            })
+            .collect();
         let draw_score = self.params.draw_score;
-        let parent = self.tree.node(parent_idx);
-        let mut best_edge = 0usize;
-        let mut best_score = f32::NEG_INFINITY;
-        for edge_idx in 0..parent.num_edges() {
-            let child = parent.child(edge_idx).map(|idx| self.tree.node(idx));
-            let score = edge_score(
-                parent,
-                edge_idx,
-                child,
-                self.tree.arena(),
-                self.params,
-                is_root,
-                draw_score,
-            );
-            if score > best_score {
-                best_score = score;
-                best_edge = edge_idx;
+        let parent_n = self.tree.node(node_idx).n();
+        let cpuct = super::uct::compute_cpuct(self.params, parent_n, is_root);
+        let puct_mult = cpuct * (self.tree.node(node_idx).children_visits().max(1) as f32).sqrt();
+        let fpu = super::uct::get_fpu(
+            self.params,
+            self.tree.node(node_idx),
+            self.tree.arena(),
+            is_root,
+            draw_score,
+        );
+        let utilities: Vec<f32> = (0..num_edges)
+            .map(|edge_idx| {
+                self.tree
+                    .node(node_idx)
+                    .child(edge_idx)
+                    .map(|child_idx| self.tree.node(child_idx))
+                    .filter(|child| child.n() > 0)
+                    .map(|child| child.q(draw_score))
+                    .unwrap_or(fpu)
+            })
+            .collect();
+        let policies: Vec<f32> = (0..num_edges)
+            .map(|edge_idx| self.tree.node(node_idx).edge(edge_idx).get_p())
+            .collect();
+
+        let mut remaining = collision_limit;
+        while remaining > 0 {
+            let mut best_idx = 0usize;
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_without_u = f32::NEG_INFINITY;
+            let mut second_best = f32::NEG_INFINITY;
+            for edge_idx in 0..num_edges {
+                let without_u = utilities[edge_idx];
+                let score = without_u + policies[edge_idx] * puct_mult / (1 + n_started[edge_idx]) as f32;
+                if score > best_score {
+                    second_best = best_score;
+                    best_score = score;
+                    best_without_u = without_u;
+                    best_idx = edge_idx;
+                } else if score > second_best {
+                    second_best = score;
+                }
+            }
+            let visits = if second_best.is_finite() && best_without_u < second_best {
+                let estimate = policies[best_idx] * puct_mult / (second_best - best_without_u)
+                    - (n_started[best_idx] + 1) as f32
+                    + 1.0;
+                estimate.clamp(1.0, 1.0e9) as u32
+            } else {
+                remaining
+            }
+            .min(remaining);
+            visits_to_perform[best_idx] += visits;
+            remaining -= visits;
+
+            let child_idx = match self.tree.node(node_idx).child(best_idx) {
+                Some(child_idx) => child_idx,
+                None => self.tree.arena_mut().spawn_child(node_idx, best_idx),
+            };
+            if self.tree.node_mut(child_idx).try_start_score_update() {
+                n_started[best_idx] += 1;
+                let child_remaining = visits - 1;
+                if self.tree.node(child_idx).n() > 0 && !self.tree.node(child_idx).is_terminal() {
+                    self.tree.node_mut(child_idx).increment_n_in_flight(child_remaining);
+                    n_started[best_idx] += child_remaining;
+                }
+                if self.tree.node(child_idx).n() == 0 || self.tree.node(child_idx).is_terminal() {
+                    visits_to_perform[best_idx] -= 1;
+                    let mut item = NodeToProcess::visit(child_idx, depth + 1);
+                    item.moves_to_visit = moves_to_base.to_vec();
+                    item.moves_to_visit.push(self.tree.node(node_idx).edge(best_idx).mv);
+                    self.minibatch.push(item);
+                }
             }
         }
-        Ok(best_edge)
+
+        for (edge_idx, visits) in visits_to_perform.into_iter().enumerate() {
+            if visits == 0 {
+                continue;
+            }
+            let child_idx = self.tree.node(node_idx).child(edge_idx).expect("selected child exists");
+            let mut moves = moves_to_base.to_vec();
+            moves.push(self.tree.node(node_idx).edge(edge_idx).mv);
+            self.pick_nodes_to_extend_task(child_idx, depth, visits, &moves, false)?;
+        }
+        Ok(())
     }
 
     /// px0 `SearchWorker::ProcessPickedTask` (`search.cc:1423-1462`)。
@@ -666,14 +701,22 @@ impl<'a> SearchWorker<'a> {
             work_done = true;
         }
         if work_done {
-            self.search_state
-                .shared_collisions
-                .lock()
-                .expect("collisions lock")
-                .clear();
+            self.cancel_shared_collisions();
             self.search_state.total_batches.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
+    }
+
+    /// px0 `Search::CancelSharedCollisions` (`search.cc:1044-1053`).
+    fn cancel_shared_collisions(&mut self) {
+        let collisions = std::mem::take(&mut *self.search_state.shared_collisions.lock().expect("collisions lock"));
+        for (node_idx, multivisit) in collisions {
+            let mut current = self.tree.node(node_idx).parent();
+            while let Some(node_idx) = current {
+                self.tree.node_mut(node_idx).cancel_score_update(multivisit);
+                current = self.tree.node(node_idx).parent();
+            }
+        }
     }
 
     /// px0 `SearchWorker::DoBackupUpdateSingleNode` (`search.cc:2175-2258`) 子集。
@@ -741,7 +784,7 @@ mod tests {
     use xiangqi_core::{initialize_magic_bitboards, GameResult, GameState, STARTPOS_FEN};
 
     use super::*;
-    use crate::search::classic::UniformBackend;
+    use crate::neural::backend::UniformBackend;
 
     static INIT: Once = Once::new();
 
@@ -773,5 +816,34 @@ mod tests {
         worker.minibatch.push(NodeToProcess::visit(root, 1));
         worker.process_picked_task(0, 1).expect("ooo terminal");
         assert!(worker.minibatch[0].ooo_completed);
+    }
+
+    #[test]
+    fn collision_multivisits_are_cancelled_after_backup() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let only_move = tree.history().last().board().generate_legal_moves()[0];
+        tree.node_mut(root).create_edges(&vec![only_move]);
+        assert!(tree.node_mut(root).try_start_score_update());
+        tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
+
+        let backend = UniformBackend::default();
+        let params = SearchParams {
+            minibatch_size: 4,
+            max_collision_visits: 4,
+            max_collision_visits_scaling_start: 0,
+            max_collision_visits_scaling_end: 1,
+            ..SearchParams::default()
+        };
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+
+        worker.execute_one_iteration().expect("collision iteration");
+
+        assert_eq!(tree.node(root).n_in_flight(), 0);
+        assert_eq!(state.shared_collisions.lock().expect("collisions lock").len(), 0);
     }
 }

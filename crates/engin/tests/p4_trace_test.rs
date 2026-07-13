@@ -2,7 +2,8 @@
 
 use std::sync::Once;
 
-use engin::search::classic::{ClassicSearch, UniformBackend};
+use engin::neural::backend::UniformBackend;
+use engin::search::classic::ClassicSearch;
 use engin::SearchBase;
 use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 

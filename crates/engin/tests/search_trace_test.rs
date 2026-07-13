@@ -4,7 +4,9 @@ use std::sync::Once;
 
 use std::path::Path;
 
-use engin::search::classic::{ClassicSearch, OnnxBackend, UniformBackend};
+use engin::neural::backend::UniformBackend;
+use engin::neural::onnx::OnnxBackend;
+use engin::search::classic::ClassicSearch;
 use engin::SearchBase;
 use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
