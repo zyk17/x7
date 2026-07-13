@@ -666,8 +666,8 @@ impl<'a> SearchWorker<'a> {
         Ok(())
     }
 
-    /// px0 `SearchWorker::ExtendNode` (`search.cc:1899-1974`)。
-    fn extend_node(&mut self, node_idx: usize, _depth: u16, moves_to_node: &[Move]) -> Result<(), EnginError> {
+    /// px0 `SearchWorker::ExtendNode` (`src/search/classic/search.cc:1899-1974`)。
+    fn extend_node(&mut self, node_idx: usize, depth: u16, moves_to_node: &[Move]) -> Result<(), EnginError> {
         let root = self.tree.current_head();
         self.history.trim(self.played_history_len);
         for mv in moves_to_node {
@@ -693,6 +693,46 @@ impl<'a> SearchWorker<'a> {
                 self.tree
                     .make_terminal(node_idx, self.history.rule_judge(), 0.0, Terminal::EndOfGame);
                 return Ok(());
+            }
+            // px0 `search.cc:1930-1959`: an initial repetition can be a
+            // forced two-fold result only after the complete cycle is inside
+            // the searched line. The special terminal can later be reverted
+            // when tree reuse moves the root into that cycle.
+            if self.history.last().repetitions() == 1
+                && depth.saturating_sub(1) >= 4
+                && self.params.two_fold_draws
+                && u32::from(depth.saturating_sub(1)) >= self.history.last().cycle_length()
+            {
+                let cycle_length = self.history.last().cycle_length();
+                let result = self.history.rule_judge();
+                if result == GameResult::Draw {
+                    self.tree
+                        .make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
+                    return Ok(());
+                }
+
+                let mut idx = self.history.len() - 1;
+                let mut idx2 = idx;
+                while idx2 > 0 {
+                    idx2 -= 1;
+                    if self.history.get(idx2).board() == self.history.last().board() {
+                        break;
+                    }
+                }
+                if idx2 > 0 && self.history.get(idx - 1).board() == self.history.get(idx2 - 1).board() {
+                    idx -= 1;
+                    while idx2 != idx {
+                        idx2 += 1;
+                        if self.history.get(idx2).repetitions() > 0 {
+                            break;
+                        }
+                    }
+                    if idx2 == idx && self.history.last().rule60_ply() < 120 {
+                        self.tree
+                            .make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
+                        return Ok(());
+                    }
+                }
             }
             if !board.has_mating_material() || self.history.last().rule60_ply() >= 120 {
                 self.tree
@@ -1217,5 +1257,36 @@ mod tests {
         assert!(!worker.tree.node(child).is_terminal());
         assert_eq!(worker.tree.node(child).n(), 0);
         assert_eq!(worker.tree.node(root).n(), 0);
+    }
+
+    #[test]
+    fn extend_node_marks_complete_first_repetition_as_twofold() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let mut history = tree.history().clone();
+        let mut moves = Vec::new();
+        for uci in ["a0a1", "a9a8", "a1a0", "a8a9"] {
+            let mv = history.last().board().parse_move(uci).expect("legal cycle move");
+            history.append(mv);
+            moves.push(mv);
+        }
+        assert_eq!(history.last().repetitions(), 1);
+        assert_eq!(history.last().cycle_length(), 4);
+
+        let first = moves[0];
+        tree.node_mut(root).create_single_child_node(first);
+        let child = tree.arena_mut().spawn_child(root, 0);
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+
+        worker.extend_node(child, 5, &moves).expect("extend twofold leaf");
+
+        assert!(worker.tree.node(child).is_twofold_terminal());
+        assert!((worker.tree.node(child).m() - 4.0).abs() < f32::EPSILON);
     }
 }
