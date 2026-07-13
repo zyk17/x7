@@ -595,22 +595,34 @@ impl<'a> SearchWorker<'a> {
         // its last expanded leaf, so using it directly would encode the wrong
         // position for a root-relative cache probe.
         self.history.trim(self.played_history_len);
-        self.prefetch_into_cache(root, budget, false)?;
+        self.prefetch_into_cache(Some(root), budget, false)?;
         Ok(())
     }
 
-    /// px0 `PrefetchIntoCache` (`search.cc:2010-2099`) 叶子子集。
+    /// px0 `Search::GetDrawScore` (`src/search/classic/search.cc:401-405`)。
+    fn draw_score(&self, is_odd_depth: bool) -> f32 {
+        if is_odd_depth == self.tree.history().is_black_to_move() {
+            self.params.draw_score
+        } else {
+            -self.params.draw_score
+        }
+    }
+
+    /// px0 `PrefetchIntoCache` (`search.cc:2010-2099`)。
     fn prefetch_into_cache(
         &mut self,
-        node_idx: usize,
+        node_idx: Option<usize>,
         budget: usize,
-        _is_odd_depth: bool,
+        is_odd_depth: bool,
     ) -> Result<usize, EnginError> {
+        let draw_score = self.draw_score(is_odd_depth);
         if budget == 0 {
             return Ok(0);
         }
-        let node = self.tree.node(node_idx);
-        if node.n_started() == 0 {
+
+        // px0 also reaches this branch for a missing child edge. It is still a
+        // valid future leaf and must be encoded from the current history.
+        if node_idx.is_none_or(|idx| self.tree.node(idx).n_started() == 0) {
             if self
                 .backend
                 .cached_evaluation(&EvalPosition {
@@ -630,10 +642,84 @@ impl<'a> SearchWorker<'a> {
             }
             return Ok(1);
         }
-        if node.n() == 0 || node.is_terminal() {
+
+        let node_idx = node_idx.expect("checked above");
+        if self.tree.node(node_idx).n() == 0 || self.tree.node(node_idx).is_terminal() {
             return Ok(0);
         }
-        Ok(0)
+
+        // px0 `search.cc:2036-2051`: score all legal edges using the same
+        // EdgeAndNode Q/U proxy as selection. The negated score permits
+        // ascending partial sorting below.
+        let is_root = node_idx == self.tree.current_head();
+        let cpuct = super::uct::compute_cpuct(self.params, self.tree.node(node_idx).n(), is_root);
+        let puct_mult = cpuct * (self.tree.node(node_idx).children_visits().max(1) as f32).sqrt();
+        let fpu = super::uct::get_fpu(
+            self.params,
+            self.tree.node(node_idx),
+            self.tree.arena(),
+            is_root,
+            draw_score,
+        );
+        let mut scores = (0..self.tree.node(node_idx).num_edges())
+            .filter_map(|edge_idx| {
+                let edge = self.tree.edge_and_node(node_idx, edge_idx);
+                (edge.p() != 0.0).then_some((-edge.u(puct_mult) - edge.q(fpu, draw_score), edge_idx))
+            })
+            .collect::<Vec<_>>();
+
+        let mut first_unsorted_index = 0usize;
+        let mut total_budget_spent = 0usize;
+        let mut budget_to_spend = budget;
+        for index in 0..scores.len() {
+            if self.search_state.stop.load(Ordering::Acquire) || budget == total_budget_spent {
+                break;
+            }
+
+            // px0 `std::partial_sort` sorts only the next 2-3 candidates.
+            // `select_nth_unstable_by` + sorting its selected prefix gives the
+            // same ordered prefix without sorting the remainder.
+            if first_unsorted_index != scores.len() && index + 2 >= first_unsorted_index {
+                let remaining_budget = budget - total_budget_spent;
+                let new_unsorted_index = std::cmp::min(
+                    scores.len(),
+                    if remaining_budget < 2 {
+                        first_unsorted_index + 2
+                    } else {
+                        first_unsorted_index + 3
+                    },
+                );
+                let selected = new_unsorted_index - first_unsorted_index;
+                let tail = &mut scores[first_unsorted_index..];
+                tail.select_nth_unstable_by(selected - 1, |left, right| left.0.total_cmp(&right.0));
+                tail[..selected].sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+                first_unsorted_index = new_unsorted_index;
+            }
+
+            let edge_idx = scores[index].1;
+            if index != scores.len() - 1 {
+                let next_score = -scores[index + 1].0;
+                let edge = self.tree.edge_and_node(node_idx, edge_idx);
+                let q = edge.q(-fpu, draw_score);
+                if next_score > q {
+                    let estimated = edge.p() * puct_mult / (next_score - q) - edge.n_started() as f32;
+                    budget_to_spend = std::cmp::min(budget - total_budget_spent, estimated as usize + 1);
+                } else {
+                    budget_to_spend = budget - total_budget_spent;
+                }
+            }
+
+            let (mv, child_idx) = {
+                let edge = self.tree.edge_and_node(node_idx, edge_idx);
+                (edge.mv(), self.tree.node(node_idx).child(edge_idx))
+            };
+            self.history.append(mv);
+            let result = self.prefetch_into_cache(child_idx, budget_to_spend, !is_odd_depth);
+            self.history.pop();
+            let budget_spent = result?;
+            total_budget_spent += budget_spent;
+        }
+        Ok(total_budget_spent)
     }
 
     /// px0 `SearchWorker::RunNNComputation` (`search.cc:2103-2107`)。
@@ -879,5 +965,33 @@ mod tests {
         worker.maybe_prefetch_into_cache().expect("prefetch");
 
         assert_eq!(worker.history.len(), worker.played_history_len);
+    }
+
+    #[test]
+    fn prefetch_descends_from_expanded_root_to_missing_child() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let mv = tree.history().last().board().generate_legal_moves()[0];
+        tree.node_mut(root).create_single_child_node(mv);
+        tree.node_mut(root).edge_mut(0).set_p(1.0);
+        assert!(tree.node_mut(root).try_start_score_update());
+        tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
+
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+        worker.initialize_iteration().expect("init");
+
+        let spent = worker
+            .prefetch_into_cache(Some(root), 1, false)
+            .expect("recursive prefetch");
+
+        assert_eq!(spent, 1);
+        assert_eq!(worker.history.len(), worker.played_history_len);
+        assert_eq!(worker.computation.as_ref().expect("computation").used_batch_size(), 1);
     }
 }
