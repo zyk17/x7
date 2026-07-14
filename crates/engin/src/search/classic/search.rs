@@ -360,7 +360,7 @@ mod tests {
                 .worker_state
                 .thread_count
                 .load(std::sync::atomic::Ordering::Acquire),
-            2
+            3
         );
     }
 
@@ -751,7 +751,8 @@ impl ClassicSearch {
             return Ok(());
         }
         let thread_count = if how_many == 0 {
-            self.backend.attributes().suggested_num_search_threads.max(1)
+            let attributes = self.backend.attributes();
+            attributes.suggested_num_search_threads + usize::from(!attributes.runs_on_cpu)
         } else {
             how_many
         };

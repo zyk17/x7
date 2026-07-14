@@ -189,6 +189,8 @@
   后节流（`src/search/classic/params.cc:473-477,621`、`search.cc:1209-1231`）。
 - [x] 将 shared tree 的 prefetch phase 收为读锁，保持 gather/fetch/backup 写锁，避免
   多 SearchWorker 在只读候选遍历上串行（`src/search/classic/search.cc:1977-2008`）。
+- [x] 翻译 `StartThreads(0)` 的 CPU/GPU worker 默认数：`suggested + !runs_on_cpu`
+  （`src/search/classic/search.cc:874-896`）。
 - [ ] 翻译可变 contempt/WDL calibration `OptionsDict`，使 WDL 重标定在 NN value 进入
   backup 前使用 px0 的完整参数计算（`src/search/classic/params.cc:57-174,688-703`、
   `search.cc:206-236,2117-2154`）。

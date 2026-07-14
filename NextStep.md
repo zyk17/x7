@@ -187,6 +187,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - 共享 `NodeTree` 已改用 read/write boundary：initialize、gather、fetch/backup 仍独占，
   `MaybePrefetchIntoCache` 改为只读树锁，允许多个 worker 并发遍历候选缓存项；对应
   px0 `SharedMutex::SharedLock`（`src/search/classic/search.cc:1977-2008`）。
+- `StartThreads(0)` 的默认 search worker 数已使用 px0 公式：backend 建议值加上一个
+  非 CPU backend worker，不再少启动 GPU pipeline 所需 worker
+  （`src/search/classic/search.cc:874-896`）。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。
