@@ -94,6 +94,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   平均值修正与强制终局父节点标记，对应
   `src/search/classic/search.cc:2175-2289`、`src/search/classic/node.cc:300-392`；
   root best-edge 缓存与 `MakeSolid` 内存布局仍待按 Rust arena 访问边界单独翻译。
+- `TaskWorkspace` 已恢复 px0 的 256-slot selection scratch 数组及选中边 score 的增量
+  更新，对应 `src/search/classic/search.h:348-365`、`search.cc:1575-1825`；
+  `Node::CreateEdges` 同步保留 px0 `uint8_t num_edges_` 的 255 条上限。
 
 ### P4 下一入口
 

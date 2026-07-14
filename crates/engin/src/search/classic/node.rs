@@ -7,9 +7,9 @@ use xiangqi_core::{GameResult, Move, MoveList, Position, PositionHistory};
 pub enum Terminal {
     #[default]
     NonTerminal, // 游戏未结束
-    EndOfGame,  // 游戏正常结束
-    Tablebase,  // 命中库
-    TwoFold,    // 两次重复
+    EndOfGame, // 游戏正常结束
+    Tablebase, // 命中库
+    TwoFold,   // 两次重复
 }
 
 /// px0 `Edge` (`node.h:85-112`)。
@@ -238,6 +238,7 @@ impl Node {
     pub fn create_edges(&mut self, moves: &MoveList) {
         assert!(self.edges.is_empty());
         assert!(self.children.iter().all(|child| child.is_none()));
+        assert!(moves.len() <= u8::MAX as usize, "px0 Node::num_edges_ is uint8_t");
         self.edges = moves.iter().copied().map(Edge::new).collect();
         self.children = vec![None; moves.len()];
     }

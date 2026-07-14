@@ -149,6 +149,12 @@ impl NodeToProcess {
 /// 跨层分配和路径状态。每个 task workspace 都必须拥有独立 history，供
 /// `ProcessPickedTask` 复原根局面后扩展叶子。
 struct TaskWorkspace {
+    // px0 uses fixed `std::array<_, 256>` scratch storage because
+    // `Node::num_edges_` is uint8_t (`search.h:350`, `node.h:320-321`).
+    current_policy: [f32; 256],
+    current_utility: [f32; 256],
+    current_score: [f32; 256],
+    current_n_started: [u32; 256],
     vtp_buffer: Vec<Vec<u32>>,
     visits_to_perform: Vec<Vec<u32>>,
     vtp_last_filled: Vec<isize>,
@@ -349,6 +355,10 @@ impl Default for TaskWorkspace {
     fn default() -> Self {
         const INITIAL_DEPTH: usize = 30;
         let mut workspace = Self {
+            current_policy: [0.0; 256],
+            current_utility: [0.0; 256],
+            current_score: [0.0; 256],
+            current_n_started: [0; 256],
             vtp_buffer: Vec::with_capacity(INITIAL_DEPTH),
             visits_to_perform: Vec::with_capacity(INITIAL_DEPTH),
             vtp_last_filled: Vec::with_capacity(INITIAL_DEPTH),
@@ -869,19 +879,20 @@ impl<'a> SearchWorker<'a> {
                     is_root_node,
                     draw_score,
                 );
-                let policies = (0..max_needed)
-                    .map(|edge_idx| self.tree.node(current_idx).edge(edge_idx).get_p())
-                    .collect::<Vec<_>>();
-                let mut utilities = Vec::with_capacity(max_needed);
-                let mut n_started = Vec::with_capacity(max_needed);
+                for edge_idx in 0..max_needed {
+                    workspace.current_policy[edge_idx] = self.tree.node(current_idx).edge(edge_idx).get_p();
+                    workspace.current_utility[edge_idx] = f32::NEG_INFINITY;
+                }
                 for edge_idx in 0..max_needed {
                     let edge = self.tree.edge_and_node(current_idx, edge_idx);
-                    n_started.push(edge.n_started());
-                    utilities.push(
-                        edge.child()
-                            .filter(|child| child.n() > 0)
-                            .map_or(fpu, |child| child.q(draw_score)),
-                    );
+                    workspace.current_n_started[edge_idx] = edge.n_started();
+                    workspace.current_utility[edge_idx] = edge
+                        .child()
+                        .filter(|child| child.n() > 0)
+                        .map_or(fpu, |child| child.q(draw_score));
+                    workspace.current_score[edge_idx] = workspace.current_utility[edge_idx]
+                        + workspace.current_policy[edge_idx] * puct_mult
+                            / (1 + workspace.current_n_started[edge_idx]) as f32;
                 }
 
                 while cur_limit > 0 {
@@ -894,25 +905,24 @@ impl<'a> SearchWorker<'a> {
                         if can_exit {
                             break;
                         }
-                        let score =
-                            utilities[edge_idx] + policies[edge_idx] * puct_mult / (1 + n_started[edge_idx]) as f32;
+                        let score = workspace.current_score[edge_idx];
                         if score > best_score {
                             second_best = best_score;
                             best_score = score;
-                            best_without_u = utilities[edge_idx];
+                            best_without_u = workspace.current_utility[edge_idx];
                             best_idx = Some(edge_idx);
                         } else if score > second_best {
                             second_best = score;
                         }
-                        if n_started[edge_idx] == 0 {
+                        if workspace.current_n_started[edge_idx] == 0 {
                             can_exit = true;
                         }
                     }
                     let best_idx = best_idx.expect("expanded non-terminal node has an edge");
                     let new_visits = if second_best.is_finite() {
                         let estimate = if best_without_u < second_best {
-                            (policies[best_idx] * puct_mult / (second_best - best_without_u)
-                                - (n_started[best_idx] + 1) as f32
+                            (workspace.current_policy[best_idx] * puct_mult / (second_best - best_without_u)
+                                - (workspace.current_n_started[best_idx] + 1) as f32
                                 + 1.0)
                                 .clamp(1.0, 1.0e9) as u32
                         } else {
@@ -938,12 +948,15 @@ impl<'a> SearchWorker<'a> {
                         workspace.current_path.len() as u16 + base_depth,
                     );
                     if self.tree.node_mut(child_idx).try_start_score_update() {
-                        n_started[best_idx] += 1;
+                        workspace.current_n_started[best_idx] += 1;
                         let remaining_visits = new_visits - 1;
                         if self.tree.node(child_idx).n() > 0 && !self.tree.node(child_idx).is_terminal() {
                             self.tree.node_mut(child_idx).increment_n_in_flight(remaining_visits);
-                            n_started[best_idx] += remaining_visits;
+                            workspace.current_n_started[best_idx] += remaining_visits;
                         }
+                        workspace.current_score[best_idx] = workspace.current_utility[best_idx]
+                            + workspace.current_policy[best_idx] * puct_mult
+                                / (1 + workspace.current_n_started[best_idx]) as f32;
                         if self.tree.node(child_idx).n() == 0 || self.tree.node(child_idx).is_terminal() {
                             workspace.visits_to_perform.last_mut().expect("visits")[best_idx] -= 1;
                             let mut item = NodeToProcess::visit(
