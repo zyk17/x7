@@ -376,6 +376,7 @@ pub struct SearchWorker<'a> {
     number_out_of_order: usize,
     played_history_len: usize,
     task_queue: PickTaskQueue,
+    task_workspaces: Vec<TaskWorkspace>,
     picking_workspace: TaskWorkspace,
 }
 
@@ -427,6 +428,9 @@ impl<'a> SearchWorker<'a> {
                     .min(4) as i32;
             }
         }
+        let task_workspaces = (0..usize::try_from(task_workers).expect("non-negative task worker count"))
+            .map(|_| TaskWorkspace::default())
+            .collect();
         let max_out_of_order = std::cmp::max(
             1,
             (params.max_out_of_order_evals_factor * target_minibatch_size as f32) as usize,
@@ -445,6 +449,7 @@ impl<'a> SearchWorker<'a> {
             task_workers,
             number_out_of_order: 0,
             task_queue: PickTaskQueue::default(),
+            task_workspaces,
             picking_workspace: TaskWorkspace::default(),
         }
     }
@@ -482,12 +487,14 @@ impl<'a> SearchWorker<'a> {
     /// A search worker owns its reusable computation, task workspaces, and
     /// history for the whole search, not merely for one iteration.
     pub fn run_blocking(&mut self) -> Result<(), EnginError> {
-        loop {
+        let result = (|| loop {
             self.execute_one_iteration()?;
             if self.search_state.stop.load(Ordering::Acquire) {
-                return Ok(());
+                break Ok(());
             }
-        }
+        })();
+        self.task_queue.close();
+        result
     }
 
     /// px0 `SearchWorker::InitializeIteration` (`search.cc:1233-1266`)。
@@ -581,10 +588,7 @@ impl<'a> SearchWorker<'a> {
             self.picking_workspace = workspace;
             process_result?;
             if needs_wait {
-                let mut workspace = std::mem::take(&mut self.picking_workspace);
-                let task_result = self.run_queued_tasks(&mut workspace);
-                self.picking_workspace = workspace;
-                task_result?;
+                self.run_tasks_synchronously()?;
                 self.task_queue.wait();
             }
 
@@ -679,10 +683,7 @@ impl<'a> SearchWorker<'a> {
             true,
         );
         self.minibatch = receiver;
-        let mut workspace = std::mem::take(&mut self.picking_workspace);
-        let task_result = self.run_queued_tasks(&mut workspace);
-        self.picking_workspace = workspace;
-        task_result?;
+        self.run_tasks_synchronously()?;
         self.task_queue.drain_results_into(&mut self.minibatch);
         result
     }
@@ -716,6 +717,23 @@ impl<'a> SearchWorker<'a> {
             self.task_queue.complete(task_id, results);
         }
         Ok(())
+    }
+
+    /// px0 task workers keep an independent workspace for their entire
+    /// `SearchWorker` lifetime (`src/search/classic/search.h:205-233`). This
+    /// synchronous bridge exercises that same ownership before the persistent
+    /// thread loop is enabled.
+    fn run_tasks_synchronously(&mut self) -> Result<(), EnginError> {
+        if self.task_workspaces.is_empty() {
+            let mut workspace = std::mem::take(&mut self.picking_workspace);
+            let result = self.run_queued_tasks(&mut workspace);
+            self.picking_workspace = workspace;
+            return result;
+        }
+        let mut workspace = std::mem::take(&mut self.task_workspaces[0]);
+        let result = self.run_queued_tasks(&mut workspace);
+        self.task_workspaces[0] = workspace;
+        result
     }
 
     /// px0 `PickNodesToExtendTask` (`src/search/classic/search.cc:1551-1897`)

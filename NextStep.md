@@ -87,6 +87,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `PickTaskQueue` 已支持 px0 的阻塞领取、condition-variable 唤醒和 `task_count=-1` 退出语义，
   对应 `src/search/classic/search.cc:1069-1124`、`search.h:225-233`；尚未把实际 task thread
   接到树的子树并发访问。
+- `SearchWorker` 在构造时按 task worker 数分配独立 `TaskWorkspace`，同步 task dispatch
+  也使用该 workspace，并在 worker 退出时关闭队列，对应
+  `src/search/classic/search.h:205-233,357-364`；实际常驻 task thread 尚未接线。
 
 ### P4 下一入口
 
