@@ -540,8 +540,43 @@ impl<'a> SearchWorker<'a> {
             true,
         );
         self.minibatch = receiver;
+        let mut workspace = std::mem::take(&mut self.picking_workspace);
+        let task_result = self.run_queued_tasks(&mut workspace);
+        self.picking_workspace = workspace;
+        task_result?;
         self.task_queue.drain_results_into(&mut self.minibatch);
         result
+    }
+
+    /// px0 `SearchWorker::RunTasks` (`src/search/classic/search.cc:1069-1140`).
+    ///
+    /// This is the task dispatch body without px0's persistent worker-thread
+    /// wait loop. It deliberately accepts a caller-owned workspace: the later
+    /// worker pool will give each task worker one stable `TaskWorkspace`.
+    fn run_queued_tasks(&mut self, workspace: &mut TaskWorkspace) -> Result<(), EnginError> {
+        while let Some((task_id, task)) = self.task_queue.take() {
+            let results = match task.kind {
+                PickTaskKind::Gathering => {
+                    let mut results = Vec::new();
+                    self.pick_nodes_to_extend_task_with_workspace(
+                        task.start.expect("gathering task start"),
+                        task.base_depth,
+                        task.collision_limit,
+                        &task.moves_to_base,
+                        &mut results,
+                        workspace,
+                        false,
+                    )?;
+                    results
+                }
+                PickTaskKind::Processing => {
+                    self.process_picked_task(task.start_idx, task.end_idx, workspace)?;
+                    Vec::new()
+                }
+            };
+            self.task_queue.complete(task_id, results);
+        }
+        Ok(())
     }
 
     /// px0 `PickNodesToExtendTask` (`src/search/classic/search.cc:1551-1897`)
@@ -1453,6 +1488,35 @@ mod tests {
             .expect("leaf visit");
         assert_eq!(visit.moves_to_visit, vec![first, second]);
         assert_eq!(visit.depth, 3);
+    }
+
+    #[test]
+    fn queued_gathering_task_merges_into_minibatch() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let mv = tree.history().last().board().generate_legal_moves()[0];
+        tree.node_mut(root).create_single_child_node(mv);
+        tree.node_mut(root).edge_mut(0).set_p(1.0);
+        assert!(tree.node_mut(root).try_start_score_update());
+        tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
+
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+        worker.task_queue.reset();
+        worker.task_queue.push(PickTask::gathering(root, 0, Vec::new(), 1));
+        let mut workspace = TaskWorkspace::default();
+
+        worker.run_queued_tasks(&mut workspace).expect("run gathering task");
+        worker.task_queue.drain_results_into(&mut worker.minibatch);
+
+        assert_eq!(worker.minibatch.len(), 1);
+        assert!(!worker.minibatch[0].is_collision);
+        assert_eq!(worker.minibatch[0].moves_to_visit, vec![mv]);
     }
 
     #[test]

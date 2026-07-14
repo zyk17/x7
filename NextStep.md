@@ -58,6 +58,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `PickNodesToExtendTask` 的 DFS state 改为显式 `TaskWorkspace` 参数，对应
   `src/search/classic/search.h:401-406,425-434`、`search.cc:1551-1827`；主 worker
   仍持有自己的 workspace，后续 gathering task 可各自持有独立 workspace。
+- `RunTasks` 的领取、按 gathering/processing 分派和完成回写已落地，对应
+  `src/search/classic/search.cc:1069-1140`；目前由主 worker 同步消费队列，task split 与
+  常驻 task worker 尚未接线。
 
 ### P4 下一入口
 
