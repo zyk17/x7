@@ -693,7 +693,11 @@ impl<'a> SearchWorker<'a> {
         self.search_state
             .backend_waiting_counter
             .fetch_add(1, Ordering::Relaxed);
-        self.collect_collisions()?;
+        // px0 takes nodes_mutex_ for collision publication before entering the
+        // read-only prefetch phase (`search.cc:1977-1987`). Keep that write
+        // boundary so another SearchWorker cannot begin backup/cancellation
+        // between this iteration's gather and collision hand-off.
+        self.with_tree(|worker| worker.collect_collisions())?;
         let prefetch_result = self.with_tree_read(|worker, tree| worker.maybe_prefetch_into_cache(tree));
         self.release_searcher_permit();
         if let Err(error) = prefetch_result {

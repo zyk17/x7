@@ -159,6 +159,9 @@
   1464-1492`）。
 - [ ] 补齐 px0 完整 out-of-order 及其多 SearchWorker 交互
   （`search.cc:1268-1508,2109-2331`）。
+- [x] 将 `CollectCollisions` 保持在 shared-tree 写阶段，随后才降为 prefetch 的只读阶段；
+  防止多 SearchWorker 在 gather/collision hand-off 间插入 backup/cancel
+  （`src/search/classic/search.cc:1183-1193,1977-2008`）。
 - [x] 用 stable boxed arena 翻译 px0 `MakeSolid` 的 child ownership 语义：在满足
   leaf/terminal in-flight 条件时补齐每个 edge 的 child slot，并在 backup 的同一时序刷新
   root best-edge cache（`src/search/classic/node.cc:245-289,394-405`、

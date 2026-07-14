@@ -211,6 +211,10 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - 可变 contempt/WDL calibration OptionsDict 已完整传入 SearchParams：按
   `WDLCalibrationElo` 选择 accurate/simplified 分支，并在 worker 构造前冻结为
   ratio/diff/max_s（`src/search/classic/params.cc:57-174,688-703`）。
+- `CollectCollisions` 已恢复为 shared-tree 写阶段，再进入只读 prefetch；这保持
+  gather 到 collision hand-off 不会被另一 SearchWorker 的 backup/cancel 打断
+  （`src/search/classic/search.cc:1183-1193,1977-2008`）。下一项只验证完整
+  out-of-order 与多 SearchWorker 的组合时序。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。
