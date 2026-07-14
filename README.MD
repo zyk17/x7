@@ -12,8 +12,15 @@
 - `C:\Users\Administrator\projects\pxzero-training`
 
 当前 P4 已有 px0 classic worker、真实 `124x10x9` ONNX backend 与 UCI 搜索接线；
-完整 collision/task-worker/prefetch 及权重 UCI 配置仍未完成。默认二进制尚不加载权重，
-不能把 UniformBackend 的测试结果当作模型搜索结果。
+完整 collision/task-worker/prefetch 仍未完成。主 UCI 使用 px0 名称 `WeightsFile` 配置
+ONNX 权重，并会在下一条 `position` 前加载它；`UniformBackend` 只用于测试，不能把其
+搜索结果当作模型结果。
+
+```text
+setoption name WeightsFile value data/x7.onnx
+position startpos
+go nodes 1000
+```
 
 ## 正式模型契约
 

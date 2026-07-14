@@ -38,10 +38,18 @@ pub fn best_move(tree: &NodeTree, params: &SearchParams) -> (Move, Move) {
             best_child_edge(tree, child, params, 1).map(|ponder_idx| tree.node(child).edge(ponder_idx).mv)
         })
         .unwrap_or(Move::NULL);
-    (
-        if root_is_black { best.flip() } else { best },
-        if root_is_black { ponder } else { ponder.flip() },
-    )
+    (orient_move(best, root_is_black), orient_move(ponder, !root_is_black))
+}
+
+/// px0 `EdgeAndNode::GetMove` returns a default null `Move` when no edge
+/// exists (`src/search/classic/node.h:356-404`). Do not mirror that sentinel:
+/// `Move::Flip` only has board-move semantics and would turn null into `a9a9`.
+fn orient_move(mv: Move, flip: bool) -> Move {
+    if flip && !mv.is_null() {
+        mv.flip()
+    } else {
+        mv
+    }
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -144,7 +152,7 @@ mod tests {
 
     use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
-    use super::{best_child_edge, SearchParams};
+    use super::{best_child_edge, orient_move, SearchParams};
     use crate::search::classic::node::NodeTree;
 
     static INIT: Once = Once::new();
@@ -172,6 +180,11 @@ mod tests {
         assert!(tree.node_mut(child).try_start_score_update());
         tree.node_mut(child).finalize_score_update(0.0, 0.0, 0.0, 1);
         assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0), Some(0));
+    }
+
+    #[test]
+    fn move_orientation_keeps_px0_null_ponder_null() {
+        assert!(orient_move(xiangqi_core::Move::NULL, true).is_null());
     }
 }
 
@@ -288,6 +301,15 @@ impl ClassicSearch {
     pub fn total_root_visits(&self) -> u32 {
         let tree = self.tree.lock().expect("tree lock");
         tree.node(tree.current_head()).n()
+    }
+
+    /// px0 `SearchBase::SetBackend` (`src/search/search.h:48-55`). Callers
+    /// must stop search first; a worker holds a cloned backend for its full
+    /// lifetime, exactly as px0 changes the backend only while stopped.
+    pub fn set_backend(&mut self, backend: Box<dyn Backend>) -> Result<(), EnginError> {
+        self.abort_search()?;
+        self.backend = Arc::from(backend);
+        Ok(())
     }
 
     pub fn run_blocking_nodes(&mut self, nodes: u32) -> (Move, u32) {

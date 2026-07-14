@@ -125,8 +125,10 @@
 - [ ] 随稳定 node 存储翻译 `MakeSolid` tree 表示；它会重建 px0 child/sibling pointer
   所有权，不能用当前 arena 伪实现（`src/search/classic/node.cc:245-289`）。
 - [ ] 对齐 px0 UCI、bench、info 统计。
-- [ ] 将 `OnnxBackend` 接入 `WeightsFile` / backend UCI 配置，替换 UCI 主线的 UniformBackend
-  （`src/engine.cc:156-165`、`src/neural/shared_params.*`）。
+- [x] 翻译 `WeightsFile` 到正式 `OnnxBackend` 的 UCI/engine 配置子集；保持 px0 配置与
+  `SetPosition` 时序，不实现多 backend registry、protobuf weight 或 autodiscover
+  （`src/neural/shared_params.cc:43-80`、`src/engine.cc:153-167,187-197`、
+  `src/search/search.h:48-55`）。
 
 ## 后续才允许做
 

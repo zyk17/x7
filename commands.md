@@ -152,6 +152,23 @@ cargo run --release -p engin -- --onnx-smoke data\x7.onnx
 
 这条命令只验证最小推理链路，不代表 GUI 正式接入效果。
 
+## 10.1 UCI 使用正式 ONNX 权重
+
+`WeightsFile` 沿用 px0 的 UCI 名称，但本项目只接受 ONNX。权重会在下一条
+`position` 前加载：
+
+```powershell
+cargo run --release -p engin
+```
+
+```text
+uci
+setoption name WeightsFile value data/x7.onnx
+isready
+position startpos
+go nodes 1000
+```
+
 ## 11. 独立 ONNX 局面评估
 
 说明：

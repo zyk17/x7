@@ -24,12 +24,16 @@ pub struct GoParams {
     pub ponder: bool,
 }
 
-/// px0 `StringUciResponder::PopulateParams` 覆盖的三项 UCI option。
+/// px0 `StringUciResponder::PopulateParams` 与 `SharedBackendParams` 的
+/// Rust ONNX 子集。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UciOptions {
     pub show_wdl: bool,
     pub show_eps: bool,
     pub show_moves_left: bool,
+    /// px0 `WeightsFile` (`src/neural/shared_params.cc:43-80`). This Rust
+    /// port accepts the formal ONNX model rather than px0's protobuf weights.
+    pub weights_file: String,
 }
 
 impl UciOptions {
@@ -47,6 +51,7 @@ impl UciOptions {
                 "option name UCI_ShowMovesLeft type check default {}",
                 bool_uci(self.show_moves_left)
             ),
+            format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
 
@@ -56,6 +61,7 @@ impl UciOptions {
             "UCI_ShowWDL" => self.show_wdl = parse_bool_option(value, "UCI_ShowWDL")?,
             "UCI_ShowEPS" => self.show_eps = parse_bool_option(value, "UCI_ShowEPS")?,
             "UCI_ShowMovesLeft" => self.show_moves_left = parse_bool_option(value, "UCI_ShowMovesLeft")?,
+            "WeightsFile" => self.weights_file = value.to_string(),
             _ => return Err(EnginError::Uci(format!("Unknown option: {name}"))),
         }
         Ok(())
@@ -89,6 +95,11 @@ pub trait StringUciResponder: UciResponder {
 pub trait EngineController {
     fn register_uci_responder(&mut self, responder: &mut dyn StringUciResponder);
     fn unregister_uci_responder(&mut self, responder: &mut dyn StringUciResponder);
+    /// Rust ownership requires explicitly forwarding the global UCI options
+    /// that px0's `Engine` reads from its shared `OptionsDict`.
+    fn set_uci_options(&mut self, _options: &UciOptions) -> Result<(), EnginError> {
+        Ok(())
+    }
     fn ensure_ready(&mut self) -> Result<(), EnginError>;
     fn new_game(&mut self) -> Result<(), EnginError>;
     fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), EnginError>;
@@ -146,6 +157,7 @@ impl<'a> UciLoop<'a> {
                 }
                 self.options
                     .set_uci_option(&get_or_empty(params, "name"), &get_or_empty(params, "value"))?;
+                self.engine.set_uci_options(self.options)?;
                 self.responder.set_options(self.options.clone());
             }
             "ucinewgame" => self.engine.new_game()?,
@@ -685,6 +697,19 @@ mod tests {
     }
 
     #[test]
+    fn weights_file_option_matches_px0_name() {
+        let mut options = UciOptions::populate_defaults();
+        options
+            .set_uci_option("WeightsFile", "data/x7.onnx")
+            .expect("weights option");
+        assert_eq!(options.weights_file, "data/x7.onnx");
+        assert!(options
+            .list_options_uci()
+            .iter()
+            .any(|line| line == "option name WeightsFile type string default data/x7.onnx"));
+    }
+
+    #[test]
     fn dispatch_position_keeps_full_history() {
         ensure_init();
         let mut options = UciOptions::populate_defaults();
@@ -750,6 +775,7 @@ mod tests {
             show_wdl: true,
             show_eps: true,
             show_moves_left: true,
+            ..UciOptions::default()
         };
         let info = ThinkingInfo {
             depth: 0,

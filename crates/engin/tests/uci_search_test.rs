@@ -1,5 +1,6 @@
 //! P3 `go nodes` UCI transcript 验收。
 
+use std::path::Path;
 use std::sync::Once;
 
 use engin::{ClassicEngine, UciLoop, UciOptions, VecUciResponder};
@@ -79,4 +80,27 @@ fn unavailable_engine_does_not_return_uniform_bestmove() {
         .iter()
         .any(|line| line.starts_with("info string cannot search:")));
     assert!(!responder.responses.iter().any(|line| line.starts_with("bestmove ")));
+}
+
+/// px0 updates its backend configuration before accepting a new position
+/// (`src/engine.cc:153-167,187-197`). The Rust `WeightsFile` subset accepts
+/// the formal ONNX artifact instead of px0 protobuf weights.
+#[test]
+fn weights_file_enables_main_uci_onnx_search_if_local_x7_exists() {
+    ensure_init();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx");
+    if !path.is_file() {
+        eprintln!("skip: {} is absent", path.display());
+        return;
+    }
+    let mut options = UciOptions::populate_defaults();
+    let mut engine = ClassicEngine::unavailable();
+    let mut responder = VecUciResponder::default();
+    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    uci.process_line(&format!("setoption name WeightsFile value {}", path.display()), "0.0.0")
+        .expect("configure weights");
+    uci.process_line("position startpos", "0.0.0").expect("position");
+    uci.process_line("go nodes 1", "0.0.0").expect("go nodes");
+    drop(uci);
+    assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
 }

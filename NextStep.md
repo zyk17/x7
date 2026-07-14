@@ -1,11 +1,11 @@
 # NextStep
 
-## 当前阶段：P4 单 worker 搜索与 UCI 生命周期已接线；完整碰撞/task workers/weights 配置未闭合
+## 当前阶段：P4 单 worker 搜索与 UCI 生命周期已接线；完整碰撞/task workers 未闭合
 
 P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `ClassicSearch`** 已接入 UCI：
 
 - 测试用 `UniformBackend` 下，`go nodes` / `go movetime` / `go wtime` / `go infinite`+`stop` 可返回 `bestmove`
-- 主 UCI 不再使用 Uniform fallback；尚未翻译 `WeightsFile` 配置时会明确返回不可搜索状态
+- 主 UCI 不再使用 Uniform fallback；`WeightsFile` 可在下一条 `position` 前加载正式 ONNX backend
 - UniformBackend NN cache 子集；fixed-nodes stopper trace（Rust stub，非 px0 二进制）
 
 当前唯一工程参考：
@@ -113,6 +113,10 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   和 remaining-playouts root smart pruning 已翻译（`src/search/classic/search.cc:705-808,
   1584-1588,1726-1742,2241-2249`）。`MakeSolid` 仍明确阻塞于稳定并发 node 存储：
   px0 `node.cc:245-289` 会转换 sibling 链及 pointer 所有权，当前 Rust arena 不能伪造。
+- `WeightsFile -> OnnxBackend` 的 UCI/engine 子集已翻译：`setoption` 保存配置，`set_position`
+  停止旧搜索后更新 backend，再构造新 `GameState`（`src/neural/shared_params.cc:43-80`、
+  `src/engine.cc:153-167,187-197`、`src/search/search.h:48-55`）。本项目只接受 ONNX，未翻译
+  px0 的 backend registry、protobuf 权重和 autodiscover。
 
 ### P4 下一入口
 
@@ -121,5 +125,4 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   selection 的树访问边界；当前 `Vec<Node>` + 整轮 `Mutex` 不能直接承载 px0 子树并发
 - `node.cc:245-289`：随稳定 node 存储边界翻译 `MakeSolid`；不能在当前 arena 上伪造
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
-- `engine.cc:153-167`、`neural/shared_params.*`：`WeightsFile` 到真实 ONNX backend 的 UCI 配置
 - px0 二进制 fixed-nodes trace 对拍

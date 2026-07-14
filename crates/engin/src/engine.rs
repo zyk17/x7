@@ -6,6 +6,7 @@ use crate::neural::backend::{Backend, UniformBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::classic::ClassicSearch;
 use crate::search::SearchBase;
+use crate::uci_loop::UciOptions;
 use crate::uci_loop::{EngineController, GoParams, StringUciResponder};
 use crate::EnginError;
 
@@ -13,7 +14,9 @@ use crate::EnginError;
 pub struct ClassicEngine {
     search: ClassicSearch,
     position: Option<GameState>,
-    unavailable_reason: Option<&'static str>,
+    unavailable_reason: Option<String>,
+    uci_weights_file: Option<String>,
+    loaded_weights_file: Option<String>,
 }
 
 impl ClassicEngine {
@@ -22,6 +25,8 @@ impl ClassicEngine {
             search: ClassicSearch::new(backend),
             position: None,
             unavailable_reason: None,
+            uci_weights_file: None,
+            loaded_weights_file: None,
         }
     }
 
@@ -38,7 +43,9 @@ impl ClassicEngine {
         Self {
             search: ClassicSearch::new(Box::new(UniformBackend::default())),
             position: None,
-            unavailable_reason: Some("P4 weights/backend UCI configuration is not translated yet"),
+            unavailable_reason: Some("WeightsFile is not configured".into()),
+            uci_weights_file: None,
+            loaded_weights_file: None,
         }
     }
 
@@ -49,12 +56,50 @@ impl ClassicEngine {
     pub fn search(&self) -> &ClassicSearch {
         &self.search
     }
+
+    /// px0 `Engine::UpdateBackendConfig` (`src/engine.cc:153-167`) restricted
+    /// to this port's single formal ONNX backend. px0's backend registry and
+    /// protobuf weight discovery are intentionally not reproduced here.
+    fn update_backend_config(&mut self) -> Result<(), EnginError> {
+        let Some(path) = self.uci_weights_file.as_deref() else {
+            self.loaded_weights_file = None;
+            self.unavailable_reason = Some("WeightsFile is not configured".into());
+            return Ok(());
+        };
+        if path.is_empty() {
+            self.loaded_weights_file = None;
+            self.unavailable_reason = Some("WeightsFile is not configured".into());
+            return Ok(());
+        }
+        if self.loaded_weights_file.as_deref() == Some(path) {
+            return Ok(());
+        }
+        self.search.abort_search()?;
+        match OnnxBackend::from_file(path) {
+            Ok(backend) => {
+                self.search.set_backend(Box::new(backend))?;
+                self.loaded_weights_file = Some(path.to_string());
+                self.unavailable_reason = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.loaded_weights_file = None;
+                self.unavailable_reason = Some(format!("cannot load WeightsFile {path}: {error}"));
+                Ok(())
+            }
+        }
+    }
 }
 
 impl EngineController for ClassicEngine {
     fn register_uci_responder(&mut self, _responder: &mut dyn StringUciResponder) {}
 
     fn unregister_uci_responder(&mut self, _responder: &mut dyn StringUciResponder) {}
+
+    fn set_uci_options(&mut self, options: &UciOptions) -> Result<(), EnginError> {
+        self.uci_weights_file = Some(options.weights_file.clone());
+        Ok(())
+    }
 
     fn ensure_ready(&mut self) -> Result<(), EnginError> {
         Ok(())
@@ -70,6 +115,13 @@ impl EngineController for ClassicEngine {
         // (`src/engine.cc:187-197`).  The old worker owns mutable tree state;
         // replacing it before all worker threads joined is a UCI race.
         self.search.abort_search()?;
+        // px0 `Engine::SetPosition` updates backend configuration after
+        // stopping search and before making the new `GameState`
+        // (`src/engine.cc:187-197`). Retrying here also handles a file that
+        // appeared after an earlier failed `setoption`.
+        if self.uci_weights_file.is_some() {
+            self.update_backend_config()?;
+        }
         let state = GameState::from_fen_moves(fen, moves)?;
         self.search.set_position(&state)?;
         self.position = Some(state);
@@ -77,7 +129,7 @@ impl EngineController for ClassicEngine {
     }
 
     fn go(&mut self, params: &GoParams, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
-        if let Some(reason) = self.unavailable_reason {
+        if let Some(reason) = &self.unavailable_reason {
             responder.send_raw_response(&format!("info string cannot search: {reason}"));
             return Ok(());
         }
