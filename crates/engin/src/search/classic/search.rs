@@ -1,7 +1,7 @@
 //! px0 `src/search/classic/search.h:49-260`、`search.cc:426-808,874-1055`、`wrapper.cc:53-141`。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -390,7 +390,7 @@ mod tests {
 
         assert!(!best.is_null());
         assert!(visits >= 64);
-        let tree = search.tree.lock().expect("tree lock");
+        let tree = search.tree.read().expect("tree lock");
         let root = tree.current_head();
         assert!(tree.node(root).has_solid_children());
         assert_eq!(tree.node(root).n_in_flight(), 0);
@@ -416,7 +416,7 @@ mod tests {
 
         assert!(!best.is_null());
         assert!(visits >= 64);
-        let tree = search.tree.lock().expect("tree lock");
+        let tree = search.tree.read().expect("tree lock");
         let root = tree.current_head();
         assert!(tree.node(root).has_solid_children());
         assert_eq!(tree.node(root).n_in_flight(), 0);
@@ -563,7 +563,7 @@ impl SearchStopController {
 }
 
 pub struct ClassicSearch {
-    tree: Arc<Mutex<NodeTree>>,
+    tree: Arc<RwLock<NodeTree>>,
     worker_state: Arc<WorkerSearchState>,
     meta: Arc<Mutex<SearchMeta>>,
     backend: Arc<dyn Backend>,
@@ -597,7 +597,7 @@ impl ClassicSearch {
         }));
         let stopper = Arc::new(Mutex::new(None));
         Self {
-            tree: Arc::new(Mutex::new(NodeTree::default())),
+            tree: Arc::new(RwLock::new(NodeTree::default())),
             worker_state: Arc::new(WorkerSearchState::new(Arc::clone(&stop), i64::MAX)),
             meta: Arc::clone(&meta),
             backend: Arc::from(backend),
@@ -615,7 +615,7 @@ impl ClassicSearch {
     }
 
     pub fn total_root_visits(&self) -> u32 {
-        let tree = self.tree.lock().expect("tree lock");
+        let tree = self.tree.read().expect("tree lock");
         tree.node(tree.current_head()).n()
     }
 
@@ -660,7 +660,7 @@ impl ClassicSearch {
         };
         self.start_search(&params).expect("search");
         self.wait_search().expect("wait");
-        let tree = self.tree.lock().expect("tree lock");
+        let tree = self.tree.read().expect("tree lock");
         let meta = self.meta.lock().expect("meta lock");
         let (best, _) = best_move(&tree, &meta.params, &meta.root_move_filter);
         let visits = tree.node(tree.current_head()).n();
@@ -783,7 +783,7 @@ impl ClassicSearch {
                 if let Some(responder) = &responder {
                     // Keep px0's tree-before-current-best lock order. Backup
                     // updates current_best_edge while holding the tree phase.
-                    let tree = watchdog_tree.lock().expect("tree lock");
+                    let tree = watchdog_tree.read().expect("tree lock");
                     let meta = watchdog_meta.lock().expect("meta lock");
                     let edge = *watchdog_worker_state.current_best_edge.lock().expect("best edge lock");
                     if edge.is_some() {
@@ -815,7 +815,7 @@ impl ClassicSearch {
                     .is_ok()
             {
                 if let Some(responder) = &responder {
-                    let tree = watchdog_tree.lock().expect("tree lock");
+                    let tree = watchdog_tree.read().expect("tree lock");
                     let meta = watchdog_meta.lock().expect("meta lock");
                     if let Some(output) = ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
                     {
@@ -862,7 +862,7 @@ impl ClassicSearch {
 impl SearchBase for ClassicSearch {
     fn new_game(&mut self) -> Result<(), EnginError> {
         self.wait_search()?;
-        *self.tree.lock().expect("tree lock") = NodeTree::default();
+        *self.tree.write().expect("tree lock") = NodeTree::default();
         self.worker_state = Arc::new(WorkerSearchState::new(Arc::clone(&self.stop), i64::MAX));
         self.outputs.clear();
         Ok(())
@@ -870,7 +870,7 @@ impl SearchBase for ClassicSearch {
 
     fn set_position(&mut self, state: &GameState) -> Result<(), EnginError> {
         self.tree
-            .lock()
+            .write()
             .expect("tree lock")
             .reset_to_position(&state.startpos, &state.moves);
         Ok(())
@@ -904,7 +904,7 @@ impl SearchBase for ClassicSearch {
         }
 
         {
-            let tree = self.tree.lock().expect("tree lock");
+            let tree = self.tree.read().expect("tree lock");
             // px0 `StringsToMovelist` (`src/search/classic/wrapper.cc:78-100`)
             // parses at the root, retains legal requests only, and rejects a
             // non-empty `searchmoves` list if none of its moves are legal.

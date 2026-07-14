@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Instant;
 
 use xiangqi_core::{GameResult, Move, MoveList, PositionHistory};
@@ -177,11 +177,11 @@ struct TaskWorkspace {
 /// px0 keeps node addresses stable while `SearchWorker` only holds
 /// `nodes_mutex_` for the tree phases (`search.cc:1142-1211,1494-1508`).
 /// Direct storage serves focused unit tests; shared storage is the production
-/// `ClassicSearch` path. `active` is non-null only while that tree mutex is
+/// `ClassicSearch` path. `active` is non-null only while that tree write lock is
 /// held by the owning search worker.
 enum TreeStorage<'a> {
     Direct(PhantomData<&'a mut NodeTree>),
-    Shared(Arc<Mutex<NodeTree>>),
+    Shared(Arc<RwLock<NodeTree>>),
 }
 
 struct WorkerTree<'a> {
@@ -198,14 +198,14 @@ impl<'a> WorkerTree<'a> {
         }
     }
 
-    fn shared(tree: Arc<Mutex<NodeTree>>) -> Self {
+    fn shared(tree: Arc<RwLock<NodeTree>>) -> Self {
         Self {
             storage: TreeStorage::Shared(tree),
             active: std::ptr::null_mut(),
         }
     }
 
-    fn shared_tree(&self) -> Option<Arc<Mutex<NodeTree>>> {
+    fn shared_tree(&self) -> Option<Arc<RwLock<NodeTree>>> {
         match &self.storage {
             TreeStorage::Direct(_) => None,
             TreeStorage::Shared(tree) => Some(Arc::clone(tree)),
@@ -570,14 +570,14 @@ impl<'a> SearchWorker<'a> {
     /// search tree, but only locks it for the required tree phases
     /// (`src/search/classic/search.cc:1088-1140,1142-1211`).
     pub(crate) fn new_shared_with_stop_controller_and_root_move_filter(
-        tree: Arc<Mutex<NodeTree>>,
+        tree: Arc<RwLock<NodeTree>>,
         backend: &'a dyn Backend,
         params: &'a SearchParams,
         search_state: &'a WorkerSearchState,
         stop_controller: Option<Arc<SearchStopController>>,
         root_move_filter: &'a [Move],
     ) -> Self {
-        let history = tree.lock().expect("tree lock").history().clone();
+        let history = tree.read().expect("tree lock").history().clone();
         let played_history_len = history.len();
         Self::from_parts(
             WorkerTree::shared(tree),
@@ -693,10 +693,8 @@ impl<'a> SearchWorker<'a> {
         self.search_state
             .backend_waiting_counter
             .fetch_add(1, Ordering::Relaxed);
-        let prefetch_result = self.with_tree(|worker| {
-            worker.collect_collisions()?;
-            worker.maybe_prefetch_into_cache()
-        });
+        self.collect_collisions()?;
+        let prefetch_result = self.with_tree_read(|worker, tree| worker.maybe_prefetch_into_cache(tree));
         self.release_searcher_permit();
         if let Err(error) = prefetch_result {
             self.search_state
@@ -722,11 +720,23 @@ impl<'a> SearchWorker<'a> {
         let Some(tree) = self.tree.shared_tree() else {
             return operation(self);
         };
-        let mut tree = tree.lock().expect("tree lock");
+        let mut tree = tree.write().expect("tree lock");
         self.tree.activate(&mut tree);
         let result = operation(self);
         self.tree.deactivate();
         result
+    }
+
+    /// px0 `MaybePrefetchIntoCache` reads its tree under `SharedLock`, while
+    /// cache submission remains private to the worker (`search.cc:1989-2007`).
+    fn with_tree_read<R>(&mut self, operation: impl FnOnce(&mut Self, &NodeTree) -> R) -> R {
+        let Some(tree) = self.tree.shared_tree() else {
+            // Direct test storage owns the tree for the worker lifetime.
+            let tree = unsafe { &*self.tree.active };
+            return operation(self, tree);
+        };
+        let tree = tree.read().expect("tree lock");
+        operation(self, &tree)
     }
 
     /// px0 `ExecuteOneIteration` permit acquisition
@@ -1697,8 +1707,10 @@ impl<'a> SearchWorker<'a> {
         Ok(())
     }
 
-    /// px0 `SearchWorker::MaybePrefetchIntoCache` (`search.cc:1989-2007`)。
-    pub fn maybe_prefetch_into_cache(&mut self) -> Result<(), EnginError> {
+    /// px0 `SearchWorker::MaybePrefetchIntoCache` (`search.cc:1989-2007`).
+    /// This phase only reads the tree; history and computation belong to this
+    /// worker and remain mutable without upgrading the tree lock.
+    fn maybe_prefetch_into_cache(&mut self, tree: &NodeTree) -> Result<(), EnginError> {
         if self.search_state.stop.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -1710,40 +1722,45 @@ impl<'a> SearchWorker<'a> {
             return Ok(());
         }
         let budget = self.params.max_prefetch_batch as usize - used;
-        let root = self.tree.current_head();
+        let root = tree.current_head();
         // px0 resets the workspace history before walking prefetch candidates
         // (`search.cc:1997-2004`). ProcessPickedTask leaves this workspace at
         // its last expanded leaf, so using it directly would encode the wrong
         // position for a root-relative cache probe.
         self.history.trim(self.played_history_len);
-        self.prefetch_into_cache(Some(root), budget, false)?;
+        self.prefetch_into_cache(tree, Some(root), budget, false)?;
         Ok(())
     }
 
     /// px0 `Search::GetDrawScore` (`src/search/classic/search.cc:401-405`)。
-    fn draw_score(&self, is_odd_depth: bool) -> f32 {
-        if is_odd_depth == self.tree.history().is_black_to_move() {
-            self.params.draw_score
+    fn draw_score_for_tree(tree: &NodeTree, params: &SearchParams, is_odd_depth: bool) -> f32 {
+        if is_odd_depth == tree.history().is_black_to_move() {
+            params.draw_score
         } else {
-            -self.params.draw_score
+            -params.draw_score
         }
+    }
+
+    fn draw_score(&self, is_odd_depth: bool) -> f32 {
+        Self::draw_score_for_tree(&self.tree, self.params, is_odd_depth)
     }
 
     /// px0 `PrefetchIntoCache` (`search.cc:2010-2099`)。
     fn prefetch_into_cache(
         &mut self,
+        tree: &NodeTree,
         node_idx: Option<usize>,
         budget: usize,
         is_odd_depth: bool,
     ) -> Result<usize, EnginError> {
-        let draw_score = self.draw_score(is_odd_depth);
+        let draw_score = Self::draw_score_for_tree(tree, self.params, is_odd_depth);
         if budget == 0 {
             return Ok(0);
         }
 
         // px0 also reaches this branch for a missing child edge. It is still a
         // valid future leaf and must be encoded from the current history.
-        if node_idx.is_none_or(|idx| self.tree.node(idx).n_started() == 0) {
+        if node_idx.is_none_or(|idx| tree.node(idx).n_started() == 0) {
             if self
                 .backend
                 .cached_evaluation(&EvalPosition {
@@ -1765,26 +1782,20 @@ impl<'a> SearchWorker<'a> {
         }
 
         let node_idx = node_idx.expect("checked above");
-        if self.tree.node(node_idx).n() == 0 || self.tree.node(node_idx).is_terminal() {
+        if tree.node(node_idx).n() == 0 || tree.node(node_idx).is_terminal() {
             return Ok(0);
         }
 
         // px0 `search.cc:2036-2051`: score all legal edges using the same
         // EdgeAndNode Q/U proxy as selection. The negated score permits
         // ascending partial sorting below.
-        let is_root = node_idx == self.tree.current_head();
-        let cpuct = super::uct::compute_cpuct(self.params, self.tree.node(node_idx).n(), is_root);
-        let puct_mult = cpuct * (self.tree.node(node_idx).children_visits().max(1) as f32).sqrt();
-        let fpu = super::uct::get_fpu(
-            self.params,
-            self.tree.node(node_idx),
-            self.tree.arena(),
-            is_root,
-            draw_score,
-        );
-        let mut scores = (0..self.tree.node(node_idx).num_edges())
+        let is_root = node_idx == tree.current_head();
+        let cpuct = super::uct::compute_cpuct(self.params, tree.node(node_idx).n(), is_root);
+        let puct_mult = cpuct * (tree.node(node_idx).children_visits().max(1) as f32).sqrt();
+        let fpu = super::uct::get_fpu(self.params, tree.node(node_idx), tree.arena(), is_root, draw_score);
+        let mut scores = (0..tree.node(node_idx).num_edges())
             .filter_map(|edge_idx| {
-                let edge = self.tree.edge_and_node(node_idx, edge_idx);
+                let edge = tree.edge_and_node(node_idx, edge_idx);
                 (edge.p() != 0.0).then_some((-edge.u(puct_mult) - edge.q(fpu, draw_score), edge_idx))
             })
             .collect::<Vec<_>>();
@@ -1820,7 +1831,7 @@ impl<'a> SearchWorker<'a> {
             let edge_idx = scores[index].1;
             if index != scores.len() - 1 {
                 let next_score = -scores[index + 1].0;
-                let edge = self.tree.edge_and_node(node_idx, edge_idx);
+                let edge = tree.edge_and_node(node_idx, edge_idx);
                 let q = edge.q(-fpu, draw_score);
                 if next_score > q {
                     let estimated = edge.p() * puct_mult / (next_score - q) - edge.n_started() as f32;
@@ -1831,11 +1842,11 @@ impl<'a> SearchWorker<'a> {
             }
 
             let (mv, child_idx) = {
-                let edge = self.tree.edge_and_node(node_idx, edge_idx);
-                (edge.mv(), self.tree.node(node_idx).child(edge_idx))
+                let edge = tree.edge_and_node(node_idx, edge_idx);
+                (edge.mv(), tree.node(node_idx).child(edge_idx))
             };
             self.history.append(mv);
-            let result = self.prefetch_into_cache(child_idx, budget_to_spend, !is_odd_depth);
+            let result = self.prefetch_into_cache(tree, child_idx, budget_to_spend, !is_odd_depth);
             self.history.pop();
             let budget_spent = result?;
             total_budget_spent += budget_spent;
@@ -2537,7 +2548,9 @@ mod tests {
             })
             .expect("seed computation");
 
-        worker.maybe_prefetch_into_cache().expect("prefetch");
+        worker
+            .with_tree_read(|worker, tree| worker.maybe_prefetch_into_cache(tree))
+            .expect("prefetch");
 
         assert_eq!(worker.history.len(), worker.played_history_len);
     }
@@ -2562,7 +2575,7 @@ mod tests {
         worker.initialize_iteration().expect("init");
 
         let spent = worker
-            .prefetch_into_cache(Some(root), 1, false)
+            .with_tree_read(|worker, tree| worker.prefetch_into_cache(tree, Some(root), 1, false))
             .expect("recursive prefetch");
 
         assert_eq!(spent, 1);
