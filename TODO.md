@@ -71,6 +71,8 @@
   （`src/search/classic/search.h:367-445`、`search.cc:1069-1140,1464-1508`）。
 - [x] 将 `PickNodesToExtendTask` 改为显式 receiver，供主 minibatch 与 gathering
   task 共用（`src/search/classic/search.h:401-406`）。
+- [x] 主选择后等待并汇合 gathering `PickTask.results`
+  （`src/search/classic/search.cc:1501-1507`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

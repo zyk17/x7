@@ -53,6 +53,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `PickNodesToExtendTask` 现在显式写入 caller receiver，对应
   `src/search/classic/search.h:401-406`；下一步可直接将 gathering task 的结果写入
   `PickTask.results`。
+- `PickNodesToExtend` 在主选择完成后等待并汇合各 `PickTask.results`，对应
+  `src/search/classic/search.cc:1501-1507`；task split/dispatch 尚未接线。
 
 ### P4 下一入口
 
