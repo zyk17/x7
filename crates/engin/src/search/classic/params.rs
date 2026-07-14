@@ -61,6 +61,35 @@ pub struct WdlRescaleParams {
     pub diff: f32,
 }
 
+/// px0 `GetContempt` (`src/search/classic/params.cc:57-89`).
+pub fn get_contempt(opponent_name: &str, contempt_list: &str, uci_rating_adv: f32) -> Result<f32, String> {
+    let mut contempt = uci_rating_adv;
+    for entry in contempt_list.split(',') {
+        if entry.is_empty() {
+            continue;
+        }
+        let mut parts = entry.split('=');
+        let first = parts.next().expect("split always yields first");
+        let second = parts.next();
+        if parts.next().is_some() {
+            return Err(format!("Invalid contempt entry:{entry}"));
+        }
+        match second {
+            None => {
+                contempt = first
+                    .parse()
+                    .map_err(|_| format!("Invalid default contempt: {entry}"))?
+            }
+            Some(value) if opponent_name.to_lowercase().contains(&first.to_lowercase()) => {
+                contempt = value.parse().map_err(|_| format!("Invalid contempt entry: {entry}"))?;
+                break;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(contempt)
+}
+
 /// px0 `AccurateWDLRescaleParams` (`params.cc:92-115`).
 pub fn accurate_wdl_rescale_params(
     contempt: f32,
@@ -346,7 +375,7 @@ impl SearchParams {
 
 #[cfg(test)]
 mod tests {
-    use super::{accurate_wdl_rescale_params, simplified_wdl_rescale_params, SearchParams};
+    use super::{accurate_wdl_rescale_params, get_contempt, simplified_wdl_rescale_params, SearchParams};
 
     /// px0 `BaseSearchParams` keeps each root PUCT parameter equal to the
     /// ordinary value unless `RootHasOwnCpuctParams` is enabled
@@ -395,5 +424,12 @@ mod tests {
         assert!(neutral.ratio.is_finite() && contempt.ratio.is_finite());
         assert!(contempt.diff.is_finite());
         assert!(contempt.diff.abs() > neutral.diff.abs());
+    }
+
+    #[test]
+    fn contempt_list_matches_px0_case_insensitive_first_match() {
+        assert_eq!(get_contempt("Example Opponent", "25,opponent=50", 10.0), Ok(50.0));
+        assert_eq!(get_contempt("Example", "other=50", 10.0), Ok(10.0));
+        assert!(get_contempt("Example", "a=b=c", 0.0).is_err());
     }
 }
