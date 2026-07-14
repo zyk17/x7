@@ -194,6 +194,8 @@
 - [ ] 翻译可变 contempt/WDL calibration `OptionsDict`，使 WDL 重标定在 NN value 进入
   backup 前使用 px0 的完整参数计算（`src/search/classic/params.cc:57-174,688-703`、
   `search.cc:206-236,2117-2154`）。
+- [x] 先固定 `FetchSingleNodeResult` 的 WDL rescale 调用时序与 px0 一致；默认
+  `ratio=1/diff=0/max_s=1.4` 不改变现有搜索数值（`src/search/classic/search.cc:2117-2154`）。
 - [x] 翻译 `WeightsFile` 到正式 `OnnxBackend` 的 UCI/engine 配置子集；保持 px0 配置与
   `SetPosition` 时序，不实现多 backend registry、protobuf weight 或 autodiscover
   （`src/neural/shared_params.cc:43-80`、`src/engine.cc:153-167,187-197`、

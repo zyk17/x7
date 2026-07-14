@@ -18,7 +18,7 @@ use crate::EnginError;
 
 use super::node::{NodeTree, Terminal};
 use super::params::SearchParams;
-use super::search::{best_child_edge, SearchStopController};
+use super::search::{best_child_edge, wdl_rescale, SearchStopController};
 
 /// px0 `Search` 中与 worker 相关的计数子集 (`search.h:49-200`)。
 #[derive(Debug)]
@@ -1898,6 +1898,27 @@ impl<'a> SearchWorker<'a> {
             ))?
             .take_result(ticket)?;
         eval.wl = -eval.wl;
+        // px0 rescales NN WDL before it reaches backup, never afterwards in
+        // UCI formatting (`src/search/classic/search.cc:2128-2143`). The
+        // neutral defaults are identity in ratio/diff terms; contempt mode is
+        // translated separately before non-zero diff becomes configurable.
+        if self.params.wdl_rescale_ratio != 1.0 {
+            let root_stm = self.tree.history().is_black_to_move();
+            let sign = if root_stm ^ (self.minibatch[index].depth % 2 == 1) {
+                1.0
+            } else {
+                -1.0
+            };
+            wdl_rescale(
+                &mut eval.wl,
+                &mut eval.d,
+                self.params.wdl_rescale_ratio,
+                0.0,
+                sign,
+                false,
+                self.params.wdl_max_s,
+            );
+        }
         if self.tree.node(node_idx).n() == 0 {
             for (edge_idx, policy) in eval.policies.iter().enumerate() {
                 self.tree.node_mut(node_idx).edge_mut(edge_idx).set_p(*policy);

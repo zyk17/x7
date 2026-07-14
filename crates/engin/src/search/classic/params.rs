@@ -94,6 +94,12 @@ pub struct SearchParams {
     /// px0 `NodesPerSecondLimit` (`params.cc:473-477,621`). Zero disables
     /// post-iteration throughput throttling.
     pub nps_limit: f32,
+    /// px0 `BaseSearchParams::WDLRescaleParams` / `WDLMaxS`
+    /// (`params.h:44-53,125-128`). Defaults are the neutral no-contempt
+    /// result of `AccurateWDLRescaleParams`.
+    pub wdl_rescale_ratio: f32,
+    pub wdl_rescale_diff: f32,
+    pub wdl_max_s: f32,
     // 指在多线程并行搜索中，多个线程同时访问并等待同一个尚未被神经网络估值的节点时的最大允许访问数。
     pub max_collision_visits: i32,
     // 最大碰撞访问量开始进行比例缩放的树尺寸。
@@ -177,6 +183,9 @@ impl Default for SearchParams {
             max_concurrent_searchers: 1,
             search_spin_backoff: false,
             nps_limit: 0.0,
+            wdl_rescale_ratio: 1.0,
+            wdl_rescale_diff: 0.0,
+            wdl_max_s: 1.4,
             max_collision_visits: 80_000,
             max_collision_visits_scaling_start: 28,
             max_collision_visits_scaling_end: 145_000,
