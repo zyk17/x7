@@ -13,7 +13,7 @@ use crate::search::SearchBase;
 use crate::uci_loop::GoParams;
 use crate::EnginError;
 
-use super::node::NodeTree;
+use super::node::{Node, NodeTree};
 use super::params::SearchParams;
 use super::stoppers::timemgr::{IterationStats, StoppersHints};
 use super::stoppers::{build_search_stoppers, ChainedSearchStopper, SearchStopper};
@@ -22,7 +22,7 @@ use super::worker::{SearchWorker, WorkerSearchState};
 pub fn best_move(tree: &NodeTree, params: &SearchParams) -> (Move, Move) {
     let root = tree.current_head();
     let root_is_black = tree.history().is_black_to_move();
-    let best_edge = best_child_edge(tree, root, params);
+    let best_edge = best_child_edge(tree, root, params, 0);
     let best = best_edge.map(|idx| tree.node(root).edge(idx).mv).unwrap_or_else(|| {
         tree.history()
             .last()
@@ -35,7 +35,7 @@ pub fn best_move(tree: &NodeTree, params: &SearchParams) -> (Move, Move) {
     let ponder = best_edge
         .and_then(|idx| {
             let child = tree.node(root).child(idx)?;
-            best_child_edge(tree, child, params).map(|ponder_idx| tree.node(child).edge(ponder_idx).mv)
+            best_child_edge(tree, child, params, 1).map(|ponder_idx| tree.node(child).edge(ponder_idx).mv)
         })
         .unwrap_or(Move::NULL);
     (
@@ -44,32 +44,135 @@ pub fn best_move(tree: &NodeTree, params: &SearchParams) -> (Move, Move) {
     )
 }
 
-fn best_child_edge(tree: &NodeTree, parent: usize, params: &SearchParams) -> Option<usize> {
-    let mut best_idx = None;
-    let mut best_n = 0;
-    let mut best_q = f32::NEG_INFINITY;
-    let mut best_p = f32::NEG_INFINITY;
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum BestEdgeRank {
+    TerminalLoss,
+    TablebaseLoss,
+    NonTerminal,
+    TablebaseWin,
+    TerminalWin,
+}
+
+fn draw_score(tree: &NodeTree, params: &SearchParams, is_odd_depth: bool) -> f32 {
+    if is_odd_depth == tree.history().is_black_to_move() {
+        params.draw_score
+    } else {
+        -params.draw_score
+    }
+}
+
+fn best_edge_rank(node: Option<&Node>) -> BestEdgeRank {
+    let Some(node) = node else {
+        return BestEdgeRank::NonTerminal;
+    };
+    if node.n() == 0 || !node.is_terminal() || node.wl() == 0.0 {
+        return BestEdgeRank::NonTerminal;
+    }
+    if node.is_tablebase_terminal() {
+        if node.wl() < 0.0 {
+            BestEdgeRank::TablebaseLoss
+        } else {
+            BestEdgeRank::TablebaseWin
+        }
+    } else if node.wl() < 0.0 {
+        BestEdgeRank::TerminalLoss
+    } else {
+        BestEdgeRank::TerminalWin
+    }
+}
+
+/// px0 `Search::GetBestChildrenNoTemperature` / `GetBestChildNoTemperature`
+/// (`src/search/classic/search.cc:705-808`).
+pub(super) fn best_child_edge(tree: &NodeTree, parent: usize, params: &SearchParams, depth: usize) -> Option<usize> {
+    if tree.node(parent).n() == 0 {
+        return None;
+    }
+    let draw_score = draw_score(tree, params, depth % 2 == 1);
+    let mut best = None;
     for edge_idx in 0..tree.node(parent).num_edges() {
-        let n = tree
-            .node(parent)
-            .child(edge_idx)
-            .map(|child| tree.node(child).n())
-            .unwrap_or(0);
-        let q = tree
-            .node(parent)
-            .child(edge_idx)
-            .map(|child| tree.node(child).q(params.draw_score))
-            .unwrap_or(0.0);
-        let p = tree.node(parent).edge(edge_idx).get_p();
-        let better = n > best_n || (n == best_n && n > 0 && q > best_q) || (n == best_n && n == 0 && p > best_p);
-        if better {
-            best_idx = Some(edge_idx);
-            best_n = n;
-            best_q = q;
-            best_p = p;
+        let candidate = tree.node(parent).child(edge_idx).map(|idx| tree.node(idx));
+        let candidate_rank = best_edge_rank(candidate);
+        let replace = match best {
+            None => true,
+            Some(best_idx) => {
+                let current = tree.node(parent).child(best_idx).map(|idx| tree.node(idx));
+                let current_rank = best_edge_rank(current);
+                if candidate_rank != current_rank {
+                    candidate_rank > current_rank
+                } else if candidate_rank == BestEdgeRank::NonTerminal
+                    && candidate.is_some_and(|node| node.n() != 0 && node.is_terminal())
+                    && current.is_some_and(|node| node.n() != 0 && node.is_terminal())
+                {
+                    let candidate = candidate.expect("checked terminal candidate");
+                    let current = current.expect("checked terminal current");
+                    if candidate.is_tablebase_terminal() != current.is_tablebase_terminal() {
+                        !candidate.is_tablebase_terminal()
+                    } else {
+                        candidate.m() < current.m()
+                    }
+                } else if candidate_rank == BestEdgeRank::NonTerminal {
+                    let candidate_n = candidate.map_or(0, Node::n);
+                    let current_n = current.map_or(0, Node::n);
+                    if candidate_n != current_n {
+                        candidate_n > current_n
+                    } else {
+                        let candidate_q = candidate.map_or(0.0, |node| node.q(draw_score));
+                        let current_q = current.map_or(0.0, |node| node.q(draw_score));
+                        if candidate_q != current_q {
+                            candidate_q > current_q
+                        } else {
+                            tree.node(parent).edge(edge_idx).get_p() > tree.node(parent).edge(best_idx).get_p()
+                        }
+                    }
+                } else if candidate_rank > BestEdgeRank::NonTerminal {
+                    candidate.expect("winning candidate").m() < current.expect("winning current").m()
+                } else {
+                    candidate.expect("losing candidate").m() > current.expect("losing current").m()
+                }
+            }
+        };
+        if replace {
+            best = Some(edge_idx);
         }
     }
-    best_idx
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Once;
+
+    use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
+
+    use super::{best_child_edge, SearchParams};
+    use crate::search::classic::node::NodeTree;
+
+    static INIT: Once = Once::new();
+
+    fn ensure_init() {
+        INIT.call_once(initialize_magic_bitboards);
+    }
+
+    #[test]
+    fn best_child_uses_prior_until_a_child_has_more_visits() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let moves = state.startpos.board().generate_legal_moves();
+        tree.node_mut(root).create_edges(&moves[..2].to_vec());
+        tree.node_mut(root).edge_mut(0).set_p(0.2);
+        tree.node_mut(root).edge_mut(1).set_p(0.8);
+        assert!(tree.node_mut(root).try_start_score_update());
+        tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
+        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0), Some(1));
+
+        let child = tree.arena_mut().spawn_child(root, 0);
+        assert!(tree.node_mut(child).try_start_score_update());
+        tree.node_mut(child).finalize_score_update(0.0, 0.0, 0.0, 1);
+        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0), Some(0));
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -338,6 +441,10 @@ impl SearchBase for ClassicSearch {
                 .lock()
                 .expect("collisions lock")
                 .clear();
+            // px0 creates a fresh `Search` object for every `StartSearch`
+            // (`src/search/classic/wrapper.cc:126-150`), so its cached root
+            // edge never crosses a UCI search boundary.
+            *self.worker_state.current_best_edge.lock().expect("best edge lock") = None;
             if let Some(limit) = nodes {
                 meta.stoppers_hints.update_estimated_remaining_playouts(limit as i64);
                 self.worker_state.set_remaining_playouts(limit as i64);

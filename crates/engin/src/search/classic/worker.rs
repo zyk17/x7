@@ -15,7 +15,7 @@ use crate::EnginError;
 
 use super::node::{NodeTree, Terminal};
 use super::params::SearchParams;
-use super::search::SearchStopController;
+use super::search::{best_child_edge, SearchStopController};
 
 /// px0 `Search` 中与 worker 相关的计数子集 (`search.h:49-200`)。
 #[derive(Debug)]
@@ -24,6 +24,10 @@ pub struct WorkerSearchState {
     pub remaining_playouts: AtomicU64,
     pub thread_count: AtomicUsize,
     pub shared_collisions: Mutex<Vec<(usize, u32)>>,
+    /// px0 `Search::current_best_edge_` (`search.h:174`, `search.cc:2212-2249`).
+    /// Rust stores the root edge index; edge ordering stays stable for one
+    /// `ClassicSearch::StartSearch` lifetime.
+    pub current_best_edge: Mutex<Option<usize>>,
     pub total_playouts: AtomicU64,
     pub total_batches: AtomicU64,
     pub first_batch: Mutex<Option<Instant>>,
@@ -45,6 +49,7 @@ impl WorkerSearchState {
             remaining_playouts: AtomicU64::new(remaining_playouts.max(0) as u64),
             thread_count: AtomicUsize::new(1),
             shared_collisions: Mutex::new(Vec::new()),
+            current_best_edge: Mutex::new(None),
             total_playouts: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
             first_batch: Mutex::new(None),
@@ -812,6 +817,18 @@ impl<'a> SearchWorker<'a> {
         let mut max_limit = u32::MAX;
         let mut passed_off = 0u32;
         let mut completed_visits = 0u32;
+        // px0 snapshots the root best edge before this selection task
+        // (`src/search/classic/search.cc:1584-1588`). It is only used for
+        // root smart pruning below; nested gathering tasks have no root edge.
+        let (current_best_edge, best_node_n) = if is_root {
+            let best_edge = *self.search_state.current_best_edge.lock().expect("best edge lock");
+            let best_n = best_edge
+                .and_then(|edge_idx| self.tree.node(root_idx).child(edge_idx))
+                .map_or(0, |child_idx| self.tree.node(child_idx).n());
+            (best_edge, best_n)
+        } else {
+            (None, 0)
+        };
 
         while !workspace.current_path.is_empty() {
             let current_idx = node_idx.expect("path has a node");
@@ -911,6 +928,21 @@ impl<'a> SearchWorker<'a> {
                     for edge_idx in 0..max_needed {
                         if can_exit {
                             break;
+                        }
+                        // px0 `search.cc:1726-1742`: when the estimated
+                        // remaining visits cannot overtake the cached root
+                        // best edge, skip the losing root candidate. The
+                        // cached edge itself is always retained so a batch
+                        // can still make progress.
+                        if is_root_node && Some(edge_idx) != current_best_edge {
+                            let edge_n = self
+                                .tree
+                                .node(current_idx)
+                                .child(edge_idx)
+                                .map_or(0, |child_idx| self.tree.node(child_idx).n());
+                            if self.search_state.remaining_playouts() < i64::from(best_node_n) - i64::from(edge_n) {
+                                continue;
+                            }
                         }
                         let score = workspace.current_score[edge_idx];
                         if score > best_score {
@@ -1586,6 +1618,7 @@ impl<'a> SearchWorker<'a> {
                 break;
             }
             let parent = self.tree.node(node_idx).parent().expect("non-root has parent");
+            let old_update_parent_bounds = update_parent_bounds;
             if self.tree.node(parent).is_terminal() {
                 n_to_fix = 0;
             }
@@ -1593,6 +1626,21 @@ impl<'a> SearchWorker<'a> {
                 && parent != root
                 && !self.tree.node(parent).is_terminal()
                 && self.maybe_set_bounds(parent, m, &mut n_to_fix, &mut v_delta, &mut d_delta, &mut m_delta);
+            // px0 refreshes the root cache only when a terminal bound may
+            // have changed the candidate or a non-cached child catches up in
+            // visits (`search.cc:2241-2249`). This avoids a full root sort on
+            // every backup while preserving the selection pruning invariant.
+            if parent == root {
+                let cached_edge = *self.search_state.current_best_edge.lock().expect("best edge lock");
+                let cached_node = cached_edge.and_then(|edge_idx| self.tree.node(root).child(edge_idx));
+                let cached_n = cached_node.map_or(0, |child_idx| self.tree.node(child_idx).n());
+                if (old_update_parent_bounds && self.tree.node(node_idx).is_terminal())
+                    || (cached_node != Some(node_idx) && cached_n <= self.tree.node(node_idx).n())
+                {
+                    *self.search_state.current_best_edge.lock().expect("best edge lock") =
+                        best_child_edge(self.tree, root, self.params, 0);
+                }
+            }
             node_idx = parent;
             v = -v;
             v_delta = -v_delta;
@@ -1674,6 +1722,24 @@ mod tests {
         let mut workspace = TaskWorkspace::default();
         worker.process_picked_task(0, 1, &mut workspace).expect("ooo terminal");
         assert!(worker.minibatch[0].ooo_completed);
+    }
+
+    #[test]
+    fn backup_refreshes_px0_root_best_edge_cache() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let search_state = WorkerSearchState::new(stop, i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
+        worker.run_until_root_visits(2).expect("two root visits");
+
+        let root = worker.tree.current_head();
+        let edge = *search_state.current_best_edge.lock().expect("best edge lock");
+        assert!(edge.is_some_and(|edge_idx| edge_idx < worker.tree.node(root).num_edges()));
     }
 
     #[test]

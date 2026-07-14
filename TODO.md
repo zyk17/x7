@@ -112,6 +112,9 @@
 - [x] 翻译 `StoppersHints` reset/min-update 及 `MaybeTriggerStop` 向下一轮 worker
   回写 remaining playouts（`src/search/classic/search.cc:596-610`、
   `src/search/classic/stoppers/timemgr.cc:35-66`）。
+- [x] 翻译 root `current_best_edge` 缓存更新、无温度 best-child 比较及
+  remaining-playouts smart pruning（`src/search/classic/search.cc:705-808,1584-1588,
+  1726-1742,2241-2249`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的
@@ -119,8 +122,8 @@
   `src/search/classic/search.cc:1494-1508`）；不能以串行任务锁替代。
 - [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
-- [ ] 翻译 px0 root best-edge 缓存更新与 `MakeSolid` tree 表示
-  （`src/search/classic/search.cc:2209-2251`、`src/search/classic/node.cc:261-289`）。
+- [ ] 随稳定 node 存储翻译 `MakeSolid` tree 表示；它会重建 px0 child/sibling pointer
+  所有权，不能用当前 arena 伪实现（`src/search/classic/node.cc:245-289`）。
 - [ ] 对齐 px0 UCI、bench、info 统计。
 - [ ] 将 `OnnxBackend` 接入 `WeightsFile` / backend UCI 配置，替换 UCI 主线的 UniformBackend
   （`src/engine.cc:156-165`、`src/neural/shared_params.*`）。

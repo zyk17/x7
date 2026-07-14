@@ -109,13 +109,17 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `StoppersHints` 现按 px0 每次 stopper pass 前 reset、大上限初始化、min-only
   更新，并将最新 remaining playouts 回写给下一轮 gather（`src/search/classic/
   search.cc:596-610`、`src/search/classic/stoppers/timemgr.cc:35-66`）。
+- root `current_best_edge`、无温度 best-child 排序（terminal/tablebase、visits、Q、prior）
+  和 remaining-playouts root smart pruning 已翻译（`src/search/classic/search.cc:705-808,
+  1584-1588,1726-1742,2241-2249`）。`MakeSolid` 仍明确阻塞于稳定并发 node 存储：
+  px0 `node.cc:245-289` 会转换 sibling 链及 pointer 所有权，当前 Rust arena 不能伪造。
 
 ### P4 下一入口
 
 - `search.cc:1828-1897`、`search.h:367-448`：task worker split 与任务队列
 - `classic/node.h:127-339`、`search.cc:1494-1508`：稳定 node 存储与 task
   selection 的树访问边界；当前 `Vec<Node>` + 整轮 `Mutex` 不能直接承载 px0 子树并发
-- `search.cc:2103-2364`：root best-edge 缓存、`MakeSolid` 与释放树锁后的
-  NN compute/fetch/backup 分阶段并发
+- `node.cc:245-289`：随稳定 node 存储边界翻译 `MakeSolid`；不能在当前 arena 上伪造
+- `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
 - `engine.cc:153-167`、`neural/shared_params.*`：`WeightsFile` 到真实 ONNX backend 的 UCI 配置
 - px0 二进制 fixed-nodes trace 对拍
