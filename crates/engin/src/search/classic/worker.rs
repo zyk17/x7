@@ -2287,6 +2287,79 @@ mod tests {
         assert!(!worker.minibatch[0].nn_queried);
     }
 
+    /// px0 immediately fetches a cache-hit leaf during `ProcessPickedTask`,
+    /// before `GatherMinibatch` reconciles and backs it up out of order
+    /// (`src/search/classic/search.cc:1423-1462,1370-1393`).
+    #[test]
+    fn out_of_order_cache_hit_avoids_nn_batch() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let backend = UniformBackend::with_wdl(0.2, 0.3, 4.0);
+        let legal_moves = tree.history().last().board().generate_legal_moves();
+        let position = EvalPosition {
+            positions: tree.history().positions().to_vec(),
+            legal_moves: legal_moves.clone(),
+        };
+        backend.store_cache(&position, backend.evaluate(tree.history(), &legal_moves));
+        let params = SearchParams {
+            out_of_order_eval: true,
+            ..SearchParams::default()
+        };
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
+        worker.initialize_iteration().expect("init");
+        assert!(worker.tree.node_mut(root).try_start_score_update());
+        worker.minibatch.push(NodeToProcess::visit(root, 1));
+
+        let mut workspace = TaskWorkspace::default();
+        worker
+            .process_picked_task(0, 1, &mut workspace)
+            .expect("cache-hit OOO evaluation");
+
+        assert!(worker.minibatch[0].ooo_completed);
+        assert!(worker.minibatch[0].is_cache_hit);
+        assert_eq!(worker.computation.as_ref().expect("computation").used_batch_size(), 0);
+        assert_eq!(worker.minibatch[0].eval.policies.len(), legal_moves.len());
+    }
+
+    /// px0 removes an OOO cache result from the minibatch only after its
+    /// immediate backup in `GatherMinibatch` (`search.cc:1370-1393`).
+    #[test]
+    fn gather_backs_up_out_of_order_cache_hit() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let backend = UniformBackend::default();
+        let legal_moves = tree.history().last().board().generate_legal_moves();
+        let position = EvalPosition {
+            positions: tree.history().positions().to_vec(),
+            legal_moves: legal_moves.clone(),
+        };
+        backend.store_cache(&position, backend.evaluate(tree.history(), &legal_moves));
+        let params = SearchParams {
+            minibatch_size: 1,
+            out_of_order_eval: true,
+            ..SearchParams::default()
+        };
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
+        worker.initialize_iteration().expect("init");
+
+        worker.gather_minibatch().expect("gather cache hit");
+
+        assert_eq!(worker.number_out_of_order, 1);
+        assert_eq!(worker.tree.node(root).n(), 1);
+        // px0 keeps gathering after the OOO backup, so the next ordinary leaf
+        // is already reserved by the time this phase returns.
+        assert!(worker.tree.node(root).n_in_flight() > 0);
+        assert!(worker.minibatch.iter().all(|item| !item.ooo_completed));
+    }
+
     #[test]
     fn backup_refreshes_px0_root_best_edge_cache() {
         ensure_init();
