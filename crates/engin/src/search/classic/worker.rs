@@ -366,8 +366,18 @@ impl<'a> SearchWorker<'a> {
             target_minibatch_size = 1;
         }
         let mut task_workers = params.task_workers_per_search_worker;
-        if task_workers < 0 && backend.attributes().runs_on_cpu {
-            task_workers = 0;
+        if task_workers < 0 {
+            if backend.attributes().runs_on_cpu {
+                task_workers = 0;
+            } else {
+                let working_threads =
+                    std::cmp::max(search_state.thread_count.load(Ordering::Acquire).saturating_sub(1), 1);
+                task_workers = std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .saturating_div(working_threads)
+                    .saturating_sub(1)
+                    .min(4) as i32;
+            }
         }
         let max_out_of_order = std::cmp::max(
             1,

@@ -69,6 +69,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   将前段交给 `PickTask::Processing`、主 worker 保留尾段，对应
   `src/search/classic/params.cc:604-612`、`search.cc:1322-1347`；当前同步执行，
   常驻 task worker 生命周期尚未接线。
+- `TaskWorkers=-1` 已按 px0 GPU 硬件并发启发式解析（每个 search worker 最多 4 个；CPU 为 0），
+  对应 `src/search/classic/search.h:205-233`；当前仍同步消费任务队列，不能在整树锁下伪造常驻
+  task thread。
 
 ### P4 下一入口
 
