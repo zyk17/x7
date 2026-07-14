@@ -237,10 +237,6 @@ impl EngineController for ClassicEngine {
             self.new_game()?;
         }
         self.search.start_search(params)?;
-        for output in std::mem::take(&mut self.search.outputs) {
-            responder.output_thinking_info(&output.infos);
-            responder.output_best_move(&output.bestmove);
-        }
         Ok(())
     }
 
@@ -252,12 +248,8 @@ impl EngineController for ClassicEngine {
         self.search.wait_search()
     }
 
-    fn stop(&mut self, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
+    fn stop(&mut self, _responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
         self.search.stop_search()?;
-        for output in std::mem::take(&mut self.search.outputs) {
-            responder.output_thinking_info(&output.infos);
-            responder.output_best_move(&output.bestmove);
-        }
         Ok(())
     }
 }

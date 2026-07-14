@@ -152,7 +152,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `engin/src/engine.rs` 已接入非 owning 的 `UciResponderForwarder`，以 Rust mutex 表达
   px0 `Engine::UciPonderForwarder` 的注册、注销和搜索线程生命周期约束（`src/engine.cc:81-136,
   238-250`）；`ClassicSearch` 已持有对应 thread-safe callback 边界（`src/search/search.h:45-99`）。
-  下一步仅将 px0 watchdog 接到此边界，不再把 responder 作为 `go()` 的临时参数。
+  最终 `info` / `bestmove` 已由搜索侧 callback 转发，不再由 `Engine::Go/Stop` 手工 drain；
+  下一步仅将 px0 watchdog 接到此边界并令 `go()` 非阻塞。
 - `engin/src/utils/fastmath.rs` 已逐式翻译 px0 `FastLog2/FastExp2/FastLog/FastExp/FastLogistic`
   （`src/utils/fastmath.h:42-92`）；classic `ComputeCpuct` 已改用 `FastLog`
   （`src/search/classic/search.cc:426-433`），不再以 Rust libm 改变 PUCT 数值路径。

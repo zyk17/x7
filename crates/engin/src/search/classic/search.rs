@@ -724,7 +724,16 @@ impl ClassicSearch {
         .collect();
         let mut bestmove = BestMoveInfo::new(best);
         bestmove.ponder = ponder;
-        self.outputs.push(SearchOutput { bestmove, infos });
+        let output = SearchOutput { bestmove, infos };
+        // px0 `Search::MaybeTriggerStop` emits through SearchBase's responder
+        // rather than returning a result to Engine (`search.cc:596-620`). The
+        // current blocking caller still retains this copy for direct tests;
+        // the next watchdog point removes that legacy collection path.
+        if let Some(responder) = &self.responder {
+            responder.output_thinking_info(&output.infos);
+            responder.output_best_move(&output.bestmove);
+        }
+        self.outputs.push(output);
         Ok(())
     }
 

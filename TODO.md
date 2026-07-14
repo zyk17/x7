@@ -170,6 +170,9 @@
 - [x] 翻译 px0 `Engine::UciPonderForwarder` 的非 owning responder 注册边界，并令
   `ClassicSearch` 在 worker 生命周期内持有 thread-safe callback；注销前先停止/join 搜索
   （`src/engine.cc:81-136,238-250`、`src/search/search.h:45-99`）。
+- [x] 删除 Engine 对搜索结果的手工 drain，最终 `info` / `bestmove` 仅通过 SearchBase
+  responder 输出，避免 worker/watchdog 接入后双发（`src/engine.cc:85-116,204-208`、
+  `src/search/classic/search.cc:596-620`）。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [x] 对 fixed-nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection 交互，核对
   solid child 不会造成 collision/in-flight 泄漏或重复扩展
