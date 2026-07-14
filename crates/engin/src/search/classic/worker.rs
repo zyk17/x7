@@ -221,7 +221,11 @@ impl PickTaskQueue {
         self.task_count.store(0, Ordering::Release);
         self.tasks_taken.store(0, Ordering::Release);
         self.completed_tasks.store(0, Ordering::Release);
-        self.tasks.lock().expect("pick task queue lock").clear();
+        let mut tasks = self.tasks.lock().expect("pick task queue lock");
+        tasks.clear();
+        // px0 reserves `MAX_TASKS` every reset because task workers retain
+        // pointers into this vector while they execute.
+        tasks.reserve(Self::MAX_TASKS);
     }
 
     /// px0 task enqueue (`src/search/classic/search.cc:1843-1856`).

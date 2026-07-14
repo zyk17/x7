@@ -88,6 +88,7 @@
   （`src/search/classic/search.cc:1400-1419`）。
 - [x] 翻译 iteration computation 的先释放后创建生命周期
   （`src/search/classic/search.cc:1233-1240`）。
+- [x] 翻译 `ResetTasks` 的 100-task 稳定容量预留（`src/search/classic/search.cc:1464-1473`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

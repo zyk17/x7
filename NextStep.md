@@ -76,6 +76,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   对应 `src/search/classic/search.cc:1400-1419`；不再以“本轮没有叶子”提前返回。
 - `InitializeIteration` 现在在创建新 computation 前释放上一轮 computation，对应
   `src/search/classic/search.cc:1233-1240`，避免后端缓存和分配生命周期漂移。
+- `ResetTasks` 每轮清空后保留 `MAX_TASKS=100` 容量，对应
+  `src/search/classic/search.cc:1464-1473`；这是后续 task worker 持有任务稳定地址的前提。
 
 ### P4 下一入口
 
