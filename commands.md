@@ -272,12 +272,32 @@ powershell -ExecutionPolicy Bypass -File scripts\search_regression.ps1
 - `seldepth`
 - `root_moves[].visits` 分布
 
-## 13. 最小 UCI 联调
+## 13. px0 Fixed-Nodes 对拍记录
+
+这条命令分别运行本机 px0 二进制和本仓库 `engin`，为同一 FEN 和相同
+`go nodes` 采集原始 UCI transcript。它不比较 score：px0 当前读取 `pb.gz`，
+本仓库读取 ONNX，二者并非完全等价权重。重点人工对照 `nodes`、`depth`、
+`seldepth`、PV 与 `bestmove`。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\compare_px0_trace.ps1 `
+  -Nodes 10000
+```
+
+默认写入被 Git 忽略的 `logs\trace\`。可传入不同 FEN：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\compare_px0_trace.ps1 `
+  -Nodes 10000 `
+  -Fen "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1"
+```
+
+## 14. 最小 UCI 联调
 
 ```powershell
 @'
 uci
-setoption name PolicyFile value C:/projects/77xiangqi_engine/data/x7.onnx
+setoption name WeightsFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos
 go nodes 64
@@ -290,7 +310,7 @@ quit
 ```powershell
 @'
 uci
-setoption name PolicyFile value C:/projects/77xiangqi_engine/data/x7.onnx
+setoption name WeightsFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos moves h2e2 h7e7
 go nodes 64
@@ -304,35 +324,17 @@ quit
 cargo run --release -p engin
 ```
 
-当前主 UCI 公开选项建议只关注：
-
-- `PolicyFile`
-- `MctsPlayouts`
-- `CPuct`
-- `FpuValue`
-- `MinibatchSize`
-- `NNCacheSize`
-- `Threads`
-- `MultiPV`
-
-说明：
-
-- 不再兼容旧别名：`Playouts / Visits / MctsCpuct / MctsFpuReduction / MctsBatchCap / MctsWorkers / SearchBatchSize`
-- 当前默认 `Threads=0`、`MinibatchSize=0`
-- `Threads=0` 表示按 backend attrs 自动推导
-- `MinibatchSize=0` 表示按 backend `recommended_batch_size`
-- `MultiPV=1` 为默认；`>1` 时每条 `info` 带 `multipv N`，共用 `depth/seldepth/time/nodes/nps`
-- 当前不含 lc0 `PerPVCounters`（每条线独立 `nodes`）；默认与 lc0 `PerPVCounters=false` 一致
+当前已翻译的 UCI options 是：`WeightsFile`、`MultiPV`、`PerPVCounters`、
+`ScoreType`、`UCI_ShowWDL`、`UCI_ShowEPS`、`UCI_ShowMovesLeft`。其余搜索参数仍
+是 Rust 内部 `SearchParams`，在对应 px0 option 层完整翻译前不伪造公开 UCI 选项。
 
 `setoption` 示例：
 
 ```powershell
 @'
 uci
-setoption name CPuct value 1.745
-setoption name Threads value 4
 setoption name MultiPV value 2
-setoption name PolicyFile value C:/projects/77xiangqi_engine/data/x7.onnx
+setoption name WeightsFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos
 go nodes 64
@@ -340,7 +342,7 @@ quit
 '@ | C:\projects\77xiangqi_engine\target\release\engin.exe
 ```
 
-## 14. 质量检查
+## 15. 质量检查
 
 ```powershell
 cargo check

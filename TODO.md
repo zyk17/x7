@@ -163,7 +163,10 @@
   leaf/terminal in-flight 条件时补齐每个 edge 的 child slot，并在 backup 的同一时序刷新
   root best-edge cache（`src/search/classic/node.cc:245-289,394-405`、
   `src/search/classic/search.cc:2211-2217`）。
-- [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
+- [x] 提供 px0 / engin fixed-nodes 原始 UCI transcript 采集脚本；由于本机 px0
+  使用 `pb.gz` 而 engin 使用 ONNX，记录用于人工对照 nodes/PV/bestmove，不做不成立的
+  数值相等断言（px0 `src/chess/uciloop.cc:178-254`、
+  `src/search/classic/wrapper.cc:53-141`）。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [x] 对 fixed-nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection 交互，核对
   solid child 不会造成 collision/in-flight 泄漏或重复扩展
