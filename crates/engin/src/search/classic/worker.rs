@@ -431,6 +431,9 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::InitializeIteration` (`search.cc:1233-1266`)。
     pub fn initialize_iteration(&mut self) -> Result<(), EnginError> {
+        // px0 resets the previous computation before asking the backend for a
+        // replacement, allowing backend-owned buffers to be recycled.
+        self.computation = None;
         self.computation = Some(self.backend.create_computation()?);
         self.minibatch.clear();
         self.minibatch.reserve(2 * self.target_minibatch_size);
