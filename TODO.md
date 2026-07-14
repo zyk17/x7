@@ -102,6 +102,10 @@
   `SearchSpinBackoff=false` 默认值：slot 仅覆盖 gather/collision/prefetch，并在 NN compute 前归还
   （`src/search/classic/params.cc:399-404,525-526,604-604,632-632`、
   `src/search/classic/search.cc:1142-1195`）。
+- [x] 翻译 `backend_waiting_counter_`、`IdlingMinimumWork=0` 与
+  `ThreadIdlingThreshold=1`：worker 在 NN compute 前后维护 backend 等待计数，且仅在多
+  SearchWorker 时使用 gather early-yield（`src/search/classic/params.cc:498-505,628-629`、
+  `src/search/classic/search.cc:1187-1199,1290-1301`）。
 - [x] 翻译 sticky-endgame 的 `MaybeSetBounds`、强制终局父 bounds 传播与
   `AdjustForTerminal` 统计修正（`src/search/classic/search.cc:2175-2289`、
   `src/search/classic/node.cc:300-392`）。

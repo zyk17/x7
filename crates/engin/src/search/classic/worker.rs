@@ -25,6 +25,8 @@ pub struct WorkerSearchState {
     /// px0 `Search::pending_searchers_` (`search.h:183-184`), the number of
     /// workers allowed to remain in the gather/process tree phase.
     pub pending_searchers: AtomicI32,
+    /// px0 `Search::backend_waiting_counter_` (`search.h:181-182`).
+    pub backend_waiting_counter: AtomicI32,
     pub remaining_playouts: AtomicU64,
     pub thread_count: AtomicUsize,
     pub shared_collisions: Mutex<Vec<(usize, u32)>>,
@@ -51,6 +53,7 @@ impl WorkerSearchState {
         Self {
             stop,
             pending_searchers: AtomicI32::new(1),
+            backend_waiting_counter: AtomicI32::new(0),
             remaining_playouts: AtomicU64::new(remaining_playouts.max(0) as u64),
             thread_count: AtomicUsize::new(1),
             shared_collisions: Mutex::new(Vec::new()),
@@ -538,14 +541,30 @@ impl<'a> SearchWorker<'a> {
         if !self.acquire_searcher_permit() {
             return Ok(());
         }
-        let gather_result = (|| {
-            self.gather_minibatch()?;
+        let gather_result = self.gather_minibatch();
+        self.release_searcher_permit();
+        gather_result?;
+        // px0 marks this worker as waiting on the backend before collision
+        // collection/prefetch, then removes it immediately after ComputeBlocking
+        // (`search.cc:1187-1199`).
+        self.search_state
+            .backend_waiting_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let prefetch_result = (|| {
             self.collect_collisions()?;
             self.maybe_prefetch_into_cache()
         })();
-        self.release_searcher_permit();
-        gather_result?;
-        self.run_nn_computation()?;
+        if let Err(error) = prefetch_result {
+            self.search_state
+                .backend_waiting_counter
+                .fetch_sub(1, Ordering::Relaxed);
+            return Err(error);
+        }
+        let compute_result = self.run_nn_computation();
+        self.search_state
+            .backend_waiting_counter
+            .fetch_sub(1, Ordering::Relaxed);
+        compute_result?;
         self.fetch_minibatch_results()?;
         self.do_backup_update()?;
         self.update_counters()
@@ -598,6 +617,16 @@ impl<'a> SearchWorker<'a> {
         if self.params.max_concurrent_searchers != 0 {
             self.search_state.pending_searchers.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    /// px0 `GatherMinibatch` backend-idling predicate
+    /// (`src/search/classic/search.cc:1290-1301`).
+    fn should_yield_for_backend(&self) -> bool {
+        let thread_count = self.search_state.thread_count.load(Ordering::Acquire);
+        thread_count > 1
+            && i32::try_from(thread_count).expect("px0 thread count fits i32")
+                - self.search_state.backend_waiting_counter.load(Ordering::Relaxed)
+                > self.params.thread_idling_threshold
     }
 
     /// 单线程测试入口：重复执行 iteration 直到 root N 达标。
@@ -680,6 +709,20 @@ impl<'a> SearchWorker<'a> {
                     .as_ref()
                     .map_or(0, |computation| computation.used_batch_size())
                     == 0
+            {
+                return Ok(());
+            }
+
+            // px0 lets another gathering worker fill an idle backend instead
+            // of accumulating redundant local work (`search.cc:1290-1301`).
+            // With one search worker this is deliberately a no-op.
+            if minibatch_size > 0
+                && self
+                    .computation
+                    .as_ref()
+                    .map_or(0, |computation| computation.used_batch_size())
+                    > usize::try_from(self.params.idling_minimum_work).expect("px0 IdlingMinimumWork is non-negative")
+                && self.should_yield_for_backend()
             {
                 return Ok(());
             }
@@ -1930,6 +1973,28 @@ mod tests {
         assert_eq!(search_state.pending_searchers.load(Ordering::Acquire), 0);
         worker.release_searcher_permit();
         assert_eq!(search_state.pending_searchers.load(Ordering::Acquire), 1);
+    }
+
+    /// px0 only applies the idling shortcut when more than one search worker
+    /// could keep the backend busy (`search.cc:1290-1301`).
+    #[test]
+    fn backend_idling_requires_another_search_worker() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let backend = UniformBackend::default();
+        let params = SearchParams {
+            thread_idling_threshold: 1,
+            ..SearchParams::default()
+        };
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
+
+        assert!(!worker.should_yield_for_backend());
+        search_state.thread_count.store(4, Ordering::Release);
+        search_state.backend_waiting_counter.store(1, Ordering::Release);
+        assert!(worker.should_yield_for_backend());
     }
 
     /// A non-CPU attribute wrapper makes the px0 automatic task-worker path

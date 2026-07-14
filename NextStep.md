@@ -97,6 +97,11 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   `src/search/classic/params.cc:399-404,604-604,525-526,632-632`、
   `src/search/classic/search.cc:1142-1195`。当前单 SearchWorker 下行为不变，作为后续多 worker
   tree boundary 的先决共享状态。
+- `WorkerSearchState::backend_waiting_counter`、`IdlingMinimumWork=0` 与
+  `ThreadIdlingThreshold=1` 已翻译：存在其他 search worker 时，当前 worker 会在 backend
+  idle 前提前结束 gather；计数覆盖 collision/prefetch/NN compute，对应
+  `src/search/classic/params.cc:498-505,628-629`、
+  `src/search/classic/search.cc:1187-1199,1290-1301`。当前单 SearchWorker 下无行为变化。
 - `SearchWorker::DoBackupUpdateSingleNode` 已补齐 sticky-endgame 的 bounds 传播、终局
   平均值修正与强制终局父节点标记，对应
   `src/search/classic/search.cc:2175-2289`、`src/search/classic/node.cc:300-392`；

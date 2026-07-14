@@ -124,6 +124,12 @@ pub struct SearchParams {
     // 单个任务的最小处理工作量。
     // 处理工作不会被拆分成小于该值的任务块（除非其超过 MinimumProcessingWork 的一半）。
     pub minimum_work_per_task_for_processing: i32,
+    /// px0 `IdlingMinimumWork` (`params.cc:498-501,628`): after this many
+    /// queued NN inputs, a worker may leave gather early when another worker
+    /// can keep the backend busy.
+    pub idling_minimum_work: i32,
+    /// px0 `ThreadIdlingThreshold` (`params.cc:502-505,629`).
+    pub thread_idling_threshold: i32,
     // 最大预取（Prefetch）批量。
     // 当引擎无法收集到足够大的 Batch 供即时使用时，尝试预取最多 X 个可能很快会有用的局面，并将它们放入缓存中。
     pub max_prefetch_batch: i32,
@@ -178,6 +184,8 @@ impl Default for SearchParams {
             minimum_work_size_for_picking: 1,
             minimum_remaining_work_size_for_picking: 20,
             minimum_work_per_task_for_processing: 8,
+            idling_minimum_work: 0,
+            thread_idling_threshold: 1,
             max_prefetch_batch: 32,
             multi_pv: 1,
             per_pv_counters: false,
