@@ -445,7 +445,7 @@ impl<'a> SearchWorker<'a> {
         let cur_n = self.tree.node(root).n();
         let remaining_n = self.search_state.remaining_playouts();
         let nodes = cur_n.min(remaining_n.max(0) as u32) as i64;
-        let collisions_left = self.params.collisions_left(nodes);
+        let mut collisions_left = self.params.collisions_left(nodes);
         self.number_out_of_order = 0;
 
         let mut minibatch_size = 0usize;
@@ -524,13 +524,6 @@ impl<'a> SearchWorker<'a> {
                 self.task_queue.wait();
             }
 
-            // px0 consumes collision budget and can increase multivisit here.
-            // That translation is still pending; do not spin on a collision
-            // that produced no independently evaluable leaf.
-            if picked_visits == 0 {
-                return Ok(());
-            }
-
             let mut some_ooo = false;
             for item in &self.minibatch[new_start..] {
                 if item.ooo_completed {
@@ -567,8 +560,33 @@ impl<'a> SearchWorker<'a> {
                 }
             }
 
-            for item in &self.minibatch[new_start..] {
-                if item.is_collision && self.search_state.stop.load(Ordering::Acquire) {
+            // px0 `search.cc:1400-1419`: consume collision work even when a
+            // gather produced no independent NN leaf. A root collision may be
+            // safely enlarged to its precomputed `maxvisit` bound, updating
+            // every ancestor's in-flight count before it is shared.
+            for index in new_start..self.minibatch.len() {
+                if !self.minibatch[index].is_collision {
+                    continue;
+                }
+                let (node_idx, extra) = {
+                    let item = &mut self.minibatch[index];
+                    let desired = item.maxvisit.min(collisions_left.max(0) as u32);
+                    let extra = desired.saturating_sub(item.multivisit);
+                    item.multivisit += extra;
+                    (item.node_idx, extra)
+                };
+                if extra > 0 {
+                    let mut node = node_idx;
+                    while let Some(parent) = self.tree.node(node).parent() {
+                        self.tree.node_mut(parent).increment_n_in_flight(extra);
+                        node = parent;
+                        if node == self.tree.current_head() {
+                            break;
+                        }
+                    }
+                }
+                collisions_left -= self.minibatch[index].multivisit as i32;
+                if collisions_left <= 0 || self.search_state.stop.load(Ordering::Acquire) {
                     return Ok(());
                 }
             }

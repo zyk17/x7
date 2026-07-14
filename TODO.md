@@ -84,6 +84,8 @@
 - [x] 翻译 processing split 的 20/8 work-size 参数和前段 task / 尾段主 worker 范围划分
   （`src/search/classic/params.cc:604-612`、`search.cc:1322-1347`）。
 - [x] 翻译 `TaskWorkers=-1` 的 CPU/GPU 硬件并发启发式（`src/search/classic/search.h:205-233`）。
+- [x] 翻译 collision `maxvisit` 扩容、祖先 in-flight 更新与预算停止
+  （`src/search/classic/search.cc:1400-1419`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

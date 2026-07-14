@@ -72,6 +72,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `TaskWorkers=-1` 已按 px0 GPU 硬件并发启发式解析（每个 search worker 最多 4 个；CPU 为 0），
   对应 `src/search/classic/search.h:205-233`；当前仍同步消费任务队列，不能在整树锁下伪造常驻
   task thread。
+- collision 的 `maxvisit` 扩容、祖先 `NInFlight` 更新与 collision-budget 停止条件已翻译，
+  对应 `src/search/classic/search.cc:1400-1419`；不再以“本轮没有叶子”提前返回。
 
 ### P4 下一入口
 
