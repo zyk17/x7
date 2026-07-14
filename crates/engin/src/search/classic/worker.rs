@@ -5,6 +5,8 @@
 //! 生命周期已按 px0 源码逐函数翻译；多 SearchWorker 的 tree access
 //! boundary 仍未完成。
 
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -170,6 +172,78 @@ struct TaskWorkspace {
     current_path: Vec<isize>,
     moves_to_path: MoveList,
     history: PositionHistory,
+}
+
+/// px0 keeps node addresses stable while `SearchWorker` only holds
+/// `nodes_mutex_` for the tree phases (`search.cc:1142-1211,1494-1508`).
+/// Direct storage serves focused unit tests; shared storage is the production
+/// `ClassicSearch` path. `active` is non-null only while that tree mutex is
+/// held by the owning search worker.
+enum TreeStorage<'a> {
+    Direct(PhantomData<&'a mut NodeTree>),
+    Shared(Arc<Mutex<NodeTree>>),
+}
+
+struct WorkerTree<'a> {
+    storage: TreeStorage<'a>,
+    active: *mut NodeTree,
+}
+
+impl<'a> WorkerTree<'a> {
+    fn direct(tree: &'a mut NodeTree) -> Self {
+        let active = tree as *mut NodeTree;
+        Self {
+            storage: TreeStorage::Direct(PhantomData),
+            active,
+        }
+    }
+
+    fn shared(tree: Arc<Mutex<NodeTree>>) -> Self {
+        Self {
+            storage: TreeStorage::Shared(tree),
+            active: std::ptr::null_mut(),
+        }
+    }
+
+    fn shared_tree(&self) -> Option<Arc<Mutex<NodeTree>>> {
+        match &self.storage {
+            TreeStorage::Direct(_) => None,
+            TreeStorage::Shared(tree) => Some(Arc::clone(tree)),
+        }
+    }
+
+    fn activate(&mut self, tree: &mut NodeTree) {
+        debug_assert!(matches!(self.storage, TreeStorage::Shared(_)));
+        debug_assert!(self.active.is_null());
+        self.active = tree;
+    }
+
+    fn deactivate(&mut self) {
+        if matches!(self.storage, TreeStorage::Shared(_)) {
+            self.active = std::ptr::null_mut();
+        }
+    }
+}
+
+impl Deref for WorkerTree<'_> {
+    type Target = NodeTree;
+
+    fn deref(&self) -> &Self::Target {
+        assert!(!self.active.is_null(), "px0 tree access outside a tree phase");
+        // SAFETY: direct storage owns the exclusive borrow. Shared storage is
+        // activated only while `with_tree` holds its mutex. Task workers run
+        // only on disjoint work published during that same phase.
+        unsafe { &*self.active }
+    }
+}
+
+impl DerefMut for WorkerTree<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        assert!(!self.active.is_null(), "px0 tree mutation outside a tree phase");
+        // SAFETY: see Deref. The owning worker waits for all task work before
+        // releasing the shared-tree phase.
+        unsafe { &mut *self.active }
+    }
 }
 
 /// px0 lets task threads operate on subtrees already made disjoint by
@@ -407,7 +481,7 @@ impl Default for TaskWorkspace {
 
 /// px0 `SearchWorker` (`src/search/classic/search.h:203-448`)。
 pub struct SearchWorker<'a> {
-    tree: &'a mut NodeTree,
+    tree: WorkerTree<'a>,
     backend: &'a dyn Backend,
     params: &'a SearchParams,
     search_state: &'a WorkerSearchState,
@@ -464,7 +538,43 @@ impl<'a> SearchWorker<'a> {
         stop_controller: Option<Arc<SearchStopController>>,
         root_move_filter: &'a [Move],
     ) -> Self {
-        Self::from_parts(tree, backend, params, search_state, stop_controller, root_move_filter)
+        let history = tree.history().clone();
+        let played_history_len = history.len();
+        Self::from_parts(
+            WorkerTree::direct(tree),
+            history,
+            played_history_len,
+            backend,
+            params,
+            search_state,
+            stop_controller,
+            root_move_filter,
+        )
+    }
+
+    /// px0 `Search::StartThreads` creates each worker against the shared
+    /// search tree, but only locks it for the required tree phases
+    /// (`src/search/classic/search.cc:1088-1140,1142-1211`).
+    pub(crate) fn new_shared_with_stop_controller_and_root_move_filter(
+        tree: Arc<Mutex<NodeTree>>,
+        backend: &'a dyn Backend,
+        params: &'a SearchParams,
+        search_state: &'a WorkerSearchState,
+        stop_controller: Option<Arc<SearchStopController>>,
+        root_move_filter: &'a [Move],
+    ) -> Self {
+        let history = tree.lock().expect("tree lock").history().clone();
+        let played_history_len = history.len();
+        Self::from_parts(
+            WorkerTree::shared(tree),
+            history,
+            played_history_len,
+            backend,
+            params,
+            search_state,
+            stop_controller,
+            root_move_filter,
+        )
     }
 
     pub fn with_context(
@@ -473,11 +583,25 @@ impl<'a> SearchWorker<'a> {
         params: &'a SearchParams,
         search_state: &'a WorkerSearchState,
     ) -> Self {
-        Self::from_parts(tree, backend, params, search_state, None, &[])
+        let history = tree.history().clone();
+        let played_history_len = history.len();
+        Self::from_parts(
+            WorkerTree::direct(tree),
+            history,
+            played_history_len,
+            backend,
+            params,
+            search_state,
+            None,
+            &[],
+        )
     }
 
+    #[allow(clippy::too_many_arguments)] // px0 SearchWorker constructor dependencies are explicit.
     fn from_parts(
-        tree: &'a mut NodeTree,
+        tree: WorkerTree<'a>,
+        history: PositionHistory,
+        played_history_len: usize,
         backend: &'a dyn Backend,
         params: &'a SearchParams,
         search_state: &'a WorkerSearchState,
@@ -514,8 +638,8 @@ impl<'a> SearchWorker<'a> {
             (params.max_out_of_order_evals_factor * target_minibatch_size as f32) as usize,
         );
         Self {
-            history: tree.history().clone(),
-            played_history_len: tree.history().len(),
+            history,
+            played_history_len,
             tree,
             backend,
             params,
@@ -537,11 +661,11 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::ExecuteOneIteration` (`search.cc:1142-1231`)。
     pub fn execute_one_iteration(&mut self) -> Result<(), EnginError> {
-        self.initialize_iteration()?;
+        self.with_tree(|worker| worker.initialize_iteration())?;
         if !self.acquire_searcher_permit() {
             return Ok(());
         }
-        let gather_result = self.gather_minibatch();
+        let gather_result = self.with_tree(|worker| worker.gather_minibatch());
         if let Err(error) = gather_result {
             self.release_searcher_permit();
             return Err(error);
@@ -552,10 +676,10 @@ impl<'a> SearchWorker<'a> {
         self.search_state
             .backend_waiting_counter
             .fetch_add(1, Ordering::Relaxed);
-        let prefetch_result = (|| {
-            self.collect_collisions()?;
-            self.maybe_prefetch_into_cache()
-        })();
+        let prefetch_result = self.with_tree(|worker| {
+            worker.collect_collisions()?;
+            worker.maybe_prefetch_into_cache()
+        });
         self.release_searcher_permit();
         if let Err(error) = prefetch_result {
             self.search_state
@@ -568,9 +692,24 @@ impl<'a> SearchWorker<'a> {
             .backend_waiting_counter
             .fetch_sub(1, Ordering::Relaxed);
         compute_result?;
-        self.fetch_minibatch_results()?;
-        self.do_backup_update()?;
+        self.with_tree(|worker| {
+            worker.fetch_minibatch_results()?;
+            worker.do_backup_update()
+        })?;
         self.update_counters()
+    }
+
+    /// Runs one px0 tree phase. In direct test storage this is a no-op; the
+    /// production shared-tree path holds the mutex only for that phase.
+    fn with_tree<R>(&mut self, operation: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(tree) = self.tree.shared_tree() else {
+            return operation(self);
+        };
+        let mut tree = tree.lock().expect("tree lock");
+        self.tree.activate(&mut tree);
+        let result = operation(self);
+        self.tree.deactivate();
+        result
     }
 
     /// px0 `ExecuteOneIteration` permit acquisition
@@ -634,7 +773,7 @@ impl<'a> SearchWorker<'a> {
 
     /// 单线程测试入口：重复执行 iteration 直到 root N 达标。
     pub fn run_until_root_visits(&mut self, target: u32) -> Result<(), EnginError> {
-        while self.tree.node(self.tree.current_head()).n() < target {
+        while self.with_tree(|worker| worker.tree.node(worker.tree.current_head()).n()) < target {
             if self.search_state.stop.load(Ordering::Acquire) {
                 break;
             }
@@ -1895,7 +2034,7 @@ impl<'a> SearchWorker<'a> {
                     || (cached_node != Some(node_idx) && cached_n <= self.tree.node(node_idx).n())
                 {
                     *self.search_state.current_best_edge.lock().expect("best edge lock") =
-                        best_child_edge(self.tree, root, self.params, 0, self.root_move_filter);
+                        best_child_edge(&self.tree, root, self.params, 0, self.root_move_filter);
                 }
             }
             node_idx = parent;

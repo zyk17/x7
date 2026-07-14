@@ -102,6 +102,11 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   idle 前提前结束 gather；计数覆盖 collision/prefetch/NN compute，对应
   `src/search/classic/params.cc:498-505,628-629`、
   `src/search/classic/search.cc:1187-1199,1290-1301`。当前单 SearchWorker 下无行为变化。
+- `SearchWorker` 已分出直接测试 tree 与生产 shared tree 两种持有方式；生产路径仅在
+  initialize、gather/collision/prefetch、fetch/backup 三个 px0 tree phase 持有 `NodeTree` mutex，
+  NN compute 不持有树锁。`ClassicSearch::StartThreads` 已允许多个 SearchWorker，固定 nodes 的
+  两 worker UniformBackend 回归通过，对应 `src/search/classic/search.cc:1088-1140,1142-1211,
+  1979-2008,2161-2174`。task workers 与多 SearchWorker 的组合压力测试仍未完成。
 - `SearchWorker::DoBackupUpdateSingleNode` 已补齐 sticky-endgame 的 bounds 传播、终局
   平均值修正与强制终局父节点标记，对应
   `src/search/classic/search.cc:2175-2289`、`src/search/classic/node.cc:300-392`；

@@ -292,12 +292,76 @@ mod tests {
     use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
     use super::{best_child_edge, best_move, orient_move, score_from_wdl, wdl_from_wl_d, ScoreType, SearchParams};
+    use crate::neural::backend::{
+        Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, UniformBackend,
+    };
     use crate::search::classic::node::NodeTree;
+    use crate::search::SearchBase;
+    use crate::EnginError;
 
     static INIT: Once = Once::new();
 
     fn ensure_init() {
         INIT.call_once(initialize_magic_bitboards);
+    }
+
+    /// Deterministic backend used to exercise px0's multi-SearchWorker
+    /// lifecycle without making the test depend on an installed ONNX runtime.
+    #[derive(Clone, Debug, Default)]
+    struct ParallelUniformBackend(UniformBackend);
+
+    impl Backend for ParallelUniformBackend {
+        fn evaluate(&self, history: &xiangqi_core::PositionHistory, legal_moves: &[xiangqi_core::Move]) -> EvalResult {
+            self.0.evaluate(history, legal_moves)
+        }
+
+        fn attributes(&self) -> BackendAttributes {
+            BackendAttributes {
+                runs_on_cpu: false,
+                suggested_num_search_threads: 2,
+                recommended_batch_size: 4,
+                maximum_batch_size: 4,
+                ..BackendAttributes::default()
+            }
+        }
+
+        fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
+            self.0.create_computation()
+        }
+
+        fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
+            self.0.cached_evaluation(position)
+        }
+    }
+
+    /// px0 `StartThreads` keeps several search workers alive while each only
+    /// locks tree phases (`search.cc:1088-1140,1142-1211`).
+    #[test]
+    fn shared_tree_allows_two_search_workers() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
+        search.set_position(&state).expect("position");
+        // This test isolates the shared SearchWorker tree boundary. Task
+        // workers have a separate lifecycle test in worker.rs.
+        search
+            .meta
+            .lock()
+            .expect("meta lock")
+            .params
+            .task_workers_per_search_worker = 0;
+
+        let (best, visits) = search.run_blocking_nodes(32);
+
+        assert!(!best.is_null());
+        assert!(visits >= 32);
+        assert_eq!(
+            search
+                .worker_state
+                .thread_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
     }
 
     #[test]
@@ -605,13 +669,6 @@ impl ClassicSearch {
         } else {
             how_many
         };
-        // px0 `Search::StartThreads` (`search.cc:1088-1140`) can run several
-        // workers because `SearchWorker` only holds `nodes_mutex_` around tree
-        // mutation. This port still owns `NodeTree` for a whole iteration, so
-        // accepting more than one worker would only advertise fake parallelism.
-        if thread_count != 1 {
-            return Err(EnginError::PortIncomplete("P4 parallel SearchWorker"));
-        }
         self.worker_state.thread_count.store(thread_count, Ordering::Release);
         self.meta.lock().expect("meta lock").search_active = true;
 
@@ -633,9 +690,8 @@ impl ClassicSearch {
                     let meta = meta.lock().expect("meta lock");
                     (meta.params.clone(), meta.root_move_filter.clone())
                 };
-                let mut tree = tree.lock().expect("tree lock");
-                let mut worker = SearchWorker::new_with_stop_controller_and_root_move_filter(
-                    &mut tree,
+                let mut worker = SearchWorker::new_shared_with_stop_controller_and_root_move_filter(
+                    tree,
                     backend.as_ref(),
                     &params,
                     worker_state.as_ref(),

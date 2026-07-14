@@ -106,6 +106,10 @@
   `ThreadIdlingThreshold=1`：worker 在 NN compute 前后维护 backend 等待计数，且仅在多
   SearchWorker 时使用 gather early-yield（`src/search/classic/params.cc:498-505,628-629`、
   `src/search/classic/search.cc:1187-1199,1290-1301`）。
+- [x] 将 production `SearchWorker` 改为 px0 分阶段 shared tree access：只在 initialize、
+  gather/collision/prefetch、fetch/backup 持有 tree mutex，NN compute 不持有；`StartThreads`
+  允许多个 SearchWorker，已覆盖两 worker fixed-nodes 回归
+  （`src/search/classic/search.cc:1088-1140,1142-1211,1979-2008,2161-2174`）。
 - [x] 翻译 sticky-endgame 的 `MaybeSetBounds`、强制终局父 bounds 传播与
   `AdjustForTerminal` 统计修正（`src/search/classic/search.cc:2175-2289`、
   `src/search/classic/node.cc:300-392`）。
