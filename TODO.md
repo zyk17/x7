@@ -191,7 +191,7 @@
   多 SearchWorker 在只读候选遍历上串行（`src/search/classic/search.cc:1977-2008`）。
 - [x] 翻译 `StartThreads(0)` 的 CPU/GPU worker 默认数：`suggested + !runs_on_cpu`
   （`src/search/classic/search.cc:874-896`）。
-- [ ] 翻译可变 contempt/WDL calibration `OptionsDict`，使 WDL 重标定在 NN value 进入
+- [x] 翻译可变 contempt/WDL calibration `OptionsDict`，使 WDL 重标定在 NN value 进入
   backup 前使用 px0 的完整参数计算（`src/search/classic/params.cc:57-174,688-703`、
   `search.cc:206-236,2117-2154`）。
 - [x] 翻译 `GetContempt` 的 opponent/默认 rating advantage 解析（`src/search/classic/params.cc:57-89`）。

@@ -202,7 +202,8 @@ impl EngineController for ClassicEngine {
             options.per_pv_counters,
             options.score_type,
             options.nodes_per_second_limit,
-        )
+        )?;
+        self.search.set_wdl_options(options)
     }
 
     fn ensure_ready(&mut self) -> Result<(), EnginError> {

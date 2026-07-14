@@ -27,7 +27,7 @@ pub struct GoParams {
 
 /// px0 `StringUciResponder::PopulateParams`、classic search display options
 /// 与 `SharedBackendParams` 的 Rust ONNX 子集。
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UciOptions {
     pub show_wdl: bool,
     pub show_eps: bool,
@@ -38,9 +38,45 @@ pub struct UciOptions {
     pub score_type: ScoreType,
     /// px0 `NodesPerSecondLimit` (`src/search/classic/params.cc:473-477,621`).
     pub nodes_per_second_limit: f32,
+    /// px0 classic WDL calibration options (`params.cc:407-477,608-620`).
+    pub uci_opponent: String,
+    pub uci_rating_adv: f32,
+    pub contempt: String,
+    pub contempt_max_value: f32,
+    pub wdl_calibration_elo: f32,
+    pub wdl_contempt_attenuation: f32,
+    pub wdl_max_s: f32,
+    pub wdl_draw_rate_target: f32,
+    pub wdl_draw_rate_reference: f32,
+    pub wdl_book_exit_bias: f32,
     /// px0 `WeightsFile` (`src/neural/shared_params.cc:43-80`). This Rust
     /// port accepts the formal ONNX model rather than px0's protobuf weights.
     pub weights_file: String,
+}
+
+impl Default for UciOptions {
+    fn default() -> Self {
+        Self {
+            show_wdl: false,
+            show_eps: false,
+            show_moves_left: false,
+            multi_pv: 1,
+            per_pv_counters: false,
+            score_type: ScoreType::WdlMu,
+            nodes_per_second_limit: 0.0,
+            uci_opponent: String::new(),
+            uci_rating_adv: 0.0,
+            contempt: String::new(),
+            contempt_max_value: 420.0,
+            wdl_calibration_elo: 0.0,
+            wdl_contempt_attenuation: 1.0,
+            wdl_max_s: 1.4,
+            wdl_draw_rate_target: 0.0,
+            wdl_draw_rate_reference: 0.5,
+            wdl_book_exit_bias: 0.65,
+            weights_file: String::new(),
+        }
+    }
 }
 
 impl UciOptions {
@@ -73,6 +109,16 @@ impl UciOptions {
                 "option name NodesPerSecondLimit type string default {}",
                 self.nodes_per_second_limit
             ),
+            format!("option name UCI_Opponent type string default {}", self.uci_opponent),
+            format!("option name UCI_RatingAdv type string default {}", self.uci_rating_adv),
+            format!("option name Contempt type string default {}", self.contempt),
+            format!("option name ContemptMaxValue type string default {}", self.contempt_max_value),
+            format!("option name WDLCalibrationElo type string default {}", self.wdl_calibration_elo),
+            format!("option name WDLContemptAttenuation type string default {}", self.wdl_contempt_attenuation),
+            format!("option name WDLMaxS type string default {}", self.wdl_max_s),
+            format!("option name WDLDrawRateTarget type string default {}", self.wdl_draw_rate_target),
+            format!("option name WDLDrawRateReference type string default {}", self.wdl_draw_rate_reference),
+            format!("option name WDLBookExitBias type string default {}", self.wdl_book_exit_bias),
             format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
@@ -87,6 +133,26 @@ impl UciOptions {
             "PerPVCounters" => self.per_pv_counters = parse_bool_option(value, "PerPVCounters")?,
             "ScoreType" => self.score_type = parse_score_type(value)?,
             "NodesPerSecondLimit" => self.nodes_per_second_limit = parse_nps_limit(value)?,
+            "UCI_Opponent" => self.uci_opponent = value.to_string(),
+            "UCI_RatingAdv" => self.uci_rating_adv = parse_float_option(value, "UCI_RatingAdv", -10_000.0, 10_000.0)?,
+            "Contempt" => self.contempt = value.to_string(),
+            "ContemptMaxValue" => {
+                self.contempt_max_value = parse_float_option(value, "ContemptMaxValue", 0.0, 10_000.0)?
+            }
+            "WDLCalibrationElo" => {
+                self.wdl_calibration_elo = parse_float_option(value, "WDLCalibrationElo", 0.0, 10_000.0)?
+            }
+            "WDLContemptAttenuation" => {
+                self.wdl_contempt_attenuation = parse_float_option(value, "WDLContemptAttenuation", -10.0, 10.0)?
+            }
+            "WDLMaxS" => self.wdl_max_s = parse_float_option(value, "WDLMaxS", 0.0, 10.0)?,
+            "WDLDrawRateTarget" => {
+                self.wdl_draw_rate_target = parse_float_option(value, "WDLDrawRateTarget", 0.0, 0.999)?
+            }
+            "WDLDrawRateReference" => {
+                self.wdl_draw_rate_reference = parse_float_option(value, "WDLDrawRateReference", 0.001, 0.999)?
+            }
+            "WDLBookExitBias" => self.wdl_book_exit_bias = parse_float_option(value, "WDLBookExitBias", -2.0, 2.0)?,
             "WeightsFile" => self.weights_file = value.to_string(),
             _ => return Err(EnginError::Uci(format!("Unknown option: {name}"))),
         }
@@ -596,6 +662,16 @@ fn parse_nps_limit(value: &str) -> Result<f32, EnginError> {
         return Err(EnginError::Uci(
             "NodesPerSecondLimit must be a number from 0 to 1000000".into(),
         ));
+    }
+    Ok(value)
+}
+
+fn parse_float_option(value: &str, name: &str, min: f32, max: f32) -> Result<f32, EnginError> {
+    let value: f32 = value
+        .parse()
+        .map_err(|_| EnginError::Uci(format!("{name} must be a number from {min} to {max}")))?;
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        return Err(EnginError::Uci(format!("{name} must be a number from {min} to {max}")));
     }
     Ok(value)
 }

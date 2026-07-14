@@ -10,11 +10,13 @@ use xiangqi_core::{GameState, Move};
 use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo, Wdl};
 use crate::neural::backend::Backend;
 use crate::search::SearchBase;
-use crate::uci_loop::GoParams;
+use crate::uci_loop::{GoParams, UciOptions};
 use crate::EnginError;
 
 use super::node::{Node, NodeTree};
-use super::params::{ContemptMode, ScoreType, SearchParams};
+use super::params::{
+    accurate_wdl_rescale_params, get_contempt, simplified_wdl_rescale_params, ContemptMode, ScoreType, SearchParams,
+};
 use super::stoppers::timemgr::{IterationStats, StoppersHints};
 use super::stoppers::{build_search_stoppers, ChainedSearchStopper, SearchStopper};
 use super::worker::{SearchWorker, WorkerSearchState};
@@ -719,6 +721,37 @@ impl ClassicSearch {
         meta.params.per_pv_counters = per_pv_counters;
         meta.params.score_type = score_type;
         meta.params.nps_limit = nps_limit;
+        Ok(())
+    }
+
+    /// px0 `BaseSearchParams` freezes WDL calibration from OptionsDict before
+    /// worker construction (`src/search/classic/params.cc:688-703`).
+    pub fn set_wdl_options(&mut self, options: &UciOptions) -> Result<(), EnginError> {
+        self.abort_search()?;
+        let contempt =
+            get_contempt(&options.uci_opponent, &options.contempt, options.uci_rating_adv).map_err(EnginError::Uci)?;
+        let rescale = if options.wdl_calibration_elo == 0.0 {
+            accurate_wdl_rescale_params(
+                contempt,
+                options.wdl_draw_rate_target,
+                options.wdl_draw_rate_reference,
+                options.wdl_book_exit_bias,
+                options.contempt_max_value,
+                options.wdl_contempt_attenuation,
+            )
+        } else {
+            simplified_wdl_rescale_params(
+                contempt,
+                options.wdl_draw_rate_reference,
+                options.wdl_calibration_elo,
+                options.contempt_max_value,
+                options.wdl_contempt_attenuation,
+            )
+        };
+        let mut meta = self.meta.lock().expect("meta lock");
+        meta.params.wdl_rescale_ratio = rescale.ratio;
+        meta.params.wdl_rescale_diff = rescale.diff;
+        meta.params.wdl_max_s = options.wdl_max_s;
         Ok(())
     }
 
