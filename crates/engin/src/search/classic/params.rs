@@ -54,6 +54,40 @@ pub enum ContemptMode {
     None,
 }
 
+/// px0 `BaseSearchParams::WDLRescaleParams` (`params.h:44-53`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WdlRescaleParams {
+    pub ratio: f32,
+    pub diff: f32,
+}
+
+/// px0 `AccurateWDLRescaleParams` (`params.cc:92-115`).
+pub fn accurate_wdl_rescale_params(
+    contempt: f32,
+    mut draw_rate_target: f32,
+    draw_rate_reference: f32,
+    book_exit_bias: f32,
+    contempt_max: f32,
+    contempt_attenuation: f32,
+) -> WdlRescaleParams {
+    if draw_rate_target > 0.0 && draw_rate_target < 0.001 {
+        draw_rate_target = 0.001;
+    }
+    let scale_reference = 1.0 / ((1.0 + draw_rate_reference) / (1.0 - draw_rate_reference)).ln();
+    let scale_target = if draw_rate_target == 0.0 {
+        scale_reference
+    } else {
+        1.0 / ((1.0 + draw_rate_target) / (1.0 - draw_rate_target)).ln()
+    };
+    let ratio = scale_target / scale_reference;
+    let sech2_left = 1.0 / (0.5 * (1.0 - book_exit_bias) / scale_target).cosh().powi(2);
+    let sech2_right = 1.0 / (0.5 * (1.0 + book_exit_bias) / scale_target).cosh().powi(2);
+    let diff = scale_target / (scale_reference * scale_reference) / (sech2_left + sech2_right) * 10.0_f32.ln() / 200.0
+        * contempt.clamp(-contempt_max, contempt_max)
+        * contempt_attenuation;
+    WdlRescaleParams { ratio, diff }
+}
+
 /// px0 `BaseSearchParams` / `SearchParams` 单线程搜索所需字段。
 #[derive(Clone, Debug)]
 pub struct SearchParams {
@@ -283,7 +317,7 @@ impl SearchParams {
 
 #[cfg(test)]
 mod tests {
-    use super::SearchParams;
+    use super::{accurate_wdl_rescale_params, SearchParams};
 
     /// px0 `BaseSearchParams` keeps each root PUCT parameter equal to the
     /// ordinary value unless `RootHasOwnCpuctParams` is enabled
@@ -316,5 +350,12 @@ mod tests {
         let params = SearchParams::default();
         assert_eq!(params.fpu_value_at_root, 1.0);
         assert_eq!(params.max_collision_visits_scaling_end, 145_000);
+    }
+
+    #[test]
+    fn accurate_wdl_defaults_are_px0_neutral() {
+        let params = accurate_wdl_rescale_params(0.0, 0.0, 0.5, 0.65, 420.0, 1.0);
+        assert!((params.ratio - 1.0).abs() < f32::EPSILON);
+        assert!(params.diff.abs() < f32::EPSILON);
     }
 }

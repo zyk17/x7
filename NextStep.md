@@ -199,6 +199,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `ContemptMode::Play` 已在每次 `StartSearch` 按 root side、ponder 与 infinite 解析为
   worker 实际使用的 White/Black/None，避免将配置态直接带入 backup
   （`src/search/classic/search.cc:156-175,2131-2143`）。
+- `AccurateWDLRescaleParams` 已逐式翻译为纯参数计算，并以 px0 默认输入验证得到
+  neutral `ratio=1/diff=0`；下一项是 UCI 参数映射和 simplified Elo 分支
+  （`src/search/classic/params.cc:92-115,688-703`）。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。
