@@ -364,6 +364,35 @@ mod tests {
         );
     }
 
+    /// px0 allows the task-worker pipeline to run inside each SearchWorker
+    /// while other workers overlap NN computation (`search.cc:1088-1211,
+    /// 1322-1347,1494-1508,1828-1864`). Keep this bounded stress regression
+    /// on the shared-tree phase boundary.
+    #[test]
+    fn shared_tree_combines_search_and_task_workers() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
+        search.set_position(&state).expect("position");
+        {
+            let mut meta = search.meta.lock().expect("meta lock");
+            meta.params.minibatch_size = 32;
+            meta.params.task_workers_per_search_worker = 1;
+            meta.params.max_collision_visits = 4;
+            meta.params.max_collision_visits_scaling_start = 0;
+            meta.params.max_collision_visits_scaling_end = 1;
+            meta.params.minimum_work_size_for_processing = 2;
+            meta.params.minimum_work_per_task_for_processing = 1;
+        }
+
+        let (best, visits) = search.run_blocking_nodes(64);
+
+        assert!(!best.is_null());
+        assert!(visits >= 64);
+        let tree = search.tree.lock().expect("tree lock");
+        assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
+    }
+
     #[test]
     fn best_child_uses_prior_until_a_child_has_more_visits() {
         ensure_init();

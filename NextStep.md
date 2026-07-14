@@ -106,7 +106,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   initialize、gather/collision/prefetch、fetch/backup 三个 px0 tree phase 持有 `NodeTree` mutex，
   NN compute 不持有树锁。`ClassicSearch::StartThreads` 已允许多个 SearchWorker，固定 nodes 的
   两 worker UniformBackend 回归通过，对应 `src/search/classic/search.cc:1088-1140,1142-1211,
-  1979-2008,2161-2174`。task workers 与多 SearchWorker 的组合压力测试仍未完成。
+  1979-2008,2161-2174`。两 SearchWorker + 每 worker 一个 task worker 的 fixed-nodes 压力回归
+  也通过，并验证 root `NInFlight` 在结束时归零。
 - `SearchWorker::DoBackupUpdateSingleNode` 已补齐 sticky-endgame 的 bounds 传播、终局
   平均值修正与强制终局父节点标记，对应
   `src/search/classic/search.cc:2175-2289`、`src/search/classic/node.cc:300-392`；

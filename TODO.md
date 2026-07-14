@@ -110,6 +110,9 @@
   gather/collision/prefetch、fetch/backup 持有 tree mutex，NN compute 不持有；`StartThreads`
   允许多个 SearchWorker，已覆盖两 worker fixed-nodes 回归
   （`src/search/classic/search.cc:1088-1140,1142-1211,1979-2008,2161-2174`）。
+- [x] 覆盖两 SearchWorker 与每 worker 一个 task worker 同时运行的 bounded fixed-nodes 路径，
+  验证完成后 root `NInFlight=0`（`src/search/classic/search.cc:1088-1211,1322-1347,
+  1494-1508,1828-1864`）。
 - [x] 翻译 sticky-endgame 的 `MaybeSetBounds`、强制终局父 bounds 传播与
   `AdjustForTerminal` 统计修正（`src/search/classic/search.cc:2175-2289`、
   `src/search/classic/node.cc:300-392`）。
