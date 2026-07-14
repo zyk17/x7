@@ -183,9 +183,11 @@
 - [x] 对 fixed-nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection 交互，核对
   solid child 不会造成 collision/in-flight 泄漏或重复扩展
   （`src/search/classic/node.h:451-523,556-626`、`search.cc:1494-1864`）。
-- [ ] 翻译 worker 内 `MaybeOutputInfo` 实时 responder 回调和可变 contempt/WDL calibration
-  OptionsDict，完成 px0 UCI info 统计（`src/search/classic/search.cc:357-368`、
-  `src/search/classic/params.h:107-128`）。
+- [x] 翻译 worker/watchdog 的 `MaybeOutputInfo` 实时 responder 回调与 collision-only
+  iteration 的 10ms 退让（`src/search/classic/search.cc:357-382,2331-2364`）。
+- [ ] 翻译可变 contempt/WDL calibration `OptionsDict`，使 WDL 重标定在 NN value 进入
+  backup 前使用 px0 的完整参数计算（`src/search/classic/params.cc:57-174,688-703`、
+  `search.cc:206-236,2117-2154`）。
 - [x] 翻译 `WeightsFile` 到正式 `OnnxBackend` 的 UCI/engine 配置子集；保持 px0 配置与
   `SetPosition` 时序，不实现多 backend registry、protobuf weight 或 autodiscover
   （`src/neural/shared_params.cc:43-80`、`src/engine.cc:153-167,187-197`、

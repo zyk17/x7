@@ -2102,10 +2102,18 @@ impl<'a> SearchWorker<'a> {
         }
     }
 
-    /// px0 `SearchWorker::UpdateCounters` (`search.cc:2331-2364`) 子集。
+    /// px0 `SearchWorker::UpdateCounters` (`search.cc:2331-2364`).
     pub fn update_counters(&mut self) -> Result<(), EnginError> {
         if let Some(controller) = &self.stop_controller {
             controller.maybe_trigger_stop(self.search_state);
+        }
+        // px0 deliberately backs off when an iteration only found collisions.
+        // Such an iteration does not advance the tree; immediately spinning
+        // again would only inflate scheduler activity while another worker
+        // owns the useful in-flight work.
+        let work_done = self.number_out_of_order > 0 || self.minibatch.iter().any(|item| !item.is_collision);
+        if !work_done {
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok(())
     }
@@ -2423,6 +2431,27 @@ mod tests {
 
         assert_eq!(tree.node(root).n_in_flight(), 0);
         assert_eq!(state.shared_collisions.lock().expect("collisions lock").len(), 0);
+    }
+
+    /// px0 `SearchWorker::UpdateCounters` treats collision-only iterations as
+    /// idle (`src/search/classic/search.cc:2340-2363`). They must not count
+    /// as useful search work merely because the minibatch is non-empty.
+    #[test]
+    fn collision_only_iteration_is_not_work_done() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let root = tree.current_head();
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
+        worker.minibatch.push(NodeToProcess::collision(root, 1, 1, 1));
+
+        let started = Instant::now();
+        worker.update_counters().expect("collision-only update");
+        assert!(started.elapsed() >= Duration::from_millis(8));
     }
 
     #[test]

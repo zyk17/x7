@@ -147,8 +147,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   324-350`）。`MultiPV`、`PerPVCounters` 的 UCI 参数与多行 root 排序已接线
   （`src/search/classic/params.cc:360-368,585-586`、`search.cc:239-246,705-808`）。当前只在
   搜索结束时发送；`ScoreType` 的全部 choice 和零 contempt 默认下的 `WDL_mu` 公式已翻译
-  （`src/search/classic/params.cc:587-595`、`search.cc:206-236,275-336`）。worker 中的实时
-  responder 回调及可变 contempt/WDL calibration OptionsDict 仍待翻译。
+  （`src/search/classic/params.cc:587-595`、`search.cc:206-236,275-336`）。可变 contempt/WDL
+  calibration OptionsDict 仍待翻译。
 - `engin/src/engine.rs` 已接入非 owning 的 `UciResponderForwarder`，以 Rust mutex 表达
   px0 `Engine::UciPonderForwarder` 的注册、注销和搜索线程生命周期约束（`src/engine.cc:81-136,
   238-250`）；`ClassicSearch` 已持有对应 thread-safe callback 边界（`src/search/search.h:45-99`）。
@@ -179,6 +179,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - watchdog 运行中的 `MaybeOutputInfo` 已按 root best edge、平均 depth、seldepth 和 5 秒
   最小频率判断发送；锁顺序保持 tree -> current-best，避免与 backup 反向（`search.cc:51,
   357-382,2211-2249`）。剩余是可变 contempt/WDL calibration OptionsDict。
+- `SearchWorker::UpdateCounters` 已在 stopper 后按 px0 对 collision-only iteration 退让 10ms，
+  避免无有效 leaf 时空转并污染运行统计（`src/search/classic/search.cc:2331-2364`）。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。
