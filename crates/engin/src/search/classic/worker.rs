@@ -2115,6 +2115,28 @@ impl<'a> SearchWorker<'a> {
         if !work_done {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // px0 applies NodesPerSecondLimit after backup/counter publication,
+        // never in gather or NN compute. The first completed batch is the
+        // timing origin for the same reason as its UCI NPS field.
+        if self.params.nps_limit > 0.0 {
+            while !self.search_state.stop.load(Ordering::Acquire) {
+                let elapsed_ms = self
+                    .search_state
+                    .first_batch
+                    .lock()
+                    .expect("first batch lock")
+                    .map(|started| started.elapsed().as_millis() as f32)
+                    .unwrap_or(0.0);
+                if elapsed_ms <= 0.0 {
+                    break;
+                }
+                let nps = self.search_state.total_playouts.load(Ordering::Acquire) as f32 * 1_000.0 / elapsed_ms;
+                if nps <= self.params.nps_limit {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         Ok(())
     }
 }

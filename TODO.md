@@ -185,6 +185,8 @@
   （`src/search/classic/node.h:451-523,556-626`、`search.cc:1494-1864`）。
 - [x] 翻译 worker/watchdog 的 `MaybeOutputInfo` 实时 responder 回调与 collision-only
   iteration 的 10ms 退让（`src/search/classic/search.cc:357-382,2331-2364`）。
+- [x] 翻译 `NodesPerSecondLimit`：UCI float 范围、SearchParams 传递和 UpdateCounters
+  后节流（`src/search/classic/params.cc:473-477,621`、`search.cc:1209-1231`）。
 - [ ] 翻译可变 contempt/WDL calibration `OptionsDict`，使 WDL 重标定在 NN value 进入
   backup 前使用 px0 的完整参数计算（`src/search/classic/params.cc:57-174,688-703`、
   `search.cc:206-236,2117-2154`）。

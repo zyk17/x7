@@ -197,8 +197,12 @@ impl EngineController for ClassicEngine {
         if self.uci_weights_file.is_some() || !options.weights_file.is_empty() {
             self.uci_weights_file = Some(options.weights_file.clone());
         }
-        self.search
-            .set_uci_info_options(options.multi_pv, options.per_pv_counters, options.score_type)
+        self.search.set_uci_info_options(
+            options.multi_pv,
+            options.per_pv_counters,
+            options.score_type,
+            options.nodes_per_second_limit,
+        )
     }
 
     fn ensure_ready(&mut self) -> Result<(), EnginError> {

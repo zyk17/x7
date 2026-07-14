@@ -91,6 +91,9 @@ pub struct SearchParams {
     /// exponential backoff instead of the default hard-spin while waiting for
     /// a `MaxConcurrentSearchers` permit.
     pub search_spin_backoff: bool,
+    /// px0 `NodesPerSecondLimit` (`params.cc:473-477,621`). Zero disables
+    /// post-iteration throughput throttling.
+    pub nps_limit: f32,
     // 指在多线程并行搜索中，多个线程同时访问并等待同一个尚未被神经网络估值的节点时的最大允许访问数。
     pub max_collision_visits: i32,
     // 最大碰撞访问量开始进行比例缩放的树尺寸。
@@ -173,6 +176,7 @@ impl Default for SearchParams {
             temperature: 0.0,
             max_concurrent_searchers: 1,
             search_spin_backoff: false,
+            nps_limit: 0.0,
             max_collision_visits: 80_000,
             max_collision_visits_scaling_start: 28,
             max_collision_visits_scaling_end: 145_000,

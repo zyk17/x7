@@ -181,6 +181,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   357-382,2211-2249`）。剩余是可变 contempt/WDL calibration OptionsDict。
 - `SearchWorker::UpdateCounters` 已在 stopper 后按 px0 对 collision-only iteration 退让 10ms，
   避免无有效 leaf 时空转并污染运行统计（`src/search/classic/search.cc:2331-2364`）。
+- `NodesPerSecondLimit` 已从 UCI option 传入 `SearchParams`，并仅在每轮 backup/counter
+  更新后以 first-batch 计时做 1ms 节流；默认 `0` 禁用，与 px0 一致
+  （`src/search/classic/params.cc:473-477,621`、`search.cc:1209-1231`）。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。

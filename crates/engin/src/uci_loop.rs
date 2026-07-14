@@ -27,7 +27,7 @@ pub struct GoParams {
 
 /// px0 `StringUciResponder::PopulateParams`、classic search display options
 /// 与 `SharedBackendParams` 的 Rust ONNX 子集。
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UciOptions {
     pub show_wdl: bool,
     pub show_eps: bool,
@@ -36,6 +36,8 @@ pub struct UciOptions {
     pub multi_pv: usize,
     pub per_pv_counters: bool,
     pub score_type: ScoreType,
+    /// px0 `NodesPerSecondLimit` (`src/search/classic/params.cc:473-477,621`).
+    pub nodes_per_second_limit: f32,
     /// px0 `WeightsFile` (`src/neural/shared_params.cc:43-80`). This Rust
     /// port accepts the formal ONNX model rather than px0's protobuf weights.
     pub weights_file: String,
@@ -65,6 +67,12 @@ impl UciOptions {
                 "option name ScoreType type combo default {} var centipawn var centipawn_with_drawscore var centipawn_2019 var centipawn_2018 var win_percentage var Q var W-L var WDL_mu",
                 self.score_type.as_uci()
             ),
+            // px0 `FloatOption::GetOptionString` advertises float values as
+            // a UCI string (`src/utils/optionsparser.cc:473-475`).
+            format!(
+                "option name NodesPerSecondLimit type string default {}",
+                self.nodes_per_second_limit
+            ),
             format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
@@ -78,6 +86,7 @@ impl UciOptions {
             "MultiPV" => self.multi_pv = parse_multi_pv(value)?,
             "PerPVCounters" => self.per_pv_counters = parse_bool_option(value, "PerPVCounters")?,
             "ScoreType" => self.score_type = parse_score_type(value)?,
+            "NodesPerSecondLimit" => self.nodes_per_second_limit = parse_nps_limit(value)?,
             "WeightsFile" => self.weights_file = value.to_string(),
             _ => return Err(EnginError::Uci(format!("Unknown option: {name}"))),
         }
@@ -577,6 +586,20 @@ fn parse_score_type(value: &str) -> Result<ScoreType, EnginError> {
     ScoreType::parse_uci(value).ok_or_else(|| EnginError::Uci(format!("Unknown ScoreType: {value}")))
 }
 
+/// px0 `FloatOption(kNpsLimitId, 0.0f, 1e6f)`
+/// (`src/search/classic/params.cc:473-477,621`).
+fn parse_nps_limit(value: &str) -> Result<f32, EnginError> {
+    let value: f32 = value
+        .parse()
+        .map_err(|_| EnginError::Uci("NodesPerSecondLimit must be a number from 0 to 1000000".into()))?;
+    if !value.is_finite() || !(0.0..=1_000_000.0).contains(&value) {
+        return Err(EnginError::Uci(
+            "NodesPerSecondLimit must be a number from 0 to 1000000".into(),
+        ));
+    }
+    Ok(value)
+}
+
 fn split_at_whitespace(value: &str) -> Vec<String> {
     if value.is_empty() {
         Vec::new()
@@ -740,6 +763,17 @@ mod tests {
             .list_options_uci()
             .iter()
             .any(|line| line == "option name WeightsFile type string default data/x7.onnx"));
+    }
+
+    #[test]
+    fn nodes_per_second_limit_matches_px0_float_range() {
+        let mut options = UciOptions::populate_defaults();
+        options
+            .set_uci_option("NodesPerSecondLimit", "1234.5")
+            .expect("px0 float option");
+        assert_eq!(options.nodes_per_second_limit, 1234.5);
+        assert!(options.set_uci_option("NodesPerSecondLimit", "-1").is_err());
+        assert!(options.set_uci_option("NodesPerSecondLimit", "1000001").is_err());
     }
 
     #[test]

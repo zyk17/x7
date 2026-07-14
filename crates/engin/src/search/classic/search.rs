@@ -642,12 +642,14 @@ impl ClassicSearch {
         multi_pv: usize,
         per_pv_counters: bool,
         score_type: ScoreType,
+        nps_limit: f32,
     ) -> Result<(), EnginError> {
         self.abort_search()?;
         let mut meta = self.meta.lock().expect("meta lock");
         meta.params.multi_pv = multi_pv;
         meta.params.per_pv_counters = per_pv_counters;
         meta.params.score_type = score_type;
+        meta.params.nps_limit = nps_limit;
         Ok(())
     }
 
