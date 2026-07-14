@@ -383,6 +383,7 @@ mod tests {
             meta.params.max_collision_visits_scaling_end = 1;
             meta.params.minimum_work_size_for_processing = 2;
             meta.params.minimum_work_per_task_for_processing = 1;
+            meta.params.solid_tree_threshold = 1;
         }
 
         let (best, visits) = search.run_blocking_nodes(64);
@@ -390,7 +391,9 @@ mod tests {
         assert!(!best.is_null());
         assert!(visits >= 64);
         let tree = search.tree.lock().expect("tree lock");
-        assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
+        let root = tree.current_head();
+        assert!(tree.node(root).has_solid_children());
+        assert_eq!(tree.node(root).n_in_flight(), 0);
     }
 
     /// px0 `DoBackupUpdateSingleNode` may solidify root while other search

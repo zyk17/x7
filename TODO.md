@@ -165,8 +165,8 @@
   `src/search/classic/search.cc:2211-2217`）。
 - [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
-- [ ] 对固定 FEN / fixed nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection
-  交互，核对没有把 solid child 当作 collision 或重复扩展
+- [x] 对 fixed-nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection 交互，核对
+  solid child 不会造成 collision/in-flight 泄漏或重复扩展
   （`src/search/classic/node.h:451-523,556-626`、`search.cc:1494-1864`）。
 - [ ] 翻译 worker 内 `MaybeOutputInfo` 实时 responder 回调和可变 contempt/WDL calibration
   OptionsDict，完成 px0 UCI info 统计（`src/search/classic/search.cc:357-368`、

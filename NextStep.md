@@ -137,7 +137,7 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   1584-1588,1726-1742,2241-2249`）。`MakeSolid` 已按 Rust arena 翻译：px0 的 sibling
   链转 `Node[]`，在本项目中等价为填充每个 edge 的稳定 boxed child slot；其 leaf/terminal
   in-flight 前置条件、root cache 刷新和 backup 时序对应 `node.cc:245-289,394-405`、
-  `search.cc:2211-2217`。
+  `search.cc:2211-2217`；fixed-nodes 已覆盖其与 multi-SearchWorker/task split 的组合。
 - `WeightsFile -> OnnxBackend` 的 UCI/engine 子集已翻译：`setoption` 保存配置，`set_position`
   停止旧搜索后更新 backend，再构造新 `GameState`（`src/neural/shared_params.cc:43-80`、
   `src/engine.cc:153-167,187-197`、`src/search/search.h:48-55`）。本项目只接受 ONNX，未翻译
