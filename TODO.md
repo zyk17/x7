@@ -173,6 +173,10 @@
 - [x] 删除 Engine 对搜索结果的手工 drain，最终 `info` / `bestmove` 仅通过 SearchBase
   responder 输出，避免 worker/watchdog 接入后双发（`src/engine.cc:85-116,204-208`、
   `src/search/classic/search.cc:596-620`）。
+- [x] 翻译 px0 `StartThreads` 的 watchdog 拓扑：`go` 非阻塞、watchdog 驱动 stopper 和
+  最终完整 MultiPV/bestmove 输出、`wait` 只 join、`stop` 只发停止请求；覆盖
+  `go infinite -> stop -> wait` 的唯一 bestmove（`src/search/classic/search.cc:595-620,
+  874-1041`）。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [x] 对 fixed-nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection 交互，核对
   solid child 不会造成 collision/in-flight 泄漏或重复扩展

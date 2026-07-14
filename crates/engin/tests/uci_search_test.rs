@@ -21,6 +21,7 @@ fn classic_engine_go_nodes_emits_bestmove() {
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
     uci.process_line("position startpos", "0.0.0").expect("position");
     uci.process_line("go nodes 8", "0.0.0").expect("go nodes");
+    uci.process_line("wait", "0.0.0").expect("wait");
     drop(uci);
     assert!(
         responder.responses.iter().any(|line| line.starts_with("bestmove ")),
@@ -45,10 +46,39 @@ fn classic_engine_movetime_runs_at_least_one_simulation() {
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
     uci.process_line("position startpos", "0.0.0").expect("position");
     uci.process_line("go movetime 0", "0.0.0").expect("go movetime");
+    uci.process_line("wait", "0.0.0").expect("wait");
     drop(uci);
 
     assert!(engine.search().total_root_visits() >= 1);
     assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
+}
+
+/// px0 `Search::StartThreads/WatchdogThread/Stop/Wait` keeps `go` non-blocking
+/// and lets the watchdog emit exactly one bestmove after an explicit stop
+/// (`src/search/classic/search.cc:874-1041`).
+#[test]
+fn classic_engine_infinite_stop_is_async_and_emits_one_bestmove() {
+    ensure_init();
+    let mut options = UciOptions::populate_defaults();
+    let mut engine = ClassicEngine::uniform();
+    let mut responder = VecUciResponder::default();
+    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    uci.process_line("position startpos", "0.0.0").expect("position");
+    uci.process_line("go infinite", "0.0.0").expect("go must not block");
+    uci.process_line("stop", "0.0.0").expect("stop must not block");
+    uci.process_line("wait", "0.0.0").expect("wait");
+    drop(uci);
+
+    assert_eq!(
+        responder
+            .responses
+            .iter()
+            .filter(|line| line.starts_with("bestmove "))
+            .count(),
+        1,
+        "responses: {:?}",
+        responder.responses
+    );
 }
 
 /// px0 `MultiPV` returns the independently ranked root children from
@@ -66,6 +96,7 @@ fn classic_engine_multipv_emits_ranked_root_lines() {
         .expect("score type option");
     uci.process_line("position startpos", "0.0.0").expect("position");
     uci.process_line("go nodes 32", "0.0.0").expect("go nodes");
+    uci.process_line("wait", "0.0.0").expect("wait");
     drop(uci);
 
     assert!(
@@ -111,6 +142,7 @@ fn classic_engine_searchmoves_restricts_root_selection() {
     uci.process_line("position startpos", "0.0.0").expect("position");
     uci.process_line("go nodes 8 searchmoves a0a1", "0.0.0")
         .expect("go searchmoves");
+    uci.process_line("wait", "0.0.0").expect("wait");
     drop(uci);
 
     assert!(
@@ -175,6 +207,7 @@ fn weights_file_enables_main_uci_onnx_search_if_local_x7_exists() {
         .expect("configure weights");
     uci.process_line("position startpos", "0.0.0").expect("position");
     uci.process_line("go nodes 1", "0.0.0").expect("go nodes");
+    uci.process_line("wait", "0.0.0").expect("wait");
     drop(uci);
     assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
 }

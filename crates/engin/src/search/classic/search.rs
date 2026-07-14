@@ -564,6 +564,10 @@ pub struct ClassicSearch {
     /// engine installs its forwarder before UCI starts a search; worker-side
     /// watchdog output is added in the following P4 translation point.
     responder: Option<Arc<dyn SearchResponder>>,
+    /// px0 `ok_to_respond_bestmove_` / `bestmove_is_sent_`
+    /// (`src/search/classic/search.h:146-151`).
+    ok_to_respond_bestmove: Arc<AtomicBool>,
+    bestmove_is_sent: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     infinite: AtomicBool,
     pub outputs: Vec<SearchOutput>,
@@ -590,6 +594,8 @@ impl ClassicSearch {
             stopper: Arc::clone(&stopper),
             stop_controller: Arc::new(SearchStopController { meta, stopper }),
             responder: None,
+            ok_to_respond_bestmove: Arc::new(AtomicBool::new(true)),
+            bestmove_is_sent: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
             infinite: AtomicBool::new(false),
             outputs: Vec::new(),
@@ -647,28 +653,26 @@ impl ClassicSearch {
         (best, visits)
     }
 
-    fn maybe_trigger_stop(&mut self) -> Result<bool, EnginError> {
-        Ok(self.stop_controller.maybe_trigger_stop(&self.worker_state))
-    }
-
-    fn emit_outputs(&mut self) -> Result<(), EnginError> {
-        let tree = self.tree.lock().expect("tree lock");
-        let meta = self.meta.lock().expect("meta lock");
-        let (best, ponder) = best_move(&tree, &meta.params, &meta.root_move_filter);
+    fn snapshot_output(
+        tree: &NodeTree,
+        meta: &SearchMeta,
+        worker_state: &WorkerSearchState,
+        has_wdl: bool,
+    ) -> Option<SearchOutput> {
+        let (best, ponder) = best_move(tree, &meta.params, &meta.root_move_filter);
         if best.is_null() {
-            return Ok(());
+            return None;
         }
         let elapsed = meta.move_start.elapsed();
-        let total_playouts = self.worker_state.total_playouts.load(Ordering::Acquire);
-        let first_batch = *self.worker_state.first_batch.lock().expect("first batch lock");
+        let total_playouts = worker_state.total_playouts.load(Ordering::Acquire);
+        let first_batch = *worker_state.first_batch.lock().expect("first batch lock");
         let nps = first_batch.and_then(|started| {
             let elapsed_ms = started.elapsed().as_millis() as u64;
             (elapsed_ms > 0).then(|| (total_playouts.saturating_mul(1000) / elapsed_ms) as i32)
         });
         let root = tree.current_head();
-        let has_wdl = self.backend.attributes().has_wdl;
         let infos = best_child_edges(
-            &tree,
+            tree,
             root,
             &meta.params,
             meta.params.multi_pv,
@@ -683,10 +687,10 @@ impl ClassicSearch {
             let default_d = tree.node(root).d();
             let mut wl = child.filter(|node| node.n() > 0).map_or(default_wl, Node::wl);
             let mut d = child.filter(|node| node.n() > 0).map_or(default_d, Node::d);
-            let default_q = -tree.node(root).q(-draw_score(&tree, &meta.params, false));
+            let default_q = -tree.node(root).q(-draw_score(tree, &meta.params, false));
             let q = child
                 .filter(|node| node.n() > 0)
-                .map_or(default_q, |node| node.q(draw_score(&tree, &meta.params, false)));
+                .map_or(default_q, |node| node.q(draw_score(tree, &meta.params, false)));
             let score = score_from_wdl(meta.params.score_type, &mut wl, &mut d, q, has_wdl);
             let mate = child.filter(|node| node.is_terminal() && wl != 0.0).map(|node| {
                 let plies = node.m().round() as i32 / 2 + if node.is_tablebase_terminal() { 101 } else { 1 };
@@ -698,8 +702,8 @@ impl ClassicSearch {
             });
             ThinkingInfo {
                 // px0 `Search::SendUciInfo` (`search.cc:249-336`).
-                depth: (self.worker_state.cum_depth.load(Ordering::Acquire) / total_playouts.max(1)) as i32,
-                seldepth: self.worker_state.max_depth.load(Ordering::Acquire) as i32,
+                depth: (worker_state.cum_depth.load(Ordering::Acquire) / total_playouts.max(1)) as i32,
+                seldepth: worker_state.max_depth.load(Ordering::Acquire) as i32,
                 time: elapsed.as_millis() as i64,
                 nodes: if meta.params.per_pv_counters {
                     child.map_or(0, Node::n) as i64
@@ -708,7 +712,7 @@ impl ClassicSearch {
                 },
                 nps: nps.unwrap_or(-1),
                 eps: nps.map_or(-1, |_| {
-                    let evaluations = self.worker_state.network_evaluations.load(Ordering::Acquire);
+                    let evaluations = worker_state.network_evaluations.load(Ordering::Acquire);
                     let elapsed_ms = first_batch.expect("nps needs first batch").elapsed().as_millis() as u64;
                     (evaluations.saturating_mul(1000) / elapsed_ms) as i32
                 }),
@@ -716,7 +720,7 @@ impl ClassicSearch {
                 score: mate.is_none().then_some(score),
                 wdl: Some(wdl_from_wl_d(wl, d)),
                 tb_hits: 0,
-                pv: principal_variation(&tree, &meta.params, edge_idx),
+                pv: principal_variation(tree, &meta.params, edge_idx),
                 multipv: if meta.params.multi_pv > 1 { index as i32 + 1 } else { -1 },
                 ..ThinkingInfo::default()
             }
@@ -724,17 +728,7 @@ impl ClassicSearch {
         .collect();
         let mut bestmove = BestMoveInfo::new(best);
         bestmove.ponder = ponder;
-        let output = SearchOutput { bestmove, infos };
-        // px0 `Search::MaybeTriggerStop` emits through SearchBase's responder
-        // rather than returning a result to Engine (`search.cc:596-620`). The
-        // current blocking caller still retains this copy for direct tests;
-        // the next watchdog point removes that legacy collection path.
-        if let Some(responder) = &self.responder {
-            responder.output_thinking_info(&output.infos);
-            responder.output_best_move(&output.bestmove);
-        }
-        self.outputs.push(output);
-        Ok(())
+        Some(SearchOutput { bestmove, infos })
     }
 
     fn start_threads(&mut self, how_many: usize) -> Result<(), EnginError> {
@@ -756,6 +750,43 @@ impl ClassicSearch {
         let backend = Arc::clone(&self.backend);
         let stop = Arc::clone(&self.stop);
         let stop_controller = Arc::clone(&self.stop_controller);
+        let responder = self.responder.clone();
+        let ok_to_respond_bestmove = Arc::clone(&self.ok_to_respond_bestmove);
+        let bestmove_is_sent = Arc::clone(&self.bestmove_is_sent);
+        let watchdog_tree = Arc::clone(&tree);
+        let watchdog_worker_state = Arc::clone(&worker_state);
+        let watchdog_meta = Arc::clone(&meta);
+        let watchdog_stop = Arc::clone(&stop);
+        let watchdog_stop_controller = Arc::clone(&stop_controller);
+        let has_wdl = self.backend.attributes().has_wdl;
+        // px0 starts a watchdog before search workers (`search.cc:874-896`).
+        // It owns the terminal bestmove response; workers only advance tree
+        // state and may request a stop through SearchStopController.
+        handles.push(thread::spawn(move || loop {
+            watchdog_stop_controller.maybe_trigger_stop(&watchdog_worker_state);
+            if watchdog_stop.load(Ordering::Acquire)
+                && ok_to_respond_bestmove.load(Ordering::Acquire)
+                && watchdog_worker_state.total_playouts.load(Ordering::Acquire) > 0
+                && bestmove_is_sent
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                if let Some(responder) = &responder {
+                    let tree = watchdog_tree.lock().expect("tree lock");
+                    let meta = watchdog_meta.lock().expect("meta lock");
+                    if let Some(output) = ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
+                    {
+                        responder.output_thinking_info(&output.infos);
+                        responder.output_best_move(&output.bestmove);
+                    }
+                }
+                break;
+            }
+            if bestmove_is_sent.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }));
         for _ in 0..thread_count {
             let tree = Arc::clone(&tree);
             let worker_state = Arc::clone(&worker_state);
@@ -806,6 +837,8 @@ impl SearchBase for ClassicSearch {
         self.outputs.clear();
         self.stop.store(false, Ordering::Release);
         self.infinite.store(params.infinite, Ordering::Release);
+        self.ok_to_respond_bestmove.store(!params.infinite, Ordering::Release);
+        self.bestmove_is_sent.store(false, Ordering::Release);
 
         let nodes = params.nodes.filter(|&n| n > 0);
         if params.nodes.is_some() && nodes.is_none() {
@@ -880,11 +913,6 @@ impl SearchBase for ClassicSearch {
         }
 
         self.start_threads(0)?;
-
-        if !params.infinite {
-            self.wait_search()?;
-            self.emit_outputs()?;
-        }
         Ok(())
     }
 
@@ -894,37 +922,28 @@ impl SearchBase for ClassicSearch {
     }
 
     fn wait_search(&mut self) -> Result<(), EnginError> {
-        loop {
-            // px0 `Engine::EnsureSearchStopped()` is also called before the
-            // first position exists (`engine.cc:146-151,187-197`).  Do not
-            // ask a stopper for root statistics unless a worker is active.
-            if self.stop.load(Ordering::Acquire) || !self.meta.lock().expect("meta lock").search_active {
-                break;
-            }
-            if self.maybe_trigger_stop()? {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        self.stop.store(true, Ordering::Release);
-        self.meta.lock().expect("meta lock").search_active = false;
+        // px0 `Search::Wait` only joins threads (`search.cc:1035-1041`). The
+        // watchdog, not this caller, owns stopping and response timing.
         let handles: Vec<_> = self.threads.lock().expect("threads lock").drain(..).collect();
         for handle in handles {
             let _ = handle.join();
         }
+        self.meta.lock().expect("meta lock").search_active = false;
         Ok(())
     }
 
     fn stop_search(&mut self) -> Result<(), EnginError> {
+        // px0 `Search::Stop` is non-blocking and enables the final response
+        // for an otherwise silent infinite search (`search.cc:1019-1025`).
+        self.ok_to_respond_bestmove.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
-        self.wait_search()?;
-        if self.infinite.load(Ordering::Acquire) {
-            self.emit_outputs()?;
-        }
         Ok(())
     }
 
     fn abort_search(&mut self) -> Result<(), EnginError> {
+        // px0 `Search::Abort` suppresses bestmove before stopping/joining
+        // (`search.cc:1027-1033`).
+        self.bestmove_is_sent.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
         self.wait_search()
     }

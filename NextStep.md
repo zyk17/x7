@@ -152,8 +152,10 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `engin/src/engine.rs` 已接入非 owning 的 `UciResponderForwarder`，以 Rust mutex 表达
   px0 `Engine::UciPonderForwarder` 的注册、注销和搜索线程生命周期约束（`src/engine.cc:81-136,
   238-250`）；`ClassicSearch` 已持有对应 thread-safe callback 边界（`src/search/search.h:45-99`）。
-  最终 `info` / `bestmove` 已由搜索侧 callback 转发，不再由 `Engine::Go/Stop` 手工 drain；
-  下一步仅将 px0 watchdog 接到此边界并令 `go()` 非阻塞。
+  最终 `info` / `bestmove` 已由搜索侧 callback 转发，不再由 `Engine::Go/Stop` 手工 drain。
+- `ClassicSearch::StartSearch` 已按 px0 改为非阻塞；watchdog 独立驱动 stopper、输出完整
+  MultiPV snapshot 和唯一 `bestmove`，`WaitSearch` 仅 join，`StopSearch` 只请求停止并允许
+  `go infinite` 输出最终结果（`src/search/classic/search.cc:363-382,595-620,874-1041`）。
 - `engin/src/utils/fastmath.rs` 已逐式翻译 px0 `FastLog2/FastExp2/FastLog/FastExp/FastLogistic`
   （`src/utils/fastmath.h:42-92`）；classic `ComputeCpuct` 已改用 `FastLog`
   （`src/search/classic/search.cc:426-433`），不再以 Rust libm 改变 PUCT 数值路径。
@@ -174,8 +176,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `classic/node.h:127-339`、`search.cc:1494-1508`：继续核对固化后的所有 child slot 在多
   SearchWorker selection/task split 下的访问边界；Rust 已有 stable `Box` arena，不再保留整轮锁
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
-- `search.cc:357-368,942-1038`、`params.h:107-128`：在已接入 forwarder 的前提下翻译
-  watchdog + 实时 `MaybeOutputInfo` responder 回调，及可变 contempt/WDL calibration
+- `search.cc:357-382`、`params.h:107-128`：补齐 watchdog 运行中的 `MaybeOutputInfo`
+  变更频率判断（当前已在结束时发送完整 snapshot），及可变 contempt/WDL calibration
   OptionsDict；结束时 MultiPV/ScoreType 已完成
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
