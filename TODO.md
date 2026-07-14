@@ -124,6 +124,9 @@
   （`src/utils/fastmath.h:42-92`、`src/search/classic/search.cc:426-433`）。
 - [x] 翻译 `ScoreType` 选择、默认零 contempt `WDL_mu` 重标定与 `SendUciInfo` score/mate
   输出（`src/search/classic/params.cc:587-620`、`search.cc:206-236,275-336`）。
+- [x] 翻译 `go searchmoves` 的合法根着法过滤，并在 root policy prefix、PUCT selection、
+  current-best cache、MultiPV/PV/bestmove 共用该过滤表（`src/search/classic/wrapper.cc:78-100`、
+  `search.cc:721-724,1668-1740`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

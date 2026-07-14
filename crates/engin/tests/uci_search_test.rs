@@ -99,6 +99,46 @@ fn classic_engine_rejects_non_positive_node_budget() {
     assert_eq!(error.to_string(), "go nodes must be positive");
 }
 
+/// px0 `StringsToMovelist` filters root selection itself, not just the final
+/// response (`src/search/classic/wrapper.cc:78-100`, `search.cc:1668-1740`).
+#[test]
+fn classic_engine_searchmoves_restricts_root_selection() {
+    ensure_init();
+    let mut options = UciOptions::populate_defaults();
+    let mut engine = ClassicEngine::uniform();
+    let mut responder = VecUciResponder::default();
+    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    uci.process_line("position startpos", "0.0.0").expect("position");
+    uci.process_line("go nodes 8 searchmoves a0a1", "0.0.0")
+        .expect("go searchmoves");
+    drop(uci);
+
+    assert!(
+        responder.responses.iter().any(|line| line.starts_with("bestmove a0a1")),
+        "responses: {:?}",
+        responder.responses
+    );
+    for info in responder.responses.iter().filter(|line| line.starts_with("info ")) {
+        assert!(info.contains(" pv a0a1"), "response escaped root filter: {info}");
+    }
+}
+
+/// px0 throws when every requested `searchmoves` entry is illegal
+/// (`src/search/classic/wrapper.cc:88-98`).
+#[test]
+fn classic_engine_rejects_all_illegal_searchmoves() {
+    ensure_init();
+    let mut options = UciOptions::populate_defaults();
+    let mut engine = ClassicEngine::uniform();
+    let mut responder = VecUciResponder::default();
+    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    uci.process_line("position startpos", "0.0.0").expect("position");
+    let error = uci
+        .process_line("go nodes 8 searchmoves a0a9", "0.0.0")
+        .expect_err("illegal searchmoves must fail");
+    assert_eq!(error.to_string(), "No legal searchmoves.");
+}
+
 #[test]
 fn unavailable_engine_does_not_return_uniform_bestmove() {
     ensure_init();

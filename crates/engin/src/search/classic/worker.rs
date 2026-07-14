@@ -372,6 +372,9 @@ pub struct SearchWorker<'a> {
     params: &'a SearchParams,
     search_state: &'a WorkerSearchState,
     stop_controller: Option<Arc<SearchStopController>>,
+    /// px0 `Search::root_move_filter_` consumed by
+    /// `PickNodesToExtendTask` (`search.cc:1592-1595,1737-1740`).
+    root_move_filter: &'a [Move],
     minibatch: Vec<NodeToProcess>,
     computation: Option<Box<dyn BackendComputation>>,
     history: PositionHistory,
@@ -407,7 +410,20 @@ impl<'a> SearchWorker<'a> {
         search_state: &'a WorkerSearchState,
         stop_controller: Option<Arc<SearchStopController>>,
     ) -> Self {
-        Self::from_parts(tree, backend, params, search_state, stop_controller)
+        Self::new_with_stop_controller_and_root_move_filter(tree, backend, params, search_state, stop_controller, &[])
+    }
+
+    /// px0 `SearchWorker::SearchWorker` receives its owner `Search`, which
+    /// owns `root_move_filter_` for this search lifetime (`search.h:205-233`).
+    pub(crate) fn new_with_stop_controller_and_root_move_filter(
+        tree: &'a mut NodeTree,
+        backend: &'a dyn Backend,
+        params: &'a SearchParams,
+        search_state: &'a WorkerSearchState,
+        stop_controller: Option<Arc<SearchStopController>>,
+        root_move_filter: &'a [Move],
+    ) -> Self {
+        Self::from_parts(tree, backend, params, search_state, stop_controller, root_move_filter)
     }
 
     pub fn with_context(
@@ -416,7 +432,7 @@ impl<'a> SearchWorker<'a> {
         params: &'a SearchParams,
         search_state: &'a WorkerSearchState,
     ) -> Self {
-        Self::from_parts(tree, backend, params, search_state, None)
+        Self::from_parts(tree, backend, params, search_state, None, &[])
     }
 
     fn from_parts(
@@ -425,6 +441,7 @@ impl<'a> SearchWorker<'a> {
         params: &'a SearchParams,
         search_state: &'a WorkerSearchState,
         stop_controller: Option<Arc<SearchStopController>>,
+        root_move_filter: &'a [Move],
     ) -> Self {
         let mut target_minibatch_size = if params.minibatch_size > 0 {
             params.minibatch_size as usize
@@ -463,6 +480,7 @@ impl<'a> SearchWorker<'a> {
             params,
             search_state,
             stop_controller,
+            root_move_filter,
             minibatch: Vec::new(),
             computation: None,
             target_minibatch_size,
@@ -877,13 +895,17 @@ impl<'a> SearchWorker<'a> {
                     self.tree.node_mut(current_idx).increment_n_in_flight(cur_limit);
                 }
 
-                // px0 `search.cc:1657-1671`: only a bounded policy prefix can
-                // affect this collision batch because edges were policy-sorted.
-                let max_needed = self
-                    .tree
-                    .node(current_idx)
-                    .num_edges()
-                    .min(self.tree.node(current_idx).n_started() as usize + cur_limit as usize + 2);
+                // px0 `search.cc:1657-1671`: normally a bounded policy prefix
+                // is sufficient. With `searchmoves`, px0 must copy every root
+                // edge because an allowed move can be outside that prefix.
+                let max_needed = if is_root_node && !self.root_move_filter.is_empty() {
+                    self.tree.node(current_idx).num_edges()
+                } else {
+                    self.tree
+                        .node(current_idx)
+                        .num_edges()
+                        .min(self.tree.node(current_idx).n_started() as usize + cur_limit as usize + 2)
+                };
                 let mut visits = workspace.vtp_buffer.pop().unwrap_or_default();
                 visits.clear();
                 visits.resize(max_needed, 0);
@@ -943,6 +965,16 @@ impl<'a> SearchWorker<'a> {
                             if self.search_state.remaining_playouts() < i64::from(best_node_n) - i64::from(edge_n) {
                                 continue;
                             }
+                        }
+                        // px0 `search.cc:1737-1740`: root filtering is part of
+                        // selection, not only bestmove/PV presentation.
+                        if is_root_node
+                            && !self.root_move_filter.is_empty()
+                            && !self
+                                .root_move_filter
+                                .contains(&self.tree.node(current_idx).edge(edge_idx).mv)
+                        {
+                            continue;
                         }
                         let score = workspace.current_score[edge_idx];
                         if score > best_score {
@@ -1638,7 +1670,7 @@ impl<'a> SearchWorker<'a> {
                     || (cached_node != Some(node_idx) && cached_n <= self.tree.node(node_idx).n())
                 {
                     *self.search_state.current_best_edge.lock().expect("best edge lock") =
-                        best_child_edge(self.tree, root, self.params, 0);
+                        best_child_edge(self.tree, root, self.params, 0, self.root_move_filter);
                 }
             }
             node_idx = parent;

@@ -20,10 +20,10 @@ use super::stoppers::{build_search_stoppers, ChainedSearchStopper, SearchStopper
 use super::worker::{SearchWorker, WorkerSearchState};
 use crate::utils::fastmath::{fast_log, fast_logistic};
 
-pub fn best_move(tree: &NodeTree, params: &SearchParams) -> (Move, Move) {
+pub fn best_move(tree: &NodeTree, params: &SearchParams, root_move_filter: &[Move]) -> (Move, Move) {
     let root = tree.current_head();
     let root_is_black = tree.history().is_black_to_move();
-    let best_edge = best_child_edge(tree, root, params, 0);
+    let best_edge = best_child_edge(tree, root, params, 0, root_move_filter);
     let best = best_edge.map(|idx| tree.node(root).edge(idx).mv).unwrap_or_else(|| {
         tree.history()
             .last()
@@ -36,7 +36,7 @@ pub fn best_move(tree: &NodeTree, params: &SearchParams) -> (Move, Move) {
     let ponder = best_edge
         .and_then(|idx| {
             let child = tree.node(root).child(idx)?;
-            best_child_edge(tree, child, params, 1).map(|ponder_idx| tree.node(child).edge(ponder_idx).mv)
+            best_child_edge(tree, child, params, 1, &[]).map(|ponder_idx| tree.node(child).edge(ponder_idx).mv)
         })
         .unwrap_or(Move::NULL);
     (orient_move(best, root_is_black), orient_move(ponder, !root_is_black))
@@ -75,7 +75,7 @@ fn principal_variation(tree: &NodeTree, params: &SearchParams, first_edge: usize
         };
         depth += 1;
         flip = !flip;
-        let Some(next_edge) = best_child_edge(tree, child, params, depth) else {
+        let Some(next_edge) = best_child_edge(tree, child, params, depth, &[]) else {
             break;
         };
         parent = child;
@@ -187,8 +187,16 @@ fn best_edge_rank(node: Option<&Node>) -> BestEdgeRank {
 
 /// px0 `Search::GetBestChildrenNoTemperature` / `GetBestChildNoTemperature`
 /// (`src/search/classic/search.cc:705-808`).
-pub(super) fn best_child_edge(tree: &NodeTree, parent: usize, params: &SearchParams, depth: usize) -> Option<usize> {
-    best_child_edges(tree, parent, params, 1, depth).into_iter().next()
+pub(super) fn best_child_edge(
+    tree: &NodeTree,
+    parent: usize,
+    params: &SearchParams,
+    depth: usize,
+    root_move_filter: &[Move],
+) -> Option<usize> {
+    best_child_edges(tree, parent, params, 1, depth, root_move_filter)
+        .into_iter()
+        .next()
 }
 
 /// px0 `Search::GetBestChildrenNoTemperature` (`src/search/classic/search.cc:705-808`).
@@ -199,12 +207,21 @@ pub(super) fn best_child_edges(
     params: &SearchParams,
     count: usize,
     depth: usize,
+    root_move_filter: &[Move],
 ) -> Vec<usize> {
     if tree.node(parent).n() == 0 {
         return Vec::new();
     }
     let draw_score = draw_score(tree, params, depth % 2 == 1);
-    let mut edges: Vec<_> = (0..tree.node(parent).num_edges()).collect();
+    let is_root = parent == tree.current_head();
+    let mut edges: Vec<_> = (0..tree.node(parent).num_edges())
+        .filter(|&edge_idx| {
+            // px0 `Search::GetBestChildrenNoTemperature`
+            // (`src/search/classic/search.cc:721-724`): `searchmoves` filters
+            // only the current root, including MultiPV and final bestmove.
+            !is_root || root_move_filter.is_empty() || root_move_filter.contains(&tree.node(parent).edge(edge_idx).mv)
+        })
+        .collect();
     edges.sort_unstable_by(|&left, &right| {
         if best_child_edge_is_better(tree, parent, left, right, draw_score) {
             std::cmp::Ordering::Less
@@ -291,12 +308,12 @@ mod tests {
         tree.node_mut(root).edge_mut(1).set_p(0.8);
         assert!(tree.node_mut(root).try_start_score_update());
         tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
-        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0), Some(1));
+        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0, &[]), Some(1));
 
         let child = tree.arena_mut().spawn_child(root, 0);
         assert!(tree.node_mut(child).try_start_score_update());
         tree.node_mut(child).finalize_score_update(0.0, 0.0, 0.0, 1);
-        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0), Some(0));
+        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0, &[]), Some(0));
     }
 
     #[test]
@@ -332,6 +349,9 @@ struct SearchMeta {
     initial_visits: u32,
     stoppers_hints: StoppersHints,
     search_active: bool,
+    /// px0 `Search::root_move_filter_` (`src/search/classic/search.h:168-171`).
+    /// It is reconstructed from legal UCI `searchmoves` for every search.
+    root_move_filter: Vec<Move>,
 }
 
 /// px0 `Search::MaybeTriggerStop` 的 worker 可调用边界
@@ -416,6 +436,7 @@ impl ClassicSearch {
             initial_visits: 0,
             stoppers_hints: StoppersHints::default(),
             search_active: false,
+            root_move_filter: Vec::new(),
         }));
         let stopper = Arc::new(Mutex::new(None));
         Self {
@@ -472,7 +493,7 @@ impl ClassicSearch {
         self.wait_search().expect("wait");
         let tree = self.tree.lock().expect("tree lock");
         let meta = self.meta.lock().expect("meta lock");
-        let (best, _) = best_move(&tree, &meta.params);
+        let (best, _) = best_move(&tree, &meta.params, &meta.root_move_filter);
         let visits = tree.node(tree.current_head()).n();
         (best, visits)
     }
@@ -484,7 +505,7 @@ impl ClassicSearch {
     fn emit_outputs(&mut self) -> Result<(), EnginError> {
         let tree = self.tree.lock().expect("tree lock");
         let meta = self.meta.lock().expect("meta lock");
-        let (best, ponder) = best_move(&tree, &meta.params);
+        let (best, ponder) = best_move(&tree, &meta.params, &meta.root_move_filter);
         if best.is_null() {
             return Ok(());
         }
@@ -497,54 +518,61 @@ impl ClassicSearch {
         });
         let root = tree.current_head();
         let has_wdl = self.backend.attributes().has_wdl;
-        let infos = best_child_edges(&tree, root, &meta.params, meta.params.multi_pv, 0)
-            .into_iter()
-            .enumerate()
-            .map(|(index, edge_idx)| {
-                let child = tree.node(root).child(edge_idx).map(|idx| tree.node(idx));
-                let default_wl = -tree.node(root).wl();
-                let default_d = tree.node(root).d();
-                let mut wl = child.filter(|node| node.n() > 0).map_or(default_wl, Node::wl);
-                let mut d = child.filter(|node| node.n() > 0).map_or(default_d, Node::d);
-                let default_q = -tree.node(root).q(-draw_score(&tree, &meta.params, false));
-                let q = child
-                    .filter(|node| node.n() > 0)
-                    .map_or(default_q, |node| node.q(draw_score(&tree, &meta.params, false)));
-                let score = score_from_wdl(meta.params.score_type, &mut wl, &mut d, q, has_wdl);
-                let mate = child.filter(|node| node.is_terminal() && wl != 0.0).map(|node| {
-                    let plies = node.m().round() as i32 / 2 + if node.is_tablebase_terminal() { 101 } else { 1 };
-                    if wl < 0.0 {
-                        -plies
-                    } else {
-                        plies
-                    }
-                });
-                ThinkingInfo {
-                    // px0 `Search::SendUciInfo` (`search.cc:249-336`).
-                    depth: (self.worker_state.cum_depth.load(Ordering::Acquire) / total_playouts.max(1)) as i32,
-                    seldepth: self.worker_state.max_depth.load(Ordering::Acquire) as i32,
-                    time: elapsed.as_millis() as i64,
-                    nodes: if meta.params.per_pv_counters {
-                        child.map_or(0, Node::n) as i64
-                    } else {
-                        total_playouts as i64 + meta.initial_visits as i64
-                    },
-                    nps: nps.unwrap_or(-1),
-                    eps: nps.map_or(-1, |_| {
-                        let evaluations = self.worker_state.network_evaluations.load(Ordering::Acquire);
-                        let elapsed_ms = first_batch.expect("nps needs first batch").elapsed().as_millis() as u64;
-                        (evaluations.saturating_mul(1000) / elapsed_ms) as i32
-                    }),
-                    mate,
-                    score: mate.is_none().then_some(score),
-                    wdl: Some(wdl_from_wl_d(wl, d)),
-                    tb_hits: 0,
-                    pv: principal_variation(&tree, &meta.params, edge_idx),
-                    multipv: if meta.params.multi_pv > 1 { index as i32 + 1 } else { -1 },
-                    ..ThinkingInfo::default()
+        let infos = best_child_edges(
+            &tree,
+            root,
+            &meta.params,
+            meta.params.multi_pv,
+            0,
+            &meta.root_move_filter,
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(index, edge_idx)| {
+            let child = tree.node(root).child(edge_idx).map(|idx| tree.node(idx));
+            let default_wl = -tree.node(root).wl();
+            let default_d = tree.node(root).d();
+            let mut wl = child.filter(|node| node.n() > 0).map_or(default_wl, Node::wl);
+            let mut d = child.filter(|node| node.n() > 0).map_or(default_d, Node::d);
+            let default_q = -tree.node(root).q(-draw_score(&tree, &meta.params, false));
+            let q = child
+                .filter(|node| node.n() > 0)
+                .map_or(default_q, |node| node.q(draw_score(&tree, &meta.params, false)));
+            let score = score_from_wdl(meta.params.score_type, &mut wl, &mut d, q, has_wdl);
+            let mate = child.filter(|node| node.is_terminal() && wl != 0.0).map(|node| {
+                let plies = node.m().round() as i32 / 2 + if node.is_tablebase_terminal() { 101 } else { 1 };
+                if wl < 0.0 {
+                    -plies
+                } else {
+                    plies
                 }
-            })
-            .collect();
+            });
+            ThinkingInfo {
+                // px0 `Search::SendUciInfo` (`search.cc:249-336`).
+                depth: (self.worker_state.cum_depth.load(Ordering::Acquire) / total_playouts.max(1)) as i32,
+                seldepth: self.worker_state.max_depth.load(Ordering::Acquire) as i32,
+                time: elapsed.as_millis() as i64,
+                nodes: if meta.params.per_pv_counters {
+                    child.map_or(0, Node::n) as i64
+                } else {
+                    total_playouts as i64 + meta.initial_visits as i64
+                },
+                nps: nps.unwrap_or(-1),
+                eps: nps.map_or(-1, |_| {
+                    let evaluations = self.worker_state.network_evaluations.load(Ordering::Acquire);
+                    let elapsed_ms = first_batch.expect("nps needs first batch").elapsed().as_millis() as u64;
+                    (evaluations.saturating_mul(1000) / elapsed_ms) as i32
+                }),
+                mate,
+                score: mate.is_none().then_some(score),
+                wdl: Some(wdl_from_wl_d(wl, d)),
+                tb_hits: 0,
+                pv: principal_variation(&tree, &meta.params, edge_idx),
+                multipv: if meta.params.multi_pv > 1 { index as i32 + 1 } else { -1 },
+                ..ThinkingInfo::default()
+            }
+        })
+        .collect();
         let mut bestmove = BestMoveInfo::new(best);
         bestmove.ponder = ponder;
         self.outputs.push(SearchOutput { bestmove, infos });
@@ -585,14 +613,18 @@ impl ClassicSearch {
             let stop = Arc::clone(&stop);
             let stop_controller = Arc::clone(&stop_controller);
             handles.push(thread::spawn(move || {
-                let params = meta.lock().expect("meta lock").params.clone();
+                let (params, root_move_filter) = {
+                    let meta = meta.lock().expect("meta lock");
+                    (meta.params.clone(), meta.root_move_filter.clone())
+                };
                 let mut tree = tree.lock().expect("tree lock");
-                let mut worker = SearchWorker::new_with_stop_controller(
+                let mut worker = SearchWorker::new_with_stop_controller_and_root_move_filter(
                     &mut tree,
                     backend.as_ref(),
                     &params,
                     worker_state.as_ref(),
                     Some(Arc::clone(&stop_controller)),
+                    &root_move_filter,
                 );
                 if worker.run_blocking().is_err() {
                     stop.store(true, Ordering::Release);
@@ -646,9 +678,26 @@ impl SearchBase for ClassicSearch {
 
         {
             let tree = self.tree.lock().expect("tree lock");
+            // px0 `StringsToMovelist` (`src/search/classic/wrapper.cc:78-100`)
+            // parses at the root, retains legal requests only, and rejects a
+            // non-empty `searchmoves` list if none of its moves are legal.
+            let board = tree.history().last().board();
+            let legal_moves = board.generate_legal_moves();
+            let mut root_move_filter = Vec::with_capacity(params.searchmoves.len());
+            for move_text in &params.searchmoves {
+                if let Ok(mv) = board.parse_move(move_text) {
+                    if legal_moves.contains(&mv) {
+                        root_move_filter.push(mv);
+                    }
+                }
+            }
+            if !params.searchmoves.is_empty() && root_move_filter.is_empty() {
+                return Err(EnginError::Uci("No legal searchmoves.".into()));
+            }
             let mut meta = self.meta.lock().expect("meta lock");
             meta.move_start = Instant::now();
             meta.initial_visits = tree.node(tree.current_head()).n();
+            meta.root_move_filter = root_move_filter;
             *self.worker_state.first_batch.lock().expect("first batch lock") = None;
             meta.stoppers_hints.reset();
             self.worker_state.total_playouts.store(0, Ordering::Release);
