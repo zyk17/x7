@@ -11,14 +11,14 @@
 - `C:\Users\Administrator\projects\px0`
 - `C:\Users\Administrator\projects\pxzero-training`
 
-当前 P4 已有 px0 classic worker、真实 `124x10x9` ONNX backend、collision、prefetch 与单个
-`SearchWorker` 内的常驻 task-worker 接线；多 `SearchWorker` 的稳定 tree access boundary、
-`MakeSolid` 和实时 UCI responder 仍未完成。主 UCI 使用 px0 名称 `WeightsFile` 配置
-ONNX 权重，并会在下一条 `position` 前加载它；`UniformBackend` 只用于测试，不能把其
-搜索结果当作模型结果。
+P4 classic 搜索基建已收口：真实 `124x10x9` ONNX backend、minibatch、NN cache、prefetch、
+collision、task worker、多 `SearchWorker` tree phase、`MakeSolid`、watchdog 实时 UCI info 和
+WDL/contempt display 均已按 px0 对照实现。主 UCI 使用 px0 名称 `WeightsFile` 配置 ONNX 权重，
+并会在下一条 `position` 前加载它；`UniformBackend` 只用于测试，不能把其搜索结果当作模型结果。
 
-当前结束搜索后的 `info` 会输出 px0 语义的平均/选择深度、NPS/EPS、WDL、PV、MultiPV 与默认
-`ScoreType/WDL_mu` 分数；实时 `info` 与可变 contempt/WDL calibration 仍是 P4 未完成项。
+`info` 输出 px0 语义的平均/选择深度、NPS/EPS、WDL、PV、MultiPV、`ScoreType/WDL_mu` 与
+可配置的 `ContemptMode`/WDL calibration。`go nodes N` 是 px0 的 completed-iteration 下限，
+不承诺 root visits 严格等于 `N`。
 
 ```text
 setoption name WeightsFile value data/x7.onnx

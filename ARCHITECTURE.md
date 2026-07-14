@@ -10,9 +10,9 @@
 2. `engin` 外围：`GameState`、UCI controller/loop、`SearchBase` 与 px0
    `NetworkAsBackendComputation`。P4 的真实 history、124-plane 编码、policy 映射、ONNX batch 和
    `WeightsFile -> OnnxBackend` 子集已接入。
-3. `engin/mcts`：px0 `src/search` 的 worker 主线；单个 worker 内的 collision/task-worker/
-   prefetch 已接线，多 worker tree access boundary 仍待翻译。
-4. px0 已有的 NN cache、prefetch、tree reuse 与并发。
+3. `engin/mcts`：px0 `src/search` 的 classic worker 主线；minibatch、collision、task-worker、
+   prefetch、tree reuse、watchdog 与多 worker tree phase 已接线。
+4. px0 已有的 NN cache、prefetch、tree reuse 与并发；后续改动只能在明确引用的 px0 语义上继续。
 5. `pxzero-training`：数据、训练与 ONNX 导出契约。
 
 只有 px0 主线翻译完成并有对拍测试后，才允许比较 lc0 或 KataGo，并将明确记录的差异作为独立优化事项。
@@ -21,7 +21,7 @@
 
 `crates/xiangqi_core`：px0 `src/chess` 的 Rust 翻译，是唯一规则真相。
 
-`crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。当前 P2 UCI、P3 单 worker 树，以及 P4 的 ONNX、collision、prefetch 和单 worker task-worker 流水线已存在；多 SearchWorker 的稳定 tree access boundary 仍待逐函数翻译。`WeightsFile` 保持 px0 的 UCI 名称，但只接受本项目 ONNX 模型，不实现 px0 的 backend registry 或 protobuf weight discovery。P4 当前会在搜索结束时按 px0 `SendUciInfo` 生成深度、NPS/EPS、WDL、PV、MultiPV 与默认 `ScoreType/WDL_mu`。实时 info 与可变 contempt/WDL calibration 要等 px0 OptionsDict 与 worker 并发边界翻译完成后再接入。
+`crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。P2 UCI、P3 tree 与 P4 的 ONNX、collision、prefetch、task-worker、多 SearchWorker tree phase、watchdog 和 WDL display 已接入。`WeightsFile` 保持 px0 的 UCI 名称，但只接受本项目 ONNX 模型，不实现 px0 的 backend registry、protobuf weight 或 autodiscover。P4 的 `SendUciInfo` 已生成深度、NPS/EPS、WDL、PV、MultiPV、ScoreType 与完整 WDL calibration display 语义。
 
 `nn/`：pxzero-training 数据/训练/导出契约的 Rust/Python 侧接入；不进入规则或搜索热路径。
 

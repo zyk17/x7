@@ -1,8 +1,9 @@
 # NextStep
 
-## 当前阶段：P4 单 worker 搜索、collision、prefetch 与常驻 task workers 已接线；多 SearchWorker tree boundary 未闭合
+## 当前阶段：P4 px0 classic 搜索基建已收口
 
-P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `ClassicSearch`** 已接入 UCI：
+P0–P4 已完成当前约定范围的逐函数 px0 翻译。P4 的 **worker 七阶段 + 异步
+`ClassicSearch`** 已接入 UCI：
 
 - 测试用 `UniformBackend` 下，`go nodes` / `go movetime` / `go wtime` / `go infinite`+`stop` 可返回 `bestmove`
 - 主 UCI 不再使用 Uniform fallback；`WeightsFile` 可在下一条 `position` 前加载正式 ONNX backend
@@ -51,9 +52,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   生命周期的 `ResetTasks` 已翻译，对应 `src/search/classic/search.h:205-249,367-445`、
   `search.cc:1069-1140,1322-1347,1464-1508,1828-1864`；主 worker 在对应阶段等待
   常驻 task workers 完成。
-- `PickNodesToExtendTask` 现在显式写入 caller receiver，对应
-  `src/search/classic/search.h:401-406`；下一步可直接将 gathering task 的结果写入
-  `PickTask.results`。
+- `PickNodesToExtendTask` 显式写入 caller receiver，gathering task 的结果通过
+  `PickTask.results` 汇合，对应 `src/search/classic/search.h:401-406`。
 - `PickNodesToExtend` 在主选择完成后等待并汇合各 `PickTask.results`，对应
   `src/search/classic/search.cc:1494-1508`；task split/dispatch 已接线。
 - `PickNodesToExtendTask` 的 DFS state 改为显式 `TaskWorkspace` 参数，对应
@@ -67,8 +67,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   `src/search/classic/search.cc:1069-1140,1182-1185,1464-1492`。
 - gathering split 已按 px0 `MinimumPickingWork=1`、`MinimumRemainingPickingWork=20`、
   `MAX_TASKS=100` 及 passed-off/completed-visits 条件翻译，对应
-  `src/search/classic/params.cc:604-612`、`search.cc:1828-1864`；常驻 task worker
-  已接线，多 SearchWorker 的并发树访问边界尚未接线。
+  `src/search/classic/params.cc:604-612`、`search.cc:1828-1864`；常驻 task worker 与
+  多 SearchWorker shared-tree phase 均已接线。
 - processing split 已按 px0 `MinimumProcessingWork=20`、`MinimumPerTaskProcessing=8`
   将前段交给 `PickTask::Processing`、主 worker 保留尾段，对应
   `src/search/classic/params.cc:604-612`、`search.cc:1322-1347`；正常搜索由
@@ -98,8 +98,7 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   px0 `MaxConcurrentSearchers`：slot 覆盖 gather/collision/prefetch，NN compute 前归还；
   `SearchSpinBackoff=false` 保持 hard-spin 默认值，对应
   `src/search/classic/params.cc:399-404,604-604,525-526,632-632`、
-  `src/search/classic/search.cc:1142-1195`。当前单 SearchWorker 下行为不变，作为后续多 worker
-  tree boundary 的先决共享状态。
+  `src/search/classic/search.cc:1142-1195`；多 SearchWorker 已消费同一共享状态。
 - `WorkerSearchState::backend_waiting_counter`、`IdlingMinimumWork=0` 与
   `ThreadIdlingThreshold=1` 已翻译：存在其他 search worker 时，当前 worker 会在 backend
   idle 前提前结束 gather；计数覆盖 collision/prefetch/NN compute，对应
@@ -147,8 +146,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   324-350`）。`MultiPV`、`PerPVCounters` 的 UCI 参数与多行 root 排序已接线
   （`src/search/classic/params.cc:360-368,585-586`、`search.cc:239-246,705-808`）。当前只在
   搜索结束时发送；`ScoreType` 的全部 choice 和零 contempt 默认下的 `WDL_mu` 公式已翻译
-  （`src/search/classic/params.cc:587-595`、`search.cc:206-236,275-336`）。可变 contempt/WDL
-  calibration OptionsDict 仍待翻译。
+  （`src/search/classic/params.cc:587-595`、`search.cc:206-236,275-336`）；可变
+  contempt/WDL calibration OptionsDict 已接入。
 - `engin/src/engine.rs` 已接入非 owning 的 `UciResponderForwarder`，以 Rust mutex 表达
   px0 `Engine::UciPonderForwarder` 的注册、注销和搜索线程生命周期约束（`src/engine.cc:81-136,
   238-250`）；`ClassicSearch` 已持有对应 thread-safe callback 边界（`src/search/search.h:45-99`）。
@@ -160,71 +159,14 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   （`src/utils/fastmath.h:42-92`）；classic `ComputeCpuct` 已改用 `FastLog`
   （`src/search/classic/search.cc:426-433`），不再以 Rust libm 改变 PUCT 数值路径。
 
-### P4 下一入口
+### P4 验收与后续
 
-- 已校正 `SearchParams` 的 px0 默认值与 root PUCT 三元组：`FpuValueAtRoot=1.0`、
-  `MaxCollisionVisitsScalingEnd=145000`，以及 `CpuctBase/FactorAtRoot` 在
-  `RootHasOwnCpuctParams` 下的取值；对应 `src/search/classic/params.h:58-65`、
-  `params.cc:543-583,644-655`。
-
-- 已完成 `go searchmoves` 的合法根着法解析和选择/PV/输出共用过滤；对应
-  `src/search/classic/wrapper.cc:78-100`、`search.cc:721-724,1668-1740`。下一项是
-  多 SearchWorker 的稳定 node 存储边界，不以假并行替代。
-- root 尚无已评估 child 的 early-stop/terminal fallback 同样不得逃逸 `searchmoves`；对应
-  `src/search/classic/wrapper.cc:78-100`、`search.cc:721-724`。
-
-- `classic/node.h:127-339`、`search.cc:1494-1508`：继续核对固化后的所有 child slot 在多
-  SearchWorker selection/task split 下的访问边界；Rust 已有 stable `Box` arena，不再保留整轮锁
-- `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
-- watchdog 运行中的 `MaybeOutputInfo` 已按 root best edge、平均 depth、seldepth 和 5 秒
-  最小频率判断发送；锁顺序保持 tree -> current-best，避免与 backup 反向（`search.cc:51,
-  357-382,2211-2249`）。剩余是可变 contempt/WDL calibration OptionsDict。
-- `SearchWorker::UpdateCounters` 已在 stopper 后按 px0 对 collision-only iteration 退让 10ms，
-  避免无有效 leaf 时空转并污染运行统计（`src/search/classic/search.cc:2331-2364`）。
-- `NodesPerSecondLimit` 已从 UCI option 传入 `SearchParams`，并仅在每轮 backup/counter
-  更新后以 first-batch 计时做 1ms 节流；默认 `0` 禁用，与 px0 一致
-  （`src/search/classic/params.cc:473-477,621`、`search.cc:1209-1231`）。
-- 共享 `NodeTree` 已改用 read/write boundary：initialize、gather、fetch/backup 仍独占，
-  `MaybePrefetchIntoCache` 改为只读树锁，允许多个 worker 并发遍历候选缓存项；对应
-  px0 `SharedMutex::SharedLock`（`src/search/classic/search.cc:1977-2008`）。
-- `StartThreads(0)` 的默认 search worker 数已使用 px0 公式：backend 建议值加上一个
-  非 CPU backend worker，不再少启动 GPU pipeline 所需 worker
-  （`src/search/classic/search.cc:874-896`）。
-- WDL 重标定的通用 `WDLRescale` 已逐式翻译并覆盖数值 guard；下一步只可从该 helper
-  接入 `FetchSingleNodeResult`，不得另写显示层近似公式
-  （`src/search/classic/search.cc:202-236,2117-2143`）。
-- NN `FetchSingleNodeResult` 已在 WDL 翻转后、policy 写入前接入零 contempt 默认的
-  WDL rescale；可变 diff 继续等待完整 contempt mode/OptionsDict 翻译
-  （`src/search/classic/search.cc:2117-2154`）。
-- `ContemptMode::Play` 已在每次 `StartSearch` 按 root side、ponder 与 infinite 解析为
-  worker 实际使用的 White/Black/None，避免将配置态直接带入 backup
-  （`src/search/classic/search.cc:156-175,2131-2143`）。
-- `AccurateWDLRescaleParams` 已逐式翻译为纯参数计算，并以 px0 默认输入验证得到
-  neutral `ratio=1/diff=0`；下一项是 UCI 参数映射和 simplified Elo 分支
-  （`src/search/classic/params.cc:92-115,688-703`）。
-- `SimplifiedWDLRescaleParams` 与 regular-to-game-pair Elo 变换也已逐式翻译；两条
-  纯计算分支现齐备，下一项只剩按 px0 OptionsDict 选择并传入 SearchParams
-  （`src/search/classic/params.cc:120-174,688-703`）。
-- `GetContempt` 已按 px0 解析 `[opponent=]value` 列表、默认 rating advantage 与首次
-  不区分大小写匹配；下一项是将该结果连至 UCI options 和 WDL 分支选择
-  （`src/search/classic/params.cc:57-89`）。
-- 可变 contempt/WDL calibration OptionsDict 已完整传入 SearchParams：按
-  `WDLCalibrationElo` 选择 accurate/simplified 分支，并在 worker 构造前冻结为
-  ratio/diff/max_s（`src/search/classic/params.cc:57-174,688-703`）。
-- `CollectCollisions` 已恢复为 shared-tree 写阶段，再进入只读 prefetch；这保持
-  gather 到 collision hand-off 不会被另一 SearchWorker 的 backup/cancel 打断
-  （`src/search/classic/search.cc:1183-1193,1977-2008`）。下一项只验证完整
-  out-of-order 与多 SearchWorker 的组合时序。
-- 两个 SearchWorker 的 root cache-hit out-of-order 回归已覆盖：完成后 root
-  `NInFlight` 与 shared collision list 均为零，验证 gather 内即时回传和另一 worker 的
-  tree phase 可正确汇合（`src/search/classic/search.cc:1268-1419,1977-1987,2109-2173`）。
-- `ContemptMode` 的四种 px0 choice 与 `WDLEvalObjectivity` 已经由 UCI 映射到
-  `SearchParams`；`SendUciInfo` 以 resolved mode、root side 和 objectivity 重建展示侧 WDL，
-  不改变已 backup 的内部 WDL（`src/search/classic/params.h:117-128`、
-  `params.cc:606-620,688-705`、`search.cc:275-291`）。
-- Rust 的 non-owning UCI responder 析构边界已收口：有限搜索在注销前完成，infinite 搜索先
-  `Stop` 再 `Wait`，不能再用 `Abort` 吞掉最终 `bestmove`；position 替换仍使用 px0 `Abort`
-  抑制旧搜索输出（`src/search/classic/search.cc:1019-1041`、`src/engine.cc:187-197`）。
+- 验收已执行：`cargo test -p engin --all-targets -- --test-threads=1`、`cargo clippy -p engin
+  --all-targets -- -D warnings`、规则层非-perft 回归、release `perft_starting_pos` d1–d5。
+- `xiangqi_core` 的 debug 全量执行会重复 1.33 亿节点的 d5 perft，超过常规审计时间窗；该项已用
+  release 测试验证。复杂 FEN perft 留作专门规则回归，不与 P4 搜索验收混在一起。
+- 后续阶段尚未定义。开始任何功能或性能改动前，先在 `TODO.md` 新建阶段、列出 px0 连续源码区间
+  与验收命令；不得以 P4 为由引入 lc0/KataGo 结构。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。

@@ -186,7 +186,9 @@
   874-1041`）。
 - [x] 翻译 watchdog 内 `MaybeOutputInfo` 的 root-edge/depth/seldepth/5 秒频率判断，且保持
   tree -> current-best 的同步顺序（`src/search/classic/search.cc:51,357-382,2211-2249`）。
-- [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
+- [x] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径；P4
+  closed audit 覆盖 shared-worker OOO/collision、async lifecycle、UCI 与 ONNX smoke
+  （`src/search/classic/search.h:201-448`、`search.cc:1069-2364`）。
 - [x] 对 fixed-nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection 交互，核对
   solid child 不会造成 collision/in-flight 泄漏或重复扩展
   （`src/search/classic/node.h:451-523,556-626`、`search.cc:1494-1864`）。
