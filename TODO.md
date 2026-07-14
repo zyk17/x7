@@ -78,6 +78,9 @@
   `search.cc:1551-1827`）。
 - [x] 翻译 `RunTasks` 的领取、gathering/processing 分派与完成回写；当前先由主 worker
   同步消费队列（`src/search/classic/search.cc:1069-1140`）。
+- [x] 翻译 gathering split 的 px0 work-size 参数、100-task reservation 与
+  passed-off/completed-visits 条件（`src/search/classic/params.cc:604-612`、
+  `search.cc:1828-1864`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

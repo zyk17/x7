@@ -214,6 +214,8 @@ pub struct PickTaskQueue {
 }
 
 impl PickTaskQueue {
+    const MAX_TASKS: usize = 100;
+
     /// px0 `SearchWorker::ResetTasks` (`src/search/classic/search.cc:1466-1473`).
     pub fn reset(&self) {
         self.task_count.store(0, Ordering::Release);
@@ -223,10 +225,16 @@ impl PickTaskQueue {
     }
 
     /// px0 task enqueue (`src/search/classic/search.cc:1843-1856`).
-    pub fn push(&self, task: PickTask) {
-        self.tasks.lock().expect("pick task queue lock").push(task);
+    pub fn push(&self, task: PickTask) -> bool {
+        let mut tasks = self.tasks.lock().expect("pick task queue lock");
+        if tasks.len() >= Self::MAX_TASKS {
+            return false;
+        }
+        tasks.push(task);
+        drop(tasks);
         self.task_count.fetch_add(1, Ordering::AcqRel);
         self.task_added.notify_all();
+        true
     }
 
     /// px0 task claim (`src/search/classic/search.cc:1076-1093`).
@@ -524,9 +532,6 @@ impl<'a> SearchWorker<'a> {
         if collision_limit == 0 {
             return Ok(());
         }
-        if self.task_workers > 0 {
-            return Err(EnginError::PortIncomplete("P4 PickNodesToExtend task workers"));
-        }
         // px0 `SearchWorker::PickNodesToExtend` begins every gather with
         // `ResetTasks` (`src/search/classic/search.cc:1485-1492`).
         self.task_queue.reset();
@@ -636,6 +641,8 @@ impl<'a> SearchWorker<'a> {
         let mut node_idx = Some(root_idx);
         let mut is_root_node = is_root;
         let mut max_limit = u32::MAX;
+        let mut passed_off = 0u32;
+        let mut completed_visits = 0u32;
 
         while !workspace.current_path.is_empty() {
             let current_idx = node_idx.expect("path has a node");
@@ -659,6 +666,7 @@ impl<'a> SearchWorker<'a> {
                             current_idx,
                             (workspace.current_path.len() + base_depth as usize) as u16,
                         ));
+                        completed_visits += 1;
                     }
                     if cur_limit > 0 {
                         let maxvisit = if cur_limit == collision_limit && base_depth == 0 && max_limit > cur_limit {
@@ -672,6 +680,7 @@ impl<'a> SearchWorker<'a> {
                             cur_limit,
                             maxvisit,
                         ));
+                        completed_visits += cur_limit;
                     }
                     node_idx = self.tree.node(current_idx).parent();
                     workspace.current_path.pop();
@@ -792,12 +801,62 @@ impl<'a> SearchWorker<'a> {
                             item.moves_to_visit = workspace.moves_to_path.clone();
                             item.moves_to_visit.push(self.tree.node(current_idx).edge(best_idx).mv);
                             receiver.push(item);
+                            completed_visits += 1;
                         }
                     }
                     if best_idx as isize > *workspace.vtp_last_filled.last().expect("last filled")
                         && workspace.visits_to_perform.last().expect("visits")[best_idx] > 0
                     {
                         *workspace.vtp_last_filled.last_mut().expect("last filled") = best_idx as isize;
+                    }
+                }
+                // px0 `search.cc:1828-1864`: pass sufficiently large child
+                // subtrees to gathering workers, while retaining enough work
+                // for the current DFS task. The queue's MAX_TASKS cap is the
+                // same classic-search reservation (100).
+                if self.task_workers > 0 {
+                    let min_work = u32::try_from(self.params.minimum_work_size_for_picking)
+                        .expect("px0 MinimumPickingWork is non-negative");
+                    let min_remaining = u32::try_from(self.params.minimum_remaining_work_size_for_picking)
+                        .expect("px0 MinimumRemainingPickingWork is non-negative");
+                    let last_filled = *workspace.vtp_last_filled.last().expect("last filled");
+                    if last_filled >= 0 {
+                        for edge_idx in 0..=last_filled as usize {
+                            let child_limit = workspace.visits_to_perform.last().expect("visits")[edge_idx];
+                            let assigned = passed_off + completed_visits;
+                            let Some(remaining) = collision_limit.checked_sub(assigned) else {
+                                break;
+                            };
+                            let Some(required_remaining) = collision_limit.checked_sub(min_remaining) else {
+                                break;
+                            };
+                            if child_limit <= min_work
+                                || child_limit >= remaining.saturating_mul(2) / 3
+                                || child_limit.saturating_add(assigned) >= required_remaining
+                            {
+                                continue;
+                            }
+                            let child_idx = self
+                                .tree
+                                .node(current_idx)
+                                .child(edge_idx)
+                                .unwrap_or_else(|| self.tree.arena_mut().spawn_child(current_idx, edge_idx));
+                            if self.tree.node(child_idx).n() == 0 || self.tree.node(child_idx).is_terminal() {
+                                continue;
+                            }
+                            let mut moves_to_base = workspace.moves_to_path.clone();
+                            moves_to_base.push(self.tree.node(current_idx).edge(edge_idx).mv);
+                            let task = PickTask::gathering(
+                                child_idx,
+                                (workspace.current_path.len() + base_depth as usize) as u16,
+                                moves_to_base,
+                                child_limit,
+                            );
+                            if self.task_queue.push(task) {
+                                workspace.visits_to_perform.last_mut().expect("visits")[edge_idx] = 0;
+                                passed_off += child_limit;
+                            }
+                        }
                     }
                 }
                 is_root_node = false;
@@ -1508,7 +1567,7 @@ mod tests {
         let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.task_queue.reset();
-        worker.task_queue.push(PickTask::gathering(root, 0, Vec::new(), 1));
+        assert!(worker.task_queue.push(PickTask::gathering(root, 0, Vec::new(), 1)));
         let mut workspace = TaskWorkspace::default();
 
         worker.run_queued_tasks(&mut workspace).expect("run gathering task");

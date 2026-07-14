@@ -61,6 +61,10 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `RunTasks` 的领取、按 gathering/processing 分派和完成回写已落地，对应
   `src/search/classic/search.cc:1069-1140`；目前由主 worker 同步消费队列，task split 与
   常驻 task worker 尚未接线。
+- gathering split 已按 px0 `MinimumPickingWork=1`、`MinimumRemainingPickingWork=20`、
+  `MAX_TASKS=100` 及 passed-off/completed-visits 条件翻译，对应
+  `src/search/classic/params.cc:604-612`、`search.cc:1828-1864`；常驻 task worker
+  和并发树访问边界尚未接线。
 
 ### P4 下一入口
 
