@@ -167,6 +167,9 @@
   使用 `pb.gz` 而 engin 使用 ONNX，记录用于人工对照 nodes/PV/bestmove，不做不成立的
   数值相等断言（px0 `src/chess/uciloop.cc:178-254`、
   `src/search/classic/wrapper.cc:53-141`）。
+- [x] 翻译 px0 `Engine::UciPonderForwarder` 的非 owning responder 注册边界，并令
+  `ClassicSearch` 在 worker 生命周期内持有 thread-safe callback；注销前先停止/join 搜索
+  （`src/engine.cc:81-136,238-250`、`src/search/search.h:45-99`）。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [x] 对 fixed-nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection 交互，核对
   solid child 不会造成 collision/in-flight 泄漏或重复扩展

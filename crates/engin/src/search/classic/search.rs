@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use xiangqi_core::{GameState, Move};
 
-use crate::callbacks::{BestMoveInfo, ThinkingInfo, Wdl};
+use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo, Wdl};
 use crate::neural::backend::Backend;
 use crate::search::SearchBase;
 use crate::uci_loop::GoParams;
@@ -560,6 +560,10 @@ pub struct ClassicSearch {
     stop: Arc<AtomicBool>,
     stopper: Arc<Mutex<Option<ChainedSearchStopper>>>,
     stop_controller: Arc<SearchStopController>,
+    /// px0 `SearchBase::uci_responder_` (`src/search/search.h:45-99`). The
+    /// engine installs its forwarder before UCI starts a search; worker-side
+    /// watchdog output is added in the following P4 translation point.
+    responder: Option<Arc<dyn SearchResponder>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     infinite: AtomicBool,
     pub outputs: Vec<SearchOutput>,
@@ -585,6 +589,7 @@ impl ClassicSearch {
             stop,
             stopper: Arc::clone(&stopper),
             stop_controller: Arc::new(SearchStopController { meta, stopper }),
+            responder: None,
             threads: Mutex::new(Vec::new()),
             infinite: AtomicBool::new(false),
             outputs: Vec::new(),
@@ -594,6 +599,12 @@ impl ClassicSearch {
     pub fn total_root_visits(&self) -> u32 {
         let tree = self.tree.lock().expect("tree lock");
         tree.node(tree.current_head()).n()
+    }
+
+    /// px0 `SearchBase` receives its responder during search construction
+    /// (`src/search/search.h:45-55`). It is immutable while workers run.
+    pub fn set_uci_responder(&mut self, responder: Arc<dyn SearchResponder>) {
+        self.responder = Some(responder);
     }
 
     /// px0 `SearchBase::SetBackend` (`src/search/search.h:48-55`). Callers

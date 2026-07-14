@@ -1,7 +1,11 @@
-//! px0 `src/engine.cc:137-220` 的 P3 引擎接线。
+//! px0 `src/engine.cc:81-250` 的 P3/P4 引擎接线。
+
+use std::ptr::NonNull;
+use std::sync::{Arc, Mutex};
 
 use xiangqi_core::{GameState, STARTPOS_FEN};
 
+use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo};
 use crate::neural::backend::{Backend, UniformBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::classic::ClassicSearch;
@@ -10,9 +14,77 @@ use crate::uci_loop::UciOptions;
 use crate::uci_loop::{EngineController, GoParams, StringUciResponder};
 use crate::EnginError;
 
+/// px0 `Engine::UciPonderForwarder` (`src/engine.cc:81-136`).
+///
+/// px0 registers the UCI loop's responder with the engine, then classic
+/// search invokes that forwarder from its watchdog thread. Rust cannot retain
+/// the responder borrow in an `Arc` because `UciLoop` still owns it, so this
+/// keeps the same non-owning registration model. The mutex serializes worker
+/// output against UCI-loop output. `ClassicEngine::unregister_uci_responder`
+/// stops and joins search before clearing the pointer, which is the lifetime
+/// invariant that makes the erased borrow sound.
+struct UciResponderForwarder {
+    responder: Mutex<Option<NonNull<dyn StringUciResponder>>>,
+}
+
+// SAFETY: the only pointer is installed by `register`, is protected by the
+// mutex, and is cleared only after all search threads joined in `unregister`.
+// This is the Rust expression of px0's UciPonderForwarder ownership contract.
+unsafe impl Send for UciResponderForwarder {}
+// SAFETY: see the `Send` implementation above; responder calls are mutexed.
+unsafe impl Sync for UciResponderForwarder {}
+
+impl UciResponderForwarder {
+    fn register(&self, responder: &mut dyn StringUciResponder) {
+        let mut slot = self.responder.lock().expect("uci responder lock");
+        assert!(slot.is_none(), "px0 UciPonderForwarder already has a responder");
+        // SAFETY: unregister joins all search threads before clearing this
+        // pointer, and UciLoop owns the responder for the registration span.
+        let pointer = unsafe {
+            std::mem::transmute::<NonNull<dyn StringUciResponder>, NonNull<dyn StringUciResponder + 'static>>(
+                NonNull::from(responder),
+            )
+        };
+        *slot = Some(pointer);
+    }
+
+    fn unregister(&self, responder: &mut dyn StringUciResponder) {
+        let mut slot = self.responder.lock().expect("uci responder lock");
+        let expected = NonNull::from(responder).cast::<()>();
+        let actual = slot
+            .as_ref()
+            .map(|pointer| pointer.cast::<()>())
+            .expect("px0 UciPonderForwarder has no responder");
+        assert_eq!(actual, expected, "px0 UciPonderForwarder responder mismatch");
+        *slot = None;
+    }
+}
+
+impl SearchResponder for UciResponderForwarder {
+    fn output_best_move(&self, info: &BestMoveInfo) {
+        let slot = self.responder.lock().expect("uci responder lock");
+        let Some(mut responder) = *slot else {
+            return;
+        };
+        // SAFETY: `register`/`unregister` maintain the documented pointer
+        // lifetime invariant and the mutex serializes all callbacks.
+        unsafe { responder.as_mut().output_best_move(info) };
+    }
+
+    fn output_thinking_info(&self, infos: &[ThinkingInfo]) {
+        let slot = self.responder.lock().expect("uci responder lock");
+        let Some(mut responder) = *slot else {
+            return;
+        };
+        // SAFETY: see `output_best_move`.
+        unsafe { responder.as_mut().output_thinking_info(infos) };
+    }
+}
+
 /// px0 `Engine` 的 P3 子集：搜索 + UCI controller。
 pub struct ClassicEngine {
     search: ClassicSearch,
+    uci_forwarder: Arc<UciResponderForwarder>,
     position: Option<GameState>,
     unavailable_reason: Option<String>,
     uci_weights_file: Option<String>,
@@ -21,8 +93,14 @@ pub struct ClassicEngine {
 
 impl ClassicEngine {
     pub fn with_backend(backend: Box<dyn Backend>) -> Self {
+        let uci_forwarder = Arc::new(UciResponderForwarder {
+            responder: Mutex::new(None),
+        });
+        let mut search = ClassicSearch::new(backend);
+        search.set_uci_responder(Arc::clone(&uci_forwarder) as Arc<dyn SearchResponder>);
         Self {
-            search: ClassicSearch::new(backend),
+            search,
+            uci_forwarder,
             position: None,
             unavailable_reason: None,
             uci_weights_file: None,
@@ -40,8 +118,14 @@ impl ClassicEngine {
     /// px0 configures a real backend before search (`src/engine.cc:153-167`).
     /// Main UCI must not silently search with the UniformBackend test stub.
     pub fn unavailable() -> Self {
+        let uci_forwarder = Arc::new(UciResponderForwarder {
+            responder: Mutex::new(None),
+        });
+        let mut search = ClassicSearch::new(Box::new(UniformBackend::default()));
+        search.set_uci_responder(Arc::clone(&uci_forwarder) as Arc<dyn SearchResponder>);
         Self {
-            search: ClassicSearch::new(Box::new(UniformBackend::default())),
+            search,
+            uci_forwarder,
             position: None,
             unavailable_reason: Some("WeightsFile is not configured".into()),
             uci_weights_file: None,
@@ -92,9 +176,17 @@ impl ClassicEngine {
 }
 
 impl EngineController for ClassicEngine {
-    fn register_uci_responder(&mut self, _responder: &mut dyn StringUciResponder) {}
+    fn register_uci_responder(&mut self, responder: &mut dyn StringUciResponder) {
+        self.uci_forwarder.register(responder);
+    }
 
-    fn unregister_uci_responder(&mut self, _responder: &mut dyn StringUciResponder) {}
+    fn unregister_uci_responder(&mut self, responder: &mut dyn StringUciResponder) {
+        // px0's UCI loop normally outlives Engine. Rust permits either drop
+        // order, so make the worker lifetime explicit before invalidating the
+        // non-owning forwarder pointer (`engine.cc:127-136,247-250`).
+        let _ = self.search.abort_search();
+        self.uci_forwarder.unregister(responder);
+    }
 
     fn set_uci_options(&mut self, options: &UciOptions) -> Result<(), EnginError> {
         // px0 always owns a configured backend manager. `ClassicEngine::uniform`

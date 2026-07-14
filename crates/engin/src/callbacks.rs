@@ -80,3 +80,14 @@ impl Default for ThinkingInfo {
         }
     }
 }
+
+/// Thread-safe output boundary owned by classic search.
+///
+/// px0 `SearchBase` stores a `UciResponder*` for the full search lifetime
+/// (`src/search/search.h:45-99`), so the watchdog may emit `info` and
+/// `bestmove` independently of the UCI command loop. Rust uses this separate
+/// trait because the UCI loop still owns the concrete mutable responder.
+pub trait SearchResponder: Send + Sync {
+    fn output_best_move(&self, info: &BestMoveInfo);
+    fn output_thinking_info(&self, infos: &[ThinkingInfo]);
+}
