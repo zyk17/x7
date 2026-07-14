@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use xiangqi_core::{GameState, Move};
 
-use crate::callbacks::{BestMoveInfo, ThinkingInfo};
+use crate::callbacks::{BestMoveInfo, ThinkingInfo, Wdl};
 use crate::neural::backend::Backend;
 use crate::search::SearchBase;
 use crate::uci_loop::GoParams;
@@ -50,6 +50,53 @@ fn orient_move(mv: Move, flip: bool) -> Move {
     } else {
         mv
     }
+}
+
+/// px0 `Search::SendUciInfo` builds each principal variation by repeatedly
+/// selecting the best no-temperature child (`src/search/classic/search.cc:343-350`).
+/// `Move::NULL` is never appended: a dangling edge ends the PV exactly as it
+/// does in px0.
+fn principal_variation(tree: &NodeTree, params: &SearchParams, first_edge: usize) -> Vec<Move> {
+    let mut pv = Vec::new();
+    let mut parent = tree.current_head();
+    let mut edge_idx = first_edge;
+    let mut depth = 0;
+    let mut flip = tree.history().is_black_to_move();
+
+    loop {
+        let mv = orient_move(tree.node(parent).edge(edge_idx).mv, flip);
+        if mv.is_null() {
+            break;
+        }
+        pv.push(mv);
+        let Some(child) = tree.node(parent).child(edge_idx) else {
+            break;
+        };
+        depth += 1;
+        flip = !flip;
+        let Some(next_edge) = best_child_edge(tree, child, params, depth) else {
+            break;
+        };
+        parent = child;
+        edge_idx = next_edge;
+    }
+    pv
+}
+
+/// px0 `Search::SendUciInfo` WDL integer conversion
+/// (`src/search/classic/search.cc:324-336`).
+fn wdl_from_wl_d(wl: f32, d: f32) -> Wdl {
+    let mut w = (500.0 * (1.0 + wl - d)).round() as i32;
+    let mut l = (500.0 * (1.0 - wl - d)).round() as i32;
+    w = w.max(0);
+    l = l.max(0);
+    let mut draw = 1000 - w - l;
+    if draw < 0 {
+        w = (w + draw / 2).clamp(0, 1000);
+        l = 1000 - w;
+        draw = 0;
+    }
+    Wdl { w, d: draw, l }
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -152,7 +199,7 @@ mod tests {
 
     use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
-    use super::{best_child_edge, orient_move, SearchParams};
+    use super::{best_child_edge, orient_move, wdl_from_wl_d, SearchParams};
     use crate::search::classic::node::NodeTree;
 
     static INIT: Once = Once::new();
@@ -186,6 +233,14 @@ mod tests {
     fn move_orientation_keeps_px0_null_ponder_null() {
         assert!(orient_move(xiangqi_core::Move::NULL, true).is_null());
     }
+
+    #[test]
+    fn wdl_integerization_matches_px0_send_uci_info() {
+        assert_eq!(
+            wdl_from_wl_d(0.1, 0.2),
+            crate::callbacks::Wdl { w: 450, d: 200, l: 350 }
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +252,7 @@ pub struct SearchOutput {
 struct SearchMeta {
     params: SearchParams,
     move_start: Instant,
+    initial_visits: u32,
     stoppers_hints: StoppersHints,
     search_active: bool,
 }
@@ -280,6 +336,7 @@ impl ClassicSearch {
         let meta = Arc::new(Mutex::new(SearchMeta {
             params: SearchParams::default(),
             move_start: Instant::now(),
+            initial_visits: 0,
             stoppers_hints: StoppersHints::default(),
             search_active: false,
         }));
@@ -334,22 +391,49 @@ impl ClassicSearch {
         let tree = self.tree.lock().expect("tree lock");
         let meta = self.meta.lock().expect("meta lock");
         let (best, ponder) = best_move(&tree, &meta.params);
-        let root_n = tree.node(tree.current_head()).n();
         if best.is_null() {
             return Ok(());
         }
         let elapsed = meta.move_start.elapsed();
+        let total_playouts = self.worker_state.total_playouts.load(Ordering::Acquire);
+        let first_batch = *self.worker_state.first_batch.lock().expect("first batch lock");
+        let nps = first_batch.and_then(|started| {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            (elapsed_ms > 0).then(|| (total_playouts.saturating_mul(1000) / elapsed_ms) as i32)
+        });
+        let root = tree.current_head();
+        let info = best_child_edge(&tree, root, &meta.params, 0).map(|edge_idx| {
+            let child = tree.node(root).child(edge_idx).map(|idx| tree.node(idx));
+            let default_wl = -tree.node(root).wl();
+            let default_d = tree.node(root).d();
+            let wl = child.filter(|node| node.n() > 0).map_or(default_wl, Node::wl);
+            let d = child.filter(|node| node.n() > 0).map_or(default_d, Node::d);
+            ThinkingInfo {
+                // `Search::SendUciInfo` (`search.cc:249-270`). ScoreType and
+                // its WDL rescaling are not translated until the px0 options
+                // layer exists, so no synthetic cp score is emitted here.
+                depth: (self.worker_state.cum_depth.load(Ordering::Acquire) / total_playouts.max(1)) as i32,
+                seldepth: self.worker_state.max_depth.load(Ordering::Acquire) as i32,
+                time: elapsed.as_millis() as i64,
+                nodes: total_playouts as i64 + meta.initial_visits as i64,
+                nps: nps.unwrap_or(-1),
+                eps: nps.map_or(-1, |_| {
+                    let evaluations = self.worker_state.network_evaluations.load(Ordering::Acquire);
+                    let elapsed_ms = first_batch.expect("nps needs first batch").elapsed().as_millis() as u64;
+                    (evaluations.saturating_mul(1000) / elapsed_ms) as i32
+                }),
+                wdl: Some(wdl_from_wl_d(wl, d)),
+                tb_hits: 0,
+                pv: principal_variation(&tree, &meta.params, edge_idx),
+                multipv: 1,
+                ..ThinkingInfo::default()
+            }
+        });
         let mut bestmove = BestMoveInfo::new(best);
         bestmove.ponder = ponder;
         self.outputs.push(SearchOutput {
             bestmove,
-            info: ThinkingInfo {
-                depth: self.worker_state.max_depth.load(Ordering::Acquire) as i32,
-                nodes: root_n as i64,
-                time: elapsed.as_millis() as i64,
-                multipv: 1,
-                ..ThinkingInfo::default()
-            },
+            info: info.unwrap_or_default(),
         });
         Ok(())
     }
@@ -451,6 +535,7 @@ impl SearchBase for ClassicSearch {
             let tree = self.tree.lock().expect("tree lock");
             let mut meta = self.meta.lock().expect("meta lock");
             meta.move_start = Instant::now();
+            meta.initial_visits = tree.node(tree.current_head()).n();
             *self.worker_state.first_batch.lock().expect("first batch lock") = None;
             meta.stoppers_hints.reset();
             self.worker_state.total_playouts.store(0, Ordering::Release);

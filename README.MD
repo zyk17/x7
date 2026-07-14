@@ -16,6 +16,10 @@
 ONNX 权重，并会在下一条 `position` 前加载它；`UniformBackend` 只用于测试，不能把其
 搜索结果当作模型结果。
 
+当前结束搜索后的 `info` 会输出 px0 语义的单 PV、平均/选择深度、NPS/EPS 与 WDL；实时
+`info`、MultiPV 和 `ScoreType/WDL_mu` 仍是 P4 未完成项，不能将暂未输出的 `score cp` 解释为
+静态分数或兼容旧引擎输出。
+
 ```text
 setoption name WeightsFile value data/x7.onnx
 position startpos

@@ -441,8 +441,8 @@ impl NodeArena {
 #[derive(Clone, Debug, Default)]
 pub struct NodeTree {
     arena: NodeArena,
-    gamebegin: Option<usize>,       // Root node of a game tree.
-    current_head: Option<usize>,    // A node which to start search from.
+    gamebegin: Option<usize>,    // Root node of a game tree.
+    current_head: Option<usize>, // A node which to start search from.
     history: PositionHistory,
 }
 

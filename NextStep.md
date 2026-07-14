@@ -117,6 +117,10 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   停止旧搜索后更新 backend，再构造新 `GameState`（`src/neural/shared_params.cc:43-80`、
   `src/engine.cc:153-167,187-197`、`src/search/search.h:48-55`）。本项目只接受 ONNX，未翻译
   px0 的 backend registry、protobuf 权重和 autodiscover。
+- `Search::SendUciInfo` 的单 PV 无温度选边、完整 PV 构造、平均/选择深度、首次 batch 后的
+  NPS/EPS、root inherited visits 和 WDL 整数化已翻译（`src/search/classic/search.cc:239-270,
+  324-350`）。当前只在搜索结束时发送；`MultiPV`、`ScoreType/WDL_mu` 和 worker 中的实时
+  responder 回调仍依赖完整 px0 OptionsDict/并发边界，不能伪造为固定 cp 分数。
 
 ### P4 下一入口
 
@@ -125,4 +129,6 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   selection 的树访问边界；当前 `Vec<Node>` + 整轮 `Mutex` 不能直接承载 px0 子树并发
 - `node.cc:245-289`：随稳定 node 存储边界翻译 `MakeSolid`；不能在当前 arena 上伪造
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
+- `search.cc:239-368`、`params.h:101-128`：MultiPV、ScoreType/WDL_mu 参数与实时
+  `MaybeOutputInfo` 回调；当前结束时单 PV 统计已完成
 - px0 二进制 fixed-nodes trace 对拍
