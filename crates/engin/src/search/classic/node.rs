@@ -101,10 +101,18 @@ pub struct Node {
     terminal: Terminal,
     lower_bound: GameResult,
     upper_bound: GameResult,
+    // win-loss, 视角: 刚刚落子的那个人（也就是带我们来到这个新局面的那个人）的视角。
+    // 因为在 MCTS 搜索树中，当我们反向传播（Backpropagation）更新父节点的胜率时，我们是用当前节点的评估值去更新父节点。
+    // 如果使用“刚刚落子的人”的视角，当前节点的胜负分（比如 +1 表示我赢了）可以直接加到父节点上，
+    // 不需要频繁地在每一步乘以 -1 去翻转正负号，从而极大地减少了代码出错（把正负号搞反）的概率。
     wl: f32,
     d: f32,
     m: f32,
+    // How many completed visits this node had.
     n: u32,
+    // (AKA virtual loss.) How many threads currently process this node (started
+    // but not finished). This value is added to n during selection which node
+    // to pick in MCTS, and also when selecting the best move.
     n_in_flight: u32,
 }
 

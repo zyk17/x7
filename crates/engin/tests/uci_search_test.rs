@@ -51,6 +51,33 @@ fn classic_engine_movetime_runs_at_least_one_simulation() {
     assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
 }
 
+/// px0 `MultiPV` returns the independently ranked root children from
+/// `Search::GetBestChildrenNoTemperature` (`search.cc:239-246,705-808`).
+#[test]
+fn classic_engine_multipv_emits_ranked_root_lines() {
+    ensure_init();
+    let mut options = UciOptions::populate_defaults();
+    let mut engine = ClassicEngine::uniform();
+    let mut responder = VecUciResponder::default();
+    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    uci.process_line("setoption name MultiPV value 2", "0.0.0")
+        .expect("multipv option");
+    uci.process_line("position startpos", "0.0.0").expect("position");
+    uci.process_line("go nodes 32", "0.0.0").expect("go nodes");
+    drop(uci);
+
+    assert!(
+        responder.responses.iter().any(|line| line.contains(" multipv 1 pv ")),
+        "responses: {:?}",
+        responder.responses
+    );
+    assert!(
+        responder.responses.iter().any(|line| line.contains(" multipv 2 pv ")),
+        "responses: {:?}",
+        responder.responses
+    );
+}
+
 #[test]
 fn classic_engine_rejects_non_positive_node_budget() {
     ensure_init();

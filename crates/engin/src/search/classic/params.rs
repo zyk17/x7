@@ -32,6 +32,9 @@ pub struct SearchParams {
     pub minimum_remaining_work_size_for_picking: i32,
     pub minimum_work_per_task_for_processing: i32,
     pub max_prefetch_batch: i32,
+    /// px0 `MultiPV` / `PerPVCounters` (`params.cc:360-368,585-586`).
+    pub multi_pv: usize,
+    pub per_pv_counters: bool,
 }
 
 fn mix(high: i32, low: i32, ratio: f32) -> i32 {
@@ -71,6 +74,8 @@ impl Default for SearchParams {
             minimum_remaining_work_size_for_picking: 20,
             minimum_work_per_task_for_processing: 8,
             max_prefetch_batch: 32,
+            multi_pv: 1,
+            per_pv_counters: false,
         }
     }
 }

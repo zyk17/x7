@@ -139,58 +139,79 @@ fn best_edge_rank(node: Option<&Node>) -> BestEdgeRank {
 /// px0 `Search::GetBestChildrenNoTemperature` / `GetBestChildNoTemperature`
 /// (`src/search/classic/search.cc:705-808`).
 pub(super) fn best_child_edge(tree: &NodeTree, parent: usize, params: &SearchParams, depth: usize) -> Option<usize> {
+    best_child_edges(tree, parent, params, 1, depth).into_iter().next()
+}
+
+/// px0 `Search::GetBestChildrenNoTemperature` (`src/search/classic/search.cc:705-808`).
+/// Bestmove and MultiPV use one ranking implementation so their ordering cannot drift.
+pub(super) fn best_child_edges(
+    tree: &NodeTree,
+    parent: usize,
+    params: &SearchParams,
+    count: usize,
+    depth: usize,
+) -> Vec<usize> {
     if tree.node(parent).n() == 0 {
-        return None;
+        return Vec::new();
     }
     let draw_score = draw_score(tree, params, depth % 2 == 1);
-    let mut best = None;
-    for edge_idx in 0..tree.node(parent).num_edges() {
-        let candidate = tree.node(parent).child(edge_idx).map(|idx| tree.node(idx));
-        let candidate_rank = best_edge_rank(candidate);
-        let replace = match best {
-            None => true,
-            Some(best_idx) => {
-                let current = tree.node(parent).child(best_idx).map(|idx| tree.node(idx));
-                let current_rank = best_edge_rank(current);
-                if candidate_rank != current_rank {
-                    candidate_rank > current_rank
-                } else if candidate_rank == BestEdgeRank::NonTerminal
-                    && candidate.is_some_and(|node| node.n() != 0 && node.is_terminal())
-                    && current.is_some_and(|node| node.n() != 0 && node.is_terminal())
-                {
-                    let candidate = candidate.expect("checked terminal candidate");
-                    let current = current.expect("checked terminal current");
-                    if candidate.is_tablebase_terminal() != current.is_tablebase_terminal() {
-                        !candidate.is_tablebase_terminal()
-                    } else {
-                        candidate.m() < current.m()
-                    }
-                } else if candidate_rank == BestEdgeRank::NonTerminal {
-                    let candidate_n = candidate.map_or(0, Node::n);
-                    let current_n = current.map_or(0, Node::n);
-                    if candidate_n != current_n {
-                        candidate_n > current_n
-                    } else {
-                        let candidate_q = candidate.map_or(0.0, |node| node.q(draw_score));
-                        let current_q = current.map_or(0.0, |node| node.q(draw_score));
-                        if candidate_q != current_q {
-                            candidate_q > current_q
-                        } else {
-                            tree.node(parent).edge(edge_idx).get_p() > tree.node(parent).edge(best_idx).get_p()
-                        }
-                    }
-                } else if candidate_rank > BestEdgeRank::NonTerminal {
-                    candidate.expect("winning candidate").m() < current.expect("winning current").m()
-                } else {
-                    candidate.expect("losing candidate").m() > current.expect("losing current").m()
-                }
-            }
-        };
-        if replace {
-            best = Some(edge_idx);
+    let mut edges: Vec<_> = (0..tree.node(parent).num_edges()).collect();
+    edges.sort_unstable_by(|&left, &right| {
+        if best_child_edge_is_better(tree, parent, left, right, draw_score) {
+            std::cmp::Ordering::Less
+        } else if best_child_edge_is_better(tree, parent, right, left, draw_score) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
         }
+    });
+    edges.truncate(count);
+    edges
+}
+
+fn best_child_edge_is_better(
+    tree: &NodeTree,
+    parent: usize,
+    edge_idx: usize,
+    best_idx: usize,
+    draw_score: f32,
+) -> bool {
+    let candidate = tree.node(parent).child(edge_idx).map(|idx| tree.node(idx));
+    let current = tree.node(parent).child(best_idx).map(|idx| tree.node(idx));
+    let candidate_rank = best_edge_rank(candidate);
+    let current_rank = best_edge_rank(current);
+    if candidate_rank != current_rank {
+        return candidate_rank > current_rank;
     }
-    best
+    if candidate_rank == BestEdgeRank::NonTerminal
+        && candidate.is_some_and(|node| node.n() != 0 && node.is_terminal())
+        && current.is_some_and(|node| node.n() != 0 && node.is_terminal())
+    {
+        let candidate = candidate.expect("checked terminal candidate");
+        let current = current.expect("checked terminal current");
+        if candidate.is_tablebase_terminal() != current.is_tablebase_terminal() {
+            return !candidate.is_tablebase_terminal();
+        }
+        return candidate.m() < current.m();
+    }
+    if candidate_rank == BestEdgeRank::NonTerminal {
+        let candidate_n = candidate.map_or(0, Node::n);
+        let current_n = current.map_or(0, Node::n);
+        if candidate_n != current_n {
+            return candidate_n > current_n;
+        }
+        let candidate_q = candidate.map_or(0.0, |node| node.q(draw_score));
+        let current_q = current.map_or(0.0, |node| node.q(draw_score));
+        if candidate_q != current_q {
+            return candidate_q > current_q;
+        }
+        return tree.node(parent).edge(edge_idx).get_p() > tree.node(parent).edge(best_idx).get_p();
+    }
+    if candidate_rank > BestEdgeRank::NonTerminal {
+        candidate.expect("winning candidate").m() < current.expect("winning current").m()
+    } else {
+        candidate.expect("losing candidate").m() > current.expect("losing current").m()
+    }
 }
 
 #[cfg(test)]
@@ -246,7 +267,7 @@ mod tests {
 #[derive(Clone, Debug)]
 pub struct SearchOutput {
     pub bestmove: BestMoveInfo,
-    pub info: ThinkingInfo,
+    pub infos: Vec<ThinkingInfo>,
 }
 
 struct SearchMeta {
@@ -369,6 +390,17 @@ impl ClassicSearch {
         Ok(())
     }
 
+    /// px0 reads `MultiPV` and `PerPVCounters` from its immutable
+    /// `BaseSearchParams` (`src/search/classic/params.h:101-103`). Rust keeps
+    /// the already parsed UCI subset in `SearchParams` before StartSearch.
+    pub fn set_uci_info_options(&mut self, multi_pv: usize, per_pv_counters: bool) -> Result<(), EnginError> {
+        self.abort_search()?;
+        let mut meta = self.meta.lock().expect("meta lock");
+        meta.params.multi_pv = multi_pv;
+        meta.params.per_pv_counters = per_pv_counters;
+        Ok(())
+    }
+
     pub fn run_blocking_nodes(&mut self, nodes: u32) -> (Move, u32) {
         let params = GoParams {
             nodes: Some(nodes as i32),
@@ -402,39 +434,44 @@ impl ClassicSearch {
             (elapsed_ms > 0).then(|| (total_playouts.saturating_mul(1000) / elapsed_ms) as i32)
         });
         let root = tree.current_head();
-        let info = best_child_edge(&tree, root, &meta.params, 0).map(|edge_idx| {
-            let child = tree.node(root).child(edge_idx).map(|idx| tree.node(idx));
-            let default_wl = -tree.node(root).wl();
-            let default_d = tree.node(root).d();
-            let wl = child.filter(|node| node.n() > 0).map_or(default_wl, Node::wl);
-            let d = child.filter(|node| node.n() > 0).map_or(default_d, Node::d);
-            ThinkingInfo {
-                // `Search::SendUciInfo` (`search.cc:249-270`). ScoreType and
-                // its WDL rescaling are not translated until the px0 options
-                // layer exists, so no synthetic cp score is emitted here.
-                depth: (self.worker_state.cum_depth.load(Ordering::Acquire) / total_playouts.max(1)) as i32,
-                seldepth: self.worker_state.max_depth.load(Ordering::Acquire) as i32,
-                time: elapsed.as_millis() as i64,
-                nodes: total_playouts as i64 + meta.initial_visits as i64,
-                nps: nps.unwrap_or(-1),
-                eps: nps.map_or(-1, |_| {
-                    let evaluations = self.worker_state.network_evaluations.load(Ordering::Acquire);
-                    let elapsed_ms = first_batch.expect("nps needs first batch").elapsed().as_millis() as u64;
-                    (evaluations.saturating_mul(1000) / elapsed_ms) as i32
-                }),
-                wdl: Some(wdl_from_wl_d(wl, d)),
-                tb_hits: 0,
-                pv: principal_variation(&tree, &meta.params, edge_idx),
-                multipv: 1,
-                ..ThinkingInfo::default()
-            }
-        });
+        let infos = best_child_edges(&tree, root, &meta.params, meta.params.multi_pv, 0)
+            .into_iter()
+            .enumerate()
+            .map(|(index, edge_idx)| {
+                let child = tree.node(root).child(edge_idx).map(|idx| tree.node(idx));
+                let default_wl = -tree.node(root).wl();
+                let default_d = tree.node(root).d();
+                let wl = child.filter(|node| node.n() > 0).map_or(default_wl, Node::wl);
+                let d = child.filter(|node| node.n() > 0).map_or(default_d, Node::d);
+                ThinkingInfo {
+                    // `Search::SendUciInfo` (`search.cc:249-270`). ScoreType and
+                    // its WDL rescaling are not translated until the px0 options
+                    // layer exists, so no synthetic cp score is emitted here.
+                    depth: (self.worker_state.cum_depth.load(Ordering::Acquire) / total_playouts.max(1)) as i32,
+                    seldepth: self.worker_state.max_depth.load(Ordering::Acquire) as i32,
+                    time: elapsed.as_millis() as i64,
+                    nodes: if meta.params.per_pv_counters {
+                        child.map_or(0, Node::n) as i64
+                    } else {
+                        total_playouts as i64 + meta.initial_visits as i64
+                    },
+                    nps: nps.unwrap_or(-1),
+                    eps: nps.map_or(-1, |_| {
+                        let evaluations = self.worker_state.network_evaluations.load(Ordering::Acquire);
+                        let elapsed_ms = first_batch.expect("nps needs first batch").elapsed().as_millis() as u64;
+                        (evaluations.saturating_mul(1000) / elapsed_ms) as i32
+                    }),
+                    wdl: Some(wdl_from_wl_d(wl, d)),
+                    tb_hits: 0,
+                    pv: principal_variation(&tree, &meta.params, edge_idx),
+                    multipv: if meta.params.multi_pv > 1 { index as i32 + 1 } else { -1 },
+                    ..ThinkingInfo::default()
+                }
+            })
+            .collect();
         let mut bestmove = BestMoveInfo::new(best);
         bestmove.ponder = ponder;
-        self.outputs.push(SearchOutput {
-            bestmove,
-            info: info.unwrap_or_default(),
-        });
+        self.outputs.push(SearchOutput { bestmove, infos });
         Ok(())
     }
 

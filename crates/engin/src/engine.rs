@@ -97,8 +97,16 @@ impl EngineController for ClassicEngine {
     fn unregister_uci_responder(&mut self, _responder: &mut dyn StringUciResponder) {}
 
     fn set_uci_options(&mut self, options: &UciOptions) -> Result<(), EnginError> {
-        self.uci_weights_file = Some(options.weights_file.clone());
-        Ok(())
+        // px0 always owns a configured backend manager. `ClassicEngine::uniform`
+        // is deliberately test-only, so an unrelated UCI display option must
+        // not turn its supplied backend into an empty WeightsFile request.
+        // Formal `ClassicEngine::unavailable` starts with `None` and remains
+        // unavailable until an actual px0-named WeightsFile is provided.
+        if self.uci_weights_file.is_some() || !options.weights_file.is_empty() {
+            self.uci_weights_file = Some(options.weights_file.clone());
+        }
+        self.search
+            .set_uci_info_options(options.multi_pv, options.per_pv_counters)
     }
 
     fn ensure_ready(&mut self) -> Result<(), EnginError> {
@@ -138,7 +146,7 @@ impl EngineController for ClassicEngine {
         }
         self.search.start_search(params)?;
         for output in std::mem::take(&mut self.search.outputs) {
-            responder.output_thinking_info(&[output.info]);
+            responder.output_thinking_info(&output.infos);
             responder.output_best_move(&output.bestmove);
         }
         Ok(())
@@ -155,7 +163,7 @@ impl EngineController for ClassicEngine {
     fn stop(&mut self, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
         self.search.stop_search()?;
         for output in std::mem::take(&mut self.search.outputs) {
-            responder.output_thinking_info(&[output.info]);
+            responder.output_thinking_info(&output.infos);
             responder.output_best_move(&output.bestmove);
         }
         Ok(())

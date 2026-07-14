@@ -24,13 +24,16 @@ pub struct GoParams {
     pub ponder: bool,
 }
 
-/// px0 `StringUciResponder::PopulateParams` 与 `SharedBackendParams` 的
-/// Rust ONNX 子集。
+/// px0 `StringUciResponder::PopulateParams`、classic search display options
+/// 与 `SharedBackendParams` 的 Rust ONNX 子集。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UciOptions {
     pub show_wdl: bool,
     pub show_eps: bool,
     pub show_moves_left: bool,
+    /// px0 `MultiPV` / `PerPVCounters` (`search/classic/params.cc:360-368,585-586`).
+    pub multi_pv: usize,
+    pub per_pv_counters: bool,
     /// px0 `WeightsFile` (`src/neural/shared_params.cc:43-80`). This Rust
     /// port accepts the formal ONNX model rather than px0's protobuf weights.
     pub weights_file: String,
@@ -42,7 +45,7 @@ impl UciOptions {
         Self::default()
     }
 
-    /// px0 `OptionsParser::ListOptionsUci` 中这三项的 UCI 行。
+    /// px0 `OptionsParser::ListOptionsUci` 的已翻译 UCI options。
     pub fn list_options_uci(&self) -> Vec<String> {
         vec![
             format!("option name UCI_ShowWDL type check default {}", bool_uci(self.show_wdl)),
@@ -51,16 +54,23 @@ impl UciOptions {
                 "option name UCI_ShowMovesLeft type check default {}",
                 bool_uci(self.show_moves_left)
             ),
+            format!("option name MultiPV type spin default {} min 1 max 500", self.multi_pv),
+            format!(
+                "option name PerPVCounters type check default {}",
+                bool_uci(self.per_pv_counters)
+            ),
             format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
 
-    /// px0 `OptionsParser::SetUciOption` 对这三项的支持子集。
+    /// px0 `OptionsParser::SetUciOption` 的已翻译 option 子集。
     pub fn set_uci_option(&mut self, name: &str, value: &str) -> Result<(), EnginError> {
         match name {
             "UCI_ShowWDL" => self.show_wdl = parse_bool_option(value, "UCI_ShowWDL")?,
             "UCI_ShowEPS" => self.show_eps = parse_bool_option(value, "UCI_ShowEPS")?,
             "UCI_ShowMovesLeft" => self.show_moves_left = parse_bool_option(value, "UCI_ShowMovesLeft")?,
+            "MultiPV" => self.multi_pv = parse_multi_pv(value)?,
+            "PerPVCounters" => self.per_pv_counters = parse_bool_option(value, "PerPVCounters")?,
             "WeightsFile" => self.weights_file = value.to_string(),
             _ => return Err(EnginError::Uci(format!("Unknown option: {name}"))),
         }
@@ -542,6 +552,17 @@ fn parse_bool_option(value: &str, name: &str) -> Result<bool, EnginError> {
         "false" => Ok(false),
         _ => Err(EnginError::Uci(format!("Flag '{name}' must be either true or false"))),
     }
+}
+
+/// px0 `IntOption(kMultiPvId, 1, 500)` (`search/classic/params.cc:585`).
+fn parse_multi_pv(value: &str) -> Result<usize, EnginError> {
+    let value: usize = value
+        .parse()
+        .map_err(|_| EnginError::Uci("MultiPV must be an integer from 1 to 500".into()))?;
+    if !(1..=500).contains(&value) {
+        return Err(EnginError::Uci("MultiPV must be an integer from 1 to 500".into()));
+    }
+    Ok(value)
 }
 
 fn split_at_whitespace(value: &str) -> Vec<String> {
