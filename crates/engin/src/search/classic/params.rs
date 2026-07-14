@@ -51,39 +51,87 @@ pub struct SearchParams {
     pub minibatch_size: i32,
     // 较高的值会促进更多的探索（更宽的搜索），较低的值会促进更多的置信度（更深的搜索）。
     pub cpuct: f32,
-    // （仅专业模式可见）专门应用于根节点的 cpuct_init 参数。
+    /// px0 `CpuctAtRoot` (`src/search/classic/params.cc:543-551`).
     pub cpuct_at_root: f32,
     // 较低的值意味着：随着节点访问次数的增加，Cpuct 的增长速度更快。
     pub cpuct_base: f32,
-    
+    /// px0 `CpuctBaseAtRoot` (`src/search/classic/params.cc:546-551`).
+    pub cpuct_base_at_root: f32,
+    // Cpuct 增长公式的乘数因子（Multiplier）
     pub cpuct_factor: f32,
+    /// px0 `CpuctFactorAtRoot` (`src/search/classic/params.cc:548-551`).
+    pub cpuct_factor_at_root: f32,
+    /// px0 `RootHasOwnCpuctParams` (`src/search/classic/params.cc:551`).
+    /// When disabled, all three `*AtRoot` values are ignored.
     pub root_has_own_cpuct_params: bool,
+    // 决定如何评估未访问的节点。FPU 通过在查询神经网络之前使用一个占位评估值，来改变搜索行为，
+    // 使引擎更早或更晚地访问未访问节点。reduction（减少）策略会从父节点评估中减去用 --fpu-value 指定的值；
+    // absolute（绝对值）策略则直接使用该值。
     pub fpu_absolute: bool,
     pub fpu_value: f32,
     pub fpu_absolute_at_root: bool,
     pub fpu_value_at_root: f32,
     pub fpu_strategy_at_root_same: bool,
+    /// px0 `DrawScore` (`src/search/classic/params.cc:605`); zero is neutral.
     pub draw_score: f32,
+    /// px0 `TwoFoldDraws`: tree-reused two-fold terminals are reverted when
+    /// the first repetition predates the current root (`search.cc:1510-1550`).
     pub two_fold_draws: bool,
+    // 在搜索过程中发现终局（游戏结束）局面时，允许前一步局面的评估“粘附”到更准确的值上。
+    // 例如，如果至少有一个走法会导致杀棋（Checkmate），则该局面应粘附为“被杀棋”；
+    // 同理，如果所有走法都是和棋或被杀，则局面应粘附为和棋或被杀。
     pub sticky_endgames: bool,
+    // 只有访问次数至少达到该数值的节点，才会被考虑进行固化，以提高缓存的局部性（Cache Locality）。
     pub solid_tree_threshold: u32,
+    // （仅专业模式可见）如果设为 0，引擎会直接选择最佳步法（贪婪选择）。较大的值会增加落子时的随机性。
     pub temperature: f32,
+    // 如果不为 0，则最多允许这么多个搜索工作线程同时收集 Mini-batch。
     pub max_concurrent_searchers: i32,
+    // 指在多线程并行搜索中，多个线程同时访问并等待同一个尚未被神经网络估值的节点时的最大允许访问数。
     pub max_collision_visits: i32,
+    // 最大碰撞访问量开始进行比例缩放的树尺寸。
+    // 即从多少个节点开始，最大碰撞访问量从 1 开始向上按比例缩放。
     pub max_collision_visits_scaling_start: i32,
+    // 最大碰撞访问量达到最大缩放的树尺寸。
+    // 设置为 0 可以完全禁用此缩放。
     pub max_collision_visits_scaling_end: i32,
+    // 碰撞访问缩放曲线的幂指数（Power）。
+    // 应用于 1 到最大值之间插值的幂指数，使其缩放轨迹呈现曲线形态。
     pub max_collision_visits_scaling_power: f32,
+    // 无序评估（即时评估）。
+    // 在收集一批局面发送给神经网络时，如果某个局面恰好在缓存中或是终局节点，则立即对其进行评估，而不放入 Batch 发送给 NN。
+    // 关闭时，这只可能发生在 Batch 的第一个节点上；开启时，可以发生在任意节点上。
     pub out_of_order_eval: bool,
+    // 无序评估的最大数量系数。
+    // 在收集一个 Batch 期间，允许的最大无序评估数量通过【最大 Batch 大小 * 该系数】计算得出。
     pub max_out_of_order_evals_factor: f32,
+    // 辅助任务工作线程（Task Workers）的数量。
+    // 用于协助搜索工作线程。设置为 -1 将使用启发式默认值。
     pub task_workers_per_search_worker: i32,
+    // 启动任务加速的最小访问量。
+    // 在利用辅助任务加速处理之前，必须收集齐至少这么多数量的访问。
     pub minimum_work_size_for_processing: i32,
+    // 分流至任务线程的最小分支访问量。
+    // 具有超过该数值的碰撞/访问的搜索分支，可以被分流（split off）给辅助任务线程处理。
     pub minimum_work_size_for_picking: i32,
+    // 分流后剩余工作的最小限制。
+    // 除非分流后仍然剩下至少这么多工作要做，否则搜索分支不会被拆分给辅助任务线程。
     pub minimum_remaining_work_size_for_picking: i32,
+    // 单个任务的最小处理工作量。
+    // 处理工作不会被拆分成小于该值的任务块（除非其超过 MinimumProcessingWork 的一半）。
     pub minimum_work_per_task_for_processing: i32,
+    // 最大预取（Prefetch）批量。
+    // 当引擎无法收集到足够大的 Batch 供即时使用时，尝试预取最多 X 个可能很快会有用的局面，并将它们放入缓存中。
     pub max_prefetch_batch: i32,
     /// px0 `MultiPV` / `PerPVCounters` (`params.cc:360-368,585-586`).
+    /// 多线分析数量（主要变线 Principal Variations）。
+    // （始终可见）在 UCI 信息输出中显示的对局线（PV）数量。
     pub multi_pv: usize,
+    // 在 UCI 中按主要变线（PV）显示节点计数。
+    // 显示每条 PV 分布的节点数，而不是仅显示总节点数。
     pub per_pv_counters: bool,
+    /// px0 `ScoreType` (`params.cc:587-595`). `Q` and `W-L` output are
+    /// their internal values scaled by 10_000, not centipawns.
     pub score_type: ScoreType,
 }
 
@@ -99,12 +147,14 @@ impl Default for SearchParams {
             cpuct: 1.0,
             cpuct_at_root: 1.745,
             cpuct_base: 38_739.0,
+            cpuct_base_at_root: 38_739.0,
             cpuct_factor: 3.894,
+            cpuct_factor_at_root: 3.894,
             root_has_own_cpuct_params: false,
             fpu_absolute: false,
             fpu_value: 0.220,
             fpu_absolute_at_root: false,
-            fpu_value_at_root: 0.220,
+            fpu_value_at_root: 1.0,
             fpu_strategy_at_root_same: true,
             draw_score: 0.0,
             two_fold_draws: true,
@@ -114,7 +164,7 @@ impl Default for SearchParams {
             max_concurrent_searchers: 1,
             max_collision_visits: 80_000,
             max_collision_visits_scaling_start: 28,
-            max_collision_visits_scaling_end: 100_000,
+            max_collision_visits_scaling_end: 145_000,
             max_collision_visits_scaling_power: 1.25,
             out_of_order_eval: true,
             max_out_of_order_evals_factor: 2.4,
@@ -140,12 +190,22 @@ impl SearchParams {
         }
     }
 
-    pub fn cpuct_base(&self, _at_root: bool) -> f32 {
-        self.cpuct_base
+    /// px0 `BaseSearchParams::GetCpuctBase` (`params.h:60-62`).
+    pub fn cpuct_base(&self, at_root: bool) -> f32 {
+        if at_root && self.root_has_own_cpuct_params {
+            self.cpuct_base_at_root
+        } else {
+            self.cpuct_base
+        }
     }
 
-    pub fn cpuct_factor(&self, _at_root: bool) -> f32 {
-        self.cpuct_factor
+    /// px0 `BaseSearchParams::GetCpuctFactor` (`params.h:63-65`).
+    pub fn cpuct_factor(&self, at_root: bool) -> f32 {
+        if at_root && self.root_has_own_cpuct_params {
+            self.cpuct_factor_at_root
+        } else {
+            self.cpuct_factor
+        }
     }
 
     pub fn fpu_absolute(&self, at_root: bool) -> bool {
@@ -179,5 +239,43 @@ impl SearchParams {
             1,
             ratio.powf(self.max_collision_visits_scaling_power),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchParams;
+
+    /// px0 `BaseSearchParams` keeps each root PUCT parameter equal to the
+    /// ordinary value unless `RootHasOwnCpuctParams` is enabled
+    /// (`src/search/classic/params.cc:644-655`).
+    #[test]
+    fn root_cpuct_parameters_follow_px0_gate() {
+        let mut params = SearchParams {
+            cpuct: 1.0,
+            cpuct_at_root: 2.0,
+            cpuct_base: 100.0,
+            cpuct_base_at_root: 200.0,
+            cpuct_factor: 3.0,
+            cpuct_factor_at_root: 4.0,
+            ..SearchParams::default()
+        };
+
+        assert_eq!(params.cpuct(true), 1.0);
+        assert_eq!(params.cpuct_base(true), 100.0);
+        assert_eq!(params.cpuct_factor(true), 3.0);
+
+        params.root_has_own_cpuct_params = true;
+        assert_eq!(params.cpuct(true), 2.0);
+        assert_eq!(params.cpuct_base(true), 200.0);
+        assert_eq!(params.cpuct_factor(true), 4.0);
+    }
+
+    /// px0 optimized defaults (`src/search/classic/params.cc:543-583`).
+    #[test]
+    fn defaults_match_px0_classic() {
+        let params = SearchParams::default();
+        assert_eq!(params.fpu_value_at_root, 1.0);
+        assert_eq!(params.max_collision_visits_scaling_end, 145_000);
     }
 }

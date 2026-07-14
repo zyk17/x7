@@ -129,6 +129,9 @@
   `search.cc:721-724,1668-1740`）。
 - [x] 覆盖 root 尚无 child 的 early-stop fallback，保证其不逃逸 `searchmoves`
   （`src/search/classic/wrapper.cc:78-100`、`search.cc:721-724`）。
+- [x] 对齐 `SearchParams` root PUCT 三元组与默认值：`CpuctBaseAtRoot`、
+  `CpuctFactorAtRoot`、`FpuValueAtRoot=1.0`、collision scaling end `145000`
+  （`src/search/classic/params.h:58-65`、`params.cc:543-583,644-655`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

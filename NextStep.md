@@ -130,6 +130,11 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 
 ### P4 下一入口
 
+- 已校正 `SearchParams` 的 px0 默认值与 root PUCT 三元组：`FpuValueAtRoot=1.0`、
+  `MaxCollisionVisitsScalingEnd=145000`，以及 `CpuctBase/FactorAtRoot` 在
+  `RootHasOwnCpuctParams` 下的取值；对应 `src/search/classic/params.h:58-65`、
+  `params.cc:543-583,644-655`。
+
 - 已完成 `go searchmoves` 的合法根着法解析和选择/PV/输出共用过滤；对应
   `src/search/classic/wrapper.cc:78-100`、`search.cc:721-724,1668-1740`。下一项仍是
   task worker 的稳定 node 存储边界，不以假并行替代。
