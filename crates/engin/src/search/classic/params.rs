@@ -88,6 +88,35 @@ pub fn accurate_wdl_rescale_params(
     WdlRescaleParams { ratio, diff }
 }
 
+/// px0 `ConvertRegularToGamePairElo` / `SimplifiedWDLRescaleParams`
+/// (`src/search/classic/params.cc:120-174`).
+pub fn simplified_wdl_rescale_params(
+    contempt: f32,
+    draw_rate_reference: f32,
+    mut elo_active: f32,
+    contempt_max: f32,
+    contempt_attenuation: f32,
+) -> WdlRescaleParams {
+    const SCALE_ZERO: f32 = 15.0;
+    const ELO_SLOPE: f32 = 425.0;
+    const OFFSET: f32 = 6.75;
+    let scale_reference = 1.0 / ((1.0 + draw_rate_reference) / (1.0 - draw_rate_reference)).ln();
+    let mut elo_opp = elo_active - contempt.clamp(-contempt_max, contempt_max);
+    let convert = |elo: f32| elo + 0.5 * 250.0 * (1.0 + ((2737.0 - elo) / 250.0).exp()).ln();
+    elo_active = convert(elo_active);
+    elo_opp = convert(elo_opp);
+    let scale = |elo: f32| 1.0 / (1.0 / SCALE_ZERO + (elo / ELO_SLOPE - OFFSET).exp());
+    let scale_active = scale(elo_active);
+    let scale_opp = scale(elo_opp);
+    let scale_target = ((scale_active * scale_active + scale_opp * scale_opp) / 2.0).sqrt();
+    let ratio = scale_target / scale_reference;
+    let mu = |elo: f32| {
+        -10.0_f32.ln() / 200.0 * SCALE_ZERO * ELO_SLOPE * (1.0 + (-elo / ELO_SLOPE + OFFSET).exp() / SCALE_ZERO).ln()
+    };
+    let diff = (mu(elo_active) - mu(elo_opp)) / (scale_reference * scale_reference) * contempt_attenuation;
+    WdlRescaleParams { ratio, diff }
+}
+
 /// px0 `BaseSearchParams` / `SearchParams` 单线程搜索所需字段。
 #[derive(Clone, Debug)]
 pub struct SearchParams {
@@ -317,7 +346,7 @@ impl SearchParams {
 
 #[cfg(test)]
 mod tests {
-    use super::{accurate_wdl_rescale_params, SearchParams};
+    use super::{accurate_wdl_rescale_params, simplified_wdl_rescale_params, SearchParams};
 
     /// px0 `BaseSearchParams` keeps each root PUCT parameter equal to the
     /// ordinary value unless `RootHasOwnCpuctParams` is enabled
@@ -357,5 +386,14 @@ mod tests {
         let params = accurate_wdl_rescale_params(0.0, 0.0, 0.5, 0.65, 420.0, 1.0);
         assert!((params.ratio - 1.0).abs() < f32::EPSILON);
         assert!(params.diff.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn simplified_wdl_contempt_changes_only_diff_at_equal_elo() {
+        let neutral = simplified_wdl_rescale_params(0.0, 0.5, 2000.0, 420.0, 1.0);
+        let contempt = simplified_wdl_rescale_params(100.0, 0.5, 2000.0, 420.0, 1.0);
+        assert!(neutral.ratio.is_finite() && contempt.ratio.is_finite());
+        assert!(contempt.diff.is_finite());
+        assert!(contempt.diff.abs() > neutral.diff.abs());
     }
 }
