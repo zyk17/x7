@@ -198,6 +198,10 @@
 - [x] 翻译可变 contempt/WDL calibration `OptionsDict`，使 WDL 重标定在 NN value 进入
   backup 前使用 px0 的完整参数计算（`src/search/classic/params.cc:57-174,688-703`、
   `search.cc:206-236,2117-2154`）。
+- [x] 暴露 `ContemptMode` 四种 choice 和 `WDLEvalObjectivity`，并在 `SendUciInfo` 按 px0
+  对显示侧 WDL 使用 resolved mode/objectivity；不改已 backup 的内部 value
+  （`src/search/classic/params.h:117-128`、`params.cc:606-620,688-705`、
+  `search.cc:275-291`）。
 - [x] 翻译 `GetContempt` 的 opponent/默认 rating advantage 解析（`src/search/classic/params.cc:57-89`）。
 - [x] 先固定 `FetchSingleNodeResult` 的 WDL rescale 调用时序与 px0 一致；默认
   `ratio=1/diff=0/max_s=1.4` 不改变现有搜索数值（`src/search/classic/search.cc:2117-2154`）。

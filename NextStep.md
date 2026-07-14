@@ -218,6 +218,10 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - 两个 SearchWorker 的 root cache-hit out-of-order 回归已覆盖：完成后 root
   `NInFlight` 与 shared collision list 均为零，验证 gather 内即时回传和另一 worker 的
   tree phase 可正确汇合（`src/search/classic/search.cc:1268-1419,1977-1987,2109-2173`）。
+- `ContemptMode` 的四种 px0 choice 与 `WDLEvalObjectivity` 已经由 UCI 映射到
+  `SearchParams`；`SendUciInfo` 以 resolved mode、root side 和 objectivity 重建展示侧 WDL，
+  不改变已 backup 的内部 WDL（`src/search/classic/params.h:117-128`、
+  `params.cc:606-620,688-705`、`search.cc:275-291`）。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。

@@ -54,6 +54,29 @@ pub enum ContemptMode {
     None,
 }
 
+impl ContemptMode {
+    /// px0 `BaseSearchParams::GetContemptMode`
+    /// (`src/search/classic/params.h:117-123`).
+    pub const fn as_uci(self) -> &'static str {
+        match self {
+            Self::Play => "play",
+            Self::White => "white_side_analysis",
+            Self::Black => "black_side_analysis",
+            Self::None => "disable",
+        }
+    }
+
+    pub fn parse_uci(value: &str) -> Option<Self> {
+        Some(match value {
+            "play" => Self::Play,
+            "white_side_analysis" => Self::White,
+            "black_side_analysis" => Self::Black,
+            "disable" => Self::None,
+            _ => return None,
+        })
+    }
+}
+
 /// px0 `BaseSearchParams::WDLRescaleParams` (`params.h:44-53`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WdlRescaleParams {
@@ -203,6 +226,7 @@ pub struct SearchParams {
     pub wdl_rescale_ratio: f32,
     pub wdl_rescale_diff: f32,
     pub wdl_max_s: f32,
+    pub wdl_eval_objectivity: f32,
     pub contempt_mode: ContemptMode,
     // 指在多线程并行搜索中，多个线程同时访问并等待同一个尚未被神经网络估值的节点时的最大允许访问数。
     pub max_collision_visits: i32,
@@ -290,6 +314,7 @@ impl Default for SearchParams {
             wdl_rescale_ratio: 1.0,
             wdl_rescale_diff: 0.0,
             wdl_max_s: 1.4,
+            wdl_eval_objectivity: 1.0,
             contempt_mode: ContemptMode::Play,
             max_collision_visits: 80_000,
             max_collision_visits_scaling_start: 28,

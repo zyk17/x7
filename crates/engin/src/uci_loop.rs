@@ -6,7 +6,7 @@ use xiangqi_core::{GameState, STARTPOS_FEN};
 
 use crate::callbacks::{BestMoveInfo, ThinkingInfo};
 use crate::error::EnginError;
-use crate::search::classic::ScoreType;
+use crate::search::classic::{ContemptMode, ScoreType};
 
 /// px0 `GoParams` (`uciloop.h:42-55`)。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -42,10 +42,12 @@ pub struct UciOptions {
     pub uci_opponent: String,
     pub uci_rating_adv: f32,
     pub contempt: String,
+    pub contempt_mode: ContemptMode,
     pub contempt_max_value: f32,
     pub wdl_calibration_elo: f32,
     pub wdl_contempt_attenuation: f32,
     pub wdl_max_s: f32,
+    pub wdl_eval_objectivity: f32,
     pub wdl_draw_rate_target: f32,
     pub wdl_draw_rate_reference: f32,
     pub wdl_book_exit_bias: f32,
@@ -67,10 +69,12 @@ impl Default for UciOptions {
             uci_opponent: String::new(),
             uci_rating_adv: 0.0,
             contempt: String::new(),
+            contempt_mode: ContemptMode::Play,
             contempt_max_value: 420.0,
             wdl_calibration_elo: 0.0,
             wdl_contempt_attenuation: 1.0,
             wdl_max_s: 1.4,
+            wdl_eval_objectivity: 1.0,
             wdl_draw_rate_target: 0.0,
             wdl_draw_rate_reference: 0.5,
             wdl_book_exit_bias: 0.65,
@@ -112,10 +116,18 @@ impl UciOptions {
             format!("option name UCI_Opponent type string default {}", self.uci_opponent),
             format!("option name UCI_RatingAdv type string default {}", self.uci_rating_adv),
             format!("option name Contempt type string default {}", self.contempt),
+            format!(
+                "option name ContemptMode type combo default {} var play var white_side_analysis var black_side_analysis var disable",
+                self.contempt_mode.as_uci()
+            ),
             format!("option name ContemptMaxValue type string default {}", self.contempt_max_value),
             format!("option name WDLCalibrationElo type string default {}", self.wdl_calibration_elo),
             format!("option name WDLContemptAttenuation type string default {}", self.wdl_contempt_attenuation),
             format!("option name WDLMaxS type string default {}", self.wdl_max_s),
+            format!(
+                "option name WDLEvalObjectivity type string default {}",
+                self.wdl_eval_objectivity
+            ),
             format!("option name WDLDrawRateTarget type string default {}", self.wdl_draw_rate_target),
             format!("option name WDLDrawRateReference type string default {}", self.wdl_draw_rate_reference),
             format!("option name WDLBookExitBias type string default {}", self.wdl_book_exit_bias),
@@ -136,6 +148,7 @@ impl UciOptions {
             "UCI_Opponent" => self.uci_opponent = value.to_string(),
             "UCI_RatingAdv" => self.uci_rating_adv = parse_float_option(value, "UCI_RatingAdv", -10_000.0, 10_000.0)?,
             "Contempt" => self.contempt = value.to_string(),
+            "ContemptMode" => self.contempt_mode = parse_contempt_mode(value)?,
             "ContemptMaxValue" => {
                 self.contempt_max_value = parse_float_option(value, "ContemptMaxValue", 0.0, 10_000.0)?
             }
@@ -146,6 +159,9 @@ impl UciOptions {
                 self.wdl_contempt_attenuation = parse_float_option(value, "WDLContemptAttenuation", -10.0, 10.0)?
             }
             "WDLMaxS" => self.wdl_max_s = parse_float_option(value, "WDLMaxS", 0.0, 10.0)?,
+            "WDLEvalObjectivity" => {
+                self.wdl_eval_objectivity = parse_float_option(value, "WDLEvalObjectivity", 0.0, 1.0)?
+            }
             "WDLDrawRateTarget" => {
                 self.wdl_draw_rate_target = parse_float_option(value, "WDLDrawRateTarget", 0.0, 0.999)?
             }
@@ -652,6 +668,12 @@ fn parse_score_type(value: &str) -> Result<ScoreType, EnginError> {
     ScoreType::parse_uci(value).ok_or_else(|| EnginError::Uci(format!("Unknown ScoreType: {value}")))
 }
 
+/// px0 `ChoiceOption(kContemptModeId, ...)`
+/// (`src/search/classic/params.h:117-123,params.cc:606-608`).
+fn parse_contempt_mode(value: &str) -> Result<ContemptMode, EnginError> {
+    ContemptMode::parse_uci(value).ok_or_else(|| EnginError::Uci(format!("Unknown ContemptMode: {value}")))
+}
+
 /// px0 `FloatOption(kNpsLimitId, 0.0f, 1e6f)`
 /// (`src/search/classic/params.cc:473-477,621`).
 fn parse_nps_limit(value: &str) -> Result<f32, EnginError> {
@@ -850,6 +872,27 @@ mod tests {
         assert_eq!(options.nodes_per_second_limit, 1234.5);
         assert!(options.set_uci_option("NodesPerSecondLimit", "-1").is_err());
         assert!(options.set_uci_option("NodesPerSecondLimit", "1000001").is_err());
+    }
+
+    /// px0 `ContemptMode` is a four-value ChoiceOption and
+    /// `WDLEvalObjectivity` is clamped to `[0, 1]`
+    /// (`src/search/classic/params.cc:606-620`).
+    #[test]
+    fn wdl_display_options_match_px0_choice_and_range() {
+        let mut options = UciOptions::populate_defaults();
+        options
+            .set_uci_option("ContemptMode", "black_side_analysis")
+            .expect("px0 contempt mode");
+        options
+            .set_uci_option("WDLEvalObjectivity", "0.25")
+            .expect("px0 objectivity");
+        assert_eq!(options.contempt_mode, ContemptMode::Black);
+        assert_eq!(options.wdl_eval_objectivity, 0.25);
+        assert!(options
+            .list_options_uci()
+            .iter()
+            .any(|line| line.contains("option name ContemptMode type combo")));
+        assert!(options.set_uci_option("WDLEvalObjectivity", "1.1").is_err());
     }
 
     #[test]

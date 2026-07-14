@@ -147,8 +147,46 @@ pub(crate) fn wdl_rescale(
     mu_new
 }
 
+/// px0 `Search::SendUciInfo` display-side WDL dependencies
+/// (`src/search/classic/search.cc:275-291`).
+struct WdlDisplayContext<'a> {
+    params: &'a SearchParams,
+    contempt_mode: ContemptMode,
+    root_is_black: bool,
+}
+
 /// px0 `Search::SendUciInfo` score branches (`search.cc:275-322`).
-fn score_from_wdl(score_type: ScoreType, wl: &mut f32, d: &mut f32, q: f32, has_wdl: bool) -> i32 {
+fn score_from_wdl(
+    score_type: ScoreType,
+    wl: &mut f32,
+    d: &mut f32,
+    q: f32,
+    has_wdl: bool,
+    display: WdlDisplayContext<'_>,
+) -> i32 {
+    let mut mu_uci = 0.0;
+    if score_type == ScoreType::WdlMu
+        || (display.params.wdl_rescale_diff != 0.0 && display.contempt_mode != ContemptMode::None)
+    {
+        let sign = if (display.contempt_mode == ContemptMode::Black) == display.root_is_black {
+            1.0
+        } else {
+            -1.0
+        };
+        mu_uci = wdl_rescale(
+            wl,
+            d,
+            display.params.wdl_rescale_ratio,
+            if display.contempt_mode == ContemptMode::None {
+                0.0
+            } else {
+                display.params.wdl_rescale_diff * display.params.wdl_eval_objectivity
+            },
+            sign,
+            true,
+            display.params.wdl_max_s,
+        );
+    }
     match score_type {
         ScoreType::CentipawnWithDrawscore => (90.0 * (1.563_754_2 * q).tan()) as i32,
         ScoreType::Centipawn => (90.0 * (1.563_754_2 * *wl).tan()) as i32,
@@ -158,14 +196,13 @@ fn score_from_wdl(score_type: ScoreType, wl: &mut f32, d: &mut f32, q: f32, has_
         ScoreType::Q => (q * 10_000.0) as i32,
         ScoreType::WinLoss => (*wl * 10_000.0) as i32,
         ScoreType::WdlMu => {
-            let mu = wdl_rescale(wl, d, 1.0, 0.0, 1.0, true, 1.4);
             let centipawn_score = 45.0 * (1.567_280_8 * *wl).tan();
             if has_wdl
-                && mu != 0.0
+                && mu_uci != 0.0
                 && wl.abs() + *d < 0.996
-                && (mu.abs() < 1.0 || centipawn_score.abs() < (100.0 * mu).abs())
+                && (mu_uci.abs() < 1.0 || centipawn_score.abs() < (100.0 * mu_uci).abs())
             {
-                (100.0 * mu) as i32
+                (100.0 * mu_uci) as i32
             } else {
                 centipawn_score as i32
             }
@@ -324,7 +361,7 @@ mod tests {
 
     use super::{
         best_child_edge, best_move, orient_move, resolve_contempt_mode, score_from_wdl, wdl_from_wl_d, wdl_rescale,
-        ContemptMode, ScoreType, SearchParams,
+        ContemptMode, ScoreType, SearchParams, WdlDisplayContext,
     };
     use crate::neural::backend::{
         Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, UniformBackend,
@@ -604,7 +641,65 @@ mod tests {
     fn score_type_q_matches_px0_scaled_q() {
         let mut wl = 0.1;
         let mut d = 0.2;
-        assert_eq!(score_from_wdl(ScoreType::Q, &mut wl, &mut d, 0.1234, true), 1234);
+        assert_eq!(
+            score_from_wdl(
+                ScoreType::Q,
+                &mut wl,
+                &mut d,
+                0.1234,
+                true,
+                WdlDisplayContext {
+                    params: &SearchParams::default(),
+                    contempt_mode: ContemptMode::None,
+                    root_is_black: false,
+                },
+            ),
+            1234
+        );
+    }
+
+    /// px0 applies `WDLEvalObjectivity` only to the display-side contempt
+    /// diff, after the search-side WDL was already backed up
+    /// (`src/search/classic/search.cc:279-291`).
+    #[test]
+    fn wdl_eval_objectivity_controls_display_contempt_only() {
+        let mut params = SearchParams {
+            wdl_rescale_diff: 0.2,
+            ..SearchParams::default()
+        };
+        let mut subjective_wl = 0.1;
+        let mut subjective_d = 0.4;
+        score_from_wdl(
+            ScoreType::Q,
+            &mut subjective_wl,
+            &mut subjective_d,
+            0.0,
+            true,
+            WdlDisplayContext {
+                params: &params,
+                contempt_mode: ContemptMode::White,
+                root_is_black: false,
+            },
+        );
+
+        params.wdl_eval_objectivity = 0.0;
+        let mut objective_wl = 0.1;
+        let mut objective_d = 0.4;
+        score_from_wdl(
+            ScoreType::Q,
+            &mut objective_wl,
+            &mut objective_d,
+            0.0,
+            true,
+            WdlDisplayContext {
+                params: &params,
+                contempt_mode: ContemptMode::White,
+                root_is_black: false,
+            },
+        );
+
+        assert_ne!(subjective_wl, objective_wl);
+        assert_ne!(subjective_d, objective_d);
     }
 }
 
@@ -818,6 +913,8 @@ impl ClassicSearch {
         meta.params.wdl_rescale_ratio = rescale.ratio;
         meta.params.wdl_rescale_diff = rescale.diff;
         meta.params.wdl_max_s = options.wdl_max_s;
+        meta.params.wdl_eval_objectivity = options.wdl_eval_objectivity;
+        meta.params.contempt_mode = options.contempt_mode;
         Ok(())
     }
 
@@ -873,7 +970,18 @@ impl ClassicSearch {
             let q = child
                 .filter(|node| node.n() > 0)
                 .map_or(default_q, |node| node.q(draw_score(tree, &meta.params, false)));
-            let score = score_from_wdl(meta.params.score_type, &mut wl, &mut d, q, has_wdl);
+            let score = score_from_wdl(
+                meta.params.score_type,
+                &mut wl,
+                &mut d,
+                q,
+                has_wdl,
+                WdlDisplayContext {
+                    params: &meta.params,
+                    contempt_mode: meta.contempt_mode,
+                    root_is_black: tree.history().is_black_to_move(),
+                },
+            );
             let mate = child.filter(|node| node.is_terminal() && wl != 0.0).map(|node| {
                 let plies = node.m().round() as i32 / 2 + if node.is_tablebase_terminal() { 101 } else { 1 };
                 if wl < 0.0 {

@@ -8,6 +8,6 @@ pub mod uct;
 pub mod worker;
 
 pub use node::{Edge, Node, NodeArena, NodeTree, Terminal};
-pub use params::{ScoreType, SearchParams};
+pub use params::{ContemptMode, ScoreType, SearchParams};
 pub use search::{best_move, ClassicSearch, SearchOutput};
 pub use worker::{NodeToProcess, SearchWorker, WorkerSearchState};
