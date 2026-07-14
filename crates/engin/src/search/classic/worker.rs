@@ -542,8 +542,10 @@ impl<'a> SearchWorker<'a> {
             return Ok(());
         }
         let gather_result = self.gather_minibatch();
-        self.release_searcher_permit();
-        gather_result?;
+        if let Err(error) = gather_result {
+            self.release_searcher_permit();
+            return Err(error);
+        }
         // px0 marks this worker as waiting on the backend before collision
         // collection/prefetch, then removes it immediately after ComputeBlocking
         // (`search.cc:1187-1199`).
@@ -554,6 +556,7 @@ impl<'a> SearchWorker<'a> {
             self.collect_collisions()?;
             self.maybe_prefetch_into_cache()
         })();
+        self.release_searcher_permit();
         if let Err(error) = prefetch_result {
             self.search_state
                 .backend_waiting_counter
