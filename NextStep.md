@@ -222,6 +222,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   `SearchParams`；`SendUciInfo` 以 resolved mode、root side 和 objectivity 重建展示侧 WDL，
   不改变已 backup 的内部 WDL（`src/search/classic/params.h:117-128`、
   `params.cc:606-620,688-705`、`search.cc:275-291`）。
+- Rust 的 non-owning UCI responder 析构边界已收口：有限搜索在注销前完成，infinite 搜索先
+  `Stop` 再 `Wait`，不能再用 `Abort` 吞掉最终 `bestmove`；position 替换仍使用 px0 `Abort`
+  抑制旧搜索输出（`src/search/classic/search.cc:1019-1041`、`src/engine.cc:187-197`）。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。

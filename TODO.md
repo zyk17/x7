@@ -174,6 +174,9 @@
 - [x] 翻译 px0 `Engine::UciPonderForwarder` 的非 owning responder 注册边界，并令
   `ClassicSearch` 在 worker 生命周期内持有 thread-safe callback；注销前先停止/join 搜索
   （`src/engine.cc:81-136,238-250`、`src/search/search.h:45-99`）。
+- [x] 收口 Rust non-owning responder 的析构边界：有限 search 在注销前 `Wait`，infinite
+  search 先 `Stop` 再 `Wait`，而 position/backend 替换继续使用 px0 `Abort` 抑制旧 bestmove
+  （`src/search/classic/search.cc:1019-1041`、`src/engine.cc:187-197`）。
 - [x] 删除 Engine 对搜索结果的手工 drain，最终 `info` / `bestmove` 仅通过 SearchBase
   responder 输出，避免 worker/watchdog 接入后双发（`src/engine.cc:85-116,204-208`、
   `src/search/classic/search.cc:596-620`）。

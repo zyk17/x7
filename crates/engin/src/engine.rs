@@ -182,9 +182,10 @@ impl EngineController for ClassicEngine {
 
     fn unregister_uci_responder(&mut self, responder: &mut dyn StringUciResponder) {
         // px0's UCI loop normally outlives Engine. Rust permits either drop
-        // order, so make the worker lifetime explicit before invalidating the
-        // non-owning forwarder pointer (`engine.cc:127-136,247-250`).
-        let _ = self.search.abort_search();
+        // order, so finish the active search while the non-owning forwarder is
+        // still registered; aborting here would suppress a finite search's
+        // required final bestmove (`search.cc:1019-1041`).
+        let _ = self.search.finish_for_responder_drop();
         self.uci_forwarder.unregister(responder);
     }
 

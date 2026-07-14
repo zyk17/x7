@@ -1135,6 +1135,18 @@ impl ClassicSearch {
         }
         Ok(())
     }
+
+    /// Rust's non-owning UCI responder must remain valid until every worker
+    /// has stopped. px0 keeps its UCI loop alive for the engine lifetime; on
+    /// this ownership boundary, finite searches are allowed to finish while an
+    /// unbounded search receives the same `Stop` then `Wait` sequence
+    /// (`src/search/classic/search.cc:1019-1041`).
+    pub fn finish_for_responder_drop(&mut self) -> Result<(), EnginError> {
+        if self.infinite.load(Ordering::Acquire) {
+            self.stop_search()?;
+        }
+        self.wait_search()
+    }
 }
 
 impl SearchBase for ClassicSearch {
