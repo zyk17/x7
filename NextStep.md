@@ -133,6 +133,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - 已完成 `go searchmoves` 的合法根着法解析和选择/PV/输出共用过滤；对应
   `src/search/classic/wrapper.cc:78-100`、`search.cc:721-724,1668-1740`。下一项仍是
   task worker 的稳定 node 存储边界，不以假并行替代。
+- root 尚无已评估 child 的 early-stop/terminal fallback 同样不得逃逸 `searchmoves`；对应
+  `src/search/classic/wrapper.cc:78-100`、`search.cc:721-724`。
 
 - `search.cc:1828-1897`、`search.h:367-448`：task worker split 与任务队列
 - `classic/node.h:127-339`、`search.cc:1494-1508`：稳定 node 存储与 task

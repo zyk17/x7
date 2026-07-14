@@ -25,13 +25,18 @@ pub fn best_move(tree: &NodeTree, params: &SearchParams, root_move_filter: &[Mov
     let root_is_black = tree.history().is_black_to_move();
     let best_edge = best_child_edge(tree, root, params, 0, root_move_filter);
     let best = best_edge.map(|idx| tree.node(root).edge(idx).mv).unwrap_or_else(|| {
-        tree.history()
-            .last()
-            .board()
-            .generate_legal_moves()
-            .first()
-            .copied()
-            .unwrap_or(Move::NULL)
+        // px0's root filter is authoritative even before a child has an
+        // evaluated visit (`wrapper.cc:78-100`, `search.cc:721-724`). A
+        // terminal/early-stop fallback must therefore not escape it.
+        root_move_filter.first().copied().unwrap_or_else(|| {
+            tree.history()
+                .last()
+                .board()
+                .generate_legal_moves()
+                .first()
+                .copied()
+                .unwrap_or(Move::NULL)
+        })
     });
     let ponder = best_edge
         .and_then(|idx| {
@@ -314,6 +319,17 @@ mod tests {
         assert!(tree.node_mut(child).try_start_score_update());
         tree.node_mut(child).finalize_score_update(0.0, 0.0, 0.0, 1);
         assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0, &[]), Some(0));
+    }
+
+    #[test]
+    fn root_filter_applies_before_the_root_has_visits() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let allowed = state.startpos.board().parse_move("a0a1").expect("legal root move");
+
+        assert_eq!(best_move(&tree, &SearchParams::default(), &[allowed]).0, allowed);
     }
 
     #[test]
