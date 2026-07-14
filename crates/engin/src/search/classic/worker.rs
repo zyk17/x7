@@ -310,6 +310,7 @@ pub struct SearchWorker<'a> {
     task_workers: i32,
     number_out_of_order: usize,
     played_history_len: usize,
+    task_queue: PickTaskQueue,
     picking_workspace: TaskWorkspace,
 }
 
@@ -368,6 +369,7 @@ impl<'a> SearchWorker<'a> {
             max_out_of_order,
             task_workers,
             number_out_of_order: 0,
+            task_queue: PickTaskQueue::default(),
             picking_workspace: TaskWorkspace::default(),
         }
     }
@@ -516,6 +518,9 @@ impl<'a> SearchWorker<'a> {
         if self.task_workers > 0 {
             return Err(EnginError::PortIncomplete("P4 PickNodesToExtend task workers"));
         }
+        // px0 `SearchWorker::PickNodesToExtend` begins every gather with
+        // `ResetTasks` (`src/search/classic/search.cc:1485-1492`).
+        self.task_queue.reset();
         self.pick_nodes_to_extend_task(self.tree.current_head(), 0, collision_limit, &MoveList::new(), true)
     }
 
