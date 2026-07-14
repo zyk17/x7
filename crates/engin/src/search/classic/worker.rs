@@ -560,6 +560,39 @@ impl<'a> SearchWorker<'a> {
         is_root: bool,
     ) -> Result<(), EnginError> {
         let mut workspace = std::mem::take(&mut self.picking_workspace);
+        let result = self.pick_nodes_to_extend_task_with_workspace(
+            root_idx,
+            base_depth,
+            collision_limit,
+            moves_to_base,
+            receiver,
+            &mut workspace,
+            is_root,
+        );
+        self.picking_workspace = workspace;
+        result
+    }
+
+    /// px0 `SearchWorker::PickNodesToExtendTask`
+    /// (`src/search/classic/search.cc:1551-1827`).
+    ///
+    /// px0 gives every gathering task an independent `TaskWorkspace`. Keeping
+    /// that workspace explicit here prevents task execution from sharing the
+    /// main worker's DFS path state.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keeps the px0 PickNodesToExtendTask input contract explicit."
+    )]
+    fn pick_nodes_to_extend_task_with_workspace(
+        &mut self,
+        root_idx: usize,
+        base_depth: u16,
+        collision_limit: u32,
+        moves_to_base: &[Move],
+        receiver: &mut Vec<NodeToProcess>,
+        workspace: &mut TaskWorkspace,
+        is_root: bool,
+    ) -> Result<(), EnginError> {
         workspace.current_path.clear();
         workspace.moves_to_path.clear();
         workspace.moves_to_path.extend_from_slice(moves_to_base);
@@ -771,7 +804,6 @@ impl<'a> SearchWorker<'a> {
                 workspace.vtp_last_filled.pop();
             }
         }
-        self.picking_workspace = workspace;
         Ok(())
     }
 

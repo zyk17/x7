@@ -55,6 +55,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   `PickTask.results`。
 - `PickNodesToExtend` 在主选择完成后等待并汇合各 `PickTask.results`，对应
   `src/search/classic/search.cc:1501-1507`；task split/dispatch 尚未接线。
+- `PickNodesToExtendTask` 的 DFS state 改为显式 `TaskWorkspace` 参数，对应
+  `src/search/classic/search.h:401-406,425-434`、`search.cc:1551-1827`；主 worker
+  仍持有自己的 workspace，后续 gathering task 可各自持有独立 workspace。
 
 ### P4 下一入口
 

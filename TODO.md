@@ -73,6 +73,9 @@
   task 共用（`src/search/classic/search.h:401-406`）。
 - [x] 主选择后等待并汇合 gathering `PickTask.results`
   （`src/search/classic/search.cc:1501-1507`）。
+- [x] 将 `PickNodesToExtendTask` 的 DFS state 显式参数化为 `TaskWorkspace`，使主 worker
+  与 gathering task 不共享 path state（`src/search/classic/search.h:401-406,425-434`、
+  `search.cc:1551-1827`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的
