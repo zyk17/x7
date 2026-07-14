@@ -154,13 +154,15 @@
   （`search.h:205-249,367-448`，`search.cc:1069-1140,1268-1508,1828-1897`）。
 - [ ] 补齐 px0 完整 out-of-order 及其多 SearchWorker 交互
   （`search.cc:1268-1508,2109-2331`）。
-- [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的
-  稳定 node 存储与访问边界（`src/search/classic/node.h:127-339`、
-  `src/search/classic/search.cc:1494-1508`）；不能以串行任务锁替代。
+- [x] 用 stable boxed arena 翻译 px0 `MakeSolid` 的 child ownership 语义：在满足
+  leaf/terminal in-flight 条件时补齐每个 edge 的 child slot，并在 backup 的同一时序刷新
+  root best-edge cache（`src/search/classic/node.cc:245-289,394-405`、
+  `src/search/classic/search.cc:2211-2217`）。
 - [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
-- [ ] 随稳定 node 存储翻译 `MakeSolid` tree 表示；它会重建 px0 child/sibling pointer
-  所有权，不能用当前 arena 伪实现（`src/search/classic/node.cc:245-289`）。
+- [ ] 对固定 FEN / fixed nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection
+  交互，核对没有把 solid child 当作 collision 或重复扩展
+  （`src/search/classic/node.h:451-523,556-626`、`search.cc:1494-1864`）。
 - [ ] 翻译 worker 内 `MaybeOutputInfo` 实时 responder 回调和可变 contempt/WDL calibration
   OptionsDict，完成 px0 UCI info 统计（`src/search/classic/search.cc:357-368`、
   `src/search/classic/params.h:107-128`）。

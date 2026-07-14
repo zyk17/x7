@@ -2016,6 +2016,17 @@ impl<'a> SearchWorker<'a> {
                     .node_mut(node_idx)
                     .adjust_for_terminal(v_delta, d_delta, m_delta, n_to_fix);
             }
+            // px0 solidifies a sufficiently visited node after its score is
+            // finalized. The root best-edge cache stores an edge iterator, so
+            // refresh it if root solidification changed that representation
+            // (`search.cc:2211-2217`, `node.cc:245-288`).
+            if self.tree.node(node_idx).n() >= self.params.solid_tree_threshold
+                && self.tree.make_solid(node_idx)
+                && node_idx == root
+            {
+                *self.search_state.current_best_edge.lock().expect("best edge lock") =
+                    best_child_edge(&self.tree, root, self.params, 0, self.root_move_filter);
+            }
             if node_idx == root {
                 break;
             }

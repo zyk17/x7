@@ -111,7 +111,7 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `SearchWorker::DoBackupUpdateSingleNode` 已补齐 sticky-endgame 的 bounds 传播、终局
   平均值修正与强制终局父节点标记，对应
   `src/search/classic/search.cc:2175-2289`、`src/search/classic/node.cc:300-392`；
-  root best-edge 缓存与 `MakeSolid` 内存布局仍待按 Rust arena 访问边界单独翻译。
+  root best-edge 缓存与 `MakeSolid` 已接到同一 backup 调用点。
 - `TaskWorkspace` 已恢复 px0 的 256-slot selection scratch 数组及选中边 score 的增量
   更新，对应 `src/search/classic/search.h:348-365`、`search.cc:1575-1825`；
   `Node::CreateEdges` 同步保留 px0 `uint8_t num_edges_` 的 255 条上限。
@@ -130,8 +130,10 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   search.cc:596-610`、`src/search/classic/stoppers/timemgr.cc:35-66`）。
 - root `current_best_edge`、无温度 best-child 排序（terminal/tablebase、visits、Q、prior）
   和 remaining-playouts root smart pruning 已翻译（`src/search/classic/search.cc:705-808,
-  1584-1588,1726-1742,2241-2249`）。`MakeSolid` 仍明确阻塞于稳定并发 node 存储：
-  px0 `node.cc:245-289` 会转换 sibling 链及 pointer 所有权，当前 Rust arena 不能伪造。
+  1584-1588,1726-1742,2241-2249`）。`MakeSolid` 已按 Rust arena 翻译：px0 的 sibling
+  链转 `Node[]`，在本项目中等价为填充每个 edge 的稳定 boxed child slot；其 leaf/terminal
+  in-flight 前置条件、root cache 刷新和 backup 时序对应 `node.cc:245-289,394-405`、
+  `search.cc:2211-2217`。
 - `WeightsFile -> OnnxBackend` 的 UCI/engine 子集已翻译：`setoption` 保存配置，`set_position`
   停止旧搜索后更新 backend，再构造新 `GameState`（`src/neural/shared_params.cc:43-80`、
   `src/engine.cc:153-167,187-197`、`src/search/search.h:48-55`）。本项目只接受 ONNX，未翻译
@@ -160,9 +162,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - root 尚无已评估 child 的 early-stop/terminal fallback 同样不得逃逸 `searchmoves`；对应
   `src/search/classic/wrapper.cc:78-100`、`search.cc:721-724`。
 
-- `classic/node.h:127-339`、`search.cc:1494-1508`：稳定 node 存储与多 SearchWorker
-  selection 的树访问边界；当前 `Vec<Node>` + 整轮 `Mutex` 不能直接承载 px0 多 worker 并发
-- `node.cc:245-289`：随稳定 node 存储边界翻译 `MakeSolid`；不能在当前 arena 上伪造
+- `classic/node.h:127-339`、`search.cc:1494-1508`：继续核对固化后的所有 child slot 在多
+  SearchWorker selection/task split 下的访问边界；Rust 已有 stable `Box` arena，不再保留整轮锁
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
 - `search.cc:357-368`、`params.h:107-128`：实时 `MaybeOutputInfo` responder 回调，及
   可变 contempt/WDL calibration OptionsDict；结束时 MultiPV/ScoreType 已完成

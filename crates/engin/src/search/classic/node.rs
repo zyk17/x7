@@ -114,6 +114,11 @@ pub struct Node {
     // but not finished). This value is added to n during selection which node
     // to pick in MCTS, and also when selecting the best move.
     n_in_flight: u32,
+    // px0 `solid_children_` (`node.h:253-255,329-330`). In C++ this changes
+    // `child_` from a sibling list into a contiguous Node array. The Rust arena
+    // already gives every child a stable allocation, so the equivalent state is
+    // that every edge owns an allocated child slot.
+    solid_children: bool,
 }
 
 impl Default for Node {
@@ -131,6 +136,7 @@ impl Default for Node {
             m: 0.0,
             n: 0,
             n_in_flight: 0,
+            solid_children: false,
         }
     }
 }
@@ -240,6 +246,11 @@ impl Node {
 
     pub fn child(&self, index: usize) -> Option<usize> {
         self.children.get(index).copied().flatten()
+    }
+
+    /// px0 `Node::MakeSolid` state predicate (`node.cc:245-288`).
+    pub const fn has_solid_children(&self) -> bool {
+        self.solid_children
     }
 
     /// px0 `Node::CreateEdges` (`node.cc:205-210`)。
@@ -404,6 +415,7 @@ impl Node {
             self.children.clear();
             self.edges.clear();
         }
+        self.solid_children = false;
     }
 
     fn reset_in_place(&mut self, parent: Option<usize>, edge_index: u16) {
@@ -512,6 +524,44 @@ impl NodeTree {
             })
             .collect::<Vec<_>>();
         self.node_mut(node_idx).make_not_terminal(&child_stats);
+    }
+
+    /// px0 `Node::MakeSolid` (`src/search/classic/node.cc:245-288`) adapted
+    /// to indexed stable Rust allocations. px0 reallocates the sibling chain
+    /// into a `Node[]`; this arena instead fills every missing edge slot with a
+    /// stable boxed child. The externally observable condition is identical:
+    /// a solid node has one child node for every edge and may not be solidified
+    /// while an immediate leaf/terminal child is in flight.
+    pub fn make_solid(&mut self, node_idx: usize) -> bool {
+        let node = self.node(node_idx);
+        if node.has_solid_children() || node.num_edges() == 0 || node.is_terminal() {
+            return false;
+        }
+
+        let mut total_in_flight = 0u32;
+        for child_idx in node.children.iter().copied().flatten() {
+            let child = self.node(child_idx);
+            if (child.n() <= 1 || child.is_terminal()) && child.n_in_flight() > 0 {
+                return false;
+            }
+            total_in_flight += child.n_in_flight();
+        }
+        if total_in_flight != node.n_in_flight() {
+            return false;
+        }
+
+        let missing_edges = self
+            .node(node_idx)
+            .children
+            .iter()
+            .enumerate()
+            .filter_map(|(edge_idx, child)| child.is_none().then_some(edge_idx))
+            .collect::<Vec<_>>();
+        for edge_idx in missing_edges {
+            self.arena.spawn_child(node_idx, edge_idx);
+        }
+        self.node_mut(node_idx).solid_children = true;
+        true
     }
 
     /// px0 `NodeTree::MakeMove` (`node.cc:465-481`)。
@@ -689,6 +739,47 @@ mod tests {
 
         assert!(node.edge(0).get_p() > node.edge(1).get_p());
         assert_eq!(node.edge(0).mv, Move::new(a0, a2));
+    }
+
+    /// px0 `Node::MakeSolid` makes every edge addressable as a child only when
+    /// no immediate leaf/terminal child is in flight (`node.cc:245-288`).
+    #[test]
+    fn make_solid_fills_all_child_slots_after_safety_check() {
+        let a0 = xiangqi_core::Square::parse("a0").expect("a0");
+        let a1 = xiangqi_core::Square::parse("a1").expect("a1");
+        let a2 = xiangqi_core::Square::parse("a2").expect("a2");
+        let startpos = Position::from_fen(xiangqi_core::STARTPOS_FEN).expect("startpos");
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&startpos, &[]);
+        let root = tree.current_head();
+        tree.node_mut(root)
+            .create_edges(&vec![Move::new(a0, a1), Move::new(a0, a2)]);
+
+        assert!(tree.make_solid(root));
+        assert!(tree.node(root).has_solid_children());
+        for edge_idx in 0..tree.node(root).num_edges() {
+            let child = tree.node(root).child(edge_idx).expect("solid child");
+            assert_eq!(tree.node(child).parent(), Some(root));
+            assert_eq!(tree.node(child).edge_index(), edge_idx as u16);
+        }
+        assert!(!tree.make_solid(root));
+    }
+
+    #[test]
+    fn make_solid_rejects_immediate_leaf_in_flight() {
+        let a0 = xiangqi_core::Square::parse("a0").expect("a0");
+        let a1 = xiangqi_core::Square::parse("a1").expect("a1");
+        let startpos = Position::from_fen(xiangqi_core::STARTPOS_FEN).expect("startpos");
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&startpos, &[]);
+        let root = tree.current_head();
+        tree.node_mut(root).create_edges(&vec![Move::new(a0, a1)]);
+        let child = tree.arena_mut().spawn_child(root, 0);
+        assert!(tree.node_mut(root).try_start_score_update());
+        assert!(tree.node_mut(child).try_start_score_update());
+
+        assert!(!tree.make_solid(root));
+        assert!(!tree.node(root).has_solid_children());
     }
 
     #[test]

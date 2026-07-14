@@ -393,6 +393,32 @@ mod tests {
         assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
     }
 
+    /// px0 `DoBackupUpdateSingleNode` may solidify root while other search
+    /// workers continue selection (`search.cc:2211-2217`, `node.cc:245-288`).
+    /// The Rust arena must keep every solid child slot selectable without
+    /// producing an in-flight leak or a duplicate expansion.
+    #[test]
+    fn shared_workers_continue_through_root_solidification() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
+        search.set_position(&state).expect("position");
+        {
+            let mut meta = search.meta.lock().expect("meta lock");
+            meta.params.task_workers_per_search_worker = 0;
+            meta.params.solid_tree_threshold = 1;
+        }
+
+        let (best, visits) = search.run_blocking_nodes(64);
+
+        assert!(!best.is_null());
+        assert!(visits >= 64);
+        let tree = search.tree.lock().expect("tree lock");
+        let root = tree.current_head();
+        assert!(tree.node(root).has_solid_children());
+        assert_eq!(tree.node(root).n_in_flight(), 0);
+    }
+
     #[test]
     fn best_child_uses_prior_until_a_child_has_more_visits() {
         ensure_init();
