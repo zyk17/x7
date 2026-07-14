@@ -84,6 +84,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   所有权建立了 px0 一致的生命周期。
 - `time_since_first_batch` 改由第一个完成 backup 的 worker 写入共享状态，watchdog 读取该状态，
   对齐 px0 worker/watchdog 分离的统计时序（`src/search/classic/search.cc:2158-2173,2331-2364`）。
+- `PickTaskQueue` 已支持 px0 的阻塞领取、condition-variable 唤醒和 `task_count=-1` 退出语义，
+  对应 `src/search/classic/search.cc:1069-1124`、`search.h:225-233`；尚未把实际 task thread
+  接到树的子树并发访问。
 
 ### P4 下一入口
 

@@ -4,7 +4,7 @@
 //! P4 worker 七阶段流水线已可单线程跑通；碰撞/task workers/OOO 完整语义
 //! 与 UCI 接线仍属开放项。
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -217,7 +217,7 @@ impl PickTask {
 #[derive(Default)]
 pub struct PickTaskQueue {
     tasks: Mutex<Vec<PickTask>>,
-    task_count: AtomicUsize,
+    task_count: AtomicIsize,
     tasks_taken: AtomicUsize,
     completed_tasks: AtomicUsize,
     task_added: Condvar,
@@ -240,6 +240,9 @@ impl PickTaskQueue {
 
     /// px0 task enqueue (`src/search/classic/search.cc:1843-1856`).
     pub fn push(&self, task: PickTask) -> bool {
+        if self.task_count.load(Ordering::Acquire) < 0 {
+            return false;
+        }
         let mut tasks = self.tasks.lock().expect("pick task queue lock");
         if tasks.len() >= Self::MAX_TASKS {
             return false;
@@ -255,7 +258,8 @@ impl PickTaskQueue {
     pub fn take(&self) -> Option<(usize, PickTask)> {
         let index = loop {
             let taken = self.tasks_taken.load(Ordering::Acquire);
-            if taken >= self.task_count.load(Ordering::Acquire) {
+            let task_count = self.task_count.load(Ordering::Acquire);
+            if task_count < 0 || taken >= task_count as usize {
                 return None;
             }
             if self
@@ -295,9 +299,39 @@ impl PickTaskQueue {
 
     /// px0 `SearchWorker::WaitForTasks` (`src/search/classic/search.cc:1475-1483`).
     pub fn wait(&self) {
-        while self.completed_tasks.load(Ordering::Acquire) < self.task_count.load(Ordering::Acquire) {
+        while self.completed_tasks.load(Ordering::Acquire) < self.task_count.load(Ordering::Acquire).max(0) as usize {
             std::hint::spin_loop();
         }
+    }
+
+    /// px0 `SearchWorker::RunTasks` sleep/exit path
+    /// (`src/search/classic/search.cc:1069-1124`).
+    ///
+    /// A `-1` task count means the owning `SearchWorker` is being destroyed.
+    /// Workers otherwise sleep until `push()` publishes more work.
+    pub fn take_blocking(&self) -> Option<(usize, PickTask)> {
+        loop {
+            if let Some(task) = self.take() {
+                return Some(task);
+            }
+            if self.task_count.load(Ordering::Acquire) < 0 {
+                return None;
+            }
+            let tasks = self.tasks.lock().expect("pick task queue lock");
+            if self.task_count.load(Ordering::Acquire) < 0 {
+                return None;
+            }
+            if self.tasks_taken.load(Ordering::Acquire) < self.task_count.load(Ordering::Acquire).max(0) as usize {
+                continue;
+            }
+            drop(self.task_added.wait(tasks).expect("pick task queue wait"));
+        }
+    }
+
+    /// px0 `SearchWorker::~SearchWorker` (`src/search/classic/search.h:225-233`).
+    pub fn close(&self) {
+        self.task_count.store(-1, Ordering::Release);
+        self.task_added.notify_all();
     }
 
     /// px0 result merge (`src/search/classic/search.cc:1501-1507`).
@@ -1677,6 +1711,29 @@ mod tests {
         assert_eq!(worker.minibatch.len(), 1);
         assert!(!worker.minibatch[0].is_collision);
         assert_eq!(worker.minibatch[0].moves_to_visit, vec![mv]);
+    }
+
+    #[test]
+    fn pick_task_queue_wakes_and_closes_like_px0_run_tasks() {
+        let queue = Arc::new(PickTaskQueue::default());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let worker_queue = Arc::clone(&queue);
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).expect("ready");
+            worker_queue.take_blocking()
+        });
+        ready_rx.recv().expect("worker ready");
+        assert!(queue.push(PickTask::processing(3, 5)));
+        let (id, task) = worker.join().expect("task worker").expect("queued task");
+        assert_eq!(id, 0);
+        assert_eq!(task.kind, PickTaskKind::Processing);
+        assert_eq!((task.start_idx, task.end_idx), (3, 5));
+
+        let closing_queue = Arc::new(PickTaskQueue::default());
+        let waiter_queue = Arc::clone(&closing_queue);
+        let waiter = std::thread::spawn(move || waiter_queue.take_blocking());
+        closing_queue.close();
+        assert!(waiter.join().expect("closing worker").is_none());
     }
 
     #[test]

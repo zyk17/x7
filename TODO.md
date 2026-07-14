@@ -93,6 +93,8 @@
   （`src/search/classic/search.h:235-249`）。
 - [x] 将 first-batch 计时移入 worker backup 后的共享统计状态
   （`src/search/classic/search.cc:2158-2173,2331-2364`）。
+- [x] 翻译 task queue 的阻塞领取、条件变量唤醒和 `-1` 退出生命周期
+  （`src/search/classic/search.cc:1069-1124`、`search.h:225-233`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的
