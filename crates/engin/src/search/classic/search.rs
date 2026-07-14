@@ -492,6 +492,16 @@ struct SearchMeta {
     root_move_filter: Vec<Move>,
 }
 
+/// px0 `last_outputted_info_edge_` and `last_outputted_uci_info_`
+/// (`src/search/classic/search.h:175-176`).
+#[derive(Default)]
+struct LiveInfoState {
+    edge: Option<usize>,
+    depth: i32,
+    seldepth: i32,
+    time: i64,
+}
+
 /// px0 `Search::MaybeTriggerStop` 的 worker 可调用边界
 /// (`src/search/classic/search.cc:596-620,2331-2334`).
 ///
@@ -568,6 +578,7 @@ pub struct ClassicSearch {
     /// (`src/search/classic/search.h:146-151`).
     ok_to_respond_bestmove: Arc<AtomicBool>,
     bestmove_is_sent: Arc<AtomicBool>,
+    live_info: Arc<Mutex<LiveInfoState>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     infinite: AtomicBool,
     pub outputs: Vec<SearchOutput>,
@@ -596,6 +607,7 @@ impl ClassicSearch {
             responder: None,
             ok_to_respond_bestmove: Arc::new(AtomicBool::new(true)),
             bestmove_is_sent: Arc::new(AtomicBool::new(false)),
+            live_info: Arc::new(Mutex::new(LiveInfoState::default())),
             threads: Mutex::new(Vec::new()),
             infinite: AtomicBool::new(false),
             outputs: Vec::new(),
@@ -758,12 +770,41 @@ impl ClassicSearch {
         let watchdog_meta = Arc::clone(&meta);
         let watchdog_stop = Arc::clone(&stop);
         let watchdog_stop_controller = Arc::clone(&stop_controller);
+        let live_info = Arc::clone(&self.live_info);
         let has_wdl = self.backend.attributes().has_wdl;
         // px0 starts a watchdog before search workers (`search.cc:874-896`).
         // It owns the terminal bestmove response; workers only advance tree
         // state and may request a stop through SearchStopController.
         handles.push(thread::spawn(move || loop {
             watchdog_stop_controller.maybe_trigger_stop(&watchdog_worker_state);
+            if !watchdog_stop.load(Ordering::Acquire) {
+                if let Some(responder) = &responder {
+                    // Keep px0's tree-before-current-best lock order. Backup
+                    // updates current_best_edge while holding the tree phase.
+                    let tree = watchdog_tree.lock().expect("tree lock");
+                    let meta = watchdog_meta.lock().expect("meta lock");
+                    let edge = *watchdog_worker_state.current_best_edge.lock().expect("best edge lock");
+                    if edge.is_some() {
+                        if let Some(output) =
+                            ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
+                        {
+                            let info = output.infos.first().expect("root best edge has info");
+                            let mut last = live_info.lock().expect("live info lock");
+                            if edge != last.edge
+                                || info.depth != last.depth
+                                || info.seldepth != last.seldepth
+                                || last.time + 5_000 < info.time
+                            {
+                                responder.output_thinking_info(&output.infos);
+                                last.edge = edge;
+                                last.depth = info.depth;
+                                last.seldepth = info.seldepth;
+                                last.time = info.time;
+                            }
+                        }
+                    }
+                }
+            }
             if watchdog_stop.load(Ordering::Acquire)
                 && ok_to_respond_bestmove.load(Ordering::Acquire)
                 && watchdog_worker_state.total_playouts.load(Ordering::Acquire) > 0
@@ -839,6 +880,7 @@ impl SearchBase for ClassicSearch {
         self.infinite.store(params.infinite, Ordering::Release);
         self.ok_to_respond_bestmove.store(!params.infinite, Ordering::Release);
         self.bestmove_is_sent.store(false, Ordering::Release);
+        *self.live_info.lock().expect("live info lock") = LiveInfoState::default();
 
         let nodes = params.nodes.filter(|&n| n > 0);
         if params.nodes.is_some() && nodes.is_none() {

@@ -177,6 +177,8 @@
   最终完整 MultiPV/bestmove 输出、`wait` 只 join、`stop` 只发停止请求；覆盖
   `go infinite -> stop -> wait` 的唯一 bestmove（`src/search/classic/search.cc:595-620,
   874-1041`）。
+- [x] 翻译 watchdog 内 `MaybeOutputInfo` 的 root-edge/depth/seldepth/5 秒频率判断，且保持
+  tree -> current-best 的同步顺序（`src/search/classic/search.cc:51,357-382,2211-2249`）。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [x] 对 fixed-nodes 覆盖 solid node 与多 SearchWorker/task split 的 selection 交互，核对
   solid child 不会造成 collision/in-flight 泄漏或重复扩展
