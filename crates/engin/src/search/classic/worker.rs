@@ -277,6 +277,15 @@ impl PickTaskQueue {
             std::hint::spin_loop();
         }
     }
+
+    /// px0 result merge (`src/search/classic/search.cc:1501-1507`).
+    pub fn drain_results_into(&self, receiver: &mut Vec<NodeToProcess>) {
+        self.wait();
+        let mut tasks = self.tasks.lock().expect("pick task queue lock");
+        for task in tasks.iter_mut() {
+            receiver.append(&mut task.results);
+        }
+    }
 }
 
 impl Default for TaskWorkspace {
@@ -531,6 +540,7 @@ impl<'a> SearchWorker<'a> {
             true,
         );
         self.minibatch = receiver;
+        self.task_queue.drain_results_into(&mut self.minibatch);
         result
     }
 
