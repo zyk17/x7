@@ -105,11 +105,20 @@ fn wdl_from_wl_d(wl: f32, d: f32) -> Wdl {
     Wdl { w, d: draw, l }
 }
 
-/// px0 `WDLRescale` (`src/search/classic/search.cc:206-236`) with the
-/// translated default zero-contempt parameters from `params.cc:614-620`:
-/// ratio=1, diff=0, max_s=1.4. The option layer for changing those values is
-/// intentionally not exposed before its full px0 contempt dependencies exist.
-fn wdl_rescale_default(wl: &mut f32, d: &mut f32) -> f32 {
+/// px0 `WDLRescale` (`src/search/classic/search.cc:202-236`).
+pub(crate) fn wdl_rescale(
+    wl: &mut f32,
+    d: &mut f32,
+    mut ratio: f32,
+    mut diff: f32,
+    sign: f32,
+    invert: bool,
+    max_s: f32,
+) -> f32 {
+    if invert {
+        diff = -diff;
+        ratio = 1.0 / ratio;
+    }
     let w = (1.0 + *wl - *d) / 2.0;
     let l = (1.0 - *wl - *d) / 2.0;
     const EPS: f32 = 0.0001;
@@ -118,13 +127,22 @@ fn wdl_rescale_default(wl: &mut f32, d: &mut f32) -> f32 {
     }
     let a = fast_log(1.0 / l - 1.0);
     let b = fast_log(1.0 / w - 1.0);
-    let s = (2.0 / (a + b)).min(1.4);
+    let mut s = 2.0 / (a + b);
+    if !invert {
+        s = s.min(max_s);
+    }
     let mu = (a - b) / (a + b);
-    let w_new = fast_logistic((-1.0 + mu) / s);
-    let l_new = fast_logistic((-1.0 - mu) / s);
+    let mut s_new = s * ratio;
+    if invert {
+        std::mem::swap(&mut s, &mut s_new);
+        s = s.min(max_s);
+    }
+    let mu_new = mu + sign * s * s * diff;
+    let w_new = fast_logistic((-1.0 + mu_new) / s_new);
+    let l_new = fast_logistic((-1.0 - mu_new) / s_new);
     *wl = w_new - l_new;
     *d = (1.0 - w_new - l_new).max(0.0);
-    mu
+    mu_new
 }
 
 /// px0 `Search::SendUciInfo` score branches (`search.cc:275-322`).
@@ -138,7 +156,7 @@ fn score_from_wdl(score_type: ScoreType, wl: &mut f32, d: &mut f32, q: f32, has_
         ScoreType::Q => (q * 10_000.0) as i32,
         ScoreType::WinLoss => (*wl * 10_000.0) as i32,
         ScoreType::WdlMu => {
-            let mu = wdl_rescale_default(wl, d);
+            let mu = wdl_rescale(wl, d, 1.0, 0.0, 1.0, true, 1.4);
             let centipawn_score = 45.0 * (1.567_280_8 * *wl).tan();
             if has_wdl
                 && mu != 0.0
@@ -291,7 +309,9 @@ mod tests {
 
     use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
-    use super::{best_child_edge, best_move, orient_move, score_from_wdl, wdl_from_wl_d, ScoreType, SearchParams};
+    use super::{
+        best_child_edge, best_move, orient_move, score_from_wdl, wdl_from_wl_d, wdl_rescale, ScoreType, SearchParams,
+    };
     use crate::neural::backend::{
         Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, UniformBackend,
     };
@@ -465,6 +485,19 @@ mod tests {
             wdl_from_wl_d(0.1, 0.2),
             crate::callbacks::Wdl { w: 450, d: 200, l: 350 }
         );
+    }
+
+    /// px0 `WDLRescale` keeps a valid WDL distribution within its numerical
+    /// guards (`src/search/classic/search.cc:202-236`).
+    #[test]
+    fn wdl_rescale_keeps_valid_distribution() {
+        let mut wl = 0.2;
+        let mut d = 0.4;
+        let mu = wdl_rescale(&mut wl, &mut d, 1.0, 0.0, 1.0, true, 10.0);
+        assert!(mu.is_finite());
+        assert!(wl.is_finite() && d.is_finite());
+        assert!((-1.0..=1.0).contains(&wl));
+        assert!((0.0..=1.0).contains(&d));
     }
 
     #[test]

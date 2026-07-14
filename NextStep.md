@@ -190,6 +190,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `StartThreads(0)` 的默认 search worker 数已使用 px0 公式：backend 建议值加上一个
   非 CPU backend worker，不再少启动 GPU pipeline 所需 worker
   （`src/search/classic/search.cc:874-896`）。
+- WDL 重标定的通用 `WDLRescale` 已逐式翻译并覆盖数值 guard；下一步只可从该 helper
+  接入 `FetchSingleNodeResult`，不得另写显示层近似公式
+  （`src/search/classic/search.cc:202-236,2117-2143`）。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。
