@@ -55,7 +55,7 @@
   `p4_async_search_test`）。
 - [x] `stoppers/*` 子集：`Visits` / `Playouts` / `TimeLimit` / `wtime` 预算 /
   `ChainedSearchStopper`；`UniformBackend` NN cache 子集。
-- [x] 固定 FEN + nodes 确定性 trace（`p4_trace_test`；UniformBackend，非 px0 二进制）。
+- [x] 固定 FEN + px0 `VisitsStopper` trace（`p4_trace_test`；UniformBackend，非 px0 二进制）。
 - [x] 翻译 `NetworkAsBackendComputation`：真实 history 编码、2062 policy 索引、
   ONNX batch、WDL 与合法着 softmax（`src/neural/encoder.cc:118-217,229-481`，
    `src/neural/wrapper.cc:49-172`）。主 UCI 在 weights 配置翻译前明确拒绝搜索，
@@ -105,6 +105,13 @@
   `src/search/classic/search.cc:1575-1825`、`src/search/classic/node.h:320-321`）。
 - [x] 翻译 `PickNodesToExtendTask` receiver 的 30-item 条件预留
   （`src/search/classic/search.cc:1570-1573`）。
+- [x] 翻译 `ProcessPickedTask` 的逐 leaf `AddInput` 后 out-of-order fetch 顺序，及
+  `UpdateCounters -> MaybeTriggerStop` 的 worker stopper 调用；删除私有 exact
+  `nodes_budget` 截断（`src/search/classic/search.cc:1423-1462,2331-2334`，
+  `src/search/classic/stoppers/stoppers.cc:59-70`）。
+- [x] 翻译 `StoppersHints` reset/min-update 及 `MaybeTriggerStop` 向下一轮 worker
+  回写 remaining playouts（`src/search/classic/search.cc:596-610`、
+  `src/search/classic/stoppers/timemgr.cc:35-66`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

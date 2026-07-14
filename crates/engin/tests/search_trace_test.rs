@@ -1,4 +1,10 @@
-//! P3 固定 nodes 搜索 trace 验收。
+//! P3 fixed-nodes 搜索 trace 验收。
+//!
+//! px0 `VisitsStopper` only stops after an iteration has completed
+//! (`src/search/classic/stoppers/stoppers.cc:59-70`,
+//! `search.cc:2331-2334`). A completed minibatch may therefore exceed a
+//! `go nodes` target; these tests assert the stopper contract rather than an
+//! unsupported exact-visit promise.
 
 use std::sync::Once;
 
@@ -17,13 +23,13 @@ fn ensure_init() {
 }
 
 #[test]
-fn fixed_nodes_increases_root_visits() {
+fn fixed_nodes_reaches_requested_root_visits() {
     ensure_init();
     let mut search = ClassicSearch::new(Box::new(UniformBackend::default()));
     let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
     search.set_position(&state).expect("set position");
     let (best, visits) = search.run_blocking_nodes(16);
-    assert_eq!(visits, 16);
+    assert!(visits >= 16);
     assert!(!best.is_null());
 }
 
@@ -34,7 +40,7 @@ fn fixed_nodes_search_returns_legal_move() {
     let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
     search.set_position(&state).expect("set position");
     let (best, visits) = search.run_blocking_nodes(32);
-    assert_eq!(visits, 32);
+    assert!(visits >= 32);
     assert!(!best.is_null());
 }
 
@@ -53,6 +59,6 @@ fn local_x7_runs_mcts_with_cnn_if_present() {
     let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
     search.set_position(&state).expect("set position");
     let (best, visits) = search.run_blocking_nodes(4);
-    assert_eq!(visits, 4);
+    assert!(visits >= 4);
     assert!(state.startpos.board().generate_legal_moves().contains(&best));
 }

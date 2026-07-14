@@ -15,14 +15,13 @@ use crate::EnginError;
 
 use super::node::{NodeTree, Terminal};
 use super::params::SearchParams;
+use super::search::SearchStopController;
 
 /// px0 `Search` 中与 worker 相关的计数子集 (`search.h:49-200`)。
 #[derive(Debug)]
 pub struct WorkerSearchState {
     pub stop: Arc<AtomicBool>,
     pub remaining_playouts: AtomicU64,
-    /// `go nodes` 预算；0 表示无限制。
-    pub nodes_budget: AtomicU64,
     pub thread_count: AtomicUsize,
     pub shared_collisions: Mutex<Vec<(usize, u32)>>,
     pub total_playouts: AtomicU64,
@@ -44,7 +43,6 @@ impl WorkerSearchState {
         Self {
             stop,
             remaining_playouts: AtomicU64::new(remaining_playouts.max(0) as u64),
-            nodes_budget: AtomicU64::new(0),
             thread_count: AtomicUsize::new(1),
             shared_collisions: Mutex::new(Vec::new()),
             total_playouts: AtomicU64::new(0),
@@ -62,15 +60,6 @@ impl WorkerSearchState {
 
     pub fn set_remaining_playouts(&self, value: i64) {
         self.remaining_playouts.store(value.max(0) as u64, Ordering::Release);
-    }
-
-    pub fn set_nodes_budget(&self, nodes: u32) {
-        self.nodes_budget.store(nodes as u64, Ordering::Release);
-    }
-
-    pub fn nodes_budget_reached(&self, root_visits: u32) -> bool {
-        let budget = self.nodes_budget.load(Ordering::Acquire);
-        budget > 0 && root_visits >= budget as u32
     }
 
     fn record_first_batch(&self) {
@@ -377,6 +366,7 @@ pub struct SearchWorker<'a> {
     backend: &'a dyn Backend,
     params: &'a SearchParams,
     search_state: &'a WorkerSearchState,
+    stop_controller: Option<Arc<SearchStopController>>,
     minibatch: Vec<NodeToProcess>,
     computation: Option<Box<dyn BackendComputation>>,
     history: PositionHistory,
@@ -398,7 +388,21 @@ impl<'a> SearchWorker<'a> {
         params: &'a SearchParams,
         search_state: &'a WorkerSearchState,
     ) -> Self {
-        Self::from_parts(tree, backend, params, search_state)
+        Self::new_with_stop_controller(tree, backend, params, search_state, None)
+    }
+
+    /// px0 constructs every worker with its owning `Search`, so
+    /// `UpdateCounters` can call `Search::MaybeTriggerStop`
+    /// (`src/search/classic/search.cc:2331-2334`). Unit tests without a
+    /// complete search owner intentionally use `None`.
+    pub(crate) fn new_with_stop_controller(
+        tree: &'a mut NodeTree,
+        backend: &'a dyn Backend,
+        params: &'a SearchParams,
+        search_state: &'a WorkerSearchState,
+        stop_controller: Option<Arc<SearchStopController>>,
+    ) -> Self {
+        Self::from_parts(tree, backend, params, search_state, stop_controller)
     }
 
     pub fn with_context(
@@ -407,7 +411,7 @@ impl<'a> SearchWorker<'a> {
         params: &'a SearchParams,
         search_state: &'a WorkerSearchState,
     ) -> Self {
-        Self::from_parts(tree, backend, params, search_state)
+        Self::from_parts(tree, backend, params, search_state, None)
     }
 
     fn from_parts(
@@ -415,6 +419,7 @@ impl<'a> SearchWorker<'a> {
         backend: &'a dyn Backend,
         params: &'a SearchParams,
         search_state: &'a WorkerSearchState,
+        stop_controller: Option<Arc<SearchStopController>>,
     ) -> Self {
         let mut target_minibatch_size = if params.minibatch_size > 0 {
             params.minibatch_size as usize
@@ -452,6 +457,7 @@ impl<'a> SearchWorker<'a> {
             backend,
             params,
             search_state,
+            stop_controller,
             minibatch: Vec::new(),
             computation: None,
             target_minibatch_size,
@@ -466,11 +472,6 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::ExecuteOneIteration` (`search.cc:1142-1231`)。
     pub fn execute_one_iteration(&mut self) -> Result<(), EnginError> {
-        let root = self.tree.current_head();
-        if self.search_state.nodes_budget_reached(self.tree.node(root).n()) {
-            self.search_state.stop.store(true, Ordering::Release);
-            return Ok(());
-        }
         self.initialize_iteration()?;
         self.gather_minibatch()?;
         self.collect_collisions()?;
@@ -1108,7 +1109,6 @@ impl<'a> SearchWorker<'a> {
         workspace: &mut TaskWorkspace,
     ) -> Result<(), EnginError> {
         workspace.history = self.tree.history().clone();
-        let mut nn_inputs = Vec::new();
         for i in start_idx..end_idx {
             let node_idx = self.minibatch[i].node_idx;
             let depth = self.minibatch[i].depth;
@@ -1117,14 +1117,24 @@ impl<'a> SearchWorker<'a> {
             if self.minibatch[i].is_extendable(is_terminal) {
                 self.extend_node(node_idx, depth, &moves_to_visit, &mut workspace.history)?;
                 if !self.tree.node(node_idx).is_terminal() {
-                    nn_inputs.push((i, workspace.history.positions().to_vec(), {
-                        self.tree
+                    let position = EvalPosition {
+                        positions: workspace.history.positions().to_vec(),
+                        legal_moves: self
+                            .tree
                             .node(node_idx)
                             .edges()
                             .iter()
                             .map(|edge| edge.mv)
-                            .collect::<MoveList>()
-                    }));
+                            .collect::<MoveList>(),
+                    };
+                    let (result, ticket) = self
+                        .computation
+                        .as_ref()
+                        .ok_or(EnginError::PortIncomplete("P4 ProcessPickedTask without computation"))?
+                        .add_input(position)?;
+                    self.minibatch[i].nn_queried = true;
+                    self.minibatch[i].is_cache_hit = result == AddInputResult::FetchedImmediately;
+                    self.minibatch[i].eval_ticket = Some(ticket);
                 }
             }
             if self.params.out_of_order_eval
@@ -1133,16 +1143,6 @@ impl<'a> SearchWorker<'a> {
                 self.fetch_single_node_result(i)?;
                 self.minibatch[i].ooo_completed = true;
             }
-        }
-        let computation = self
-            .computation
-            .as_mut()
-            .ok_or(EnginError::PortIncomplete("P4 ProcessPickedTask without computation"))?;
-        for (index, positions, legal_moves) in nn_inputs {
-            let (result, ticket) = computation.add_input(EvalPosition { positions, legal_moves })?;
-            self.minibatch[index].nn_queried = true;
-            self.minibatch[index].is_cache_hit = result == AddInputResult::FetchedImmediately;
-            self.minibatch[index].eval_ticket = Some(ticket);
         }
         Ok(())
     }
@@ -1625,7 +1625,9 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::UpdateCounters` (`search.cc:2331-2364`) 子集。
     pub fn update_counters(&mut self) -> Result<(), EnginError> {
-        let _ = self.search_state.stop.load(Ordering::Acquire);
+        if let Some(controller) = &self.stop_controller {
+            controller.maybe_trigger_stop(self.search_state);
+        }
         Ok(())
     }
 }

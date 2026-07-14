@@ -14,7 +14,8 @@
 
 - `ClassicSearch` 多线程 `StartThreads` + `SearchWorker` 七阶段
 - `go nodes` / `movetime` / `wtime` / `infinite`+`stop` → `bestmove`
-- `nodes_budget` 精确控制 root visits；`TimeLimitStopper` 至少搜 1 node
+- `VisitsStopper` 在完成 iteration 后停止，允许 batch 轻微越过 `go nodes`；
+  `TimeLimitStopper` 至少搜 1 node
 - `p4_trace_test`：startpos 16 nodes 确定性
 - `UniformBackend` NN cache 子集
 

@@ -85,13 +85,74 @@ struct SearchMeta {
     search_active: bool,
 }
 
+/// px0 `Search::MaybeTriggerStop` 的 worker 可调用边界
+/// (`src/search/classic/search.cc:596-620,2331-2334`).
+///
+/// px0 的 watchdog 与每个 `SearchWorker::UpdateCounters` 都触发同一个
+/// stopper。Rust 端将该共享所有权显式化，避免只靠外层轮询而让一个缓存
+/// batch 在 `go nodes` 后继续扩大。
+pub(crate) struct SearchStopController {
+    meta: Arc<Mutex<SearchMeta>>,
+    stopper: Arc<Mutex<Option<ChainedSearchStopper>>>,
+}
+
+impl SearchStopController {
+    fn populate_iteration_stats(meta: &SearchMeta, worker_state: &WorkerSearchState) -> IterationStats {
+        let root_visits = worker_state.total_playouts.load(Ordering::Acquire) as i64;
+        IterationStats {
+            time_since_movestart: meta.move_start.elapsed().as_millis() as i64,
+            time_since_first_batch: worker_state
+                .first_batch
+                .lock()
+                .expect("first batch lock")
+                .map_or(0, |first_batch| first_batch.elapsed().as_millis() as i64),
+            total_nodes: root_visits,
+            nodes_since_movestart: root_visits,
+            batches_since_movestart: worker_state.total_batches.load(Ordering::Acquire) as i64,
+            average_depth: {
+                let playouts = worker_state.total_playouts.load(Ordering::Acquire);
+                worker_state
+                    .cum_depth
+                    .load(Ordering::Acquire)
+                    .checked_div(playouts)
+                    .unwrap_or(0) as i32
+            },
+        }
+    }
+
+    pub(crate) fn maybe_trigger_stop(&self, worker_state: &WorkerSearchState) -> bool {
+        let stats = {
+            let meta = self.meta.lock().expect("meta lock");
+            Self::populate_iteration_stats(&meta, worker_state)
+        };
+        let mut stopper_guard = self.stopper.lock().expect("stopper lock");
+        let Some(stopper) = stopper_guard.as_mut() else {
+            return false;
+        };
+        let mut meta = self.meta.lock().expect("meta lock");
+        let mut hints = meta.stoppers_hints.clone();
+        // px0 resets shared hints before every stopper pass; individual
+        // stoppers then reduce the estimates (`search.cc:596-610`,
+        // `stoppers/timemgr.cc:60-66`).
+        hints.reset();
+        let should_stop = stopper.should_stop(&stats, &mut hints);
+        worker_state.set_remaining_playouts(hints.estimated_remaining_playouts());
+        meta.stoppers_hints = hints;
+        if should_stop {
+            worker_state.stop.store(true, Ordering::Release);
+        }
+        should_stop
+    }
+}
+
 pub struct ClassicSearch {
     tree: Arc<Mutex<NodeTree>>,
     worker_state: Arc<WorkerSearchState>,
     meta: Arc<Mutex<SearchMeta>>,
     backend: Arc<dyn Backend>,
     stop: Arc<AtomicBool>,
-    stopper: Mutex<Option<ChainedSearchStopper>>,
+    stopper: Arc<Mutex<Option<ChainedSearchStopper>>>,
+    stop_controller: Arc<SearchStopController>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     infinite: AtomicBool,
     pub outputs: Vec<SearchOutput>,
@@ -100,18 +161,21 @@ pub struct ClassicSearch {
 impl ClassicSearch {
     pub fn new(backend: Box<dyn Backend>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let meta = Arc::new(Mutex::new(SearchMeta {
+            params: SearchParams::default(),
+            move_start: Instant::now(),
+            stoppers_hints: StoppersHints::default(),
+            search_active: false,
+        }));
+        let stopper = Arc::new(Mutex::new(None));
         Self {
             tree: Arc::new(Mutex::new(NodeTree::default())),
             worker_state: Arc::new(WorkerSearchState::new(Arc::clone(&stop), i64::MAX)),
-            meta: Arc::new(Mutex::new(SearchMeta {
-                params: SearchParams::default(),
-                move_start: Instant::now(),
-                stoppers_hints: StoppersHints::default(),
-                search_active: false,
-            })),
+            meta: Arc::clone(&meta),
             backend: Arc::from(backend),
             stop,
-            stopper: Mutex::new(None),
+            stopper: Arc::clone(&stopper),
+            stop_controller: Arc::new(SearchStopController { meta, stopper }),
             threads: Mutex::new(Vec::new()),
             infinite: AtomicBool::new(false),
             outputs: Vec::new(),
@@ -137,48 +201,8 @@ impl ClassicSearch {
         (best, visits)
     }
 
-    fn populate_iteration_stats(meta: &SearchMeta, worker_state: &WorkerSearchState) -> IterationStats {
-        // px0's watchdog reads shared counters while workers own the node
-        // mutex. The root visit count equals completed playouts after backup.
-        let root_visits = worker_state.total_playouts.load(Ordering::Acquire) as i64;
-        IterationStats {
-            time_since_movestart: meta.move_start.elapsed().as_millis() as i64,
-            time_since_first_batch: worker_state
-                .first_batch
-                .lock()
-                .expect("first batch lock")
-                .map_or(0, |first_batch| first_batch.elapsed().as_millis() as i64),
-            total_nodes: root_visits,
-            nodes_since_movestart: root_visits,
-            batches_since_movestart: worker_state.total_batches.load(Ordering::Acquire) as i64,
-            average_depth: {
-                let playouts = worker_state.total_playouts.load(Ordering::Acquire);
-                worker_state
-                    .cum_depth
-                    .load(Ordering::Acquire)
-                    .checked_div(playouts)
-                    .unwrap_or(0) as i32
-            },
-        }
-    }
-
     fn maybe_trigger_stop(&mut self) -> Result<bool, EnginError> {
-        let stats = {
-            let meta = self.meta.lock().expect("meta lock");
-            Self::populate_iteration_stats(&meta, &self.worker_state)
-        };
-        let mut stopper_guard = self.stopper.lock().expect("stopper lock");
-        let Some(stopper) = stopper_guard.as_mut() else {
-            return Ok(false);
-        };
-        let mut hints = self.meta.lock().expect("meta lock").stoppers_hints.clone();
-        if stopper.should_stop(&stats, &mut hints) {
-            self.meta.lock().expect("meta lock").stoppers_hints = hints;
-            self.stop.store(true, Ordering::Release);
-            return Ok(true);
-        }
-        self.meta.lock().expect("meta lock").stoppers_hints = hints;
-        Ok(false)
+        Ok(self.stop_controller.maybe_trigger_stop(&self.worker_state))
     }
 
     fn emit_outputs(&mut self) -> Result<(), EnginError> {
@@ -230,16 +254,24 @@ impl ClassicSearch {
         let meta = Arc::clone(&self.meta);
         let backend = Arc::clone(&self.backend);
         let stop = Arc::clone(&self.stop);
+        let stop_controller = Arc::clone(&self.stop_controller);
         for _ in 0..thread_count {
             let tree = Arc::clone(&tree);
             let worker_state = Arc::clone(&worker_state);
             let meta = Arc::clone(&meta);
             let backend = Arc::clone(&backend);
             let stop = Arc::clone(&stop);
+            let stop_controller = Arc::clone(&stop_controller);
             handles.push(thread::spawn(move || {
                 let params = meta.lock().expect("meta lock").params.clone();
                 let mut tree = tree.lock().expect("tree lock");
-                let mut worker = SearchWorker::new(&mut tree, backend.as_ref(), &params, worker_state.as_ref());
+                let mut worker = SearchWorker::new_with_stop_controller(
+                    &mut tree,
+                    backend.as_ref(),
+                    &params,
+                    worker_state.as_ref(),
+                    Some(Arc::clone(&stop_controller)),
+                );
                 if worker.run_blocking().is_err() {
                     stop.store(true, Ordering::Release);
                 }
@@ -307,11 +339,8 @@ impl SearchBase for ClassicSearch {
                 .expect("collisions lock")
                 .clear();
             if let Some(limit) = nodes {
-                self.worker_state.set_nodes_budget(limit as u32);
                 meta.stoppers_hints.update_estimated_remaining_playouts(limit as i64);
                 self.worker_state.set_remaining_playouts(limit as i64);
-            } else {
-                self.worker_state.set_nodes_budget(0);
             }
             let chain = build_search_stoppers(params, tree.history(), false);
             *self.stopper.lock().expect("stopper lock") = Some(chain);

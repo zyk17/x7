@@ -6,7 +6,7 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 
 - 测试用 `UniformBackend` 下，`go nodes` / `go movetime` / `go wtime` / `go infinite`+`stop` 可返回 `bestmove`
 - 主 UCI 不再使用 Uniform fallback；尚未翻译 `WeightsFile` 配置时会明确返回不可搜索状态
-- UniformBackend NN cache 子集；固定 nodes 确定性 trace（Rust stub，非 px0 二进制）
+- UniformBackend NN cache 子集；fixed-nodes stopper trace（Rust stub，非 px0 二进制）
 
 当前唯一工程参考：
 
@@ -27,7 +27,7 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 ### P4 已落地
 
 - `engin/src/search/classic/backend.rs`：`UniformBackendComputation` + cache（`backend.h:67-78`）
-- `engin/src/search/classic/worker.rs`：七阶段 + `nodes_budget` + OOO 子集
+- `engin/src/search/classic/worker.rs`：七阶段 + px0 `VisitsStopper` + OOO 子集
 - `engin/src/search/classic/node.rs`：`EdgeAndNode` Q/U/NStarted 代理；worker 的
   单 worker `PickNodesToExtendTask` 显式 workspace/path-backtrack 翻译
   （`search.cc:1551-1827`，task split 尚未翻译）
@@ -99,6 +99,16 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   `Node::CreateEdges` 同步保留 px0 `uint8_t num_edges_` 的 255 条上限。
 - `PickNodesToExtendTask` 已恢复 px0 receiver 在容量不足 30 时的按需预留，主 minibatch
   与 gathering task result 可跨 iteration 复用容量（`src/search/classic/search.cc:1570-1573`）。
+- `ProcessPickedTask` 现在在每个非 terminal leaf 扩展后立即 `AddInput`，再执行
+  out-of-order fetch（`src/search/classic/search.cc:1423-1462`）；不再通过临时输入列表改变
+  cache-hit 的回传时序。
+- `UpdateCounters` 现在直接调用共享 `VisitsStopper`，并删除 Rust 私有的
+  `nodes_budget` 硬截断（`src/search/classic/search.cc:596-620,2331-2334`，
+  `src/search/classic/stoppers/stoppers.cc:59-70`）。因此 `go nodes N` 是 px0 的
+  completed-iteration 下限，不承诺 root visits 严格等于 `N`。
+- `StoppersHints` 现按 px0 每次 stopper pass 前 reset、大上限初始化、min-only
+  更新，并将最新 remaining playouts 回写给下一轮 gather（`src/search/classic/
+  search.cc:596-610`、`src/search/classic/stoppers/timemgr.cc:35-66`）。
 
 ### P4 下一入口
 

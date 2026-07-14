@@ -1,4 +1,4 @@
-//! P4 确定性 trace：UniformBackend 下固定 FEN + nodes 可复现。
+//! P4 确定性 trace：UniformBackend 下 fixed-nodes stopper 可复现。
 
 use std::sync::Once;
 
@@ -25,7 +25,10 @@ fn startpos_trace_is_deterministic() {
     let a = run(16);
     let b = run(16);
     assert_eq!(a.0, b.0);
-    assert_eq!(a.1, 16);
+    // px0 `VisitsStopper` stops after `UpdateCounters`, so a completed batch
+    // may carry root visits past the target (`stoppers.cc:59-70`).
+    assert!(a.1 >= 16);
+    assert_eq!(a.1, b.1);
 }
 
 #[test]
