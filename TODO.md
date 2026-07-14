@@ -196,6 +196,8 @@
   `search.cc:206-236,2117-2154`）。
 - [x] 先固定 `FetchSingleNodeResult` 的 WDL rescale 调用时序与 px0 一致；默认
   `ratio=1/diff=0/max_s=1.4` 不改变现有搜索数值（`src/search/classic/search.cc:2117-2154`）。
+- [x] 翻译 `ContemptMode::Play` 的 StartSearch 运行态解析，并让 worker 只消费已解析
+  side/disable mode（`src/search/classic/search.cc:156-175,2131-2143`）。
 - [x] 翻译 `WeightsFile` 到正式 `OnnxBackend` 的 UCI/engine 配置子集；保持 px0 配置与
   `SetPosition` 时序，不实现多 backend registry、protobuf weight 或 autodiscover
   （`src/neural/shared_params.cc:43-80`、`src/engine.cc:153-167,187-197`、

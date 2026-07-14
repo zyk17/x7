@@ -43,6 +43,17 @@ impl ScoreType {
     }
 }
 
+/// px0 `ContemptMode` (`src/search/classic/params.h:37`). `Play` is resolved
+/// once per `StartSearch`; workers only receive White, Black, or None.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContemptMode {
+    #[default]
+    Play,
+    White,
+    Black,
+    None,
+}
+
 /// px0 `BaseSearchParams` / `SearchParams` 单线程搜索所需字段。
 #[derive(Clone, Debug)]
 pub struct SearchParams {
@@ -100,6 +111,7 @@ pub struct SearchParams {
     pub wdl_rescale_ratio: f32,
     pub wdl_rescale_diff: f32,
     pub wdl_max_s: f32,
+    pub contempt_mode: ContemptMode,
     // 指在多线程并行搜索中，多个线程同时访问并等待同一个尚未被神经网络估值的节点时的最大允许访问数。
     pub max_collision_visits: i32,
     // 最大碰撞访问量开始进行比例缩放的树尺寸。
@@ -186,6 +198,7 @@ impl Default for SearchParams {
             wdl_rescale_ratio: 1.0,
             wdl_rescale_diff: 0.0,
             wdl_max_s: 1.4,
+            contempt_mode: ContemptMode::Play,
             max_collision_visits: 80_000,
             max_collision_visits_scaling_start: 28,
             max_collision_visits_scaling_end: 145_000,

@@ -14,7 +14,7 @@ use crate::uci_loop::GoParams;
 use crate::EnginError;
 
 use super::node::{Node, NodeTree};
-use super::params::{ScoreType, SearchParams};
+use super::params::{ContemptMode, ScoreType, SearchParams};
 use super::stoppers::timemgr::{IterationStats, StoppersHints};
 use super::stoppers::{build_search_stoppers, ChainedSearchStopper, SearchStopper};
 use super::worker::{SearchWorker, WorkerSearchState};
@@ -188,6 +188,17 @@ fn draw_score(tree: &NodeTree, params: &SearchParams, is_odd_depth: bool) -> f32
     }
 }
 
+/// px0 `Search::StartSearch` resolves `play` into a concrete side before
+/// workers begin (`src/search/classic/search.cc:156-175`).
+fn resolve_contempt_mode(configured: ContemptMode, infinite: bool, root_is_black: bool, ponder: bool) -> ContemptMode {
+    match configured {
+        ContemptMode::Play if infinite => ContemptMode::None,
+        ContemptMode::Play if root_is_black != ponder => ContemptMode::Black,
+        ContemptMode::Play => ContemptMode::White,
+        mode => mode,
+    }
+}
+
 fn best_edge_rank(node: Option<&Node>) -> BestEdgeRank {
     let Some(node) = node else {
         return BestEdgeRank::NonTerminal;
@@ -310,7 +321,8 @@ mod tests {
     use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
     use super::{
-        best_child_edge, best_move, orient_move, score_from_wdl, wdl_from_wl_d, wdl_rescale, ScoreType, SearchParams,
+        best_child_edge, best_move, orient_move, resolve_contempt_mode, score_from_wdl, wdl_from_wl_d, wdl_rescale,
+        ContemptMode, ScoreType, SearchParams,
     };
     use crate::neural::backend::{
         Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, UniformBackend,
@@ -501,6 +513,26 @@ mod tests {
     }
 
     #[test]
+    fn play_contempt_resolves_like_px0_start_search() {
+        assert_eq!(
+            resolve_contempt_mode(ContemptMode::Play, true, false, false),
+            ContemptMode::None
+        );
+        assert_eq!(
+            resolve_contempt_mode(ContemptMode::Play, false, false, false),
+            ContemptMode::White
+        );
+        assert_eq!(
+            resolve_contempt_mode(ContemptMode::Play, false, true, false),
+            ContemptMode::Black
+        );
+        assert_eq!(
+            resolve_contempt_mode(ContemptMode::Play, false, false, true),
+            ContemptMode::Black
+        );
+    }
+
+    #[test]
     fn score_type_q_matches_px0_scaled_q() {
         let mut wl = 0.1;
         let mut d = 0.2;
@@ -523,6 +555,9 @@ struct SearchMeta {
     /// px0 `Search::root_move_filter_` (`src/search/classic/search.h:168-171`).
     /// It is reconstructed from legal UCI `searchmoves` for every search.
     root_move_filter: Vec<Move>,
+    /// px0 resolves `ContemptMode::PLAY` at search start
+    /// (`src/search/classic/search.cc:156-175`).
+    contempt_mode: ContemptMode,
 }
 
 /// px0 `last_outputted_info_edge_` and `last_outputted_uci_info_`
@@ -627,6 +662,7 @@ impl ClassicSearch {
             stoppers_hints: StoppersHints::default(),
             search_active: false,
             root_move_filter: Vec::new(),
+            contempt_mode: ContemptMode::None,
         }));
         let stopper = Arc::new(Mutex::new(None));
         Self {
@@ -872,10 +908,11 @@ impl ClassicSearch {
             let stop = Arc::clone(&stop);
             let stop_controller = Arc::clone(&stop_controller);
             handles.push(thread::spawn(move || {
-                let (params, root_move_filter) = {
+                let (mut params, root_move_filter, contempt_mode) = {
                     let meta = meta.lock().expect("meta lock");
-                    (meta.params.clone(), meta.root_move_filter.clone())
+                    (meta.params.clone(), meta.root_move_filter.clone(), meta.contempt_mode)
                 };
+                params.contempt_mode = contempt_mode;
                 let mut worker = SearchWorker::new_shared_with_stop_controller_and_root_move_filter(
                     tree,
                     backend.as_ref(),
@@ -959,6 +996,12 @@ impl SearchBase for ClassicSearch {
             meta.move_start = Instant::now();
             meta.initial_visits = tree.node(tree.current_head()).n();
             meta.root_move_filter = root_move_filter;
+            meta.contempt_mode = resolve_contempt_mode(
+                meta.params.contempt_mode,
+                params.infinite,
+                tree.history().is_black_to_move(),
+                params.ponder,
+            );
             *self.worker_state.first_batch.lock().expect("first batch lock") = None;
             meta.stoppers_hints.reset();
             self.worker_state.total_playouts.store(0, Ordering::Release);

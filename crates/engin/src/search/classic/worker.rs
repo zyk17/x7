@@ -17,7 +17,7 @@ use crate::neural::backend::{AddInputResult, Backend, BackendComputation, EvalPo
 use crate::EnginError;
 
 use super::node::{NodeTree, Terminal};
-use super::params::SearchParams;
+use super::params::{ContemptMode, SearchParams};
 use super::search::{best_child_edge, wdl_rescale, SearchStopController};
 
 /// px0 `Search` 中与 worker 相关的计数子集 (`search.h:49-200`)。
@@ -1902,8 +1902,10 @@ impl<'a> SearchWorker<'a> {
         // UCI formatting (`src/search/classic/search.cc:2128-2143`). The
         // neutral defaults are identity in ratio/diff terms; contempt mode is
         // translated separately before non-zero diff becomes configurable.
-        if self.params.wdl_rescale_ratio != 1.0 {
-            let root_stm = self.tree.history().is_black_to_move();
+        if self.params.wdl_rescale_ratio != 1.0
+            || (self.params.wdl_rescale_diff != 0.0 && self.params.contempt_mode != ContemptMode::None)
+        {
+            let root_stm = (self.params.contempt_mode == ContemptMode::Black) == self.tree.history().is_black_to_move();
             let sign = if root_stm ^ (self.minibatch[index].depth % 2 == 1) {
                 1.0
             } else {
@@ -1913,7 +1915,11 @@ impl<'a> SearchWorker<'a> {
                 &mut eval.wl,
                 &mut eval.d,
                 self.params.wdl_rescale_ratio,
-                0.0,
+                if self.params.contempt_mode == ContemptMode::None {
+                    0.0
+                } else {
+                    self.params.wdl_rescale_diff
+                },
                 sign,
                 false,
                 self.params.wdl_max_s,
