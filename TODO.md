@@ -157,8 +157,9 @@
 - [x] 对齐常驻 task worker 的 idle 与析构退出：`GatherMinibatch` 后 `task_count=-1` 仅休眠，
   `exiting` 才终止 worker；覆盖下一轮 `ResetTasks` 复用（`search.cc:1069-1140,1182-1185,
   1464-1492`）。
-- [ ] 补齐 px0 完整 out-of-order 及其多 SearchWorker 交互
-  （`search.cc:1268-1508,2109-2331`）。
+- [x] 覆盖 px0 完整 out-of-order 及其多 SearchWorker 交互：root NN-cache hit 在
+  gather 内即时回传，另一 worker 继续 tree phase，最终 root `NInFlight` 与 shared
+  collision list 均归零（`search.cc:1268-1508,1977-1987,2109-2331`）。
 - [x] 将 `CollectCollisions` 保持在 shared-tree 写阶段，随后才降为 prefetch 的只读阶段；
   防止多 SearchWorker 在 gather/collision hand-off 间插入 backup/cancel
   （`src/search/classic/search.cc:1183-1193,1977-2008`）。

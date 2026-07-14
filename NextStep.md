@@ -215,6 +215,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   gather 到 collision hand-off 不会被另一 SearchWorker 的 backup/cancel 打断
   （`src/search/classic/search.cc:1183-1193,1977-2008`）。下一项只验证完整
   out-of-order 与多 SearchWorker 的组合时序。
+- 两个 SearchWorker 的 root cache-hit out-of-order 回归已覆盖：完成后 root
+  `NInFlight` 与 shared collision list 均为零，验证 gather 内即时回传和另一 worker 的
+  tree phase 可正确汇合（`src/search/classic/search.cc:1268-1419,1977-1987,2109-2173`）。
 - `scripts/compare_px0_trace.ps1` 已固定 px0 / engin 的同 FEN、同 `go nodes`
   transcript 采集入口（`uciloop.cc:178-254`、`classic/wrapper.cc:53-141`）。两端当前
   分别读取 `pb.gz` 和 ONNX，故只作 nodes/PV/bestmove 行为对照，不作 score 精确断言。

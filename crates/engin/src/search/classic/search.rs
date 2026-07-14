@@ -368,6 +368,16 @@ mod tests {
         }
     }
 
+    impl ParallelUniformBackend {
+        /// Seeds px0's NN-cache equivalent so concurrent workers exercise the
+        /// `AddInput -> FetchedImmediately -> OOO backup` path.
+        fn seed_cache(&self, position: &EvalPosition) {
+            let history = xiangqi_core::PositionHistory::from_positions(position.positions.clone());
+            self.0
+                .store_cache(position, self.0.evaluate(&history, &position.legal_moves));
+        }
+    }
+
     /// px0 `StartThreads` keeps several search workers alive while each only
     /// locks tree phases (`search.cc:1088-1140,1142-1211`).
     #[test]
@@ -428,6 +438,62 @@ mod tests {
         let root = tree.current_head();
         assert!(tree.node(root).has_solid_children());
         assert_eq!(tree.node(root).n_in_flight(), 0);
+    }
+
+    /// px0 publishes cache-hit out-of-order results during gather, while other
+    /// SearchWorkers can continue their independent tree phases
+    /// (`search.cc:1268-1419,1977-1987,2109-2173`). The shared collision list
+    /// must be drained by backup and leave no root reservation behind.
+    #[test]
+    fn shared_workers_reconcile_out_of_order_cache_hits() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let backend = ParallelUniformBackend::default();
+        let mut search = super::ClassicSearch::new(Box::new(backend.clone()));
+        search.set_position(&state).expect("position");
+        {
+            let tree = search.tree.read().expect("tree lock");
+            let history = tree.history();
+            backend.seed_cache(&EvalPosition {
+                positions: history.positions().to_vec(),
+                legal_moves: history.last().board().generate_legal_moves(),
+            });
+        }
+        {
+            let mut meta = search.meta.lock().expect("meta lock");
+            meta.params.minibatch_size = 4;
+            meta.params.task_workers_per_search_worker = 0;
+            meta.params.max_collision_visits = 4;
+            meta.params.max_collision_visits_scaling_start = 0;
+            meta.params.max_collision_visits_scaling_end = 1;
+        }
+
+        let (best, visits) = search.run_blocking_nodes(64);
+
+        assert!(!best.is_null());
+        assert!(visits >= 64);
+        assert!(
+            search
+                .worker_state
+                .total_batches
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+        );
+        assert!(
+            search
+                .worker_state
+                .total_playouts
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= u64::from(visits)
+        );
+        let tree = search.tree.read().expect("tree lock");
+        assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
+        assert!(search
+            .worker_state
+            .shared_collisions
+            .lock()
+            .expect("collisions lock")
+            .is_empty());
     }
 
     /// px0 `DoBackupUpdateSingleNode` may solidify root while other search
