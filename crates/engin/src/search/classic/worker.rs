@@ -521,7 +521,17 @@ impl<'a> SearchWorker<'a> {
         // px0 `SearchWorker::PickNodesToExtend` begins every gather with
         // `ResetTasks` (`src/search/classic/search.cc:1485-1492`).
         self.task_queue.reset();
-        self.pick_nodes_to_extend_task(self.tree.current_head(), 0, collision_limit, &MoveList::new(), true)
+        let mut receiver = std::mem::take(&mut self.minibatch);
+        let result = self.pick_nodes_to_extend_task(
+            self.tree.current_head(),
+            0,
+            collision_limit,
+            &MoveList::new(),
+            &mut receiver,
+            true,
+        );
+        self.minibatch = receiver;
+        result
     }
 
     /// px0 `PickNodesToExtendTask` (`src/search/classic/search.cc:1551-1897`)
@@ -536,6 +546,7 @@ impl<'a> SearchWorker<'a> {
         base_depth: u16,
         collision_limit: u32,
         moves_to_base: &[Move],
+        receiver: &mut Vec<NodeToProcess>,
         is_root: bool,
     ) -> Result<(), EnginError> {
         let mut workspace = std::mem::take(&mut self.picking_workspace);
@@ -566,7 +577,7 @@ impl<'a> SearchWorker<'a> {
                 if self.tree.node(current_idx).n() == 0 || self.tree.node(current_idx).is_terminal() {
                     if is_root_node && self.tree.node_mut(current_idx).try_start_score_update() {
                         cur_limit -= 1;
-                        self.minibatch.push(NodeToProcess::visit(
+                        receiver.push(NodeToProcess::visit(
                             current_idx,
                             (workspace.current_path.len() + base_depth as usize) as u16,
                         ));
@@ -577,7 +588,7 @@ impl<'a> SearchWorker<'a> {
                         } else {
                             0
                         };
-                        self.minibatch.push(NodeToProcess::collision(
+                        receiver.push(NodeToProcess::collision(
                             current_idx,
                             (workspace.current_path.len() + base_depth as usize) as u16,
                             cur_limit,
@@ -702,7 +713,7 @@ impl<'a> SearchWorker<'a> {
                             );
                             item.moves_to_visit = workspace.moves_to_path.clone();
                             item.moves_to_visit.push(self.tree.node(current_idx).edge(best_idx).mv);
-                            self.minibatch.push(item);
+                            receiver.push(item);
                         }
                     }
                     if best_idx as isize > *workspace.vtp_last_filled.last().expect("last filled")
