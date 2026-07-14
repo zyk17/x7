@@ -87,6 +87,10 @@ pub struct SearchParams {
     pub temperature: f32,
     // 如果不为 0，则最多允许这么多个搜索工作线程同时收集 Mini-batch。
     pub max_concurrent_searchers: i32,
+    /// px0 `SearchSpinBackoff` (`params.cc:525-526,632`): choose an
+    /// exponential backoff instead of the default hard-spin while waiting for
+    /// a `MaxConcurrentSearchers` permit.
+    pub search_spin_backoff: bool,
     // 指在多线程并行搜索中，多个线程同时访问并等待同一个尚未被神经网络估值的节点时的最大允许访问数。
     pub max_collision_visits: i32,
     // 最大碰撞访问量开始进行比例缩放的树尺寸。
@@ -162,6 +166,7 @@ impl Default for SearchParams {
             solid_tree_threshold: 100,
             temperature: 0.0,
             max_concurrent_searchers: 1,
+            search_spin_backoff: false,
             max_collision_visits: 80_000,
             max_collision_visits_scaling_start: 28,
             max_collision_visits_scaling_end: 145_000,

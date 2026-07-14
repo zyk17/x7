@@ -722,6 +722,8 @@ impl SearchBase for ClassicSearch {
             self.worker_state.cum_depth.store(0, Ordering::Release);
             self.worker_state.max_depth.store(0, Ordering::Release);
             self.worker_state
+                .set_max_concurrent_searchers(meta.params.max_concurrent_searchers);
+            self.worker_state
                 .shared_collisions
                 .lock()
                 .expect("collisions lock")

@@ -91,6 +91,12 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `SearchWorker` 在构造时按 task worker 数分配独立 `TaskWorkspace`，正常搜索由每个
   常驻 task thread 独占一个 workspace，并在 worker 退出时关闭队列、join 全部 task threads；
   对应 `src/search/classic/search.h:205-249,357-364`。
+- `WorkerSearchState::pending_searchers` 与 `SearchWorker::ExecuteOneIteration` 现翻译
+  px0 `MaxConcurrentSearchers`：slot 覆盖 gather/collision/prefetch，NN compute 前归还；
+  `SearchSpinBackoff=false` 保持 hard-spin 默认值，对应
+  `src/search/classic/params.cc:399-404,604-604,525-526,632-632`、
+  `src/search/classic/search.cc:1142-1195`。当前单 SearchWorker 下行为不变，作为后续多 worker
+  tree boundary 的先决共享状态。
 - `SearchWorker::DoBackupUpdateSingleNode` 已补齐 sticky-endgame 的 bounds 传播、终局
   平均值修正与强制终局父节点标记，对应
   `src/search/classic/search.cc:2175-2289`、`src/search/classic/node.cc:300-392`；

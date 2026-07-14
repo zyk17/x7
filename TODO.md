@@ -98,6 +98,10 @@
   （`src/search/classic/search.cc:1069-1124`、`search.h:225-233`）。
 - [x] 翻译构造期 per-task `TaskWorkspace` 分配及 worker 退出队列关闭
   （`src/search/classic/search.h:205-233,357-364`）。
+- [x] 翻译 `MaxConcurrentSearchers` 的 `pending_searchers_` acquire/release 时序及
+  `SearchSpinBackoff=false` 默认值：slot 仅覆盖 gather/collision/prefetch，并在 NN compute 前归还
+  （`src/search/classic/params.cc:399-404,525-526,604-604,632-632`、
+  `src/search/classic/search.cc:1142-1195`）。
 - [x] 翻译 sticky-endgame 的 `MaybeSetBounds`、强制终局父 bounds 传播与
   `AdjustForTerminal` 统计修正（`src/search/classic/search.cc:2175-2289`、
   `src/search/classic/node.cc:300-392`）。

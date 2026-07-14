@@ -5,7 +5,7 @@
 //! 生命周期已按 px0 源码逐函数翻译；多 SearchWorker 的 tree access
 //! boundary 仍未完成。
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -22,6 +22,9 @@ use super::search::{best_child_edge, SearchStopController};
 #[derive(Debug)]
 pub struct WorkerSearchState {
     pub stop: Arc<AtomicBool>,
+    /// px0 `Search::pending_searchers_` (`search.h:183-184`), the number of
+    /// workers allowed to remain in the gather/process tree phase.
+    pub pending_searchers: AtomicI32,
     pub remaining_playouts: AtomicU64,
     pub thread_count: AtomicUsize,
     pub shared_collisions: Mutex<Vec<(usize, u32)>>,
@@ -47,6 +50,7 @@ impl WorkerSearchState {
     pub fn new(stop: Arc<AtomicBool>, remaining_playouts: i64) -> Self {
         Self {
             stop,
+            pending_searchers: AtomicI32::new(1),
             remaining_playouts: AtomicU64::new(remaining_playouts.max(0) as u64),
             thread_count: AtomicUsize::new(1),
             shared_collisions: Mutex::new(Vec::new()),
@@ -73,6 +77,13 @@ impl WorkerSearchState {
         if first_batch.is_none() {
             *first_batch = Some(Instant::now());
         }
+    }
+
+    /// px0 initializes `pending_searchers_` on every `StartSearch`
+    /// (`src/search/classic/search.cc:153`). A zero limit disables this
+    /// throttle, matching px0 `MaxConcurrentSearchers=0`.
+    pub fn set_max_concurrent_searchers(&self, limit: i32) {
+        self.pending_searchers.store(limit.max(0), Ordering::Release);
     }
 }
 
@@ -524,13 +535,69 @@ impl<'a> SearchWorker<'a> {
     /// px0 `SearchWorker::ExecuteOneIteration` (`search.cc:1142-1231`)。
     pub fn execute_one_iteration(&mut self) -> Result<(), EnginError> {
         self.initialize_iteration()?;
-        self.gather_minibatch()?;
-        self.collect_collisions()?;
-        self.maybe_prefetch_into_cache()?;
+        if !self.acquire_searcher_permit() {
+            return Ok(());
+        }
+        let gather_result = (|| {
+            self.gather_minibatch()?;
+            self.collect_collisions()?;
+            self.maybe_prefetch_into_cache()
+        })();
+        self.release_searcher_permit();
+        gather_result?;
         self.run_nn_computation()?;
         self.fetch_minibatch_results()?;
         self.do_backup_update()?;
         self.update_counters()
+    }
+
+    /// px0 `ExecuteOneIteration` permit acquisition
+    /// (`src/search/classic/search.cc:1147-1182`). The default hard-spin is
+    /// preserved; `SearchSpinBackoff` only adds periodic yielding after the
+    /// same failed CAS loop.
+    fn acquire_searcher_permit(&self) -> bool {
+        if self.params.max_concurrent_searchers == 0 {
+            return true;
+        }
+
+        let mut spins = 0usize;
+        loop {
+            // px0 permits one first iteration even when a stop arrives before
+            // this worker reaches the throttle (`search.cc:1156-1160`).
+            if self.search_state.stop.load(Ordering::Acquire)
+                && self.search_state.total_playouts.load(Ordering::Acquire) > 0
+            {
+                return false;
+            }
+
+            let available = self.search_state.pending_searchers.load(Ordering::Acquire);
+            if available > 0
+                && self
+                    .search_state
+                    .pending_searchers
+                    .compare_exchange_weak(available, available - 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return true;
+            }
+
+            spins += 1;
+            if self.params.search_spin_backoff && spins >= 512 {
+                std::thread::yield_now();
+                spins = 0;
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// px0 releases the slot immediately after prefetch and before waiting on
+    /// the backend (`src/search/classic/search.cc:1192-1195`). A zero limit
+    /// represents disabled throttling and therefore owns no slot.
+    fn release_searcher_permit(&self) {
+        if self.params.max_concurrent_searchers != 0 {
+            self.search_state.pending_searchers.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// 单线程测试入口：重复执行 iteration 直到 root N 达标。
@@ -1842,6 +1909,27 @@ mod tests {
 
     fn ensure_init() {
         INIT.call_once(initialize_magic_bitboards);
+    }
+
+    /// px0 replenishes `pending_searchers_` before NN work, so a worker that
+    /// leaves the gather phase cannot starve later workers
+    /// (`search.cc:1147-1195`).
+    #[test]
+    fn searcher_permit_returns_slot_after_gather_phase() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        search_state.set_max_concurrent_searchers(1);
+        let worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
+
+        assert!(worker.acquire_searcher_permit());
+        assert_eq!(search_state.pending_searchers.load(Ordering::Acquire), 0);
+        worker.release_searcher_permit();
+        assert_eq!(search_state.pending_searchers.load(Ordering::Acquire), 1);
     }
 
     /// A non-CPU attribute wrapper makes the px0 automatic task-worker path
