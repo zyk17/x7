@@ -119,7 +119,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   与 gathering task result 可跨 iteration 复用容量（`src/search/classic/search.cc:1570-1573`）。
 - `ProcessPickedTask` 现在在每个非 terminal leaf 扩展后立即 `AddInput`，再执行
   out-of-order fetch（`src/search/classic/search.cc:1423-1462`）；不再通过临时输入列表改变
-  cache-hit 的回传时序。
+  cache-hit 的回传时序。其 collision 与 px0 一样在入口立即跳过，故终局 collision 不会被
+  错标为 OOO completed；`out_of_order_skips_terminal_collision` 覆盖该时序。
 - `UpdateCounters` 现在直接调用共享 `VisitsStopper`，并删除 Rust 私有的
   `nodes_budget` 硬截断（`src/search/classic/search.cc:596-620,2331-2334`，
   `src/search/classic/stoppers/stoppers.cc:59-70`）。因此 `go nodes N` 是 px0 的

@@ -1538,9 +1538,15 @@ impl<'a> SearchWorker<'a> {
     ) -> Result<(), EnginError> {
         workspace.history = self.tree.history().clone();
         for i in start_idx..end_idx {
+            // px0 immediately skips collisions here. They only carry an
+            // in-flight reservation and must not enter terminal/cache OOO
+            // evaluation (`search.cc:1429-1432`).
+            if self.minibatch[i].is_collision {
+                continue;
+            }
             let node_idx = self.minibatch[i].node_idx;
             let depth = self.minibatch[i].depth;
-            let moves_to_visit = self.minibatch[i].moves_to_visit.clone();
+            let moves_to_visit = std::mem::take(&mut self.minibatch[i].moves_to_visit);
             let is_terminal = self.tree.node(node_idx).is_terminal();
             if self.minibatch[i].is_extendable(is_terminal) {
                 self.extend_node(node_idx, depth, &moves_to_visit, &mut workspace.history)?;
@@ -2237,6 +2243,37 @@ mod tests {
         let mut workspace = TaskWorkspace::default();
         worker.process_picked_task(0, 1, &mut workspace).expect("ooo terminal");
         assert!(worker.minibatch[0].ooo_completed);
+    }
+
+    /// px0 `ProcessPickedTask` skips a collision before checking its terminal
+    /// state (`src/search/classic/search.cc:1429-1436`). A collision is only
+    /// cancelled or shared by Gather/backup; it can never become an OOO result.
+    #[test]
+    fn out_of_order_skips_terminal_collision() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        tree.make_terminal(root, GameResult::Draw, 0.0, Terminal::EndOfGame);
+        let backend = UniformBackend::default();
+        let params = SearchParams {
+            out_of_order_eval: true,
+            ..SearchParams::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let search_state = WorkerSearchState::new(stop, i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
+        worker.initialize_iteration().expect("init");
+        worker.minibatch.push(NodeToProcess::collision(root, 1, 1, 1));
+
+        let mut workspace = TaskWorkspace::default();
+        worker
+            .process_picked_task(0, 1, &mut workspace)
+            .expect("skip collision");
+
+        assert!(!worker.minibatch[0].ooo_completed);
+        assert!(!worker.minibatch[0].nn_queried);
     }
 
     #[test]

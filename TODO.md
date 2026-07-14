@@ -125,6 +125,8 @@
   `UpdateCounters -> MaybeTriggerStop` 的 worker stopper 调用；删除私有 exact
   `nodes_budget` 截断（`src/search/classic/search.cc:1423-1462,2331-2334`，
   `src/search/classic/stoppers/stoppers.cc:59-70`）。
+- [x] 对齐 `ProcessPickedTask` 对 collision 的入口早退：终局 collision 不能进入 OOO
+  fetch/backup，保持其仅由 gather/backup 取消或共享（`src/search/classic/search.cc:1429-1460`）。
 - [x] 翻译 `StoppersHints` reset/min-update 及 `MaybeTriggerStop` 向下一轮 worker
   回写 remaining playouts（`src/search/classic/search.cc:596-610`、
   `src/search/classic/stoppers/timemgr.cc:35-66`）。
