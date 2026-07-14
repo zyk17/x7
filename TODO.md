@@ -154,6 +154,9 @@
   （`src/search/classic/params.h:58-65`、`params.cc:543-583,644-655`）。
 - [x] 翻译 task worker split、任务队列与常驻 task-worker 生命周期
   （`search.h:205-249,367-448`，`search.cc:1069-1140,1268-1508,1828-1897`）。
+- [x] 对齐常驻 task worker 的 idle 与析构退出：`GatherMinibatch` 后 `task_count=-1` 仅休眠，
+  `exiting` 才终止 worker；覆盖下一轮 `ResetTasks` 复用（`search.cc:1069-1140,1182-1185,
+  1464-1492`）。
 - [ ] 补齐 px0 完整 out-of-order 及其多 SearchWorker 交互
   （`search.cc:1268-1508,2109-2331`）。
 - [x] 用 stable boxed arena 翻译 px0 `MakeSolid` 的 child ownership 语义：在满足

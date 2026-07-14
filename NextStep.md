@@ -62,6 +62,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `RunTasks` 的领取、按 gathering/processing 分派和完成回写，以及 `RunBlocking`
   内的常驻 task-worker 生命周期已落地，对应 `src/search/classic/search.h:205-249`、
   `search.cc:1069-1140`；直接单元测试入口仍保留同步 bridge。
+- `GatherMinibatch` 后的 `task_count=-1` 与析构 `exiting` 已拆开：前者只令常驻 task
+  worker 休眠、下一轮 `ResetTasks` 复用，后者才唤醒并退出；对应
+  `src/search/classic/search.cc:1069-1140,1182-1185,1464-1492`。
 - gathering split 已按 px0 `MinimumPickingWork=1`、`MinimumRemainingPickingWork=20`、
   `MAX_TASKS=100` 及 passed-off/completed-visits 条件翻译，对应
   `src/search/classic/params.cc:604-612`、`search.cc:1828-1864`；常驻 task worker

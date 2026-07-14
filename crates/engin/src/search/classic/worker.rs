@@ -334,6 +334,10 @@ pub struct PickTaskQueue {
     task_count: AtomicIsize,
     tasks_taken: AtomicUsize,
     completed_tasks: AtomicUsize,
+    // px0 keeps `task_count_ == -1` between iterations while persistent task
+    // workers sleep. Only `exiting_` makes that sentinel terminate a worker
+    // (`search.cc:1097-1119`, `search.h:435-445`).
+    exiting: AtomicBool,
     task_added: Condvar,
 }
 
@@ -418,21 +422,30 @@ impl PickTaskQueue {
         }
     }
 
+    /// px0 `task_count_.store(-1)` after `GatherMinibatch`
+    /// (`src/search/classic/search.cc:1182-1185`). This idles persistent task
+    /// workers; it does not destroy them.
+    pub fn idle(&self) {
+        self.task_count.store(-1, Ordering::Release);
+        self.task_added.notify_all();
+    }
+
     /// px0 `SearchWorker::RunTasks` sleep/exit path
     /// (`src/search/classic/search.cc:1069-1124`).
     ///
-    /// A `-1` task count means the owning `SearchWorker` is being destroyed.
-    /// Workers otherwise sleep until `push()` publishes more work.
+    /// A `-1` task count means either idle or exiting. Workers only return
+    /// after `close()` sets `exiting`; otherwise they sleep until `reset/push`
+    /// publishes the next iteration's work.
     pub fn take_blocking(&self) -> Option<(usize, PickTask)> {
         loop {
             if let Some(task) = self.take() {
                 return Some(task);
             }
-            if self.task_count.load(Ordering::Acquire) < 0 {
+            if self.exiting.load(Ordering::Acquire) {
                 return None;
             }
             let tasks = self.tasks.lock().expect("pick task queue lock");
-            if self.task_count.load(Ordering::Acquire) < 0 {
+            if self.exiting.load(Ordering::Acquire) {
                 return None;
             }
             if self.tasks_taken.load(Ordering::Acquire) < self.task_count.load(Ordering::Acquire).max(0) as usize {
@@ -444,6 +457,7 @@ impl PickTaskQueue {
 
     /// px0 `SearchWorker::~SearchWorker` (`src/search/classic/search.h:225-233`).
     pub fn close(&self) {
+        self.exiting.store(true, Ordering::Release);
         self.task_count.store(-1, Ordering::Release);
         self.task_added.notify_all();
     }
@@ -666,6 +680,9 @@ impl<'a> SearchWorker<'a> {
             return Ok(());
         }
         let gather_result = self.with_tree(|worker| worker.gather_minibatch());
+        // px0 idles persistent task workers before the backend phase; they
+        // remain available for `ResetTasks` in the next gather.
+        self.task_queue.idle();
         if let Err(error) = gather_result {
             self.release_searcher_permit();
             return Err(error);
@@ -803,6 +820,9 @@ impl<'a> SearchWorker<'a> {
                 });
             }
             let result = self.run_blocking_without_task_threads();
+            // The scoped threads must see `exiting_` before scope exit joins
+            // them. This is px0 destruction timing, not the per-iteration
+            // `idle()` sentinel above.
             self.task_queue.close();
             result
         });
@@ -811,14 +831,12 @@ impl<'a> SearchWorker<'a> {
     }
 
     fn run_blocking_without_task_threads(&mut self) -> Result<(), EnginError> {
-        let result = (|| loop {
+        (|| loop {
             self.execute_one_iteration()?;
             if self.search_state.stop.load(Ordering::Acquire) {
                 break Ok(());
             }
-        })();
-        self.task_queue.close();
-        result
+        })()
     }
 
     /// px0 `SearchWorker::InitializeIteration` (`search.cc:1233-1266`)。
@@ -2606,6 +2624,30 @@ mod tests {
         let waiter = std::thread::spawn(move || waiter_queue.take_blocking());
         closing_queue.close();
         assert!(waiter.join().expect("closing worker").is_none());
+    }
+
+    /// px0 sets `task_count_ = -1` after one gather without destroying its
+    /// persistent task workers; the next `ResetTasks` reuses the same worker
+    /// (`src/search/classic/search.cc:1182-1185,1464-1492`).
+    #[test]
+    fn pick_task_queue_idles_then_reuses_worker_next_iteration() {
+        let queue = Arc::new(PickTaskQueue::default());
+        let worker_queue = Arc::clone(&queue);
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let first = worker_queue.take_blocking()?.0;
+            first_tx.send(()).expect("first task claimed");
+            let second = worker_queue.take_blocking()?.0;
+            Some((first, second))
+        });
+
+        assert!(queue.push(PickTask::processing(0, 1)));
+        first_rx.recv().expect("first task");
+        queue.idle();
+        queue.reset();
+        assert!(queue.push(PickTask::processing(1, 2)));
+
+        assert_eq!(worker.join().expect("persistent task worker"), Some((0, 0)));
     }
 
     #[test]
