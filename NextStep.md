@@ -65,6 +65,10 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   `MAX_TASKS=100` 及 passed-off/completed-visits 条件翻译，对应
   `src/search/classic/params.cc:604-612`、`search.cc:1828-1864`；常驻 task worker
   和并发树访问边界尚未接线。
+- processing split 已按 px0 `MinimumProcessingWork=20`、`MinimumPerTaskProcessing=8`
+  将前段交给 `PickTask::Processing`、主 worker 保留尾段，对应
+  `src/search/classic/params.cc:604-612`、`search.cc:1322-1347`；当前同步执行，
+  常驻 task worker 生命周期尚未接线。
 
 ### P4 下一入口
 

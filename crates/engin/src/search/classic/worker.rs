@@ -431,11 +431,6 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::GatherMinibatch` (`search.cc:1268-1363`) 单线程子集。
     pub fn gather_minibatch(&mut self) -> Result<(), EnginError> {
-        if self.task_workers > 0 {
-            return Err(EnginError::PortIncomplete(
-                "P4 SearchWorker::GatherMinibatch task workers",
-            ));
-        }
         let root = self.tree.current_head();
         let cur_n = self.tree.node(root).n();
         let remaining_n = self.search_state.remaining_playouts();
@@ -467,10 +462,57 @@ impl<'a> SearchWorker<'a> {
                     picked_visits += 1;
                 }
             }
+            // px0 `search.cc:1322-1347`: split the initial contiguous work
+            // ranges into processing tasks, retaining the final range for the
+            // main worker. Until persistent task threads are translated, this
+            // worker consumes that same queue synchronously after its range.
+            let mut main_start = new_start;
+            let mut needs_wait = false;
+            if self.task_workers > 0
+                && picked_visits
+                    >= usize::try_from(self.params.minimum_work_size_for_processing)
+                        .expect("px0 MinimumProcessingWork is non-negative")
+            {
+                let min_per_task = usize::try_from(self.params.minimum_work_per_task_for_processing)
+                    .expect("px0 MinimumPerTaskProcessing is non-negative");
+                assert!(min_per_task > 0, "px0 MinimumPerTaskProcessing is positive");
+                let task_workers = usize::try_from(self.task_workers).expect("positive task worker count");
+                let num_tasks = (picked_visits / min_per_task).clamp(2, task_workers + 1);
+                let per_worker = picked_visits / num_tasks;
+                self.task_queue.reset();
+                let mut found = 0usize;
+                let mut queued = 0usize;
+                for index in new_start..self.minibatch.len() {
+                    if self.minibatch[index].is_collision {
+                        continue;
+                    }
+                    found += 1;
+                    if found == per_worker {
+                        if !self.task_queue.push(PickTask::processing(main_start, index + 1)) {
+                            break;
+                        }
+                        main_start = index + 1;
+                        found = 0;
+                        queued += 1;
+                        if queued == num_tasks - 1 {
+                            break;
+                        }
+                    }
+                }
+                needs_wait = queued > 0;
+            }
+
             let mut workspace = std::mem::take(&mut self.picking_workspace);
-            let process_result = self.process_picked_task(new_start, self.minibatch.len(), &mut workspace);
+            let process_result = self.process_picked_task(main_start, self.minibatch.len(), &mut workspace);
             self.picking_workspace = workspace;
             process_result?;
+            if needs_wait {
+                let mut workspace = std::mem::take(&mut self.picking_workspace);
+                let task_result = self.run_queued_tasks(&mut workspace);
+                self.picking_workspace = workspace;
+                task_result?;
+                self.task_queue.wait();
+            }
 
             // px0 consumes collision budget and can increase multivisit here.
             // That translation is still pending; do not spin on a collision
@@ -1576,6 +1618,39 @@ mod tests {
         assert_eq!(worker.minibatch.len(), 1);
         assert!(!worker.minibatch[0].is_collision);
         assert_eq!(worker.minibatch[0].moves_to_visit, vec![mv]);
+    }
+
+    #[test]
+    fn gathering_uses_px0_processing_task_ranges() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let moves = tree.history().last().board().generate_legal_moves();
+        tree.node_mut(root).create_edges(&moves);
+        for edge_idx in 0..tree.node(root).num_edges() {
+            tree.node_mut(root).edge_mut(edge_idx).set_p(1.0 / moves.len() as f32);
+        }
+        assert!(tree.node_mut(root).try_start_score_update());
+        tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
+
+        let backend = UniformBackend::default();
+        let params = SearchParams {
+            minibatch_size: 32,
+            task_workers_per_search_worker: 1,
+            minimum_work_size_for_processing: 2,
+            minimum_work_per_task_for_processing: 1,
+            out_of_order_eval: false,
+            ..SearchParams::default()
+        };
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+        worker.initialize_iteration().expect("init");
+        worker.gather_minibatch().expect("gather processing tasks");
+
+        assert!(worker.minibatch.len() >= 2);
+        assert!(worker.computation.as_ref().expect("computation").used_batch_size() >= 2);
     }
 
     #[test]

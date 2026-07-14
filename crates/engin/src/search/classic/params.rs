@@ -27,8 +27,10 @@ pub struct SearchParams {
     pub out_of_order_eval: bool,
     pub max_out_of_order_evals_factor: f32,
     pub task_workers_per_search_worker: i32,
+    pub minimum_work_size_for_processing: i32,
     pub minimum_work_size_for_picking: i32,
     pub minimum_remaining_work_size_for_picking: i32,
+    pub minimum_work_per_task_for_processing: i32,
     pub max_prefetch_batch: i32,
 }
 
@@ -64,8 +66,10 @@ impl Default for SearchParams {
             out_of_order_eval: true,
             max_out_of_order_evals_factor: 2.4,
             task_workers_per_search_worker: -1,
+            minimum_work_size_for_processing: 20,
             minimum_work_size_for_picking: 1,
             minimum_remaining_work_size_for_picking: 20,
+            minimum_work_per_task_for_processing: 8,
             max_prefetch_batch: 32,
         }
     }

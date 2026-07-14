@@ -81,6 +81,8 @@
 - [x] 翻译 gathering split 的 px0 work-size 参数、100-task reservation 与
   passed-off/completed-visits 条件（`src/search/classic/params.cc:604-612`、
   `search.cc:1828-1864`）。
+- [x] 翻译 processing split 的 20/8 work-size 参数和前段 task / 尾段主 worker 范围划分
+  （`src/search/classic/params.cc:604-612`、`search.cc:1322-1347`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的
