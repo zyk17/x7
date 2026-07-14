@@ -795,6 +795,12 @@ impl<'a> SearchWorker<'a> {
         workspace: &mut TaskWorkspace,
         is_root: bool,
     ) -> Result<(), EnginError> {
+        // px0 only reserves when the receiver is still small: the main
+        // minibatch and reusable gathering-task result vectors then retain
+        // their capacity across iterations (`search.cc:1570-1573`).
+        if receiver.capacity() < 30 {
+            receiver.reserve(30 - receiver.capacity());
+        }
         workspace.current_path.clear();
         workspace.moves_to_path.clear();
         workspace.moves_to_path.extend_from_slice(moves_to_base);

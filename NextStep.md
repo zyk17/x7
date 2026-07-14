@@ -97,6 +97,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `TaskWorkspace` 已恢复 px0 的 256-slot selection scratch 数组及选中边 score 的增量
   更新，对应 `src/search/classic/search.h:348-365`、`search.cc:1575-1825`；
   `Node::CreateEdges` 同步保留 px0 `uint8_t num_edges_` 的 255 条上限。
+- `PickNodesToExtendTask` 已恢复 px0 receiver 在容量不足 30 时的按需预留，主 minibatch
+  与 gathering task result 可跨 iteration 复用容量（`src/search/classic/search.cc:1570-1573`）。
 
 ### P4 下一入口
 
