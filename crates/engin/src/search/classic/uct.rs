@@ -2,8 +2,10 @@
 
 use super::node::{Node, NodeArena};
 use super::params::SearchParams;
+use crate::utils::fastmath::fast_log;
 
-/// px0 `ComputeCpuct` (`search.cc`)。
+/// px0 `ComputeCpuct` (`src/search/classic/search.cc:426-433`), including
+/// its `FastLog` approximation from `src/utils/fastmath.h:81-83`.
 pub fn compute_cpuct(params: &SearchParams, n: u32, is_root: bool) -> f32 {
     let init = params.cpuct(is_root);
     let k = params.cpuct_factor(is_root);
@@ -11,7 +13,7 @@ pub fn compute_cpuct(params: &SearchParams, n: u32, is_root: bool) -> f32 {
     if k == 0.0 {
         init
     } else {
-        init + k * ((n as f32 + base) / base).ln()
+        init + k * fast_log((n as f32 + base) / base)
     }
 }
 

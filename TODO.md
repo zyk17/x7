@@ -120,6 +120,8 @@
   （`src/search/classic/search.cc:239-270,324-350`）。
 - [x] 翻译 `MultiPV` / `PerPVCounters` UCI 参数、共享 best-child 排序与多行 root PV 输出
   （`src/search/classic/params.cc:360-368,585-586`、`search.cc:239-246,705-808`）。
+- [x] 翻译 px0 FastMath，并令 classic `ComputeCpuct` 使用 `FastLog`
+  （`src/utils/fastmath.h:42-92`、`src/search/classic/search.cc:426-433`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

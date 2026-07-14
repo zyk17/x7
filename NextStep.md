@@ -123,6 +123,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   （`src/search/classic/params.cc:360-368,585-586`、`search.cc:239-246,705-808`）。当前只在
   搜索结束时发送；`ScoreType/WDL_mu` 和 worker 中的实时 responder 回调仍依赖完整 px0
   OptionsDict/并发边界，不能伪造为固定 cp 分数。
+- `engin/src/utils/fastmath.rs` 已逐式翻译 px0 `FastLog2/FastExp2/FastLog/FastExp/FastLogistic`
+  （`src/utils/fastmath.h:42-92`）；classic `ComputeCpuct` 已改用 `FastLog`
+  （`src/search/classic/search.cc:426-433`），不再以 Rust libm 改变 PUCT 数值路径。
 
 ### P4 下一入口
 

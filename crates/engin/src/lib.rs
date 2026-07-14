@@ -6,6 +6,7 @@ pub mod error;
 pub mod neural;
 pub mod search;
 pub mod uci_loop;
+pub mod utils;
 
 pub use callbacks::{BestMoveInfo, ThinkingInfo, Wdl};
 pub use engine::ClassicEngine;
