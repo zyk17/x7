@@ -50,6 +50,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `engin/src/search/classic/worker.rs`：`PickTask`、`PickTaskQueue` 与 worker
   生命周期的 `ResetTasks` 已翻译，对应 `src/search/classic/search.h:367-445`、
   `search.cc:1069-1140,1464-1508`；task dispatch/split 尚未接线。
+- `PickNodesToExtendTask` 现在显式写入 caller receiver，对应
+  `src/search/classic/search.h:401-406`；下一步可直接将 gathering task 的结果写入
+  `PickTask.results`。
 
 ### P4 下一入口
 
