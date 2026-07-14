@@ -291,7 +291,7 @@ mod tests {
 
     use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
-    use super::{best_child_edge, orient_move, score_from_wdl, wdl_from_wl_d, ScoreType, SearchParams};
+    use super::{best_child_edge, best_move, orient_move, score_from_wdl, wdl_from_wl_d, ScoreType, SearchParams};
     use crate::search::classic::node::NodeTree;
 
     static INIT: Once = Once::new();
