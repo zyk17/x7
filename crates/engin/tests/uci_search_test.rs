@@ -62,6 +62,8 @@ fn classic_engine_multipv_emits_ranked_root_lines() {
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
     uci.process_line("setoption name MultiPV value 2", "0.0.0")
         .expect("multipv option");
+    uci.process_line("setoption name ScoreType value Q", "0.0.0")
+        .expect("score type option");
     uci.process_line("position startpos", "0.0.0").expect("position");
     uci.process_line("go nodes 32", "0.0.0").expect("go nodes");
     drop(uci);
@@ -73,6 +75,11 @@ fn classic_engine_multipv_emits_ranked_root_lines() {
     );
     assert!(
         responder.responses.iter().any(|line| line.contains(" multipv 2 pv ")),
+        "responses: {:?}",
+        responder.responses
+    );
+    assert!(
+        responder.responses.iter().any(|line| line.contains(" score cp 0 ")),
         "responses: {:?}",
         responder.responses
     );

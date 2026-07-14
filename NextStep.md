@@ -121,8 +121,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   NPS/EPS、root inherited visits 和 WDL 整数化已翻译（`src/search/classic/search.cc:239-270,
   324-350`）。`MultiPV`、`PerPVCounters` 的 UCI 参数与多行 root 排序已接线
   （`src/search/classic/params.cc:360-368,585-586`、`search.cc:239-246,705-808`）。当前只在
-  搜索结束时发送；`ScoreType/WDL_mu` 和 worker 中的实时 responder 回调仍依赖完整 px0
-  OptionsDict/并发边界，不能伪造为固定 cp 分数。
+  搜索结束时发送；`ScoreType` 的全部 choice 和零 contempt 默认下的 `WDL_mu` 公式已翻译
+  （`src/search/classic/params.cc:587-595`、`search.cc:206-236,275-336`）。worker 中的实时
+  responder 回调及可变 contempt/WDL calibration OptionsDict 仍待翻译。
 - `engin/src/utils/fastmath.rs` 已逐式翻译 px0 `FastLog2/FastExp2/FastLog/FastExp/FastLogistic`
   （`src/utils/fastmath.h:42-92`）；classic `ComputeCpuct` 已改用 `FastLog`
   （`src/search/classic/search.cc:426-433`），不再以 Rust libm 改变 PUCT 数值路径。
@@ -134,6 +135,6 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   selection 的树访问边界；当前 `Vec<Node>` + 整轮 `Mutex` 不能直接承载 px0 子树并发
 - `node.cc:245-289`：随稳定 node 存储边界翻译 `MakeSolid`；不能在当前 arena 上伪造
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
-- `search.cc:239-368`、`params.h:103-128`：ScoreType/WDL_mu 参数与实时
-  `MaybeOutputInfo` 回调；MultiPV/PerPVCounters 已完成
+- `search.cc:357-368`、`params.h:107-128`：实时 `MaybeOutputInfo` responder 回调，及
+  可变 contempt/WDL calibration OptionsDict；结束时 MultiPV/ScoreType 已完成
 - px0 二进制 fixed-nodes trace 对拍

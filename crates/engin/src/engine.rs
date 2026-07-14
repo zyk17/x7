@@ -106,7 +106,7 @@ impl EngineController for ClassicEngine {
             self.uci_weights_file = Some(options.weights_file.clone());
         }
         self.search
-            .set_uci_info_options(options.multi_pv, options.per_pv_counters)
+            .set_uci_info_options(options.multi_pv, options.per_pv_counters, options.score_type)
     }
 
     fn ensure_ready(&mut self) -> Result<(), EnginError> {

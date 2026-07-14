@@ -14,10 +14,11 @@ use crate::uci_loop::GoParams;
 use crate::EnginError;
 
 use super::node::{Node, NodeTree};
-use super::params::SearchParams;
+use super::params::{ScoreType, SearchParams};
 use super::stoppers::timemgr::{IterationStats, StoppersHints};
 use super::stoppers::{build_search_stoppers, ChainedSearchStopper, SearchStopper};
 use super::worker::{SearchWorker, WorkerSearchState};
+use crate::utils::fastmath::{fast_log, fast_logistic};
 
 pub fn best_move(tree: &NodeTree, params: &SearchParams) -> (Move, Move) {
     let root = tree.current_head();
@@ -97,6 +98,54 @@ fn wdl_from_wl_d(wl: f32, d: f32) -> Wdl {
         draw = 0;
     }
     Wdl { w, d: draw, l }
+}
+
+/// px0 `WDLRescale` (`src/search/classic/search.cc:206-236`) with the
+/// translated default zero-contempt parameters from `params.cc:614-620`:
+/// ratio=1, diff=0, max_s=1.4. The option layer for changing those values is
+/// intentionally not exposed before its full px0 contempt dependencies exist.
+fn wdl_rescale_default(wl: &mut f32, d: &mut f32) -> f32 {
+    let w = (1.0 + *wl - *d) / 2.0;
+    let l = (1.0 - *wl - *d) / 2.0;
+    const EPS: f32 = 0.0001;
+    if !(EPS < w && w < 1.0 - EPS && EPS < *d && *d < 1.0 - EPS && EPS < l && l < 1.0 - EPS) {
+        return 0.0;
+    }
+    let a = fast_log(1.0 / l - 1.0);
+    let b = fast_log(1.0 / w - 1.0);
+    let s = (2.0 / (a + b)).min(1.4);
+    let mu = (a - b) / (a + b);
+    let w_new = fast_logistic((-1.0 + mu) / s);
+    let l_new = fast_logistic((-1.0 - mu) / s);
+    *wl = w_new - l_new;
+    *d = (1.0 - w_new - l_new).max(0.0);
+    mu
+}
+
+/// px0 `Search::SendUciInfo` score branches (`search.cc:275-322`).
+fn score_from_wdl(score_type: ScoreType, wl: &mut f32, d: &mut f32, q: f32, has_wdl: bool) -> i32 {
+    match score_type {
+        ScoreType::CentipawnWithDrawscore => (90.0 * (1.563_754_2 * q).tan()) as i32,
+        ScoreType::Centipawn => (90.0 * (1.563_754_2 * *wl).tan()) as i32,
+        ScoreType::Centipawn2019 => (295.0 * *wl / (1.0 - 0.976_953_15 * wl.powi(14))) as i32,
+        ScoreType::Centipawn2018 => (290.680_63 * (1.548_090_8 * *wl).tan()) as i32,
+        ScoreType::WinPercentage => (*wl * 5000.0 + 5000.0) as i32,
+        ScoreType::Q => (q * 10_000.0) as i32,
+        ScoreType::WinLoss => (*wl * 10_000.0) as i32,
+        ScoreType::WdlMu => {
+            let mu = wdl_rescale_default(wl, d);
+            let centipawn_score = 45.0 * (1.567_280_8 * *wl).tan();
+            if has_wdl
+                && mu != 0.0
+                && wl.abs() + *d < 0.996
+                && (mu.abs() < 1.0 || centipawn_score.abs() < (100.0 * mu).abs())
+            {
+                (100.0 * mu) as i32
+            } else {
+                centipawn_score as i32
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -220,7 +269,7 @@ mod tests {
 
     use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
-    use super::{best_child_edge, orient_move, wdl_from_wl_d, SearchParams};
+    use super::{best_child_edge, orient_move, score_from_wdl, wdl_from_wl_d, ScoreType, SearchParams};
     use crate::search::classic::node::NodeTree;
 
     static INIT: Once = Once::new();
@@ -261,6 +310,13 @@ mod tests {
             wdl_from_wl_d(0.1, 0.2),
             crate::callbacks::Wdl { w: 450, d: 200, l: 350 }
         );
+    }
+
+    #[test]
+    fn score_type_q_matches_px0_scaled_q() {
+        let mut wl = 0.1;
+        let mut d = 0.2;
+        assert_eq!(score_from_wdl(ScoreType::Q, &mut wl, &mut d, 0.1234, true), 1234);
     }
 }
 
@@ -393,11 +449,17 @@ impl ClassicSearch {
     /// px0 reads `MultiPV` and `PerPVCounters` from its immutable
     /// `BaseSearchParams` (`src/search/classic/params.h:101-103`). Rust keeps
     /// the already parsed UCI subset in `SearchParams` before StartSearch.
-    pub fn set_uci_info_options(&mut self, multi_pv: usize, per_pv_counters: bool) -> Result<(), EnginError> {
+    pub fn set_uci_info_options(
+        &mut self,
+        multi_pv: usize,
+        per_pv_counters: bool,
+        score_type: ScoreType,
+    ) -> Result<(), EnginError> {
         self.abort_search()?;
         let mut meta = self.meta.lock().expect("meta lock");
         meta.params.multi_pv = multi_pv;
         meta.params.per_pv_counters = per_pv_counters;
+        meta.params.score_type = score_type;
         Ok(())
     }
 
@@ -434,6 +496,7 @@ impl ClassicSearch {
             (elapsed_ms > 0).then(|| (total_playouts.saturating_mul(1000) / elapsed_ms) as i32)
         });
         let root = tree.current_head();
+        let has_wdl = self.backend.attributes().has_wdl;
         let infos = best_child_edges(&tree, root, &meta.params, meta.params.multi_pv, 0)
             .into_iter()
             .enumerate()
@@ -441,12 +504,23 @@ impl ClassicSearch {
                 let child = tree.node(root).child(edge_idx).map(|idx| tree.node(idx));
                 let default_wl = -tree.node(root).wl();
                 let default_d = tree.node(root).d();
-                let wl = child.filter(|node| node.n() > 0).map_or(default_wl, Node::wl);
-                let d = child.filter(|node| node.n() > 0).map_or(default_d, Node::d);
+                let mut wl = child.filter(|node| node.n() > 0).map_or(default_wl, Node::wl);
+                let mut d = child.filter(|node| node.n() > 0).map_or(default_d, Node::d);
+                let default_q = -tree.node(root).q(-draw_score(&tree, &meta.params, false));
+                let q = child
+                    .filter(|node| node.n() > 0)
+                    .map_or(default_q, |node| node.q(draw_score(&tree, &meta.params, false)));
+                let score = score_from_wdl(meta.params.score_type, &mut wl, &mut d, q, has_wdl);
+                let mate = child.filter(|node| node.is_terminal() && wl != 0.0).map(|node| {
+                    let plies = node.m().round() as i32 / 2 + if node.is_tablebase_terminal() { 101 } else { 1 };
+                    if wl < 0.0 {
+                        -plies
+                    } else {
+                        plies
+                    }
+                });
                 ThinkingInfo {
-                    // `Search::SendUciInfo` (`search.cc:249-270`). ScoreType and
-                    // its WDL rescaling are not translated until the px0 options
-                    // layer exists, so no synthetic cp score is emitted here.
+                    // px0 `Search::SendUciInfo` (`search.cc:249-336`).
                     depth: (self.worker_state.cum_depth.load(Ordering::Acquire) / total_playouts.max(1)) as i32,
                     seldepth: self.worker_state.max_depth.load(Ordering::Acquire) as i32,
                     time: elapsed.as_millis() as i64,
@@ -461,6 +535,8 @@ impl ClassicSearch {
                         let elapsed_ms = first_batch.expect("nps needs first batch").elapsed().as_millis() as u64;
                         (evaluations.saturating_mul(1000) / elapsed_ms) as i32
                     }),
+                    mate,
+                    score: mate.is_none().then_some(score),
                     wdl: Some(wdl_from_wl_d(wl, d)),
                     tb_hits: 0,
                     pv: principal_variation(&tree, &meta.params, edge_idx),

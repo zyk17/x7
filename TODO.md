@@ -122,6 +122,8 @@
   （`src/search/classic/params.cc:360-368,585-586`、`search.cc:239-246,705-808`）。
 - [x] 翻译 px0 FastMath，并令 classic `ComputeCpuct` 使用 `FastLog`
   （`src/utils/fastmath.h:42-92`、`src/search/classic/search.cc:426-433`）。
+- [x] 翻译 `ScoreType` 选择、默认零 contempt `WDL_mu` 重标定与 `SendUciInfo` score/mate
+  输出（`src/search/classic/params.cc:587-620`、`search.cc:206-236,275-336`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的
@@ -131,9 +133,9 @@
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
 - [ ] 随稳定 node 存储翻译 `MakeSolid` tree 表示；它会重建 px0 child/sibling pointer
   所有权，不能用当前 arena 伪实现（`src/search/classic/node.cc:245-289`）。
-- [ ] 翻译 `ScoreType/WDL_mu` 与 worker 内 `MaybeOutputInfo` 实时 responder 回调，完成
-  px0 UCI info 统计（`src/search/classic/search.cc:239-368`、
-  `src/search/classic/params.h:103-128`）。
+- [ ] 翻译 worker 内 `MaybeOutputInfo` 实时 responder 回调和可变 contempt/WDL calibration
+  OptionsDict，完成 px0 UCI info 统计（`src/search/classic/search.cc:357-368`、
+  `src/search/classic/params.h:107-128`）。
 - [x] 翻译 `WeightsFile` 到正式 `OnnxBackend` 的 UCI/engine 配置子集；保持 px0 配置与
   `SetPosition` 时序，不实现多 backend registry、protobuf weight 或 autodiscover
   （`src/neural/shared_params.cc:43-80`、`src/engine.cc:153-167,187-197`、

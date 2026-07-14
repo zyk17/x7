@@ -1,12 +1,61 @@
 //! px0 `src/search/classic/params.h:37-260`、`params.cc:543-640` 默认值子集。
 
+/// px0 `ScoreType` choices (`src/search/classic/params.cc:587-595`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScoreType {
+    Centipawn,
+    CentipawnWithDrawscore,
+    Centipawn2019,
+    Centipawn2018,
+    WinPercentage,
+    Q,
+    WinLoss,
+    #[default]
+    WdlMu,
+}
+
+impl ScoreType {
+    pub const fn as_uci(self) -> &'static str {
+        match self {
+            Self::Centipawn => "centipawn",
+            Self::CentipawnWithDrawscore => "centipawn_with_drawscore",
+            Self::Centipawn2019 => "centipawn_2019",
+            Self::Centipawn2018 => "centipawn_2018",
+            Self::WinPercentage => "win_percentage",
+            Self::Q => "Q",
+            Self::WinLoss => "W-L",
+            Self::WdlMu => "WDL_mu",
+        }
+    }
+
+    pub fn parse_uci(value: &str) -> Option<Self> {
+        Some(match value {
+            "centipawn" => Self::Centipawn,
+            "centipawn_with_drawscore" => Self::CentipawnWithDrawscore,
+            "centipawn_2019" => Self::Centipawn2019,
+            "centipawn_2018" => Self::Centipawn2018,
+            "win_percentage" => Self::WinPercentage,
+            "Q" => Self::Q,
+            "W-L" => Self::WinLoss,
+            "WDL_mu" => Self::WdlMu,
+            _ => return None,
+        })
+    }
+}
+
 /// px0 `BaseSearchParams` / `SearchParams` 单线程搜索所需字段。
 #[derive(Clone, Debug)]
 pub struct SearchParams {
+    // 引擎试图打包多少个局面（positions）进行神经网络的并行计算。较大的 Batch 可能会稍微降低棋力，
+    // 特别是在总模拟次数（playouts）较少的情况下。设置为 0 则使用后端推荐的默认值。
     pub minibatch_size: i32,
+    // 较高的值会促进更多的探索（更宽的搜索），较低的值会促进更多的置信度（更深的搜索）。
     pub cpuct: f32,
+    // （仅专业模式可见）专门应用于根节点的 cpuct_init 参数。
     pub cpuct_at_root: f32,
+    // 较低的值意味着：随着节点访问次数的增加，Cpuct 的增长速度更快。
     pub cpuct_base: f32,
+    
     pub cpuct_factor: f32,
     pub root_has_own_cpuct_params: bool,
     pub fpu_absolute: bool,
@@ -35,6 +84,7 @@ pub struct SearchParams {
     /// px0 `MultiPV` / `PerPVCounters` (`params.cc:360-368,585-586`).
     pub multi_pv: usize,
     pub per_pv_counters: bool,
+    pub score_type: ScoreType,
 }
 
 fn mix(high: i32, low: i32, ratio: f32) -> i32 {
@@ -76,6 +126,7 @@ impl Default for SearchParams {
             max_prefetch_batch: 32,
             multi_pv: 1,
             per_pv_counters: false,
+            score_type: ScoreType::WdlMu,
         }
     }
 }

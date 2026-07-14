@@ -6,6 +6,7 @@ use xiangqi_core::{GameState, STARTPOS_FEN};
 
 use crate::callbacks::{BestMoveInfo, ThinkingInfo};
 use crate::error::EnginError;
+use crate::search::classic::ScoreType;
 
 /// px0 `GoParams` (`uciloop.h:42-55`)。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -34,6 +35,7 @@ pub struct UciOptions {
     /// px0 `MultiPV` / `PerPVCounters` (`search/classic/params.cc:360-368,585-586`).
     pub multi_pv: usize,
     pub per_pv_counters: bool,
+    pub score_type: ScoreType,
     /// px0 `WeightsFile` (`src/neural/shared_params.cc:43-80`). This Rust
     /// port accepts the formal ONNX model rather than px0's protobuf weights.
     pub weights_file: String,
@@ -59,6 +61,10 @@ impl UciOptions {
                 "option name PerPVCounters type check default {}",
                 bool_uci(self.per_pv_counters)
             ),
+            format!(
+                "option name ScoreType type combo default {} var centipawn var centipawn_with_drawscore var centipawn_2019 var centipawn_2018 var win_percentage var Q var W-L var WDL_mu",
+                self.score_type.as_uci()
+            ),
             format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
@@ -71,6 +77,7 @@ impl UciOptions {
             "UCI_ShowMovesLeft" => self.show_moves_left = parse_bool_option(value, "UCI_ShowMovesLeft")?,
             "MultiPV" => self.multi_pv = parse_multi_pv(value)?,
             "PerPVCounters" => self.per_pv_counters = parse_bool_option(value, "PerPVCounters")?,
+            "ScoreType" => self.score_type = parse_score_type(value)?,
             "WeightsFile" => self.weights_file = value.to_string(),
             _ => return Err(EnginError::Uci(format!("Unknown option: {name}"))),
         }
@@ -563,6 +570,11 @@ fn parse_multi_pv(value: &str) -> Result<usize, EnginError> {
         return Err(EnginError::Uci("MultiPV must be an integer from 1 to 500".into()));
     }
     Ok(value)
+}
+
+/// px0 `ChoiceOption(kScoreTypeId, ...)` (`search/classic/params.cc:587-595`).
+fn parse_score_type(value: &str) -> Result<ScoreType, EnginError> {
+    ScoreType::parse_uci(value).ok_or_else(|| EnginError::Uci(format!("Unknown ScoreType: {value}")))
 }
 
 fn split_at_whitespace(value: &str) -> Vec<String> {
