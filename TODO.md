@@ -67,6 +67,8 @@
 - [x] 将 `BackendComputation` 收为 task-safe 内部状态，允许并发 `AddInput`，并在
   ONNX compute 期间释放 batch-state 锁（`src/neural/backend.h:75-87`、
   `src/search/classic/search.cc:1423-1462`）。
+- [x] 翻译 `PickTask`、队列领取/完成/等待与每轮 `ResetTasks` 生命周期
+  （`src/search/classic/search.h:367-445`、`search.cc:1069-1140,1464-1508`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

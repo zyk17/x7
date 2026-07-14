@@ -47,6 +47,9 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `engin/src/neural/backend.rs`、`onnx.rs`：`BackendComputation` 以 task-safe
   内部状态承载并发 `AddInput`，对应 `src/neural/backend.h:75-87` 与
   `src/search/classic/search.cc:1423-1462`；NN compute 期间不持有 batch 状态锁。
+- `engin/src/search/classic/worker.rs`：`PickTask`、`PickTaskQueue` 与 worker
+  生命周期的 `ResetTasks` 已翻译，对应 `src/search/classic/search.h:367-445`、
+  `search.cc:1069-1140,1464-1508`；task dispatch/split 尚未接线。
 
 ### P4 下一入口
 
