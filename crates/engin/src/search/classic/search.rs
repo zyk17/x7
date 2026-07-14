@@ -81,7 +81,6 @@ pub struct SearchOutput {
 struct SearchMeta {
     params: SearchParams,
     move_start: Instant,
-    first_batch: Option<Instant>,
     stoppers_hints: StoppersHints,
     search_active: bool,
 }
@@ -107,7 +106,6 @@ impl ClassicSearch {
             meta: Arc::new(Mutex::new(SearchMeta {
                 params: SearchParams::default(),
                 move_start: Instant::now(),
-                first_batch: None,
                 stoppers_hints: StoppersHints::default(),
                 search_active: false,
             })),
@@ -145,7 +143,11 @@ impl ClassicSearch {
         let root_visits = worker_state.total_playouts.load(Ordering::Acquire) as i64;
         IterationStats {
             time_since_movestart: meta.move_start.elapsed().as_millis() as i64,
-            time_since_first_batch: meta.first_batch.map(|t| t.elapsed().as_millis() as i64).unwrap_or(0),
+            time_since_first_batch: worker_state
+                .first_batch
+                .lock()
+                .expect("first batch lock")
+                .map_or(0, |first_batch| first_batch.elapsed().as_millis() as i64),
             total_nodes: root_visits,
             nodes_since_movestart: root_visits,
             batches_since_movestart: worker_state.total_batches.load(Ordering::Acquire) as i64,
@@ -240,13 +242,6 @@ impl ClassicSearch {
                 let mut worker = SearchWorker::new(&mut tree, backend.as_ref(), &params, worker_state.as_ref());
                 if worker.run_blocking().is_err() {
                     stop.store(true, Ordering::Release);
-                    return;
-                }
-                if worker_state.total_batches.load(Ordering::Acquire) > 0 {
-                    let mut meta = meta.lock().expect("meta lock");
-                    if meta.first_batch.is_none() {
-                        meta.first_batch = Some(Instant::now());
-                    }
                 }
             }));
         }
@@ -299,7 +294,7 @@ impl SearchBase for ClassicSearch {
             let tree = self.tree.lock().expect("tree lock");
             let mut meta = self.meta.lock().expect("meta lock");
             meta.move_start = Instant::now();
-            meta.first_batch = None;
+            *self.worker_state.first_batch.lock().expect("first batch lock") = None;
             meta.stoppers_hints.reset();
             self.worker_state.total_playouts.store(0, Ordering::Release);
             self.worker_state.total_batches.store(0, Ordering::Release);

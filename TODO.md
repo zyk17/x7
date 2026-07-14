@@ -91,6 +91,8 @@
 - [x] 翻译 `ResetTasks` 的 100-task 稳定容量预留（`src/search/classic/search.cc:1464-1473`）。
 - [x] 翻译 `SearchWorker::RunBlocking` 的每次搜索持久 worker 生命周期
   （`src/search/classic/search.h:235-249`）。
+- [x] 将 first-batch 计时移入 worker backup 后的共享统计状态
+  （`src/search/classic/search.cc:2158-2173,2331-2364`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的

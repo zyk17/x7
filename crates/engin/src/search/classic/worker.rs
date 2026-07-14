@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use xiangqi_core::{GameResult, Move, MoveList, PositionHistory};
 
@@ -26,6 +27,7 @@ pub struct WorkerSearchState {
     pub shared_collisions: Mutex<Vec<(usize, u32)>>,
     pub total_playouts: AtomicU64,
     pub total_batches: AtomicU64,
+    pub first_batch: Mutex<Option<Instant>>,
     pub network_evaluations: AtomicU64,
     pub cum_depth: AtomicU64,
     pub max_depth: AtomicU16,
@@ -47,6 +49,7 @@ impl WorkerSearchState {
             shared_collisions: Mutex::new(Vec::new()),
             total_playouts: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
+            first_batch: Mutex::new(None),
             network_evaluations: AtomicU64::new(0),
             cum_depth: AtomicU64::new(0),
             max_depth: AtomicU16::new(0),
@@ -68,6 +71,13 @@ impl WorkerSearchState {
     pub fn nodes_budget_reached(&self, root_visits: u32) -> bool {
         let budget = self.nodes_budget.load(Ordering::Acquire);
         budget > 0 && root_visits >= budget as u32
+    }
+
+    fn record_first_batch(&self) {
+        let mut first_batch = self.first_batch.lock().expect("first batch lock");
+        if first_batch.is_none() {
+            *first_batch = Some(Instant::now());
+        }
     }
 }
 
@@ -1382,6 +1392,7 @@ impl<'a> SearchWorker<'a> {
         if work_done {
             self.cancel_shared_collisions();
             self.search_state.total_batches.fetch_add(1, Ordering::AcqRel);
+            self.search_state.record_first_batch();
         }
         Ok(())
     }

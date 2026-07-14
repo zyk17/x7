@@ -82,6 +82,8 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   `SearchWorker::RunBlocking` 持久执行 iteration，对应
   `src/search/classic/search.h:235-249`；为 task workspace/NN computation 的跨 iteration
   所有权建立了 px0 一致的生命周期。
+- `time_since_first_batch` 改由第一个完成 backup 的 worker 写入共享状态，watchdog 读取该状态，
+  对齐 px0 worker/watchdog 分离的统计时序（`src/search/classic/search.cc:2158-2173,2331-2364`）。
 
 ### P4 下一入口
 
