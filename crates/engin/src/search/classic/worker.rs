@@ -433,6 +433,19 @@ impl<'a> SearchWorker<'a> {
         Ok(())
     }
 
+    /// px0 `SearchWorker::RunBlocking` (`src/search/classic/search.h:235-249`).
+    ///
+    /// A search worker owns its reusable computation, task workspaces, and
+    /// history for the whole search, not merely for one iteration.
+    pub fn run_blocking(&mut self) -> Result<(), EnginError> {
+        loop {
+            self.execute_one_iteration()?;
+            if self.search_state.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+        }
+    }
+
     /// px0 `SearchWorker::InitializeIteration` (`search.cc:1233-1266`)。
     pub fn initialize_iteration(&mut self) -> Result<(), EnginError> {
         // px0 resets the previous computation before asking the backend for a

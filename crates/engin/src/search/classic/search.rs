@@ -139,12 +139,10 @@ impl ClassicSearch {
         (best, visits)
     }
 
-    fn populate_iteration_stats(
-        meta: &SearchMeta,
-        worker_state: &WorkerSearchState,
-        tree: &NodeTree,
-    ) -> IterationStats {
-        let root_visits = tree.node(tree.current_head()).n() as i64;
+    fn populate_iteration_stats(meta: &SearchMeta, worker_state: &WorkerSearchState) -> IterationStats {
+        // px0's watchdog reads shared counters while workers own the node
+        // mutex. The root visit count equals completed playouts after backup.
+        let root_visits = worker_state.total_playouts.load(Ordering::Acquire) as i64;
         IterationStats {
             time_since_movestart: meta.move_start.elapsed().as_millis() as i64,
             time_since_first_batch: meta.first_batch.map(|t| t.elapsed().as_millis() as i64).unwrap_or(0),
@@ -164,9 +162,8 @@ impl ClassicSearch {
 
     fn maybe_trigger_stop(&mut self) -> Result<bool, EnginError> {
         let stats = {
-            let tree = self.tree.lock().expect("tree lock");
             let meta = self.meta.lock().expect("meta lock");
-            Self::populate_iteration_stats(&meta, &self.worker_state, &tree)
+            Self::populate_iteration_stats(&meta, &self.worker_state)
         };
         let mut stopper_guard = self.stopper.lock().expect("stopper lock");
         let Some(stopper) = stopper_guard.as_mut() else {
@@ -206,29 +203,6 @@ impl ClassicSearch {
         Ok(())
     }
 
-    fn run_one_iteration(
-        tree: &Arc<Mutex<NodeTree>>,
-        worker_state: &Arc<WorkerSearchState>,
-        meta: &Arc<Mutex<SearchMeta>>,
-        backend: &Arc<dyn Backend>,
-    ) -> Result<(), EnginError> {
-        let remaining = meta
-            .lock()
-            .expect("meta lock")
-            .stoppers_hints
-            .estimated_remaining_playouts();
-        worker_state.set_remaining_playouts(if remaining > 0 { remaining } else { i64::MAX });
-        let params = meta.lock().expect("meta lock").params.clone();
-        let mut tree_guard = tree.lock().expect("tree lock");
-        let mut worker = SearchWorker::new(&mut tree_guard, backend.as_ref(), &params, worker_state.as_ref());
-        worker.execute_one_iteration()?;
-        let mut meta_guard = meta.lock().expect("meta lock");
-        if meta_guard.first_batch.is_none() && worker_state.total_batches.load(Ordering::Acquire) > 0 {
-            meta_guard.first_batch = Some(Instant::now());
-        }
-        Ok(())
-    }
-
     fn start_threads(&mut self, how_many: usize) -> Result<(), EnginError> {
         let mut handles = self.threads.lock().expect("threads lock");
         if !handles.is_empty() {
@@ -261,15 +235,17 @@ impl ClassicSearch {
             let backend = Arc::clone(&backend);
             let stop = Arc::clone(&stop);
             handles.push(thread::spawn(move || {
-                while !stop.load(Ordering::Acquire) {
-                    if !meta.lock().expect("meta lock").search_active {
-                        break;
-                    }
-                    if stop.load(Ordering::Acquire) || !meta.lock().expect("meta lock").search_active {
-                        break;
-                    }
-                    if ClassicSearch::run_one_iteration(&tree, &worker_state, &meta, &backend).is_err() {
-                        break;
+                let params = meta.lock().expect("meta lock").params.clone();
+                let mut tree = tree.lock().expect("tree lock");
+                let mut worker = SearchWorker::new(&mut tree, backend.as_ref(), &params, worker_state.as_ref());
+                if worker.run_blocking().is_err() {
+                    stop.store(true, Ordering::Release);
+                    return;
+                }
+                if worker_state.total_batches.load(Ordering::Acquire) > 0 {
+                    let mut meta = meta.lock().expect("meta lock");
+                    if meta.first_batch.is_none() {
+                        meta.first_batch = Some(Instant::now());
                     }
                 }
             }));
