@@ -6,17 +6,17 @@ use xiangqi_core::{GameResult, Move, MoveList, Position, PositionHistory};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Terminal {
     #[default]
-    NonTerminal,
-    EndOfGame,
-    Tablebase,
-    TwoFold,
+    NonTerminal, // 游戏未结束
+    EndOfGame,  // 游戏正常结束
+    Tablebase,  // 命中库
+    TwoFold,    // 两次重复
 }
 
 /// px0 `Edge` (`node.h:85-112`)。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Edge {
     pub mv: Move,
-    p: u16,
+    p: u16, // value of Move policy prior returned from the neural net (but can be changed by adding Dirichlet noise).Must be in [0,1].
 }
 
 impl Edge {
@@ -41,6 +41,7 @@ impl Edge {
 }
 
 /// px0 `EdgeAndNode` (`src/search/classic/node.h:356-410`)。
+/// 保存一对边和节点, 提供代理函数, 简化访问他们
 ///
 /// C++ 版本把一条 edge 与其可选 child node 组合为只读代理。Rust 的树使用
 /// arena 索引保存 child，因此此类型只在读取统计时短暂借用二者。
@@ -79,6 +80,8 @@ impl<'a> EdgeAndNode<'a> {
     }
 
     /// px0 `EdgeAndNode::GetU` (`node.h:406-410`)。
+    /// Returns U = numerator * p / N.
+    /// Passed numerator is expected to be equal to (cpuct * sqrt(N[parent])).
     pub fn u(self, numerator: f32) -> f32 {
         numerator * self.p() / (1 + self.n_started()) as f32
     }
