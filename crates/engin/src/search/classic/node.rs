@@ -177,6 +177,16 @@ impl Node {
         self.m
     }
 
+    /// px0 `Node::GetLowerBound` / `GetUpperBound`
+    /// (`src/search/classic/node.h:153-156`).
+    pub const fn lower_bound(&self) -> GameResult {
+        self.lower_bound
+    }
+
+    pub const fn upper_bound(&self) -> GameResult {
+        self.upper_bound
+    }
+
     pub fn q(&self, draw_score: f32) -> f32 {
         self.wl + draw_score * self.d
     }
@@ -188,6 +198,11 @@ impl Node {
     /// px0 `Node::IsTwoFoldTerminal` (`src/search/classic/node.h:147-149`)。
     pub const fn is_twofold_terminal(&self) -> bool {
         matches!(self.terminal, Terminal::TwoFold)
+    }
+
+    /// px0 `EdgeAndNode::IsTbTerminal` (`src/search/classic/node.h:394-398`).
+    pub const fn is_tablebase_terminal(&self) -> bool {
+        matches!(self.terminal, Terminal::Tablebase)
     }
 
     pub fn edge(&self, index: usize) -> &Edge {
@@ -266,6 +281,19 @@ impl Node {
         self.m += multivisit as f32 * (m - self.m) / (self.n + multivisit) as f32;
         self.n += multivisit;
         self.n_in_flight -= multivisit;
+    }
+
+    /// px0 `Node::AdjustForTerminal` (`src/search/classic/node.cc:368-373`).
+    ///
+    /// A sticky terminal discovered below this non-terminal node changes the
+    /// already accumulated average by `multivisit / n`, rather than adding a
+    /// new visit. `MaybeSetBounds` supplies the exact delta to apply.
+    pub fn adjust_for_terminal(&mut self, v: f32, d: f32, m: f32, multivisit: u32) {
+        debug_assert!(self.n >= multivisit);
+        let n = self.n as f32;
+        self.wl += multivisit as f32 * v / n;
+        self.d += multivisit as f32 * d / n;
+        self.m += multivisit as f32 * m / n;
     }
 
     /// px0 `Node::RevertTerminalVisits` (`src/search/classic/node.cc:375-392`)。

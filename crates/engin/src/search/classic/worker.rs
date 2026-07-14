@@ -1461,13 +1461,94 @@ impl<'a> SearchWorker<'a> {
         }
     }
 
-    /// px0 `SearchWorker::DoBackupUpdateSingleNode` (`search.cc:2175-2258`) 子集。
+    /// px0 `SearchWorker::MaybeSetBounds` (`search.cc:2229-2289`).
+    fn maybe_set_bounds(
+        &mut self,
+        parent_idx: usize,
+        m: f32,
+        n_to_fix: &mut u32,
+        v_delta: &mut f32,
+        d_delta: &mut f32,
+        m_delta: &mut f32,
+    ) -> bool {
+        let mut losing_m: f32 = 0.0;
+        let mut prefer_tablebase = false;
+        let mut lower = GameResult::BlackWon;
+        let mut upper = GameResult::BlackWon;
+
+        for edge_idx in 0..self.tree.node(parent_idx).num_edges() {
+            let child = self
+                .tree
+                .node(parent_idx)
+                .child(edge_idx)
+                .map(|idx| self.tree.node(idx));
+            let edge_lower = child.map_or(GameResult::BlackWon, |node| node.lower_bound());
+            let edge_upper = child.map_or(GameResult::WhiteWon, |node| node.upper_bound());
+            lower = lower.max(edge_lower);
+            upper = upper.max(edge_upper);
+
+            let is_tablebase = child.is_some_and(|node| node.is_tablebase_terminal());
+            if edge_lower == GameResult::WhiteWon && !is_tablebase {
+                prefer_tablebase = false;
+                break;
+            }
+            if edge_upper == GameResult::BlackWon {
+                losing_m = losing_m.max(child.map_or(0.0, |node| node.m()));
+            }
+            prefer_tablebase |= is_tablebase;
+        }
+
+        if lower == GameResult::BlackWon && upper == GameResult::WhiteWon {
+            return false;
+        }
+        if lower == upper {
+            let parent = self.tree.node(parent_idx);
+            *n_to_fix = parent.n();
+            debug_assert!(*n_to_fix > 0);
+            let current_v = parent.wl();
+            let current_d = parent.d();
+            let current_m = parent.m();
+            let result = upper.negate();
+            let plies_left = if upper == GameResult::BlackWon {
+                losing_m.max(m)
+            } else {
+                m
+            } + 1.0;
+            self.tree.make_terminal(
+                parent_idx,
+                result,
+                plies_left,
+                if prefer_tablebase {
+                    Terminal::Tablebase
+                } else {
+                    Terminal::EndOfGame
+                },
+            );
+            let parent = self.tree.node(parent_idx);
+            *v_delta = -(parent.wl() - current_v);
+            *d_delta = parent.d() - current_d;
+            *m_delta = parent.m() - current_m;
+        } else {
+            self.tree
+                .node_mut(parent_idx)
+                .set_bounds(upper.negate(), lower.negate());
+        }
+        true
+    }
+
+    /// px0 `SearchWorker::DoBackupUpdateSingleNode` (`search.cc:2175-2289`).
     fn do_backup_update_single_node(&mut self, item: &NodeToProcess) {
         let mut node_idx = item.node_idx;
         let mut v = item.eval.wl;
         let mut d = item.eval.d;
         let mut m = item.eval.m;
         let root = self.tree.current_head();
+        let mut update_parent_bounds =
+            self.params.sticky_endgames && self.tree.node(node_idx).is_terminal() && self.tree.node(node_idx).n() == 0;
+        let mut n_to_fix = 0;
+        let mut v_delta = 0.0;
+        let mut d_delta = 0.0;
+        let mut m_delta = 0.0;
         loop {
             if self.tree.node(node_idx).is_terminal() {
                 v = self.tree.node(node_idx).wl();
@@ -1477,12 +1558,25 @@ impl<'a> SearchWorker<'a> {
             self.tree
                 .node_mut(node_idx)
                 .finalize_score_update(v, d, m, item.multivisit);
+            if n_to_fix > 0 && !self.tree.node(node_idx).is_terminal() {
+                self.tree
+                    .node_mut(node_idx)
+                    .adjust_for_terminal(v_delta, d_delta, m_delta, n_to_fix);
+            }
             if node_idx == root {
                 break;
             }
             let parent = self.tree.node(node_idx).parent().expect("non-root has parent");
+            if self.tree.node(parent).is_terminal() {
+                n_to_fix = 0;
+            }
+            update_parent_bounds = update_parent_bounds
+                && parent != root
+                && !self.tree.node(parent).is_terminal()
+                && self.maybe_set_bounds(parent, m, &mut n_to_fix, &mut v_delta, &mut d_delta, &mut m_delta);
             node_idx = parent;
             v = -v;
+            v_delta = -v_delta;
             m += 1.0;
         }
         self.search_state
@@ -1588,6 +1682,43 @@ mod tests {
 
         assert_eq!(tree.node(root).n_in_flight(), 0);
         assert_eq!(state.shared_collisions.lock().expect("collisions lock").len(), 0);
+    }
+
+    #[test]
+    fn sticky_terminal_backup_sets_non_root_parent_bounds_like_px0() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let mv = tree.history().last().board().generate_legal_moves()[0];
+        tree.node_mut(root).create_single_child_node(mv);
+        let parent = tree.arena_mut().spawn_child(root, 0);
+        tree.node_mut(parent).create_single_child_node(mv);
+        let leaf = tree.arena_mut().spawn_child(parent, 0);
+        tree.make_terminal(leaf, GameResult::WhiteWon, 0.0, Terminal::EndOfGame);
+
+        // A child only exists after its parent was extended, so px0's
+        // `MaybeSetBounds` always sees a previously visited parent.
+        assert!(tree.node_mut(parent).try_start_score_update());
+        tree.node_mut(parent).finalize_score_update(0.0, 0.0, 0.0, 1);
+
+        for node_idx in [root, parent, leaf] {
+            assert!(tree.node_mut(node_idx).try_start_score_update());
+        }
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+        worker.do_backup_update_single_node(&NodeToProcess::visit(leaf, 2));
+
+        // px0 `MaybeSetBounds` does not terminalize root, but it turns this
+        // non-root forced child into a sticky loss for its side to move.
+        assert!(!worker.tree.node(root).is_terminal());
+        assert!(worker.tree.node(parent).is_terminal());
+        assert!((worker.tree.node(parent).wl() + 1.0).abs() < f32::EPSILON);
+        assert_eq!(worker.tree.node(parent).lower_bound(), GameResult::BlackWon);
+        assert_eq!(worker.tree.node(parent).upper_bound(), GameResult::BlackWon);
     }
 
     #[test]

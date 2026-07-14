@@ -97,6 +97,9 @@
   （`src/search/classic/search.cc:1069-1124`、`search.h:225-233`）。
 - [x] 翻译构造期 per-task `TaskWorkspace` 分配及 worker 退出队列关闭
   （`src/search/classic/search.h:205-233,357-364`）。
+- [x] 翻译 sticky-endgame 的 `MaybeSetBounds`、强制终局父 bounds 传播与
+  `AdjustForTerminal` 统计修正（`src/search/classic/search.cc:2175-2289`、
+  `src/search/classic/node.cc:300-392`）。
 - [ ] 翻译 task worker split、任务队列与完整 out-of-order
   （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的
@@ -104,6 +107,8 @@
   `src/search/classic/search.cc:1494-1508`）；不能以串行任务锁替代。
 - [ ] 对固定 FEN / fixed nodes 记录 **px0 二进制** node、PV、bestmove trace。
 - [ ] 逐函数翻译 px0 minibatch、prefetch、tree reuse 与多 task worker 并发路径。
+- [ ] 翻译 px0 root best-edge 缓存更新与 `MakeSolid` tree 表示
+  （`src/search/classic/search.cc:2209-2251`、`src/search/classic/node.cc:261-289`）。
 - [ ] 对齐 px0 UCI、bench、info 统计。
 - [ ] 将 `OnnxBackend` 接入 `WeightsFile` / backend UCI 配置，替换 UCI 主线的 UniformBackend
   （`src/engine.cc:156-165`、`src/neural/shared_params.*`）。

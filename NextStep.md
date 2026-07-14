@@ -90,12 +90,17 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `SearchWorker` 在构造时按 task worker 数分配独立 `TaskWorkspace`，同步 task dispatch
   也使用该 workspace，并在 worker 退出时关闭队列，对应
   `src/search/classic/search.h:205-233,357-364`；实际常驻 task thread 尚未接线。
+- `SearchWorker::DoBackupUpdateSingleNode` 已补齐 sticky-endgame 的 bounds 传播、终局
+  平均值修正与强制终局父节点标记，对应
+  `src/search/classic/search.cc:2175-2289`、`src/search/classic/node.cc:300-392`；
+  root best-edge 缓存与 `MakeSolid` 内存布局仍待按 Rust arena 访问边界单独翻译。
 
 ### P4 下一入口
 
 - `search.cc:1828-1897`、`search.h:367-448`：task worker split 与任务队列
 - `classic/node.h:127-339`、`search.cc:1494-1508`：稳定 node 存储与 task
   selection 的树访问边界；当前 `Vec<Node>` + 整轮 `Mutex` 不能直接承载 px0 子树并发
-- `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
+- `search.cc:2103-2364`：root best-edge 缓存、`MakeSolid` 与释放树锁后的
+  NN compute/fetch/backup 分阶段并发
 - `engine.cc:153-167`、`neural/shared_params.*`：`WeightsFile` 到真实 ONNX backend 的 UCI 配置
 - px0 二进制 fixed-nodes trace 对拍
