@@ -76,8 +76,9 @@
 - [x] 将 `PickNodesToExtendTask` 的 DFS state 显式参数化为 `TaskWorkspace`，使主 worker
   与 gathering task 不共享 path state（`src/search/classic/search.h:401-406,425-434`、
   `search.cc:1551-1827`）。
-- [x] 翻译 `RunTasks` 的领取、gathering/processing 分派与完成回写；当前先由主 worker
-  同步消费队列（`src/search/classic/search.cc:1069-1140`）。
+- [x] 翻译 `RunTasks` 的领取、gathering/processing 分派与完成回写，以及 `RunBlocking`
+  内常驻 task-worker 的启动、阻塞领取、关闭和 join（`src/search/classic/search.h:205-249`、
+  `search.cc:1069-1140`）；直接单元测试入口保留同步 bridge。
 - [x] 翻译 gathering split 的 px0 work-size 参数、100-task reservation 与
   passed-off/completed-visits 条件（`src/search/classic/params.cc:604-612`、
   `search.cc:1828-1864`）。
@@ -132,8 +133,10 @@
 - [x] 对齐 `SearchParams` root PUCT 三元组与默认值：`CpuctBaseAtRoot`、
   `CpuctFactorAtRoot`、`FpuValueAtRoot=1.0`、collision scaling end `145000`
   （`src/search/classic/params.h:58-65`、`params.cc:543-583,644-655`）。
-- [ ] 翻译 task worker split、任务队列与完整 out-of-order
-  （`search.h:367-448`，`search.cc:1268-1508,1828-1897,2109-2331`）。
+- [x] 翻译 task worker split、任务队列与常驻 task-worker 生命周期
+  （`search.h:205-249,367-448`，`search.cc:1069-1140,1268-1508,1828-1897`）。
+- [ ] 补齐 px0 完整 out-of-order 及其多 SearchWorker 交互
+  （`search.cc:1268-1508,2109-2331`）。
 - [ ] 将 `NodeTree` 从整轮独占 `Mutex` 改为可承载 px0 task-subtree selection 的
   稳定 node 存储与访问边界（`src/search/classic/node.h:127-339`、
   `src/search/classic/search.cc:1494-1508`）；不能以串行任务锁替代。

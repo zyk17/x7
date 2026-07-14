@@ -1,8 +1,9 @@
 //! px0 `src/search/classic/search.h:201-448` 的 P4 worker。
 //!
 //! P3 仍由 `SearchSession` 单线程直连 `Backend::evaluate()`。
-//! P4 worker 七阶段流水线已可单线程跑通；碰撞/task workers/OOO 完整语义
-//! 与 UCI 接线仍属开放项。
+//! P4 worker 七阶段流水线、碰撞和单个 SearchWorker 内的 task-worker
+//! 生命周期已按 px0 源码逐函数翻译；多 SearchWorker 的 tree access
+//! boundary 仍未完成。
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -155,6 +156,31 @@ struct TaskWorkspace {
     current_path: Vec<isize>,
     moves_to_path: MoveList,
     history: PositionHistory,
+}
+
+/// px0 lets task threads operate on subtrees already made disjoint by
+/// `PickNodesToExtendTask` while the owning search worker retains the tree
+/// boundary (`src/search/classic/search.cc:1494-1508,1828-1864`). Rust cannot
+/// express that runtime-disjoint borrowing through ordinary `&mut` aliases.
+/// This pointer is therefore confined to `SearchWorker::run_blocking`, whose
+/// task lifecycle joins every thread before the worker is dropped.
+#[derive(Clone, Copy)]
+struct TaskWorkerPtr<'a> {
+    worker: *mut SearchWorker<'a>,
+}
+
+// SAFETY: `run_tasks` only accesses a task's disjoint subtree, task workspace,
+// and minibatch range. The owner waits for every queued task before a later
+// phase may reuse those regions, exactly as px0 does at search.cc:1494-1508.
+unsafe impl Send for TaskWorkerPtr<'_> {}
+
+impl<'a> TaskWorkerPtr<'a> {
+    /// # Safety
+    /// Inherits the scoped/disjoint-subtree contract documented on
+    /// `TaskWorkerPtr`.
+    unsafe fn run(self, tid: usize) {
+        unsafe { (&mut *self.worker).run_tasks(tid) }
+    }
 }
 
 /// px0 `SearchWorker::PickTask` (`src/search/classic/search.h:367-393`).
@@ -386,6 +412,7 @@ pub struct SearchWorker<'a> {
     task_queue: PickTaskQueue,
     task_workspaces: Vec<TaskWorkspace>,
     picking_workspace: TaskWorkspace,
+    task_threads_active: bool,
 }
 
 impl<'a> SearchWorker<'a> {
@@ -490,6 +517,7 @@ impl<'a> SearchWorker<'a> {
             task_queue: PickTaskQueue::default(),
             task_workspaces,
             picking_workspace: TaskWorkspace::default(),
+            task_threads_active: false,
         }
     }
 
@@ -521,6 +549,30 @@ impl<'a> SearchWorker<'a> {
     /// A search worker owns its reusable computation, task workspaces, and
     /// history for the whole search, not merely for one iteration.
     pub fn run_blocking(&mut self) -> Result<(), EnginError> {
+        if self.task_workers <= 0 {
+            return self.run_blocking_without_task_threads();
+        }
+
+        self.task_threads_active = true;
+        let task_workers = usize::try_from(self.task_workers).expect("positive task worker count");
+        let worker = TaskWorkerPtr { worker: self as *mut _ };
+        let result = std::thread::scope(|scope| {
+            for tid in 0..task_workers {
+                let task_worker = worker;
+                scope.spawn(move || {
+                    // SAFETY: see `TaskWorkerPtr` and `run_tasks`.
+                    unsafe { task_worker.run(tid) }
+                });
+            }
+            let result = self.run_blocking_without_task_threads();
+            self.task_queue.close();
+            result
+        });
+        self.task_threads_active = false;
+        result
+    }
+
+    fn run_blocking_without_task_threads(&mut self) -> Result<(), EnginError> {
         let result = (|| loop {
             self.execute_one_iteration()?;
             if self.search_state.stop.load(Ordering::Acquire) {
@@ -579,8 +631,8 @@ impl<'a> SearchWorker<'a> {
             }
             // px0 `search.cc:1322-1347`: split the initial contiguous work
             // ranges into processing tasks, retaining the final range for the
-            // main worker. Until persistent task threads are translated, this
-            // worker consumes that same queue synchronously after its range.
+            // main worker. `RunBlocking` owns persistent task workers; direct
+            // unit-test entry points consume the same queue synchronously.
             let mut main_start = new_start;
             let mut needs_wait = false;
             if self.task_workers > 0
@@ -622,8 +674,7 @@ impl<'a> SearchWorker<'a> {
             self.picking_workspace = workspace;
             process_result?;
             if needs_wait {
-                self.run_tasks_synchronously()?;
-                self.task_queue.wait();
+                self.wait_for_queued_tasks()?;
             }
 
             let mut some_ooo = false;
@@ -717,16 +768,16 @@ impl<'a> SearchWorker<'a> {
             true,
         );
         self.minibatch = receiver;
-        self.run_tasks_synchronously()?;
+        self.wait_for_queued_tasks()?;
         self.task_queue.drain_results_into(&mut self.minibatch);
         result
     }
 
     /// px0 `SearchWorker::RunTasks` (`src/search/classic/search.cc:1069-1140`).
     ///
-    /// This is the task dispatch body without px0's persistent worker-thread
-    /// wait loop. It deliberately accepts a caller-owned workspace: the later
-    /// worker pool will give each task worker one stable `TaskWorkspace`.
+    /// This synchronous form is retained only for direct unit-test entry
+    /// points that do not call `RunBlocking`. The normal search path uses the
+    /// persistent loop below with the same dispatch semantics.
     fn run_queued_tasks(&mut self, workspace: &mut TaskWorkspace) -> Result<(), EnginError> {
         while let Some((task_id, task)) = self.task_queue.take() {
             let results = match task.kind {
@@ -753,10 +804,71 @@ impl<'a> SearchWorker<'a> {
         Ok(())
     }
 
+    /// px0 `SearchWorker::RunTasks` (`src/search/classic/search.cc:1069-1140`).
+    ///
+    /// # Safety
+    /// The caller is `run_blocking`'s scoped task-thread lifetime. `PickTask`
+    /// only publishes non-overlapping subtree/range work, and the owning
+    /// worker waits for completion before advancing the corresponding phase
+    /// (`search.cc:1494-1508,1322-1347`).
+    unsafe fn run_tasks(&mut self, tid: usize) {
+        while let Some((task_id, task)) = self.task_queue.take_blocking() {
+            // SAFETY: each persistent task thread owns exactly one workspace;
+            // `tid` is assigned once by `run_blocking` and never reused by a
+            // second task thread.
+            let workspace = unsafe { &mut *self.task_workspaces.as_mut_ptr().add(tid) };
+            let results = match task.kind {
+                PickTaskKind::Gathering => {
+                    let mut results = Vec::new();
+                    if self
+                        .pick_nodes_to_extend_task_with_workspace(
+                            task.start.expect("gathering task start"),
+                            task.base_depth,
+                            task.collision_limit,
+                            &task.moves_to_base,
+                            &mut results,
+                            workspace,
+                            false,
+                        )
+                        .is_err()
+                    {
+                        self.search_state.stop.store(true, Ordering::Release);
+                        Vec::new()
+                    } else {
+                        results
+                    }
+                }
+                PickTaskKind::Processing => {
+                    if self
+                        .process_picked_task(task.start_idx, task.end_idx, workspace)
+                        .is_err()
+                    {
+                        self.search_state.stop.store(true, Ordering::Release);
+                    }
+                    Vec::new()
+                }
+            };
+            self.task_queue.complete(task_id, results);
+        }
+    }
+
+    /// px0's main worker waits for persistent task workers; direct unit tests
+    /// keep the synchronous bridge because they do not enter `run_blocking`.
+    fn wait_for_queued_tasks(&mut self) -> Result<(), EnginError> {
+        if self.task_threads_active {
+            self.task_queue.wait();
+            Ok(())
+        } else {
+            self.run_tasks_synchronously()?;
+            self.task_queue.wait();
+            Ok(())
+        }
+    }
+
     /// px0 task workers keep an independent workspace for their entire
     /// `SearchWorker` lifetime (`src/search/classic/search.h:205-233`). This
-    /// synchronous bridge exercises that same ownership before the persistent
-    /// thread loop is enabled.
+    /// synchronous bridge exercises the same ownership for direct unit tests
+    /// that intentionally do not enter the persistent thread loop.
     fn run_tasks_synchronously(&mut self) -> Result<(), EnginError> {
         if self.task_workspaces.is_empty() {
             let mut workspace = std::mem::take(&mut self.picking_workspace);
@@ -1714,19 +1826,95 @@ impl<'a> SearchWorker<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::sync::Once;
+    use std::time::{Duration, Instant};
 
     use xiangqi_core::{initialize_magic_bitboards, GameResult, GameState, STARTPOS_FEN};
 
     use super::*;
-    use crate::neural::backend::UniformBackend;
+    use crate::neural::backend::{
+        Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, UniformBackend,
+    };
 
     static INIT: Once = Once::new();
 
     fn ensure_init() {
         INIT.call_once(initialize_magic_bitboards);
+    }
+
+    /// A non-CPU attribute wrapper makes the px0 automatic task-worker path
+    /// observable while retaining UniformBackend's deterministic computation.
+    #[derive(Clone, Debug, Default)]
+    struct GpuUniformBackend(UniformBackend);
+
+    impl Backend for GpuUniformBackend {
+        fn evaluate(&self, history: &PositionHistory, legal_moves: &[Move]) -> EvalResult {
+            self.0.evaluate(history, legal_moves)
+        }
+
+        fn attributes(&self) -> BackendAttributes {
+            BackendAttributes {
+                runs_on_cpu: false,
+                recommended_batch_size: 4,
+                maximum_batch_size: 4,
+                ..BackendAttributes::default()
+            }
+        }
+
+        fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
+            self.0.create_computation()
+        }
+
+        fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
+            self.0.cached_evaluation(position)
+        }
+    }
+
+    /// px0 creates task threads in `SearchWorker`'s constructor and keeps
+    /// them alive through `RunBlocking` (`search.h:205-249`).  This verifies
+    /// the Rust worker uses that path instead of the direct-test synchronous
+    /// bridge, then closes every task thread before returning.
+    #[test]
+    fn run_blocking_uses_and_closes_persistent_task_workers() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+
+        let backend = GpuUniformBackend::default();
+        let params = SearchParams {
+            minibatch_size: 4,
+            task_workers_per_search_worker: 1,
+            minimum_work_size_for_processing: 2,
+            minimum_work_per_task_for_processing: 1,
+            max_collision_visits: 4,
+            max_collision_visits_scaling_start: 0,
+            max_collision_visits_scaling_end: 1,
+            out_of_order_eval: false,
+            ..SearchParams::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let search_state = Arc::new(WorkerSearchState::new(Arc::clone(&stop), i64::MAX));
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
+
+        std::thread::scope(|scope| {
+            let state = Arc::clone(&search_state);
+            let stop = Arc::clone(&stop);
+            let stopper = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while state.total_playouts.load(Ordering::Acquire) < 16 && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                stop.store(true, Ordering::Release);
+            });
+            worker.run_blocking().expect("persistent task-worker search");
+            stopper.join().expect("stopper thread");
+        });
+
+        assert!(search_state.total_playouts.load(Ordering::Acquire) >= 16);
+        assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
     }
 
     #[test]

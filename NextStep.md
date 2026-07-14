@@ -1,6 +1,6 @@
 # NextStep
 
-## 当前阶段：P4 单 worker 搜索与 UCI 生命周期已接线；完整碰撞/task workers 未闭合
+## 当前阶段：P4 单 worker 搜索、collision、prefetch 与常驻 task workers 已接线；多 SearchWorker tree boundary 未闭合
 
 P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `ClassicSearch`** 已接入 UCI：
 
@@ -30,7 +30,7 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `engin/src/search/classic/worker.rs`：七阶段 + px0 `VisitsStopper` + OOO 子集
 - `engin/src/search/classic/node.rs`：`EdgeAndNode` Q/U/NStarted 代理；worker 的
   单 worker `PickNodesToExtendTask` 显式 workspace/path-backtrack 翻译
-  （`search.cc:1551-1827`，task split 尚未翻译）
+  （`search.cc:1551-1827`，task split 已接线）
 - `engin/src/search/classic/worker.rs`：递归 `PrefetchIntoCache`（`search.cc:1989-2099`）
 - `engin/src/search/classic/search.rs`：异步 `StartThreads`、`ClassicSearch` 取代 `SearchSession` 主路径
 - `engin/src/search/classic/stoppers/*`：Visits/Playouts/TimeLimit/wtime 预算
@@ -47,31 +47,32 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `engin/src/neural/backend.rs`、`onnx.rs`：`BackendComputation` 以 task-safe
   内部状态承载并发 `AddInput`，对应 `src/neural/backend.h:75-87` 与
   `src/search/classic/search.cc:1423-1462`；NN compute 期间不持有 batch 状态锁。
-- `engin/src/search/classic/worker.rs`：`PickTask`、`PickTaskQueue` 与 worker
-  生命周期的 `ResetTasks` 已翻译，对应 `src/search/classic/search.h:367-445`、
-  `search.cc:1069-1140,1464-1508`；task dispatch/split 尚未接线。
+- `engin/src/search/classic/worker.rs`：`PickTask`、`PickTaskQueue`、`RunTasks` 与 worker
+  生命周期的 `ResetTasks` 已翻译，对应 `src/search/classic/search.h:205-249,367-445`、
+  `search.cc:1069-1140,1322-1347,1464-1508,1828-1864`；主 worker 在对应阶段等待
+  常驻 task workers 完成。
 - `PickNodesToExtendTask` 现在显式写入 caller receiver，对应
   `src/search/classic/search.h:401-406`；下一步可直接将 gathering task 的结果写入
   `PickTask.results`。
 - `PickNodesToExtend` 在主选择完成后等待并汇合各 `PickTask.results`，对应
-  `src/search/classic/search.cc:1501-1507`；task split/dispatch 尚未接线。
+  `src/search/classic/search.cc:1494-1508`；task split/dispatch 已接线。
 - `PickNodesToExtendTask` 的 DFS state 改为显式 `TaskWorkspace` 参数，对应
   `src/search/classic/search.h:401-406,425-434`、`search.cc:1551-1827`；主 worker
   仍持有自己的 workspace，后续 gathering task 可各自持有独立 workspace。
-- `RunTasks` 的领取、按 gathering/processing 分派和完成回写已落地，对应
-  `src/search/classic/search.cc:1069-1140`；目前由主 worker 同步消费队列，task split 与
-  常驻 task worker 尚未接线。
+- `RunTasks` 的领取、按 gathering/processing 分派和完成回写，以及 `RunBlocking`
+  内的常驻 task-worker 生命周期已落地，对应 `src/search/classic/search.h:205-249`、
+  `search.cc:1069-1140`；直接单元测试入口仍保留同步 bridge。
 - gathering split 已按 px0 `MinimumPickingWork=1`、`MinimumRemainingPickingWork=20`、
   `MAX_TASKS=100` 及 passed-off/completed-visits 条件翻译，对应
   `src/search/classic/params.cc:604-612`、`search.cc:1828-1864`；常驻 task worker
-  和并发树访问边界尚未接线。
+  已接线，多 SearchWorker 的并发树访问边界尚未接线。
 - processing split 已按 px0 `MinimumProcessingWork=20`、`MinimumPerTaskProcessing=8`
   将前段交给 `PickTask::Processing`、主 worker 保留尾段，对应
-  `src/search/classic/params.cc:604-612`、`search.cc:1322-1347`；当前同步执行，
-  常驻 task worker 生命周期尚未接线。
+  `src/search/classic/params.cc:604-612`、`search.cc:1322-1347`；正常搜索由
+  常驻 task workers 执行，直接单元测试使用同步 bridge。
 - `TaskWorkers=-1` 已按 px0 GPU 硬件并发启发式解析（每个 search worker 最多 4 个；CPU 为 0），
-  对应 `src/search/classic/search.h:205-233`；当前仍同步消费任务队列，不能在整树锁下伪造常驻
-  task thread。
+  对应 `src/search/classic/search.h:205-233`；常驻 task worker 会在 `RunBlocking` 生命周期内
+  启动、阻塞领取任务，并在退出前关闭和 join。
 - collision 的 `maxvisit` 扩容、祖先 `NInFlight` 更新与 collision-budget 停止条件已翻译，
   对应 `src/search/classic/search.cc:1400-1419`；不再以“本轮没有叶子”提前返回。
 - `InitializeIteration` 现在在创建新 computation 前释放上一轮 computation，对应
@@ -85,11 +86,11 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
 - `time_since_first_batch` 改由第一个完成 backup 的 worker 写入共享状态，watchdog 读取该状态，
   对齐 px0 worker/watchdog 分离的统计时序（`src/search/classic/search.cc:2158-2173,2331-2364`）。
 - `PickTaskQueue` 已支持 px0 的阻塞领取、condition-variable 唤醒和 `task_count=-1` 退出语义，
-  对应 `src/search/classic/search.cc:1069-1124`、`search.h:225-233`；尚未把实际 task thread
-  接到树的子树并发访问。
-- `SearchWorker` 在构造时按 task worker 数分配独立 `TaskWorkspace`，同步 task dispatch
-  也使用该 workspace，并在 worker 退出时关闭队列，对应
-  `src/search/classic/search.h:205-233,357-364`；实际常驻 task thread 尚未接线。
+  对应 `src/search/classic/search.cc:1069-1124`、`search.h:225-233`；实际 task thread 已接到
+  单个 SearchWorker 的拆分子树/processing range。
+- `SearchWorker` 在构造时按 task worker 数分配独立 `TaskWorkspace`，正常搜索由每个
+  常驻 task thread 独占一个 workspace，并在 worker 退出时关闭队列、join 全部 task threads；
+  对应 `src/search/classic/search.h:205-249,357-364`。
 - `SearchWorker::DoBackupUpdateSingleNode` 已补齐 sticky-endgame 的 bounds 传播、终局
   平均值修正与强制终局父节点标记，对应
   `src/search/classic/search.cc:2175-2289`、`src/search/classic/node.cc:300-392`；
@@ -136,14 +137,13 @@ P0–P3 规则、UCI、搜索树均已通过。P4 **worker 七阶段 + 异步 `C
   `params.cc:543-583,644-655`。
 
 - 已完成 `go searchmoves` 的合法根着法解析和选择/PV/输出共用过滤；对应
-  `src/search/classic/wrapper.cc:78-100`、`search.cc:721-724,1668-1740`。下一项仍是
-  task worker 的稳定 node 存储边界，不以假并行替代。
+  `src/search/classic/wrapper.cc:78-100`、`search.cc:721-724,1668-1740`。下一项是
+  多 SearchWorker 的稳定 node 存储边界，不以假并行替代。
 - root 尚无已评估 child 的 early-stop/terminal fallback 同样不得逃逸 `searchmoves`；对应
   `src/search/classic/wrapper.cc:78-100`、`search.cc:721-724`。
 
-- `search.cc:1828-1897`、`search.h:367-448`：task worker split 与任务队列
-- `classic/node.h:127-339`、`search.cc:1494-1508`：稳定 node 存储与 task
-  selection 的树访问边界；当前 `Vec<Node>` + 整轮 `Mutex` 不能直接承载 px0 子树并发
+- `classic/node.h:127-339`、`search.cc:1494-1508`：稳定 node 存储与多 SearchWorker
+  selection 的树访问边界；当前 `Vec<Node>` + 整轮 `Mutex` 不能直接承载 px0 多 worker 并发
 - `node.cc:245-289`：随稳定 node 存储边界翻译 `MakeSolid`；不能在当前 arena 上伪造
 - `search.cc:2103-2364`：释放树锁后的 NN compute/fetch/backup 分阶段并发
 - `search.cc:357-368`、`params.h:107-128`：实时 `MaybeOutputInfo` responder 回调，及
