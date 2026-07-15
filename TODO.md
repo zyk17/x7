@@ -27,6 +27,8 @@
   `nps_start_time_` 的 watchdog 初始化、UCI nps/eps 与 NPS limit 时钟归属。
 - [x] 按 `src/search/classic/search.cc:874-896,908-922,1268-1284` 重置每轮搜索的
   remaining-playouts hint；首轮不得提前套用 `go nodes` 或沿用上轮预算。
+- [x] 按 `src/search/classic/search.cc:596-610` 加入 root-first-visit stopper gate；未扩展根节点
+  不能被 budget stopper 提前结束。
 
 - [x] 按 `src/search/classic/search.h:435-445`、`search.cc:1069-1119,1464-1483` 翻译
   `task_taking_started`、claim、idle、wake、close 与重用；已补多线程唯一领取回归。

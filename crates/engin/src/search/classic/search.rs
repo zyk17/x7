@@ -438,6 +438,13 @@ impl SearchStopController {
             let mut meta = self.meta.lock().expect("meta lock");
             Self::populate_iteration_stats(&mut meta, worker_state)
         };
+        // px0 refuses to invoke stoppers before the root has completed its
+        // first visit (`src/search/classic/search.cc:596-610`). In
+        // particular, a zero-time request must not turn an unexpanded root
+        // into a terminal search result.
+        if stats.total_nodes == 0 {
+            return false;
+        }
         let mut stopper_guard = self.stopper.lock().expect("stopper lock");
         let Some(stopper) = stopper_guard.as_mut() else {
             return false;

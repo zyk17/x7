@@ -46,6 +46,9 @@ batch 回写时私自设定时间原点。
 `total_nodes` 发布。参考 `src/search/classic/search.cc:874-896,908-922,1268-1284`。这避免前一轮
 预算或 tree-reuse visits 污染新搜索首轮 gathering。
 
+stopper 现在也遵守 px0 的 root-first-visit gate：root 尚无访问时只等待，不执行 budget stopper。
+参考 `src/search/classic/search.cc:596-610`。
+
 已对齐 tree reuse 的 stopper 统计：`total_nodes` 必须是本轮 `total_playouts + initial_visits`，而
 `nodes_since_movestart` 只统计本轮 playouts。参考 px0 `search.cc:908-922`。
 
