@@ -16,6 +16,7 @@ pub const PLANES_PER_BOARD: usize = 15;
 pub const AUX_PLANE_BASE: usize = MOVE_HISTORY * PLANES_PER_BOARD;
 
 pub mod backend;
+pub mod cache;
 pub mod onnx;
 
 /// px0 `src/neural/encoder.h:42`。

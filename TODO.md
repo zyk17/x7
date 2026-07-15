@@ -9,9 +9,9 @@
 - P2：`src/chess/gamestate.*`、`uciloop.*`；`position ... moves ...` 保留完整历史。
 - P3：`src/search/classic/node.*`、`params.*`、基本 selection/extend/backup/tree reuse。
 - P4 已接通的部分：`src/neural/backend.h:45-138`、`src/neural/encoder.cc:118-217,229-481`、
-  `src/neural/wrapper.cc:49-172`、`src/search/classic/search.cc:1142-1231,1268-1508,1551-1827,
-  1977-2334` 的单 worker/minibatch/prefetch/OOO/shared-tree 子集。真实 ONNX 的 px0 MemCache
-  尚未翻译；当前 cache 仅限 `UniformBackend` 测试路径。
+  `src/neural/wrapper.cc:49-172`、`src/neural/memcache.h:34-45,memcache.cc:38-190`、
+  `src/search/classic/search.cc:1142-1231,1268-1508,1551-1827,1977-2334` 的 ONNX/MemCache、
+  单 worker/minibatch/prefetch/OOO/shared-tree 子集。
 - 正式 UCI `WeightsFile` 生命周期：`src/engine.cc:137-197,206-219`，没有权重时明确拒绝搜索，
   不回退到 `UniformBackend`。
 - NN 训练入口：参考 `pxzero-training/tf/train.py:110-126`、`tf/configs/example.yaml:4-31`，已收为
@@ -24,9 +24,10 @@
 当前：GPU task split 已接通；CPU 保持 px0 `task_workers_=0`。下一步验证多 SearchWorker、OOO、
 stop 与真实 ONNX/DirectML 时序。
 
-- [ ] 逐段翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为真实 ONNX 的
-  `CachingBackend` wrapper：以当前局面 hash 为 key、保留合法着数量防碰撞、缓存 miss 仅在
-  `ComputeBlocking` 后写入、`ucinewgame` 清 cache。不要把测试用 `UniformBackend` cache 当作正式实现。
+- [x] 翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为正式 ONNX 的
+  `CachingBackend` wrapper：当前局面 hash 为 key、合法着数量防碰撞、cache miss 仅在
+  `ComputeBlocking` 后写入、`ucinewgame` 清 cache；`NNCacheSize` 默认/范围为
+  `src/neural/shared_params.cc:63-82` 的 `2000000` / `0..999999999`。
 
 - [ ] 翻译 px0 `src/search/classic/stoppers/common.cc:118-186`、`stoppers/simple.cc:74-126` 及其
   对应测试后，再开放 `go wtime/btime/winc/binc/movestogo`。当前仅支持逐函数已对齐的

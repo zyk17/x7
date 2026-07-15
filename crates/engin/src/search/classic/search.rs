@@ -610,6 +610,12 @@ impl ClassicSearch {
         Ok(())
     }
 
+    /// px0 applies `NNCacheSize` through `Engine::UpdateBackendConfig`
+    /// (`src/engine.cc:153-167`) before each new search parameter snapshot.
+    pub fn set_nn_cache_size(&mut self, size: usize) {
+        self.backend.set_cache_size(size);
+    }
+
     pub fn run_blocking_nodes(&mut self, nodes: u32) -> (Move, u32) {
         let params = GoParams {
             nodes: Some(nodes as i32),
@@ -865,6 +871,10 @@ impl ClassicSearch {
 impl SearchBase for ClassicSearch {
     fn new_game(&mut self) -> Result<(), EnginError> {
         self.wait_search()?;
+        // px0 `Engine::NewGame` clears the `CachingBackend` before rebuilding
+        // search state (`src/engine.cc:199-203`). The backend owns this cache;
+        // a non-caching test backend intentionally treats it as a no-op.
+        self.backend.clear_cache();
         *self.tree.write() = NodeTree::default();
         self.worker_state = Arc::new(WorkerSearchState::new(Arc::clone(&self.stop)));
         self.outputs.clear();

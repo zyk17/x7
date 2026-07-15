@@ -6,6 +6,7 @@ use xiangqi_core::{GameState, STARTPOS_FEN};
 
 use crate::callbacks::{BestMoveInfo, ThinkingInfo};
 use crate::error::EnginError;
+use crate::neural::cache::DEFAULT_NN_CACHE_SIZE;
 use crate::search::classic::{ContemptMode, ScoreType};
 
 /// px0 `GoParams` (`uciloop.h:42-55`)。
@@ -51,6 +52,8 @@ pub struct UciOptions {
     pub wdl_draw_rate_target: f32,
     pub wdl_draw_rate_reference: f32,
     pub wdl_book_exit_bias: f32,
+    /// px0 `NNCacheSize` (`src/neural/shared_params.cc:63-82`).
+    pub nn_cache_size: usize,
     /// px0 `WeightsFile` (`src/neural/shared_params.cc:43-80`). This Rust
     /// port accepts the formal ONNX model rather than px0's protobuf weights.
     pub weights_file: String,
@@ -78,6 +81,7 @@ impl Default for UciOptions {
             wdl_draw_rate_target: 0.0,
             wdl_draw_rate_reference: 0.5,
             wdl_book_exit_bias: 0.65,
+            nn_cache_size: DEFAULT_NN_CACHE_SIZE,
             weights_file: String::new(),
         }
     }
@@ -131,6 +135,10 @@ impl UciOptions {
             format!("option name WDLDrawRateTarget type string default {}", self.wdl_draw_rate_target),
             format!("option name WDLDrawRateReference type string default {}", self.wdl_draw_rate_reference),
             format!("option name WDLBookExitBias type string default {}", self.wdl_book_exit_bias),
+            format!(
+                "option name NNCacheSize type spin default {} min 0 max 999999999",
+                self.nn_cache_size
+            ),
             format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
@@ -169,6 +177,7 @@ impl UciOptions {
                 self.wdl_draw_rate_reference = parse_float_option(value, "WDLDrawRateReference", 0.001, 0.999)?
             }
             "WDLBookExitBias" => self.wdl_book_exit_bias = parse_float_option(value, "WDLBookExitBias", -2.0, 2.0)?,
+            "NNCacheSize" => self.nn_cache_size = parse_cache_size(value)?,
             "WeightsFile" => self.weights_file = value.to_string(),
             _ => return Err(EnginError::Uci(format!("Unknown option: {name}"))),
         }
@@ -688,6 +697,20 @@ fn parse_nps_limit(value: &str) -> Result<f32, EnginError> {
     Ok(value)
 }
 
+/// px0 `IntOption(kNNCacheSizeId, 0, 999999999)`
+/// (`src/neural/shared_params.cc:63-82`).
+fn parse_cache_size(value: &str) -> Result<usize, EnginError> {
+    let value: usize = value
+        .parse()
+        .map_err(|_| EnginError::Uci("NNCacheSize must be an integer from 0 to 999999999".into()))?;
+    if value > 999_999_999 {
+        return Err(EnginError::Uci(
+            "NNCacheSize must be an integer from 0 to 999999999".into(),
+        ));
+    }
+    Ok(value)
+}
+
 fn parse_float_option(value: &str, name: &str, min: f32, max: f32) -> Result<f32, EnginError> {
     let value: f32 = value
         .parse()
@@ -892,6 +915,13 @@ mod tests {
             .list_options_uci()
             .iter()
             .any(|line| line.contains("option name ContemptMode type combo")));
+        assert!(options
+            .list_options_uci()
+            .iter()
+            .any(|line| line.contains("option name NNCacheSize type spin default 2000000")));
+        options.set_uci_option("NNCacheSize", "0").expect("zero cache size");
+        assert_eq!(options.nn_cache_size, 0);
+        assert!(options.set_uci_option("NNCacheSize", "1000000000").is_err());
         assert!(options.set_uci_option("WDLEvalObjectivity", "1.1").is_err());
     }
 

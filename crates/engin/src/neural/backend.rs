@@ -7,6 +7,8 @@ use xiangqi_core::{Move, MoveList, Position, PositionHistory};
 
 use crate::EnginError;
 
+use super::cache::{CachedEval, EvalCache, DEFAULT_NN_CACHE_SIZE};
+
 /// px0 `BackendAttributes` (`src/neural/backend.h:45-52`)。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendAttributes {
@@ -90,6 +92,183 @@ pub trait Backend: Send + Sync {
     fn cached_evaluation(&self, _position: &EvalPosition) -> Option<EvalResult> {
         None
     }
+
+    /// px0 `CachingBackend::ClearCache` (`src/neural/memcache.h:34-38`).
+    /// Non-caching backends deliberately keep the no-op default.
+    fn clear_cache(&self) {}
+
+    /// px0 `CachingBackend::SetCacheSize` (`src/neural/memcache.h:36-38`).
+    fn set_cache_size(&self, _size: usize) {}
+}
+
+/// px0 `CachingBackend` / `MemCache` (`src/neural/memcache.h:34-45`,
+/// `memcache.cc:58-190`). This wrapper, rather than the ONNX implementation,
+/// owns cache lookup, batch miss forwarding and post-compute insertion.
+pub struct CachingBackend {
+    wrapped: Arc<dyn Backend>,
+    cache: Arc<Mutex<EvalCache>>,
+}
+
+impl CachingBackend {
+    pub fn new(wrapped: Box<dyn Backend>) -> Self {
+        Self {
+            wrapped: Arc::from(wrapped),
+            cache: Arc::new(Mutex::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE))),
+        }
+    }
+
+    fn cache_key(position: &EvalPosition) -> u64 {
+        // px0 `ComputeEvalPositionHash` (`memcache.cc:38-45`). History and
+        // repetitions are intentionally not in this cache key yet.
+        position.positions.last().map_or(0, Position::hash)
+    }
+
+    fn cached(&self, position: &EvalPosition) -> Option<EvalResult> {
+        self.cache
+            .lock()
+            .expect("NN cache lock")
+            .get(Self::cache_key(position), position.legal_moves.len())
+    }
+
+    fn resize_cache(&self, size: usize) {
+        self.cache.lock().expect("NN cache lock").set_capacity(size);
+    }
+}
+
+impl Backend for CachingBackend {
+    fn evaluate(&self, history: &PositionHistory, legal_moves: &[Move]) -> EvalResult {
+        let computation = self.create_computation().expect("create caching computation");
+        let (_, ticket) = computation
+            .add_input(EvalPosition {
+                positions: history.positions().to_vec(),
+                legal_moves: legal_moves.to_vec(),
+            })
+            .expect("enqueue caching evaluation");
+        computation.compute_blocking().expect("run caching evaluation");
+        computation.take_result(ticket).expect("fetch caching evaluation")
+    }
+
+    fn attributes(&self) -> BackendAttributes {
+        self.wrapped.attributes()
+    }
+
+    fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
+        Ok(Box::new(CachingBackendComputation {
+            wrapped: self.wrapped.create_computation()?,
+            cache: Arc::clone(&self.cache),
+            state: Mutex::new(CachingComputationState::default()),
+        }))
+    }
+
+    fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
+        self.cached(position)
+    }
+
+    fn clear_cache(&self) {
+        self.cache.lock().expect("NN cache lock").clear();
+        self.wrapped.clear_cache();
+    }
+
+    fn set_cache_size(&self, size: usize) {
+        self.resize_cache(size);
+        self.wrapped.set_cache_size(size);
+    }
+}
+
+/// One px0 `MemCacheComputation::Entry` (`memcache.cc:109-120`).
+struct CacheEntry {
+    outer_ticket: EvalTicket,
+    inner_ticket: EvalTicket,
+    key: u64,
+    num_moves: usize,
+}
+
+#[derive(Default)]
+struct CachingComputationState {
+    entries: Vec<CacheEntry>,
+    results: HashMap<usize, EvalResult>,
+    next_ticket: usize,
+}
+
+struct CachingBackendComputation {
+    wrapped: Box<dyn BackendComputation>,
+    cache: Arc<Mutex<EvalCache>>,
+    state: Mutex<CachingComputationState>,
+}
+
+impl BackendComputation for CachingBackendComputation {
+    fn used_batch_size(&self) -> usize {
+        self.wrapped.used_batch_size()
+    }
+
+    fn add_input(&self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError> {
+        let outer_ticket = {
+            let mut state = self.state.lock().expect("caching computation lock");
+            let ticket = EvalTicket(state.next_ticket);
+            state.next_ticket += 1;
+            ticket
+        };
+        let key = CachingBackend::cache_key(&position);
+        if let Some(result) = self
+            .cache
+            .lock()
+            .expect("NN cache lock")
+            .get(key, position.legal_moves.len())
+        {
+            self.state
+                .lock()
+                .expect("caching computation lock")
+                .results
+                .insert(outer_ticket.0, result);
+            return Ok((AddInputResult::FetchedImmediately, outer_ticket));
+        }
+
+        let num_moves = position.legal_moves.len();
+        let (_, inner_ticket) = self.wrapped.add_input(position)?;
+        self.state
+            .lock()
+            .expect("caching computation lock")
+            .entries
+            .push(CacheEntry {
+                outer_ticket,
+                inner_ticket,
+                key,
+                num_moves,
+            });
+        Ok((AddInputResult::EnqueuedForEval, outer_ticket))
+    }
+
+    fn compute_blocking(&self) -> Result<(), EnginError> {
+        self.wrapped.compute_blocking()?;
+        let entries = std::mem::take(&mut self.state.lock().expect("caching computation lock").entries);
+        let mut results = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let result = self.wrapped.take_result(entry.inner_ticket)?;
+            self.cache.lock().expect("NN cache lock").insert_if_absent(
+                entry.key,
+                CachedEval {
+                    result: result.clone(),
+                    num_moves: entry.num_moves,
+                },
+            );
+            results.push((entry.outer_ticket.0, result));
+        }
+        self.state
+            .lock()
+            .expect("caching computation lock")
+            .results
+            .extend(results);
+        Ok(())
+    }
+
+    fn take_result(&self, ticket: EvalTicket) -> Result<EvalResult, EnginError> {
+        self.state
+            .lock()
+            .expect("caching computation lock")
+            .results
+            .remove(&ticket.0)
+            .ok_or(EnginError::PortIncomplete("CachingBackendComputation missing result"))
+    }
 }
 
 /// px0 `UniformBackend` 的 P4 batch 实现（测试/对拍用）。
@@ -161,20 +340,13 @@ impl BackendComputation for UniformBackendComputation {
     }
 }
 
-/// 测试用：均匀 policy + 固定 WDL，带 px0 风格 NN cache。
+/// 测试用：均匀 policy + 固定 WDL，复用正式 px0 风格 NN cache 容器。
 #[derive(Clone, Debug)]
 pub struct UniformBackend {
     pub wl: f32,
     pub d: f32,
     pub m: f32,
-    cache: Arc<Mutex<HashMap<u64, CachedEval>>>,
-}
-
-/// px0 `neural/memcache.cc:50-55`：policy 缓存必须带合法着数量。
-#[derive(Clone, Debug)]
-struct CachedEval {
-    result: EvalResult,
-    num_moves: usize,
+    cache: Arc<Mutex<EvalCache>>,
 }
 
 impl Default for UniformBackend {
@@ -183,7 +355,7 @@ impl Default for UniformBackend {
             wl: 0.0,
             d: 0.0,
             m: 0.0,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE))),
         }
     }
 }
@@ -198,7 +370,7 @@ impl UniformBackend {
             wl,
             d,
             m,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE))),
         }
     }
 }
@@ -218,12 +390,7 @@ impl Backend for UniformBackend {
     fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
         let key = Self::cache_key(position);
         let requested_moves = position.legal_moves.len();
-        self.cache
-            .lock()
-            .expect("cache lock")
-            .get(&key)
-            .filter(|cached| requested_moves == 0 || cached.num_moves == requested_moves)
-            .map(|cached| cached.result.clone())
+        self.cache.lock().expect("cache lock").get(key, requested_moves)
     }
 
     fn attributes(&self) -> BackendAttributes {
@@ -233,12 +400,20 @@ impl Backend for UniformBackend {
     fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
         Ok(Box::new(UniformBackendComputation::new(self.clone())))
     }
+
+    fn clear_cache(&self) {
+        self.cache.lock().expect("cache lock").clear();
+    }
+
+    fn set_cache_size(&self, size: usize) {
+        self.cache.lock().expect("cache lock").set_capacity(size);
+    }
 }
 
 impl UniformBackend {
     pub fn store_cache(&self, position: &EvalPosition, result: EvalResult) {
         let key = Self::cache_key(position);
-        self.cache.lock().expect("cache lock").insert(
+        self.cache.lock().expect("cache lock").insert_if_absent(
             key,
             CachedEval {
                 result,
@@ -253,7 +428,16 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    use xiangqi_core::STARTPOS_FEN;
+
     use super::*;
+
+    fn startpos_request(num_moves: usize) -> EvalPosition {
+        EvalPosition {
+            positions: vec![Position::from_fen(STARTPOS_FEN).expect("startpos")],
+            legal_moves: vec![Move::NULL; num_moves],
+        }
+    }
 
     #[test]
     fn computation_accepts_concurrent_task_inputs() {
@@ -280,5 +464,54 @@ mod tests {
         for ticket in tickets {
             assert!(computation.take_result(ticket).is_ok());
         }
+    }
+
+    /// px0 `MemCacheComputation::AddInput/ComputeBlocking`
+    /// (`memcache.cc:101-129`): cache hits skip the wrapped batch, while a
+    /// different legal move count is a collision-safe miss.
+    #[test]
+    fn caching_backend_returns_hits_only_after_completed_batch_and_checks_move_count() {
+        let backend = CachingBackend::new(Box::new(UniformBackend::default()));
+        let first = backend.create_computation().expect("first computation");
+        let (status, first_ticket) = first.add_input(startpos_request(2)).expect("first input");
+        assert_eq!(status, AddInputResult::EnqueuedForEval);
+        first.compute_blocking().expect("first compute");
+        assert_eq!(first.take_result(first_ticket).expect("first result").policies.len(), 2);
+
+        let hit = backend.create_computation().expect("hit computation");
+        let (status, hit_ticket) = hit.add_input(startpos_request(2)).expect("hit input");
+        assert_eq!(status, AddInputResult::FetchedImmediately);
+        assert_eq!(hit.used_batch_size(), 0);
+        assert_eq!(hit.take_result(hit_ticket).expect("cached result").policies.len(), 2);
+
+        let collision_guard = backend.create_computation().expect("miss computation");
+        let (status, _) = collision_guard
+            .add_input(startpos_request(1))
+            .expect("mismatched moves");
+        assert_eq!(status, AddInputResult::EnqueuedForEval);
+    }
+
+    #[test]
+    fn caching_backend_new_game_clear_boundary_removes_completed_entries() {
+        let backend = CachingBackend::new(Box::new(UniformBackend::default()));
+        let computation = backend.create_computation().expect("computation");
+        let (_, ticket) = computation.add_input(startpos_request(1)).expect("input");
+        computation.compute_blocking().expect("compute");
+        computation.take_result(ticket).expect("result");
+        assert!(backend.cached_evaluation(&startpos_request(1)).is_some());
+
+        backend.clear_cache();
+        assert!(backend.cached_evaluation(&startpos_request(1)).is_none());
+    }
+
+    #[test]
+    fn caching_backend_respects_px0_zero_capacity() {
+        let backend = CachingBackend::new(Box::new(UniformBackend::default()));
+        backend.set_cache_size(0);
+        let computation = backend.create_computation().expect("computation");
+        let (_, ticket) = computation.add_input(startpos_request(1)).expect("input");
+        computation.compute_blocking().expect("compute");
+        computation.take_result(ticket).expect("result");
+        assert!(backend.cached_evaluation(&startpos_request(1)).is_none());
     }
 }

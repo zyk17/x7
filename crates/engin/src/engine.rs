@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use xiangqi_core::{GameState, STARTPOS_FEN};
 
 use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo};
-use crate::neural::backend::{Backend, UniformBackend};
+use crate::neural::backend::{Backend, CachingBackend, UniformBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::classic::ClassicSearch;
 use crate::search::SearchBase;
@@ -134,7 +134,9 @@ impl ClassicEngine {
     /// Explicit backend construction for tests and direct callers. Formal UCI
     /// startup uses `new` and receives its model through `WeightsFile`.
     pub fn from_onnx_file(path: impl AsRef<std::path::Path>) -> Result<Self, EnginError> {
-        Ok(Self::with_backend(Box::new(OnnxBackend::from_file(path)?)))
+        Ok(Self::with_backend(Box::new(CachingBackend::new(Box::new(
+            OnnxBackend::from_file(path)?,
+        )))))
     }
 
     /// Deterministic test-only constructor. It never participates in the
@@ -172,7 +174,7 @@ impl ClassicEngine {
         self.stop_and_drop_search()?;
         match OnnxBackend::from_file(&path) {
             Ok(backend) => {
-                let mut search = ClassicSearch::new(Box::new(backend));
+                let mut search = ClassicSearch::new(Box::new(CachingBackend::new(Box::new(backend))));
                 search.set_uci_responder(Arc::clone(&self.uci_forwarder) as Arc<dyn SearchResponder>);
                 Self::apply_uci_options(&mut search, &self.uci_options)?;
                 self.search = Some(search);
@@ -197,7 +199,9 @@ impl ClassicEngine {
             options.score_type,
             options.nodes_per_second_limit,
         )?;
-        search.set_wdl_options(options)
+        search.set_wdl_options(options)?;
+        search.set_nn_cache_size(options.nn_cache_size);
+        Ok(())
     }
 
     /// px0 `Engine::EnsureSearchStopped` (`src/engine.cc:149-151`).

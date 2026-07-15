@@ -117,7 +117,7 @@ cargo run --release -p engin
 ```
 
 当前已翻译的 UCI options 是：`WeightsFile`、`MultiPV`、`PerPVCounters`、
-`ScoreType`、`UCI_ShowWDL`、`UCI_ShowEPS`、`UCI_ShowMovesLeft`。其余搜索参数仍
+`ScoreType`、`UCI_ShowWDL`、`UCI_ShowEPS`、`UCI_ShowMovesLeft`、`NNCacheSize`。其余搜索参数仍
 是 Rust 内部 `SearchParams`，在对应 px0 option 层完整翻译前不伪造公开 UCI 选项。
 
 当前已实现的 `go` 预算只有 `nodes`、`movetime`、`infinite`。`depth`、`mate`、`ponder` 与

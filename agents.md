@@ -25,8 +25,9 @@
 
 - `crates/xiangqi_core`：翻译 px0 `src/chess`。
 - `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2/P3 已完成，P4 的 ONNX、单/多
-  `SearchWorker`、minibatch、prefetch、collision、shared-tree 与 scoped task-worker 主线已接入。
-  真实 ONNX MemCache 尚未翻译，`UniformBackend` 的 cache 仅用于测试。
+  `SearchWorker`、minibatch、MemCache、prefetch、collision、shared-tree 与 scoped task-worker 主线已接入。
+  正式 ONNX 必须经 `CachingBackend`，其 key/collision guard/回填时序只能对照
+  `px0/src/neural/memcache.cc:38-190` 修改。
   task worker 共享一个 `SearchWorker`，但每个 task thread 独占一个 `TaskWorkspace`；唯一准确状态以
   `NextStep.md`、`TODO.md` 为准。
 - `nn/`：对齐 pxzero-training 的数据、训练和导出。
