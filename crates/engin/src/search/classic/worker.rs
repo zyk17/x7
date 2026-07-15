@@ -1,8 +1,9 @@
 //! px0 `src/search/classic/search.h:201-448` 的 P4 worker。
 //!
 //! P4 worker 七阶段流水线、碰撞和 task queue 数据结构已按 px0 源码翻译。
-//! px0 task worker 独占 `SearchWorker` 的并发生命周期尚未翻译；正式搜索
-//! 因而禁用 task split，队列只供后续实现和直接单测使用。
+//! px0 task thread 共享一个 `SearchWorker`，但各自独占 `TaskWorkspace`。
+//! 其跨 task 的 `nodes_mutex_` 持锁语义尚未安全翻译；正式搜索因而禁用
+//! task split，队列只供后续实现和直接单测使用。
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -631,11 +632,11 @@ impl<'a> SearchWorker<'a> {
         if target_minibatch_size == 0 {
             target_minibatch_size = 1;
         }
-        // px0 resolves `TaskWorkers=-1` to real independent SearchWorker
-        // instances here (`src/search/classic/search.h:205-233`). That
-        // ownership/lifetime has not been translated. Do not turn the
-        // requested count into synchronous task splitting: it adds work while
-        // falsely presenting the px0 parallel pipeline as active.
+        // px0 resolves `TaskWorkers=-1` and starts task threads here
+        // (`src/search/classic/search.h:205-233`). Those threads share this
+        // SearchWorker while owning separate TaskWorkspaces. Rust has not yet
+        // translated px0's cross-task nodes_mutex_ lifetime safely, so do not
+        // turn the requested count into synchronous task splitting.
         let task_workers = 0;
         let task_workspaces = (0..usize::try_from(task_workers).expect("non-negative task worker count"))
             .map(|_| TaskWorkspace::default())
@@ -807,10 +808,11 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::RunBlocking` (`src/search/classic/search.h:235-249`).
     ///
-    /// px0 task workers are independent `SearchWorker` objects. That
-    /// ownership boundary has not been translated yet, so queued work remains
-    /// on the owning worker's private workspaces. This avoids aliasing one
-    /// mutable Rust worker through multiple raw pointers.
+    /// px0 task threads share this `SearchWorker` and each own one
+    /// `TaskWorkspace`. That tree-phase ownership boundary has not been
+    /// translated yet, so queued work remains on the owning worker's private
+    /// workspace. This avoids aliasing one mutable Rust worker through raw
+    /// pointers.
     pub fn run_blocking(&mut self) -> Result<(), EnginError> {
         self.run_blocking_without_task_threads()
     }

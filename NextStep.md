@@ -40,6 +40,14 @@ task-worker 完成。
 每次只翻译一个连续参考区间，补对应回归，再提交。禁止重新引入原始指针或 `unsafe impl Send` 来
 跨线程共享一个 `SearchWorker`。
 
+### 已确认的前置缺口
+
+px0 `Node` 本身不是原子对象；`PickNodesToExtend` 在 `search.cc:1494-1501` 持有
+`nodes_mutex_`，task thread 在该锁保护的约定下执行 `PickNodesToExtendTask`。Rust 当前
+`NodeTree` 同样是普通可变对象，且 `WorkerTree` 只能在一个 worker 的 tree phase 中临时激活。
+因此，真实 task thread 接线前必须先逐函数建立能表达这一所有权的安全 tree-phase 边界；不能通过
+`*mut SearchWorker`、`unsafe impl Send` 或把任务同步执行来伪造 px0 task-worker。
+
 ## 验收
 
 ```powershell

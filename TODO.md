@@ -22,6 +22,8 @@
   `task_taking_started`、claim、idle、wake、close 与重用；已补多线程唯一领取回归。
 - [ ] 按 `src/search/classic/search.h:205-249,357-448, search.cc:1122-1140,1268-1508` 翻译一个 `SearchWorker` + 每 task thread
   一个独占 `TaskWorkspace` 的 px0 所有权关系；禁止共享 Rust `&mut SearchWorker` 或 workspace。
+- [ ] 先对照 `src/search/classic/search.cc:1494-1501` 与 `src/search/classic/node.h:127-330` 建立
+  Rust 的安全 tree-phase 所有权边界；当前普通 `NodeTree` 不得以 raw pointer 跨 task thread 共享。
 - [ ] 按 `src/search/classic/search.cc:1069-1140,1268-1508` 翻译 task queue 的领取、执行、
   gathering/processing 回写和 `WaitForTasks`。
 - [ ] 按 `src/search/classic/search.cc:1828-1897` 翻译 split、idle、退出和 join；
