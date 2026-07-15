@@ -47,6 +47,9 @@ batch 回写时私自设定时间原点。
 `src/search/classic/search.h:368-369, search.cc:596-610,908-922,981-1017,1268-1284`。不能把它放进
 共享 worker state，否则多个 worker 会互相覆盖 gather 提示。
 
+因此 `WorkerSearchState` 只保存 px0 `Search` 共享计数和同步状态，不再暴露没有 px0 对应物的
+`remaining_playouts` 构造参数。
+
 stopper 现在也遵守 px0 的 root-first-visit gate：root 尚无访问时只等待，不执行 budget stopper。
 参考 `src/search/classic/search.cc:596-610`。
 

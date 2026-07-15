@@ -44,12 +44,12 @@ pub struct WorkerSearchState {
 
 impl Default for WorkerSearchState {
     fn default() -> Self {
-        Self::new(Arc::new(AtomicBool::new(false)), i64::MAX)
+        Self::new(Arc::new(AtomicBool::new(false)))
     }
 }
 
 impl WorkerSearchState {
-    pub fn new(stop: Arc<AtomicBool>, _remaining_playouts: i64) -> Self {
+    pub fn new(stop: Arc<AtomicBool>) -> Self {
         Self {
             stop,
             pending_searchers: AtomicI32::new(1),
@@ -2123,7 +2123,7 @@ mod tests {
         tree.reset_to_position(&state.startpos, &state.moves);
         let backend = UniformBackend::default();
         let params = SearchParams::default();
-        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         search_state.set_max_concurrent_searchers(1);
         let worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
 
@@ -2146,7 +2146,7 @@ mod tests {
             thread_idling_threshold: 1,
             ..SearchParams::default()
         };
-        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
 
         assert!(!worker.should_yield_for_backend());
@@ -2205,7 +2205,7 @@ mod tests {
             ..SearchParams::default()
         };
         let stop = Arc::new(AtomicBool::new(false));
-        let search_state = Arc::new(WorkerSearchState::new(Arc::clone(&stop), i64::MAX));
+        let search_state = Arc::new(WorkerSearchState::new(Arc::clone(&stop)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
 
         assert_eq!(worker.task_workers, 0);
@@ -2242,7 +2242,7 @@ mod tests {
             ..SearchParams::default()
         };
         let stop = Arc::new(AtomicBool::new(false));
-        let search_state = WorkerSearchState::new(stop, i64::MAX);
+        let search_state = WorkerSearchState::new(stop);
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.initialize_iteration().expect("init");
         // `PickNodesToExtendTask` always reserves the path before handing an
@@ -2272,7 +2272,7 @@ mod tests {
             ..SearchParams::default()
         };
         let stop = Arc::new(AtomicBool::new(false));
-        let search_state = WorkerSearchState::new(stop, i64::MAX);
+        let search_state = WorkerSearchState::new(stop);
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.initialize_iteration().expect("init");
         worker.minibatch.push(NodeToProcess::collision(root, 1, 1, 1));
@@ -2307,7 +2307,7 @@ mod tests {
             out_of_order_eval: true,
             ..SearchParams::default()
         };
-        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.initialize_iteration().expect("init");
         assert!(worker.tree.node_mut(root).try_start_score_update());
@@ -2345,7 +2345,7 @@ mod tests {
             out_of_order_eval: true,
             ..SearchParams::default()
         };
-        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.initialize_iteration().expect("init");
 
@@ -2368,7 +2368,7 @@ mod tests {
         let backend = UniformBackend::default();
         let params = SearchParams::default();
         let stop = Arc::new(AtomicBool::new(false));
-        let search_state = WorkerSearchState::new(stop, i64::MAX);
+        let search_state = WorkerSearchState::new(stop);
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.run_until_root_visits(2).expect("two root visits");
 
@@ -2397,7 +2397,7 @@ mod tests {
             max_collision_visits_scaling_end: 1,
             ..SearchParams::default()
         };
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
 
         worker.execute_one_iteration().expect("collision iteration");
@@ -2417,7 +2417,7 @@ mod tests {
         tree.reset_to_position(&state.startpos, &state.moves);
         let backend = UniformBackend::default();
         let params = SearchParams::default();
-        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let root = tree.current_head();
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.minibatch.push(NodeToProcess::collision(root, 1, 1, 1));
@@ -2451,7 +2451,7 @@ mod tests {
         }
         let backend = UniformBackend::default();
         let params = SearchParams::default();
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.do_backup_update_single_node(&NodeToProcess::visit(leaf, 2));
 
@@ -2472,7 +2472,7 @@ mod tests {
         tree.reset_to_position(&state.startpos, &state.moves);
         let backend = UniformBackend::default();
         let params = SearchParams::default();
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.initialize_iteration().expect("init");
 
@@ -2510,7 +2510,7 @@ mod tests {
 
         let backend = UniformBackend::default();
         let params = SearchParams::default();
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.initialize_iteration().expect("init");
 
@@ -2534,7 +2534,7 @@ mod tests {
             draw_score: 0.25,
             ..SearchParams::default()
         };
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let worker = SearchWorker::new(&mut tree, &backend, &params, &state);
 
         assert!((worker.draw_score(false) - 0.25).abs() < f32::EPSILON);
@@ -2565,7 +2565,7 @@ mod tests {
 
         let backend = UniformBackend::default();
         let params = SearchParams::default();
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.pick_nodes_to_extend(1).expect("pick nodes");
 
@@ -2593,7 +2593,7 @@ mod tests {
 
         let backend = UniformBackend::default();
         let params = SearchParams::default();
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.task_queue.reset();
         assert!(worker.task_queue.push(PickTask::gathering(root, 0, Vec::new(), 1)));
@@ -2704,7 +2704,7 @@ mod tests {
             out_of_order_eval: false,
             ..SearchParams::default()
         };
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.initialize_iteration().expect("init");
         worker.gather_minibatch().expect("gather full batch");
@@ -2731,7 +2731,7 @@ mod tests {
 
         let backend = UniformBackend::default();
         let params = SearchParams::default();
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.ensure_node_twofold_correct_for_depth(child, 1);
 
@@ -2762,7 +2762,7 @@ mod tests {
         let child = tree.arena_mut().spawn_child(root, 0);
         let backend = UniformBackend::default();
         let params = SearchParams::default();
-        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
+        let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
 
         worker

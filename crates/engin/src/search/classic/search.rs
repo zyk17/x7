@@ -515,7 +515,7 @@ impl ClassicSearch {
         let watchdog_cv = Arc::new(Condvar::new());
         Self {
             tree: Arc::new(RwLock::new(NodeTree::default())),
-            worker_state: Arc::new(WorkerSearchState::new(Arc::clone(&stop), i64::MAX)),
+            worker_state: Arc::new(WorkerSearchState::new(Arc::clone(&stop))),
             meta: Arc::clone(&meta),
             backend: Arc::from(backend),
             stop,
@@ -864,7 +864,7 @@ impl SearchBase for ClassicSearch {
     fn new_game(&mut self) -> Result<(), EnginError> {
         self.wait_search()?;
         *self.tree.write().expect("tree lock") = NodeTree::default();
-        self.worker_state = Arc::new(WorkerSearchState::new(Arc::clone(&self.stop), i64::MAX));
+        self.worker_state = Arc::new(WorkerSearchState::new(Arc::clone(&self.stop)));
         self.outputs.clear();
         Ok(())
     }
