@@ -1083,6 +1083,42 @@ mod tests {
         );
     }
 
+    /// px0 allows every GPU SearchWorker to keep its own helper threads while
+    /// `nodes_mutex_` serializes the outer tree phase (`search.h:205-244`,
+    /// `search.cc:1088-1140,1268-1508`). This exercises that composition with
+    /// a deterministic backend rather than relying on a local ONNX runtime.
+    #[test]
+    fn shared_search_workers_complete_scoped_task_phases() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
+        search.set_position(&state).expect("position");
+        {
+            let mut meta = search.meta.lock().expect("meta lock");
+            meta.params.minibatch_size = 8;
+            meta.params.task_workers_per_search_worker = 1;
+            meta.params.minimum_work_size_for_processing = 2;
+            meta.params.minimum_work_per_task_for_processing = 1;
+            meta.params.max_collision_visits = 8;
+            meta.params.max_collision_visits_scaling_start = 0;
+            meta.params.max_collision_visits_scaling_end = 1;
+            meta.params.out_of_order_eval = false;
+        }
+
+        let (best, visits) = search.run_blocking_nodes(96);
+
+        assert!(!best.is_null());
+        assert!(visits >= 96);
+        let tree = search.tree.read();
+        assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
+        assert!(search
+            .worker_state
+            .shared_collisions
+            .lock()
+            .expect("collisions lock")
+            .is_empty());
+    }
+
     /// px0 publishes cache-hit out-of-order results during gather, while other
     /// SearchWorkers can continue their independent tree phases
     /// (`search.cc:1268-1419,1977-1987,2109-2173`). The shared collision list

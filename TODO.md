@@ -42,8 +42,9 @@ stop 与真实 ONNX/DirectML 时序。
 - [x] 按 `src/search/classic/search.cc:1494-1501,1828-1897`、`src/search/classic/node.h:423-525,547-610`
   与 `src/utils/mutex.h:93-125` 建立受限 `TaskTreeBridge`：只允许 scoped task thread 在 active
   tree phase 内访问普通 Node；`task_count=-1` 与 `exiting` 继续分开。
-- [ ] 对照 `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334` 验证多 SearchWorker +
-  task worker 的 tree phase、in-flight、OOO 与 counters。
+- [x] 对照 `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334` 验证多 SearchWorker +
+  task worker 的 tree phase、in-flight 与 counters；固定 visits 回归确认 root `NInFlight=0` 与
+  shared collision 已清空。OOO 的 task-worker 组合仍由真实 ONNX/DirectML 验收覆盖。
 - [ ] 在 DirectML/ONNX 下补固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...`、
   backend reload 的回归；结束时 root `NInFlight=0`。
 

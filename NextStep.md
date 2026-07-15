@@ -88,7 +88,8 @@ phase + scoped task-thread 内，不改变 px0 的 selection、in-flight 或 bac
    - `task_taking_started`、task claim、idle、wake、close 与重用已在
      `crates/engin/src/search/classic/worker.rs` 对照实现并有多线程领取回归。
 2. `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334`
-   - 对照 `MaxConcurrentSearchers`、tree phase、out-of-order backup 与 counter 时序。
+   - 多 SearchWorker + scoped task worker 的 fixed-visits shared-tree 回归已通过；继续对照
+     `MaxConcurrentSearchers`、out-of-order backup 与 counter 时序。
 3. 在 DirectML/ONNX 下对照固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...` 与
    backend reload；结束时 root `NInFlight=0`。
 
