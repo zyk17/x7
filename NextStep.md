@@ -98,10 +98,13 @@ px0 的 selection、in-flight 或 backup 算法。
 ### 已确认的前置缺口
 
 px0 `Node` 本身不是原子对象；`PickNodesToExtend` 在 `search.cc:1494-1501` 持有
-`nodes_mutex_`，task thread 在该锁保护的约定下执行 `PickNodesToExtendTask`。Rust 当前
+`nodes_mutex_`，task thread 在该锁保护的约定下执行 `PickNodesToExtendTask`。`SharedMutex::Lock`
+本身只是 `std::unique_lock<std::shared_timed_mutex>` 的包装（`src/utils/mutex.h:93-125`）：px0 依赖
+task split 后的逻辑不重叠，让 task thread 在主线程持锁期间直接修改普通 `Node`。Rust 当前
 `NodeTree` 同样是普通可变对象，且 `WorkerTree` 只能在一个 worker 的 tree phase 中临时激活。
-因此，真实 task thread 接线前必须先逐函数建立能表达这一所有权的安全 tree-phase 边界；不能通过
-`*mut SearchWorker`、`unsafe impl Send` 或把任务同步执行来伪造 px0 task-worker。
+因此，真实 task thread 接线前必须先逐函数建立能表达“主线程独占 phase + 已切分子任务”的安全所有权；
+不能通过 `*mut SearchWorker`、`unsafe impl Send`、每次任务重新拿全树锁，或把任务同步执行来伪造
+px0 task-worker。
 
 ## 验收
 
