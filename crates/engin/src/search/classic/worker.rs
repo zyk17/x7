@@ -6,7 +6,9 @@
 //! task split，队列只供后续实现和直接单测使用。
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
+
+use parking_lot::RwLock;
 
 use xiangqi_core::{GameResult, Move, MoveList, PositionHistory};
 
@@ -520,7 +522,7 @@ impl<'a> SearchWorker<'a> {
         stop_controller: Option<Arc<SearchStopController>>,
         root_move_filter: &'a [Move],
     ) -> Self {
-        let history = tree.read().expect("tree lock").history().clone();
+        let history = tree.read().history().clone();
         let played_history_len = history.len();
         Self::from_parts(
             WorkerTree::shared(tree),
@@ -665,7 +667,7 @@ impl<'a> SearchWorker<'a> {
                 result
             }
             TreeStorage::Shared(shared) => {
-                let mut tree = shared.write().expect("tree lock");
+                let mut tree = shared.write();
                 let result = operation(self, &mut tree);
                 drop(tree);
                 self.tree.storage = TreeStorage::Shared(shared);
@@ -686,7 +688,7 @@ impl<'a> SearchWorker<'a> {
                 result
             }
             TreeStorage::Shared(shared) => {
-                let tree = shared.read().expect("tree lock");
+                let tree = shared.read();
                 let result = operation(self, &tree);
                 drop(tree);
                 self.tree.storage = TreeStorage::Shared(shared);

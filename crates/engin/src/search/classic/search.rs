@@ -1,7 +1,9 @@
 //! px0 `src/search/classic/search.h:49-260`、`search.cc:426-808,874-1055`、`wrapper.cc:53-141`。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
+
+use parking_lot::RwLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -537,7 +539,7 @@ impl ClassicSearch {
     }
 
     pub fn total_root_visits(&self) -> u32 {
-        let tree = self.tree.read().expect("tree lock");
+        let tree = self.tree.read();
         tree.node(tree.current_head()).n()
     }
 
@@ -615,7 +617,7 @@ impl ClassicSearch {
         };
         self.start_search(&params).expect("search");
         self.wait_search().expect("wait");
-        let tree = self.tree.read().expect("tree lock");
+        let tree = self.tree.read();
         let meta = self.meta.lock().expect("meta lock");
         let (best, _) = best_move(&tree, &meta.params, &meta.root_move_filter);
         let visits = tree.node(tree.current_head()).n();
@@ -758,7 +760,7 @@ impl ClassicSearch {
                     if let Some(responder) = &responder {
                         // Keep px0's tree-before-current-best lock order. Backup
                         // updates current_best_edge while holding the tree phase.
-                        let tree = watchdog_tree.read().expect("tree lock");
+                        let tree = watchdog_tree.read();
                         let meta = watchdog_meta.lock().expect("meta lock");
                         let edge = *watchdog_worker_state.current_best_edge.lock().expect("best edge lock");
                         if edge.is_some() {
@@ -790,7 +792,7 @@ impl ClassicSearch {
                         .is_ok()
                 {
                     if let Some(responder) = &responder {
-                        let tree = watchdog_tree.read().expect("tree lock");
+                        let tree = watchdog_tree.read();
                         let meta = watchdog_meta.lock().expect("meta lock");
                         if let Some(output) =
                             ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
@@ -863,17 +865,14 @@ impl ClassicSearch {
 impl SearchBase for ClassicSearch {
     fn new_game(&mut self) -> Result<(), EnginError> {
         self.wait_search()?;
-        *self.tree.write().expect("tree lock") = NodeTree::default();
+        *self.tree.write() = NodeTree::default();
         self.worker_state = Arc::new(WorkerSearchState::new(Arc::clone(&self.stop)));
         self.outputs.clear();
         Ok(())
     }
 
     fn set_position(&mut self, state: &GameState) -> Result<(), EnginError> {
-        self.tree
-            .write()
-            .expect("tree lock")
-            .reset_to_position(&state.startpos, &state.moves);
+        self.tree.write().reset_to_position(&state.startpos, &state.moves);
         Ok(())
     }
 
@@ -905,7 +904,7 @@ impl SearchBase for ClassicSearch {
         }
 
         {
-            let tree = self.tree.read().expect("tree lock");
+            let tree = self.tree.read();
             // px0 `StringsToMovelist` (`src/search/classic/wrapper.cc:78-100`)
             // parses at the root, retains legal requests only, and rejects a
             // non-empty `searchmoves` list if none of its moves are legal.
@@ -1096,7 +1095,7 @@ mod tests {
         let mut search = super::ClassicSearch::new(Box::new(backend.clone()));
         search.set_position(&state).expect("position");
         {
-            let tree = search.tree.read().expect("tree lock");
+            let tree = search.tree.read();
             let history = tree.history();
             backend.seed_cache(&EvalPosition {
                 positions: history.positions().to_vec(),
@@ -1130,7 +1129,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire)
                 >= u64::from(visits)
         );
-        let tree = search.tree.read().expect("tree lock");
+        let tree = search.tree.read();
         assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
         assert!(search
             .worker_state
@@ -1160,7 +1159,7 @@ mod tests {
 
         assert!(!best.is_null());
         assert!(visits >= 64);
-        let tree = search.tree.read().expect("tree lock");
+        let tree = search.tree.read();
         let root = tree.current_head();
         assert!(tree.node(root).has_solid_children());
         assert_eq!(tree.node(root).n_in_flight(), 0);

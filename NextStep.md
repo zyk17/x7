@@ -74,6 +74,10 @@ backend 的异步调度。安全 tree-phase 重构完成前，不以 task worker
 此前 `active: *mut NodeTree` 的隐式访问桥接；它是后续安全连接真实 task workers 的前置条件，不改变
 px0 的 selection、in-flight 或 backup 算法。
 
+共享 `NodeTree` 的通用 `RwLock` 已采用 `parking_lot`，替代标准库会 poison 的锁接口；这只承担锁
+机制，不承载任何搜索策略或节点语义。参考 px0 的 `nodes_mutex_` 使用边界
+`src/search/classic/search.cc:1142-1211,1494-1508`。
+
 下一步必须逐函数翻译，不补写并发捷径：
 
 1. 已完成队列原子状态机：`src/search/classic/search.h:435-445`、
