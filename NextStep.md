@@ -28,6 +28,9 @@ task-worker 完成。
 当前保持安全基线：正式搜索继续禁用 task split（等价于 px0 CPU backend 的 `task_workers_=0`
 分支），优先验证多个 `SearchWorker`、minibatch、cache、prefetch 与 backend computation 的主线。
 
+已移除旧 collision-only `sleep(10ms)`：它不在 px0 `SearchWorker::UpdateCounters`
+(`src/search/classic/search.cc:2331-2364`) 中，会人为降低并扭曲低节点吞吐。
+
 task worker 不直接执行 GPU 推理。它在 px0 中并行执行 gathering/processing，减少 selection、node
 extend 和 `BackendComputation::AddInput` 的 CPU 准备间隔；这能帮助持续向 GPU 提交输入，但不是 GPU
 吞吐的唯一或首要来源。持续喂卡首先依赖多个搜索 worker、真实 batch、共享 backend computation 与
