@@ -120,6 +120,10 @@ cargo run --release -p engin
 `ScoreType`、`UCI_ShowWDL`、`UCI_ShowEPS`、`UCI_ShowMovesLeft`。其余搜索参数仍
 是 Rust 内部 `SearchParams`，在对应 px0 option 层完整翻译前不伪造公开 UCI 选项。
 
+当前已实现的 `go` 预算只有 `nodes`、`movetime`、`infinite`。`depth`、`mate`、`ponder` 与
+`wtime/btime/winc/binc/movestogo` 会明确报错，直到 px0 对应 stopper、ponder 生命周期和
+`SimpleTimeManager` 被逐函数翻译；不要把它们与 `nodes` 混用。
+
 连续命令生命周期冒烟。按 px0 语义，前一条无限搜索被静默回收，只有最后一条 `go` 返回
 `bestmove`：
 
@@ -167,4 +171,10 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests
 
 ```powershell
 cargo test -p engin --lib
+```
+
+P1 px0 规则对拍包含 depth-5 perft，建议只在 release 运行：
+
+```powershell
+cargo test --release -p xiangqi_core
 ```

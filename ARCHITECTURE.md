@@ -25,6 +25,10 @@
 
 `crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。P2 UCI、P3 tree 与 P4 的 ONNX、collision、prefetch、task-worker、多 SearchWorker tree phase、watchdog 和 WDL display 已接入。`WeightsFile` 保持 px0 的 UCI 名称，但只接受本项目 ONNX 模型，不实现 px0 的 backend registry、protobuf weight 或 autodiscover。P4 的 `SendUciInfo` 已生成深度、NPS/EPS、WDL、PV、MultiPV、ScoreType 与完整 WDL calibration display 语义。`ClassicEngine` 保持 px0 的会话边界：每个新 `go`、`position`、`ucinewgame` 都先回收旧搜索；`setoption` 只更新下一次 `go` 的参数快照，不中断当前搜索（`src/engine.cc:148-224`、`src/search/classic/wrapper.cc:100-140`）。
 
+未完成对应 px0 stopper 或生命周期的 UCI 命令不得伪装支持：当前只有 `nodes`、`movetime` 和
+`infinite` 可启动搜索。`depth/mate` 等待 `common.cc` 的完整 stopper 翻译，`ponder/ponderhit`
+等待 `engine.cc` 的 Ponder option/重设局面链路，时钟字段等待 `stoppers/simple.cc`。
+
 `nn/`：pxzero-training 的 `dataset / model / training` 配置布局为参考的独立 Python 训练子项目；训练从单一 YAML 启动，固定 `124x10x9 -> 2062 + WDL` 的纯 CNN 契约，不进入规则或搜索热路径。
 
 ## 翻译纪律

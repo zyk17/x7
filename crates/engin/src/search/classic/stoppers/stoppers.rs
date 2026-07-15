@@ -1,9 +1,7 @@
 //! px0 `stoppers/stoppers.h`、`stoppers.cc:39-131`、`common.cc:118-165`、`simple.cc:74-126`。
 
-use crate::uci_loop::GoParams;
-use xiangqi_core::PositionHistory;
-
 use super::timemgr::{IterationStats, StoppersHints};
+use crate::uci_loop::GoParams;
 
 /// px0 `SearchStopper` (`timemgr.h:88-102`)。
 pub trait SearchStopper: Send {
@@ -109,13 +107,10 @@ impl SearchStopper for TimeLimitStopper {
     }
 }
 
-/// px0 `PopulateCommonUciStoppers` + `SimpleTimeManager::GetStopper` 子集。
-pub fn build_search_stoppers(
-    params: &GoParams,
-    history: &PositionHistory,
-    nodes_as_playouts: bool,
-) -> ChainedSearchStopper {
-    let position = history.last();
+/// px0 `PopulateCommonUciStoppers` (`stoppers/common.cc:118-165`) 的已翻译
+/// 固定预算部分。`wtime/btime` 需要完整翻译 `SimpleTimeManager`，不能用
+/// 自定义百分比公式代替。
+pub fn build_search_stoppers(params: &GoParams, nodes_as_playouts: bool) -> ChainedSearchStopper {
     let mut chain = ChainedSearchStopper::new();
     if let Some(nodes) = params.nodes.filter(|&n| n > 0) {
         if nodes_as_playouts {
@@ -126,23 +121,6 @@ pub fn build_search_stoppers(
     }
     if let Some(movetime) = params.movetime.filter(|&t| t >= 0) {
         chain.add(Box::new(TimeLimitStopper::new(movetime)));
-    }
-    if !params.infinite && !params.ponder {
-        let is_black = history.is_black_to_move();
-        let time = if is_black { params.btime } else { params.wtime };
-        if let Some(remaining) = time.filter(|&t| t > 0) {
-            let inc = if is_black {
-                params.binc.unwrap_or(0)
-            } else {
-                params.winc.unwrap_or(0)
-            };
-            let overhead = 50i64;
-            let available = (remaining - overhead).max(0);
-            let ply = position.game_ply() as f32;
-            let pct = (0.014 + ply * 0.00049).min(0.5);
-            let budget = (available as f32 * pct + inc as f32 * 0.5).round() as i64;
-            chain.add(Box::new(TimeLimitStopper::new(budget.max(1))));
-        }
     }
     chain
 }

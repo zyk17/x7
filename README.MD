@@ -34,6 +34,10 @@ px0 对照路径，完整约束见 `AGENTS.md`。
 新搜索的 `bestmove`。这一生命周期对照 px0 `src/engine.cc:148-151,187-224` 与
 `src/search/classic/wrapper.cc:100-140`。
 
+当前只开放已逐函数翻译的 `go nodes`、`go movetime`、`go infinite`。`go depth`、`go mate`、
+`go ponder`、`ponderhit` 以及 `wtime/btime/winc/binc/movestogo` 都会明确拒绝，不能与其他预算
+组合后静默变成普通搜索；后者须等待 px0 `SimpleTimeManager` 完整翻译。
+
 ```text
 position startpos
 go nodes 1000

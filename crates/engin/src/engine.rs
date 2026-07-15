@@ -271,6 +271,13 @@ impl EngineController for ClassicEngine {
     }
 
     fn go(&mut self, params: &GoParams, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
+        // px0 rejects `go ponder` unless the Ponder option enabled its full
+        // position/ponderhit lifecycle (`src/engine.cc:205-215`). This port
+        // has not translated that option or lifecycle, so accepting the token
+        // and silently running a normal search would be a false UCI feature.
+        if params.ponder {
+            return Err(EnginError::Uci("Ponder is not enabled.".into()));
+        }
         // px0 `Engine::Go` initializes a missing position through `NewGame`
         // before calling `StartSearch` (`src/engine.cc:206-219`). NewGame in
         // turn runs SetPosition and UpdateBackendConfig, so checking the
@@ -296,7 +303,9 @@ impl EngineController for ClassicEngine {
     }
 
     fn ponder_hit(&mut self) -> Result<(), EnginError> {
-        Ok(())
+        // px0 `Engine::PonderHit` rejects this outside an active ponder search
+        // (`src/engine.cc:226-235`). Ponder is intentionally unavailable here.
+        Err(EnginError::Uci("ponderhit while not pondering".into()))
     }
 
     fn wait(&mut self) -> Result<(), EnginError> {
@@ -387,6 +396,62 @@ mod tests {
 
         assert!(engine.position.is_some());
         assert!(engine.search().expect("search").total_root_visits() >= 1);
+    }
+
+    #[test]
+    fn unavailable_ponder_paths_are_rejected_instead_of_running_normally() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        let error = engine
+            .go(
+                &GoParams {
+                    ponder: true,
+                    nodes: Some(1),
+                    ..GoParams::default()
+                },
+                &mut responder,
+            )
+            .expect_err("ponder must not become a normal search");
+        assert!(error.to_string().contains("Ponder is not enabled"));
+        assert!(engine.ponder_hit().is_err());
+    }
+
+    #[test]
+    fn unavailable_depth_and_mate_stoppers_are_not_silently_combined_with_nodes() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        for params in [
+            GoParams {
+                nodes: Some(1),
+                depth: Some(4),
+                ..GoParams::default()
+            },
+            GoParams {
+                nodes: Some(1),
+                mate: Some(2),
+                ..GoParams::default()
+            },
+        ] {
+            let error = engine.go(&params, &mut responder).expect_err("untranslated stopper");
+            assert!(error.to_string().contains("go depth/go mate stopper"));
+        }
+    }
+
+    #[test]
+    fn unavailable_clock_manager_is_not_replaced_by_a_local_heuristic() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        let error = engine
+            .go(
+                &GoParams {
+                    wtime: Some(1_000),
+                    winc: Some(10),
+                    ..GoParams::default()
+                },
+                &mut responder,
+            )
+            .expect_err("untranslated clock manager must be rejected");
+        assert!(error.to_string().contains("go wtime/btime time manager"));
     }
 
     #[test]

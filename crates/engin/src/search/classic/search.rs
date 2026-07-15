@@ -877,6 +877,27 @@ impl SearchBase for ClassicSearch {
     }
 
     fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError> {
+        // px0 translates these limits through DepthStopper/MateStopper
+        // (`src/search/classic/stoppers/common.cc:118-160`). This port has not
+        // translated their complete IterationStats dependencies, so reject the
+        // UCI request consistently rather than silently ignoring it when a
+        // nodes or movetime budget is also present.
+        if params.depth.is_some() || params.mate.is_some() {
+            return Err(EnginError::PortIncomplete("go depth/go mate stopper"));
+        }
+        // px0 delegates clock allocation to `SimpleTimeManager`
+        // (`src/search/classic/stoppers/simple.cc:74-126`). Keeping the UCI
+        // fields but replacing that logic with a local percentage is not a
+        // 1:1 port, so only fixed `movetime` is available until P4 translates
+        // the manager and its tests.
+        if params.wtime.is_some()
+            || params.btime.is_some()
+            || params.winc.is_some()
+            || params.binc.is_some()
+            || params.movestogo.is_some()
+        {
+            return Err(EnginError::PortIncomplete("go wtime/btime time manager"));
+        }
         self.outputs.clear();
         self.stop.store(false, Ordering::Release);
         self.infinite.store(params.infinite, Ordering::Release);
@@ -894,11 +915,7 @@ impl SearchBase for ClassicSearch {
             }
         }
 
-        let has_budget = nodes.is_some()
-            || params.movetime.is_some()
-            || params.infinite
-            || params.wtime.is_some()
-            || params.btime.is_some();
+        let has_budget = nodes.is_some() || params.movetime.is_some() || params.infinite;
         if !has_budget {
             return Err(EnginError::PortIncomplete("time-based search stopper"));
         }
@@ -948,7 +965,7 @@ impl SearchBase for ClassicSearch {
             // (`src/search/classic/wrapper.cc:126-150`), so its cached root
             // edge never crosses a UCI search boundary.
             *self.worker_state.current_best_edge.lock().expect("best edge lock") = None;
-            let chain = build_search_stoppers(params, tree.history(), false);
+            let chain = build_search_stoppers(params, false);
             *self.stopper.lock().expect("stopper lock") = Some(chain);
         }
 

@@ -10,11 +10,14 @@
 - P3：`src/search/classic/node.*`、`params.*`、基本 selection/extend/backup/tree reuse。
 - P4 已接通的部分：`src/neural/backend.h:45-138`、`src/neural/encoder.cc:118-217,229-481`、
   `src/neural/wrapper.cc:49-172`、`src/search/classic/search.cc:1142-1231,1268-1508,1551-1827,
-  1977-2334` 的单 worker/minibatch/cache/prefetch/OOO/shared-tree 子集。
+  1977-2334` 的单 worker/minibatch/prefetch/OOO/shared-tree 子集。真实 ONNX 的 px0 MemCache
+  尚未翻译；当前 cache 仅限 `UniformBackend` 测试路径。
 - 正式 UCI `WeightsFile` 生命周期：`src/engine.cc:137-197,206-219`，没有权重时明确拒绝搜索，
   不回退到 `UniformBackend`。
 - NN 训练入口：参考 `pxzero-training/tf/train.py:110-126`、`tf/configs/example.yaml:4-31`，已收为
   单一 `dataset / model / training` YAML；当前不移植其 TensorFlow 兼容层或旧数据管道。
+- P1-P3 进入 P4 前复核：`cargo test --release -p xiangqi_core`（22 项 px0 规则/history 对拍）、
+  `cargo test -p engin --lib`（79 项 P2/P3/controller/tree/UCT 回归）与 UCI/P4 生命周期集成测试已通过。
 
 ## P4：task-worker 生命周期，未完成
 
@@ -24,6 +27,10 @@ stop 与真实 ONNX/DirectML 时序。
 - [ ] 逐段翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为真实 ONNX 的
   `CachingBackend` wrapper：以当前局面 hash 为 key、保留合法着数量防碰撞、缓存 miss 仅在
   `ComputeBlocking` 后写入、`ucinewgame` 清 cache。不要把测试用 `UniformBackend` cache 当作正式实现。
+
+- [ ] 翻译 px0 `src/search/classic/stoppers/common.cc:118-186`、`stoppers/simple.cc:74-126` 及其
+  对应测试后，再开放 `go wtime/btime/winc/binc/movestogo`。当前仅支持逐函数已对齐的
+  `go nodes`、`go movetime`、`go infinite`；`depth`、`mate`、`ponder` 同样明确拒绝，不能静默降级。
 
 - [x] 按 `src/search/classic/search.cc:981-1034` 翻译 watchdog 的 counters-mutex/condition-variable
   等待与 `FireStopInternal` 唤醒；不再固定 1ms polling。

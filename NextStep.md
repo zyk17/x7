@@ -10,6 +10,22 @@
 P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正式 ONNX 路径使用
 `124x10x9 -> 2062 + WDL`，Windows 实测后端为 DirectML。
 
+## P1-P3 进入 P4 前复核（2026-07-15）
+
+- P1：Rust `xiangqi_core` 的 release 全量对拍已通过：px0 移植的 `board_test.cc` depth-5 perft、
+  `position_test.cc` 的 history/repetition/RuleJudge 与 FEN/hash 用例均为绿。参考
+  `src/chess/board_test.cc:70-232`、`position.cc:41-205`。
+- P2：`position ... moves ...` 保存完整 history；每次 `go`、`position`、`ucinewgame` 都先
+  `Abort + Wait` 上一搜索。未翻译的 `depth/mate/ponder/clock manager` 已明确拒绝，不能静默执行。
+  参考 `src/engine.cc:148-235`、`src/search/classic/wrapper.cc:100-150`、
+  `src/search/classic/stoppers/common.cc:118-186`。
+- P3：Node 的 edge policy 编码、`MakeSolid`、terminal visit 反转、tree reuse 与 UCT/参数默认值已有
+  对应单测，且 `cargo test -p engin --lib` 通过。参考 `src/search/classic/node.cc:161-543`、
+  `params.cc:543-640`、`search.cc:408-433`。
+
+结论：P1-P3 没有阻断 P4 的已知语义偏差。P4 只能继续翻译明确列出的 px0 连续区间；不得重新开放
+未翻译的 UCI 预算或用本地启发式替代 px0 时间管理。
+
 `nn/` 的训练入口已完成独立收口：参考 pxzero-training 的 YAML 布局，但不移植其旧 TensorFlow
 兼容层；当前唯一启动方式是 `train_px0.py --config <yaml>`。这不是 P4 搜索任务的一部分。
 

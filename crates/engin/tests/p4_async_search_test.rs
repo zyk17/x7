@@ -26,17 +26,19 @@ fn go_infinite_stop_emits_bestmove() {
 }
 
 #[test]
-fn go_wtime_budget_emits_bestmove() {
+fn untranslated_clock_manager_is_rejected() {
     ensure_init();
     let mut options = UciOptions::populate_defaults();
     let mut engine = ClassicEngine::uniform();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
     uci.process_line("position startpos", "0.0.0").expect("position");
-    uci.process_line("go wtime 1000 winc 0", "0.0.0").expect("go wtime");
+    let error = uci
+        .process_line("go wtime 1000 winc 0", "0.0.0")
+        .expect_err("untranslated clock manager");
     drop(uci);
-    assert!(engine.search().expect("uniform search").total_root_visits() >= 1);
-    assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
+    assert!(error.to_string().contains("go wtime/btime time manager"));
+    assert_eq!(engine.search().expect("uniform search").total_root_visits(), 0);
 }
 
 /// px0 `Engine::SetPosition` stops and joins an old search before replacing

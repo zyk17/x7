@@ -8,14 +8,15 @@
 - `OnnxBackend`：px0 `wrapper.cc:49-172`，本地 `data/x7.onnx` 冒烟通过
 - P4 尚未完成：task worker、树锁阶段拆分、UCI 权重配置
 
-2026-07-12：P4 异步搜索 + UCI 接线完成。
+2026-07-12：P4 异步搜索 + UCI 接线完成（历史记录；后续实现已替代部分描述）。
 
 验收（`cargo test -p engin -p xiangqi_core --release` 全绿）：
 
 - `ClassicSearch` 多线程 `StartThreads` + `SearchWorker` 七阶段
-- `go nodes` / `movetime` / `wtime` / `infinite`+`stop` → `bestmove`
+- `go nodes` / `movetime` / `infinite`+`stop` → `bestmove`
 - `VisitsStopper` 在完成 iteration 后停止，允许 batch 轻微越过 `go nodes`；
-  `TimeLimitStopper` 至少搜 1 node
+  `TimeLimitStopper` 至少搜 1 node。此前自定义的 `wtime` 分配已删除，等待 px0
+  `SimpleTimeManager` 逐函数翻译
 - `p4_trace_test`：startpos 16 nodes 确定性
 - `UniformBackend` NN cache 子集
 
