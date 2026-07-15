@@ -106,6 +106,13 @@ task split 后的逻辑不重叠，让 task thread 在主线程持锁期间直�
 不能通过 `*mut SearchWorker`、`unsafe impl Send`、每次任务重新拿全树锁，或把任务同步执行来伪造
 px0 task-worker。
 
+这不是仅把 `Vec<Box<Node>>` 改成线程安全容器就能解决的问题。px0 自己声明 `Edge_Iterator` 和
+`VisitedNode_Iterator` 非线程安全（`src/search/classic/node.h:423-436,547-551`），而
+`Edge_Iterator::Actualize` 又明确允许其他 task 在 iterator 调用间隙创建 sibling
+（`src/search/classic/node.h:485-525`）。此外 twofold 修正会沿 parent 链回写
+（`src/search/classic/search.cc:1510-1550`）。Rust 端必须先把这些读写操作收成可验证的 phase API，
+再连接 task thread；不得以每节点锁替换后假定算法已经等价。
+
 ## 验收
 
 ```powershell

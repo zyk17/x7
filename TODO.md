@@ -41,6 +41,9 @@
 - [ ] 先对照 `src/search/classic/search.cc:1494-1501`、`src/search/classic/node.h:127-330` 与
   `src/utils/mutex.h:93-125` 建立 Rust 的安全 tree-phase 所有权边界：px0 的普通 `Node` 依赖
   已切分任务的逻辑不重叠，不得以 raw pointer、全树锁串行化或同步执行伪造。
+- [ ] 在接入 task thread 前对照 `src/search/classic/node.h:423-525,547-610` 与
+  `src/search/classic/search.cc:1510-1550`，把 iterator/sibling actualize 和 twofold parent
+  回写收成可验证的 Rust phase API；不能仅以每节点 mutex 宣称语义等价。
 - [ ] 按 `src/search/classic/search.cc:1069-1140,1268-1508` 翻译 task queue 的领取、执行、
   gathering/processing 回写和 `WaitForTasks`。
 - [ ] 按 `src/search/classic/search.cc:1828-1897` 翻译 split、idle、退出和 join；
