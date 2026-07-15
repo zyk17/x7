@@ -1,30 +1,31 @@
 # temp
 
-2026-07-13：P4 第一检查点：真实 ONNX backend 已接入（尚未作为 UCI 默认 backend）。
+2026-07-15 收尾记录。
 
-- `PositionHistory -> 124x10x9`：px0 `encoder.cc:118-217`，含真实历史与 `FEN_ONLY`
-- 2062 move table：由 px0 `encoder.cc:229-481` 机械提取，SHA256
-  `884BEA3BBD05A119E7E8A2965993FAAAA564FD46440BD249E9D728336CC89924`
-- `OnnxBackend`：px0 `wrapper.cc:49-172`，本地 `data/x7.onnx` 冒烟通过
-- P4 尚未完成：task worker、树锁阶段拆分、UCI 权重配置
+- 当前正式模型契约：`124x10x9 -> 2062 + WDL`；正式 UCI 只在 `WeightsFile` 成功加载 ONNX 后搜索，
+  不回退到 `UniformBackend`。
+- P4 单 worker 主线已可用：ONNX、MemCache、minibatch、prefetch、collision、shared-tree、watchdog、
+  legacy clock manager 与 UCI 生命周期已接通。
+- px0 默认 legacy 时钟预算已实现：`MoveOverheadMs`、`Slowmover`、
+  `go wtime/btime/winc/binc/movestogo`。`depth/mate/ponder/ponderhit` 仍明确拒绝。
+- 已知 P4 缺口：GPU task-worker 的 raw-pointer 翻译会在真实 ONNX 搜索中重复 `ExtendNode`；当前强制
+  `task_workers=0`。后续必须依照 px0 `src/search/classic/search.h:205-244,348-445` 与
+  `search.cc:1069-1508` 重新建立无别名的 task 所有权，再恢复该路径。
 
-2026-07-12：P4 异步搜索 + UCI 接线完成（历史记录；后续实现已替代部分描述）。
+本次代码验收：
 
-验收（`cargo test -p engin -p xiangqi_core --release` 全绿）：
+```powershell
+cargo fmt --check
+cargo test --release -p engin --lib       # 88 passed
+cargo test --release -p xiangqi_core      # 22 passed
+cargo build --release -p engin
+```
 
-- `ClassicSearch` 多线程 `StartThreads` + `SearchWorker` 七阶段
-- `go nodes` / `movetime` / `infinite`+`stop` → `bestmove`
-- `VisitsStopper` 在完成 iteration 后停止，允许 batch 轻微越过 `go nodes`；
-  `TimeLimitStopper` 至少搜 1 node。此前自定义的 `wtime` 分配已删除，等待 px0
-  `SimpleTimeManager` 逐函数翻译
-- `p4_trace_test`：startpos 16 nodes 确定性
-- `UniformBackend` NN cache 子集
+真实 ONNX UCI 冒烟已验证 `WeightsFile`、legacy 时钟预算和 `bestmove`：
 
-未闭合：
-
-- 完整 `PickNodesToExtendTask`、task workers、`RunTasks`
-- 完整 `PrefetchIntoCache` 递归
-- px0 二进制 trace golden
-- 真实 ONNX / `pxzero-training` 导出接入
-
-下一入口：`PickNodesToExtendTask` 或 `src/neural/*` ONNX。
+```powershell
+@('uci', 'setoption name MoveOverheadMs value 0', 'setoption name Slowmover value 1.5',
+  'setoption name WeightsFile value data\x7.onnx', 'isready', 'position startpos',
+  'go wtime 1000 btime 1000 winc 10 binc 10', 'wait', 'quit') |
+  .\target\release\engin.exe
+```

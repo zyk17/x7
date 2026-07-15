@@ -12,12 +12,16 @@
   `src/neural/wrapper.cc:49-172`、`src/neural/memcache.h:34-45,memcache.cc:38-190`、
   `src/search/classic/search.cc:1142-1231,1268-1508,1551-1827,1977-2334` 的 ONNX/MemCache、
   单 worker/minibatch/prefetch/OOO/shared-tree 子集。
+- P4 legacy 时钟预算：`src/search/classic/stoppers/factory.cc:44-115`、`legacy.cc:43-174`、
+  `stoppers.cc:39-129`、`common.cc:118-165`；已支持 `MoveOverheadMs`、`Slowmover` 与
+  `go wtime/btime/winc/binc/movestogo`，不暴露未翻译的其他 time manager。
 - 正式 UCI `WeightsFile` 生命周期：`src/engine.cc:137-197,206-219`，没有权重时明确拒绝搜索，
   不回退到 `UniformBackend`。
 - NN 训练入口：参考 `pxzero-training/tf/train.py:110-126`、`tf/configs/example.yaml:4-31`，已收为
   单一 `dataset / model / training` YAML；当前不移植其 TensorFlow 兼容层或旧数据管道。
 - P1-P3 进入 P4 前复核：`cargo test --release -p xiangqi_core`（22 项 px0 规则/history 对拍）、
-  `cargo test -p engin --lib`（79 项 P2/P3/controller/tree/UCT 回归）与 UCI/P4 生命周期集成测试已通过。
+  `cargo test --release -p engin --lib`（88 项 P2/P3/controller/tree/UCT/P4 回归）与真实 ONNX UCI
+  生命周期/legacy clock 冒烟已通过。
 
 ## P4：单 worker 搜索流水线可用；task-worker 待重构
 
@@ -39,6 +43,10 @@ task split 不可用：当前 Rust raw-pointer 版本会让两个 task 重复扩
   共享 remaining-playouts hint。
 - [x] 按 `src/search/classic/search.cc:596-610` 加入 root-first-visit stopper gate；未扩展根节点
   不能被 budget stopper 提前结束。
+- [x] 按 `src/search/classic/stoppers/factory.cc:44-115`、`legacy.cc:43-174`、
+  `stoppers.cc:39-129`、`common.cc:118-165` 翻译 factory 默认 legacy time manager：
+  `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；不暴露
+  `simple/smooth/alphazero`。
 
 - [x] 在 DirectML/ONNX 下完成固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...`、
   backend reload 的 release UCI 冒烟。另验证 `go infinite -> go nodes` 与

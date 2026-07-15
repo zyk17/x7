@@ -16,7 +16,8 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
   `position_test.cc` 的 history/repetition/RuleJudge 与 FEN/hash 用例均为绿。参考
   `src/chess/board_test.cc:70-232`、`position.cc:41-205`。
 - P2：`position ... moves ...` 保存完整 history；每次 `go`、`position`、`ucinewgame` 都先
-  `Abort + Wait` 上一搜索。未翻译的 `depth/mate/ponder/clock manager` 已明确拒绝，不能静默执行。
+  `Abort + Wait` 上一搜索。px0 默认 legacy clock manager 已翻译；未翻译的 `depth/mate/ponder`
+  仍明确拒绝，不能静默执行。
   参考 `src/engine.cc:148-235`、`src/search/classic/wrapper.cc:100-150`、
   `src/search/classic/stoppers/common.cc:118-186`。
 - P3：Node 的 edge policy 编码、`MakeSolid`、terminal visit 反转、tree reuse 与 UCT/参数默认值已有
@@ -93,17 +94,16 @@ UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/
 (`simple/smooth/alphazero`) 仍不暴露，避免把未翻译配置伪装成可用功能。
 
 完整 task-worker 是明确缺口，不得把 `TaskTreeBridge` / `TaskWorkerRunner` 当作可启用实现；后续只能
-从 px0 `search.h:205-244,348-445`、`search.cc:1069-1508` 重新建立无别名的数据所有权边界。
-因此，真实 task thread 已通过“主线程独占 phase + 已切分子任务”的受限 bridge 接线。它使用
-`*mut SearchWorker` 和 `unsafe impl Send`，但只存在于 scoped thread 生命周期，且 `WaitForTasks`
-完成前不清空 active tree pointer；不得扩大该例外或改为每次任务全树锁。
+从 px0 `search.h:205-244,348-445`、`search.cc:1069-1508` 重新建立无别名的数据所有权边界。此前的
+`*mut SearchWorker` / `unsafe impl Send` bridge 在真实 ONNX 正时间搜索会触发重复 `ExtendNode`，已
+完全停用；不得恢复或以全树锁掩盖该错误。
 
 这不是仅把 `Vec<Box<Node>>` 改成线程安全容器就能解决的问题。px0 自己声明 `Edge_Iterator` 和
 `VisitedNode_Iterator` 非线程安全（`src/search/classic/node.h:423-436,547-551`），而
 `Edge_Iterator::Actualize` 又明确允许其他 task 在 iterator 调用间隙创建 sibling
 （`src/search/classic/node.h:485-525`）。此外 twofold 修正会沿 parent 链回写
-（`src/search/classic/search.cc:1510-1550`）。Rust 端以 active tree phase 保留该外部同步契约；
-不得以每节点锁替换后假定算法已经等价。
+（`src/search/classic/search.cc:1510-1550`）。未来 Rust 端必须先证明 task 的节点范围和 workspace
+所有权不重叠；不得以每节点锁或 raw-pointer alias 假定算法已经等价。
 
 ## 验收
 
@@ -120,5 +120,5 @@ DirectML 本地冒烟：
   .\target\release\engin.exe
 ```
 
-P4 只有在真实 ONNX/DirectML 下 task worker 生命周期、固定 nodes、`stop`、`position ... moves ...`
-和 tree in-flight 清理均对照 px0 通过后才能关闭。
+P4 的单 worker 子目标已可验收；P4 只有在真实 ONNX/DirectML 下安全 task-worker 生命周期、固定
+nodes、`stop`、`position ... moves ...` 和 tree in-flight 清理均对照 px0 通过后才能完全关闭。

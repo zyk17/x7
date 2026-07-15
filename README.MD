@@ -11,14 +11,13 @@
 - `C:\Users\Administrator\projects\px0`
 - `C:\Users\Administrator\projects\pxzero-training`
 
-P4 已收口。当前已接通真实 `124x10x9` ONNX backend、minibatch、prefetch、collision、
-shared-tree search worker、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。正式 ONNX 已由
+P4 的单 worker 主线已接通真实 `124x10x9` ONNX backend、minibatch、prefetch、collision、
+shared-tree、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。正式 ONNX 已由
 px0 `MemCache` 风格的 `CachingBackend` 包裹：按局面 hash 查找、以合法着数量防碰撞、batch 完成后写入、
 `ucinewgame` 清空；默认 `NNCacheSize=2000000`。
-此前 Rust 端把一个 `SearchWorker` 的可变状态错误地交给多个 task thread，已删除该不安全路径；
-px0 task-worker 生命周期已按 scoped thread 翻译：每个 task thread 独占一个 `TaskWorkspace`，并只在
-明确的 gathering/processing tree phase 内访问共享搜索状态。受限 raw-pointer bridge 仅存在于这条
-px0 对照路径，完整约束见 `AGENTS.md`。
+px0 的 GPU task-worker 尚未完成：此前 Rust 端把一个 `SearchWorker` 的可变状态错误地交给多个 task
+thread，真实 ONNX 搜索会重复 `ExtendNode`。该 raw-pointer 路径已停用，当前强制
+`task_workers=0`，只保留安全的单 worker 搜索；后续必须按 px0 重新建立无别名的 task 所有权边界。
 
 主 UCI 使用 px0 名称 `WeightsFile` 配置 ONNX 权重，并会在下一条 `position` 前加载它。正式
 `ClassicEngine` 在权重成功加载前没有 `ClassicSearch`，不会以 `UniformBackend` 代替模型搜索。
@@ -35,9 +34,10 @@ px0 对照路径，完整约束见 `AGENTS.md`。
 新搜索的 `bestmove`。这一生命周期对照 px0 `src/engine.cc:148-151,187-224` 与
 `src/search/classic/wrapper.cc:100-140`。
 
-当前只开放已逐函数翻译的 `go nodes`、`go movetime`、`go infinite`。`go depth`、`go mate`、
-`go ponder`、`ponderhit` 以及 `wtime/btime/winc/binc/movestogo` 都会明确拒绝，不能与其他预算
-组合后静默变成普通搜索；后者须等待 px0 `SimpleTimeManager` 完整翻译。
+当前开放 `go nodes`、`go movetime`、`go infinite` 与 px0 默认 legacy 时钟预算
+`wtime/btime/winc/binc/movestogo`；对应 UCI 选项是 `MoveOverheadMs` 和 `Slowmover`。`go depth`、
+`go mate`、`go ponder`、`ponderhit` 仍会明确拒绝，不能静默变成普通搜索。只翻译并暴露 px0 factory 的
+默认 `legacy` time manager，不暴露尚未翻译的 `simple/smooth/alphazero` 变体。
 
 ```text
 position startpos
