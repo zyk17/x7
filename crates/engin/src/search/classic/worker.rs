@@ -660,25 +660,14 @@ impl<'a> SearchWorker<'a> {
         if target_minibatch_size == 0 {
             target_minibatch_size = 1;
         }
-        // px0 `SearchWorker` resolves its task-worker count at construction
-        // (`src/search/classic/search.h:210-224`). CPU backends keep this at
-        // zero; GPU backends default to at most four helpers per search worker.
-        let task_workers = if params.task_workers_per_search_worker < 0 {
-            if backend.attributes().runs_on_cpu {
-                0
-            } else {
-                let working_threads = search_state
-                    .thread_count
-                    .load(Ordering::Acquire)
-                    .saturating_sub(1)
-                    .max(1);
-                let available = thread::available_parallelism().map_or(1, usize::from);
-                i32::try_from((available / working_threads).saturating_sub(1).min(4))
-                    .expect("px0 task worker count fits i32")
-            }
-        } else {
-            params.task_workers_per_search_worker
-        };
+        // Gap from px0 `SearchWorker` construction (`search.h:210-224`): its
+        // task threads mutate disjoint C++ subobjects under the long-lived
+        // `nodes_mutex_` phase. The prior raw-pointer Rust translation aliased
+        // one `&mut SearchWorker` across task threads and could duplicate
+        // `ExtendNode`, so it is not a valid port. Keep the exact px0 CPU
+        // `task_workers_=0` execution branch for every backend until task
+        // ownership is split into independently borrowable state.
+        let task_workers = 0;
         let task_workspaces = (0..usize::try_from(task_workers).expect("non-negative task worker count"))
             .map(|_| TaskWorkspace::default())
             .collect();
@@ -2425,10 +2414,12 @@ mod tests {
         }
     }
 
-    /// px0 starts GPU task workers from the configured count and keeps them
-    /// alive for the parent `SearchWorker` lifetime (`search.h:205-244`).
+    /// The raw-pointer task-worker attempt is deliberately disabled until its
+    /// ownership model can reproduce px0 `search.h:205-244` without aliasing
+    /// mutable Rust state. GPU backends must retain the correct synchronous
+    /// worker path rather than crashing while extending a duplicate leaf.
     #[test]
-    fn gpu_task_workers_run_and_leave_no_in_flight_visits() {
+    fn gpu_backend_falls_back_to_safe_synchronous_worker() {
         ensure_init();
         let mut tree = NodeTree::default();
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -2450,7 +2441,7 @@ mod tests {
         let search_state = Arc::new(WorkerSearchState::new(Arc::clone(&stop)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
 
-        assert_eq!(worker.task_workers, 1);
+        assert_eq!(worker.task_workers, 0);
 
         std::thread::scope(|scope| {
             let state = Arc::clone(&search_state);
@@ -2462,12 +2453,12 @@ mod tests {
                 }
                 stop.store(true, Ordering::Release);
             });
-            worker.run_blocking().expect("task-work search");
+            worker.run_blocking().expect("synchronous GPU search");
             stopper.join().expect("stopper thread");
         });
 
         assert!(search_state.total_playouts.load(Ordering::Acquire) >= 16);
-        assert!(worker.task_thread_executions.load(Ordering::Acquire) > 0);
+        assert_eq!(worker.task_thread_executions.load(Ordering::Acquire), 0);
         assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
     }
 

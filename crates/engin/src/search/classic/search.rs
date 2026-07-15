@@ -20,7 +20,7 @@ use super::params::{
     accurate_wdl_rescale_params, get_contempt, simplified_wdl_rescale_params, ContemptMode, ScoreType, SearchParams,
 };
 use super::stoppers::timemgr::{IterationStats, StoppersHints};
-use super::stoppers::{build_search_stoppers, ChainedSearchStopper, SearchStopper};
+use super::stoppers::{build_search_stoppers, ChainedSearchStopper, LegacyTimeManager, SearchStopper};
 use super::worker::{SearchWorker, WorkerSearchState};
 use crate::utils::fastmath::{fast_log, fast_logistic};
 
@@ -463,6 +463,18 @@ impl SearchStopController {
         should_stop
     }
 
+    /// px0 `Search::MaybeTriggerStop` calls `OnSearchDone` exactly once after
+    /// claiming the terminal bestmove response (`search.cc:596-620`).
+    pub(crate) fn on_search_done(&self, worker_state: &WorkerSearchState) {
+        let stats = {
+            let mut meta = self.meta.lock().expect("meta lock");
+            Self::populate_iteration_stats(&mut meta, worker_state)
+        };
+        if let Some(stopper) = self.stopper.lock().expect("stopper lock").as_mut() {
+            stopper.on_search_done(&stats);
+        }
+    }
+
     /// px0's `GetTimeSinceFirstBatch` with the `GetTimeSinceStart` fallback
     /// used by `NodesPerSecondLimit` (`src/search/classic/search.cc:393-398,
     /// 1213-1231`).
@@ -498,6 +510,13 @@ pub struct ClassicSearch {
     live_info: Arc<Mutex<LiveInfoState>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     infinite: AtomicBool,
+    /// px0 factory default `legacy` manager (`stoppers/factory.cc:73-114`).
+    time_manager: LegacyTimeManager,
+    /// Pending `MoveOverheadMs`; px0 only reconstructs the manager for a new
+    /// game or a position outside the retained tree (`wrapper.cc:100-112`).
+    move_overhead_ms: i64,
+    /// Same pending lifecycle for px0 `Slowmover` (`stoppers/factory.cc:73-114`).
+    slowmover: f32,
     pub outputs: Vec<SearchOutput>,
 }
 
@@ -534,6 +553,9 @@ impl ClassicSearch {
             live_info: Arc::new(Mutex::new(LiveInfoState::default())),
             threads: Mutex::new(Vec::new()),
             infinite: AtomicBool::new(false),
+            time_manager: LegacyTimeManager::new(200, 1.0),
+            move_overhead_ms: 200,
+            slowmover: 1.0,
             outputs: Vec::new(),
         }
     }
@@ -614,6 +636,14 @@ impl ClassicSearch {
     /// (`src/engine.cc:153-167`) before each new search parameter snapshot.
     pub fn set_nn_cache_size(&mut self, size: usize) {
         self.backend.set_cache_size(size);
+    }
+
+    /// px0 `PopulateTimeManagementOptions` / `MakeTimeManager`
+    /// (`stoppers/factory.cc:73-114`). The active manager is deliberately
+    /// preserved until px0 would create a new game manager.
+    pub fn set_time_management_options(&mut self, move_overhead_ms: i64, slowmover: f32) {
+        self.move_overhead_ms = move_overhead_ms;
+        self.slowmover = slowmover;
     }
 
     pub fn run_blocking_nodes(&mut self, nodes: u32) -> (Move, u32) {
@@ -797,6 +827,7 @@ impl ClassicSearch {
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                 {
+                    watchdog_stop_controller.on_search_done(&watchdog_worker_state);
                     if let Some(responder) = &responder {
                         let tree = watchdog_tree.read();
                         let meta = watchdog_meta.lock().expect("meta lock");
@@ -876,13 +907,17 @@ impl SearchBase for ClassicSearch {
         // a non-caching test backend intentionally treats it as a no-op.
         self.backend.clear_cache();
         *self.tree.write() = NodeTree::default();
+        self.time_manager = LegacyTimeManager::new(self.move_overhead_ms, self.slowmover);
         self.worker_state = Arc::new(WorkerSearchState::new(Arc::clone(&self.stop)));
         self.outputs.clear();
         Ok(())
     }
 
     fn set_position(&mut self, state: &GameState) -> Result<(), EnginError> {
-        self.tree.write().reset_to_position(&state.startpos, &state.moves);
+        let same_game = self.tree.write().reset_to_position(&state.startpos, &state.moves);
+        if !same_game {
+            self.time_manager = LegacyTimeManager::new(self.move_overhead_ms, self.slowmover);
+        }
         Ok(())
     }
 
@@ -894,19 +929,6 @@ impl SearchBase for ClassicSearch {
         // nodes or movetime budget is also present.
         if params.depth.is_some() || params.mate.is_some() {
             return Err(EnginError::PortIncomplete("go depth/go mate stopper"));
-        }
-        // px0 delegates clock allocation to `SimpleTimeManager`
-        // (`src/search/classic/stoppers/simple.cc:74-126`). Keeping the UCI
-        // fields but replacing that logic with a local percentage is not a
-        // 1:1 port, so only fixed `movetime` is available until P4 translates
-        // the manager and its tests.
-        if params.wtime.is_some()
-            || params.btime.is_some()
-            || params.winc.is_some()
-            || params.binc.is_some()
-            || params.movestogo.is_some()
-        {
-            return Err(EnginError::PortIncomplete("go wtime/btime time manager"));
         }
         self.outputs.clear();
         self.stop.store(false, Ordering::Release);
@@ -925,7 +947,15 @@ impl SearchBase for ClassicSearch {
             }
         }
 
-        let has_budget = nodes.is_some() || params.movetime.is_some() || params.infinite;
+        let has_clock_budget = {
+            let tree = self.tree.read();
+            if tree.history().is_black_to_move() {
+                params.btime.is_some()
+            } else {
+                params.wtime.is_some()
+            }
+        };
+        let has_budget = nodes.is_some() || params.movetime.is_some() || has_clock_budget || params.infinite;
         if !has_budget {
             return Err(EnginError::PortIncomplete("time-based search stopper"));
         }
@@ -975,7 +1005,13 @@ impl SearchBase for ClassicSearch {
             // (`src/search/classic/wrapper.cc:126-150`), so its cached root
             // edge never crosses a UCI search boundary.
             *self.worker_state.current_best_edge.lock().expect("best edge lock") = None;
-            let chain = build_search_stoppers(params, false);
+            let time_manager_stopper = self.time_manager.get_stopper(params, tree.history().last());
+            let chain = build_search_stoppers(
+                params,
+                false,
+                self.time_manager.move_overhead_ms(),
+                time_manager_stopper,
+            );
             *self.stopper.lock().expect("stopper lock") = Some(chain);
         }
 

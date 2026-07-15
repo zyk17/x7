@@ -201,6 +201,7 @@ impl ClassicEngine {
         )?;
         search.set_wdl_options(options)?;
         search.set_nn_cache_size(options.nn_cache_size);
+        search.set_time_management_options(options.move_overhead_ms, options.slowmover);
         Ok(())
     }
 
@@ -442,10 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_clock_manager_is_not_replaced_by_a_local_heuristic() {
+    fn legacy_clock_manager_accepts_px0_uci_clock_budget() {
         let mut engine = ClassicEngine::uniform();
         let mut responder = VecUciResponder::default();
-        let error = engine
+        engine
             .go(
                 &GoParams {
                     wtime: Some(1_000),
@@ -454,8 +455,9 @@ mod tests {
                 },
                 &mut responder,
             )
-            .expect_err("untranslated clock manager must be rejected");
-        assert!(error.to_string().contains("go wtime/btime time manager"));
+            .expect("px0 legacy clock manager");
+        engine.wait().expect("clock search wait");
+        assert!(engine.search().expect("search").total_root_visits() > 0);
     }
 
     #[test]

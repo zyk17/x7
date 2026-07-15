@@ -19,10 +19,11 @@
 - P1-P3 进入 P4 前复核：`cargo test --release -p xiangqi_core`（22 项 px0 规则/history 对拍）、
   `cargo test -p engin --lib`（79 项 P2/P3/controller/tree/UCT 回归）与 UCI/P4 生命周期集成测试已通过。
 
-## P4：task-worker 生命周期，已完成
+## P4：单 worker 搜索流水线可用；task-worker 待重构
 
-GPU task split 已接通；CPU 保持 px0 `task_workers_=0`。多 SearchWorker、OOO、stop 与真实
-ONNX/DirectML 时序已有回归和 release 冒烟。
+单 worker/minibatch/OOO/cache/stop 与真实 ONNX/DirectML 时序已有回归和 release 冒烟。GPU
+task split 不可用：当前 Rust raw-pointer 版本会让两个 task 重复扩展同一未扩展节点，已统一退回
+`task_workers_=0`，不能作为 px0 对齐完成项。
 
 - [x] 翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为正式 ONNX 的
   `CachingBackend` wrapper：当前局面 hash 为 key、合法着数量防碰撞、cache miss 仅在
@@ -39,31 +40,18 @@ ONNX/DirectML 时序已有回归和 release 冒烟。
 - [x] 按 `src/search/classic/search.cc:596-610` 加入 root-first-visit stopper gate；未扩展根节点
   不能被 budget stopper 提前结束。
 
-- [x] 按 `src/search/classic/search.h:435-445`、`search.cc:1069-1119,1464-1483` 翻译
-  `task_taking_started`、claim、idle、wake、close 与重用；已补多线程唯一领取回归。
-- [x] 按 `src/search/classic/search.cc:1142-1211,1494-1508` 将 Rust `NodeTree` 收为显式
-  tree-phase 借用，删除 `active: *mut NodeTree`；direct 与 shared tree 均通过同一安全边界进入
-  selection/process/fetch/backup。
-- [x] 按 `src/search/classic/search.h:205-249,357-448, search.cc:1069-1140,1268-1508` 翻译一个
-  `SearchWorker` + 每 task thread 一个独占 `TaskWorkspace` 的 lifecycle、gathering/processing
-  回写与 `WaitForTasks`；GPU 回归确认 helper 实际领取任务。
-- [x] 按 `src/search/classic/search.cc:1494-1501,1828-1897`、`src/search/classic/node.h:423-525,547-610`
-  与 `src/utils/mutex.h:93-125` 建立受限 `TaskTreeBridge`：只允许 scoped task thread 在 active
-  tree phase 内访问普通 Node；`task_count=-1` 与 `exiting` 继续分开。
-- [x] 对照 `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334` 验证多 SearchWorker +
-  task worker 的 tree phase、in-flight 与 counters；固定 visits 回归确认 root `NInFlight=0` 与
-  shared collision 已清空。OOO cache-hit 组合已启用 task worker 回归。
 - [x] 在 DirectML/ONNX 下完成固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...`、
   backend reload 的 release UCI 冒烟。另验证 `go infinite -> go nodes` 与
   `go infinite -> position ... -> go nodes`：旧搜索静默回收，只有最后一次 `go` 输出 `bestmove`。
   对照 `src/engine.cc:148-224`、`src/search/classic/wrapper.cc:100-140`。
 
-## 后续：完整 UCI 时间管理（不阻塞 P4）
+## 后续：P4 task-worker 的安全所有权翻译
 
-- [ ] 先翻译 px0 `src/search/classic/stoppers/factory.cc:44-115` 的 `MoveOverheadMs`、
-  `TimeManager` 配置解析及默认 `legacy` 选择；不能把 `simple` 单独当作 px0 默认。
-- [ ] 在 factory 已对齐后，按被选 manager 的连续区间翻译 `legacy.cc`（默认）及其测试；只有届时
-  才开放 `go wtime/btime/winc/binc/movestogo`。`simple.cc:37-132` 只是显式选择 simple 时的分支。
+- [ ] 重新设计 Rust task 的所有权边界，对照 px0 `src/search/classic/search.h:205-244,348-445`、
+  `search.cc:1069-1508`：task 只能拥有独立 workspace 与明确不重叠的 node/minibatch range，不能共享
+  `&mut SearchWorker` 或通过 raw pointer 直接修改整棵树。
+- [ ] 在固定 visits、`go movetime`、真实 ONNX/DirectML 下补重复 ExtendNode、`NInFlight==0`、stop/wait
+  回归；只有该回归稳定后才能恢复 px0 GPU `task_workers_` 默认解析。
 
 ## 约束
 

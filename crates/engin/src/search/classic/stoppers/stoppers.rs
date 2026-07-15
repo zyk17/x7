@@ -1,4 +1,4 @@
-//! px0 `stoppers/stoppers.h`、`stoppers.cc:39-131`、`common.cc:118-165`、`simple.cc:74-126`。
+//! px0 `stoppers/stoppers.h`、`stoppers.cc:39-131`、`common.cc:118-165`。
 
 use super::timemgr::{IterationStats, StoppersHints};
 use crate::uci_loop::GoParams;
@@ -6,6 +6,9 @@ use crate::uci_loop::GoParams;
 /// px0 `SearchStopper` (`timemgr.h:88-102`)。
 pub trait SearchStopper: Send {
     fn should_stop(&mut self, stats: &IterationStats, hints: &mut StoppersHints) -> bool;
+
+    /// px0 `SearchStopper::OnSearchDone` (`stoppers.h:48-51`).
+    fn on_search_done(&mut self, _stats: &IterationStats) {}
 }
 
 /// px0 `ChainedSearchStopper` (`stoppers.cc:39-53`)。
@@ -38,6 +41,12 @@ impl SearchStopper for ChainedSearchStopper {
         self.stoppers
             .iter_mut()
             .any(|stopper| stopper.should_stop(stats, hints))
+    }
+
+    fn on_search_done(&mut self, stats: &IterationStats) {
+        for stopper in &mut self.stoppers {
+            stopper.on_search_done(stats);
+        }
     }
 }
 
@@ -98,6 +107,11 @@ impl TimeLimitStopper {
     pub const fn new(time_limit_ms: i64) -> Self {
         Self { time_limit_ms }
     }
+
+    /// px0 `TimeLimitStopper::GetTimeLimitMs` (`stoppers.cc:131`).
+    pub const fn time_limit_ms(&self) -> i64 {
+        self.time_limit_ms
+    }
 }
 
 impl SearchStopper for TimeLimitStopper {
@@ -107,11 +121,17 @@ impl SearchStopper for TimeLimitStopper {
     }
 }
 
-/// px0 `PopulateCommonUciStoppers` (`stoppers/common.cc:118-165`) 的已翻译
-/// 固定预算部分。`wtime/btime` 需要完整翻译 `SimpleTimeManager`，不能用
-/// 自定义百分比公式代替。
-pub fn build_search_stoppers(params: &GoParams, nodes_as_playouts: bool) -> ChainedSearchStopper {
+/// px0 `PopulateCommonUciStoppers` (`stoppers/common.cc:118-165`)。
+pub fn build_search_stoppers(
+    params: &GoParams,
+    nodes_as_playouts: bool,
+    move_overhead_ms: i64,
+    time_manager_stopper: Option<Box<dyn SearchStopper>>,
+) -> ChainedSearchStopper {
     let mut chain = ChainedSearchStopper::new();
+    if let Some(stopper) = time_manager_stopper {
+        chain.add(stopper);
+    }
     if let Some(nodes) = params.nodes.filter(|&n| n > 0) {
         if nodes_as_playouts {
             chain.add(Box::new(PlayoutsStopper::new(nodes as i64, true)));
@@ -120,7 +140,7 @@ pub fn build_search_stoppers(params: &GoParams, nodes_as_playouts: bool) -> Chai
         }
     }
     if let Some(movetime) = params.movetime.filter(|&t| t >= 0) {
-        chain.add(Box::new(TimeLimitStopper::new(movetime)));
+        chain.add(Box::new(TimeLimitStopper::new(movetime - move_overhead_ms)));
     }
     chain
 }

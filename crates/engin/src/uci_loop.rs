@@ -54,6 +54,10 @@ pub struct UciOptions {
     pub wdl_book_exit_bias: f32,
     /// px0 `NNCacheSize` (`src/neural/shared_params.cc:63-82`).
     pub nn_cache_size: usize,
+    /// px0 `MoveOverheadMs` (`search/classic/stoppers/factory.cc:44-82`).
+    pub move_overhead_ms: i64,
+    /// px0 `Slowmover` (`search/classic/stoppers/factory.cc:68-82`).
+    pub slowmover: f32,
     /// px0 `WeightsFile` (`src/neural/shared_params.cc:43-80`). This Rust
     /// port accepts the formal ONNX model rather than px0's protobuf weights.
     pub weights_file: String,
@@ -82,6 +86,8 @@ impl Default for UciOptions {
             wdl_draw_rate_reference: 0.5,
             wdl_book_exit_bias: 0.65,
             nn_cache_size: DEFAULT_NN_CACHE_SIZE,
+            move_overhead_ms: 200,
+            slowmover: 1.0,
             weights_file: String::new(),
         }
     }
@@ -139,6 +145,8 @@ impl UciOptions {
                 "option name NNCacheSize type spin default {} min 0 max 999999999",
                 self.nn_cache_size
             ),
+            format!("option name MoveOverheadMs type spin default {} min 0 max 100000000", self.move_overhead_ms),
+            format!("option name Slowmover type string default {}", self.slowmover),
             format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
@@ -178,6 +186,8 @@ impl UciOptions {
             }
             "WDLBookExitBias" => self.wdl_book_exit_bias = parse_float_option(value, "WDLBookExitBias", -2.0, 2.0)?,
             "NNCacheSize" => self.nn_cache_size = parse_cache_size(value)?,
+            "MoveOverheadMs" => self.move_overhead_ms = parse_move_overhead(value)?,
+            "Slowmover" => self.slowmover = parse_slowmover(value)?,
             "WeightsFile" => self.weights_file = value.to_string(),
             _ => return Err(EnginError::Uci(format!("Unknown option: {name}"))),
         }
@@ -711,6 +721,26 @@ fn parse_cache_size(value: &str) -> Result<usize, EnginError> {
     Ok(value)
 }
 
+/// px0 `IntOption(kMoveOverheadId, 0, 100000000)`
+/// (`search/classic/stoppers/factory.cc:73-82`).
+fn parse_move_overhead(value: &str) -> Result<i64, EnginError> {
+    let value: i64 = value
+        .parse()
+        .map_err(|_| EnginError::Uci("MoveOverheadMs must be an integer from 0 to 100000000".into()))?;
+    if !(0..=100_000_000).contains(&value) {
+        return Err(EnginError::Uci(
+            "MoveOverheadMs must be an integer from 0 to 100000000".into(),
+        ));
+    }
+    Ok(value)
+}
+
+/// px0 `FloatOption(kSlowMoverId, 0.0, 100.0)`
+/// (`search/classic/stoppers/factory.cc:80-82`).
+fn parse_slowmover(value: &str) -> Result<f32, EnginError> {
+    parse_float_option(value, "Slowmover", 0.0, 100.0)
+}
+
 fn parse_float_option(value: &str, name: &str, min: f32, max: f32) -> Result<f32, EnginError> {
     let value: f32 = value
         .parse()
@@ -884,6 +914,28 @@ mod tests {
             .list_options_uci()
             .iter()
             .any(|line| line == "option name WeightsFile type string default data/x7.onnx"));
+    }
+
+    #[test]
+    fn move_overhead_option_matches_px0_range_and_default() {
+        let mut options = UciOptions::default();
+        assert_eq!(options.move_overhead_ms, 200);
+        options
+            .set_uci_option("MoveOverheadMs", "17")
+            .expect("valid px0 move overhead");
+        assert_eq!(options.move_overhead_ms, 17);
+        assert!(options.set_uci_option("MoveOverheadMs", "-1").is_err());
+        assert!(options.set_uci_option("MoveOverheadMs", "100000001").is_err());
+    }
+
+    #[test]
+    fn slowmover_option_matches_px0_range_and_default() {
+        let mut options = UciOptions::default();
+        assert_eq!(options.slowmover, 1.0);
+        options.set_uci_option("Slowmover", "1.5").expect("valid px0 slowmover");
+        assert_eq!(options.slowmover, 1.5);
+        assert!(options.set_uci_option("Slowmover", "-0.1").is_err());
+        assert!(options.set_uci_option("Slowmover", "100.1").is_err());
     }
 
     #[test]
