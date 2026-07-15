@@ -942,10 +942,15 @@ impl SearchBase for ClassicSearch {
             // (`src/search/classic/wrapper.cc:126-150`), so its cached root
             // edge never crosses a UCI search boundary.
             *self.worker_state.current_best_edge.lock().expect("best edge lock") = None;
-            if let Some(limit) = nodes {
-                meta.stoppers_hints.update_estimated_remaining_playouts(limit as i64);
-                self.worker_state.set_remaining_playouts(limit as i64);
-            }
+            // px0 constructs a new SearchWorker for each StartSearch. Its
+            // first gather therefore sees default `latest_time_manager_hints_`;
+            // the stopper publishes the actual `go nodes` remaining budget
+            // only after the first completed iteration
+            // (`src/search/classic/search.cc:908-922,1268-1284`). Reset the
+            // persistent Rust worker state to that same default so a previous
+            // search cannot leak its remaining budget into this one.
+            self.worker_state
+                .set_remaining_playouts(meta.stoppers_hints.estimated_remaining_playouts());
             let chain = build_search_stoppers(params, tree.history(), false);
             *self.stopper.lock().expect("stopper lock") = Some(chain);
             if nodes.is_none() {

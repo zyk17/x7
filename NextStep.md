@@ -41,6 +41,11 @@ watchdog 已按 px0 `Search::WatchdogThread` / `FireStopInternal` 的等待边�
 `src/search/classic/search.cc:249-264,393-398,908-918,1213-1231`。不再由 worker 在首个 backend
 batch 回写时私自设定时间原点。
 
+每次 `StartSearch` 还会把 Rust 持久 `WorkerSearchState` 的 remaining-playouts 重置为 px0
+`StoppersHints` 默认值；`go nodes` 的真实剩余预算只能在第一轮完成后由 stopper 用
+`total_nodes` 发布。参考 `src/search/classic/search.cc:874-896,908-922,1268-1284`。这避免前一轮
+预算或 tree-reuse visits 污染新搜索首轮 gathering。
+
 已对齐 tree reuse 的 stopper 统计：`total_nodes` 必须是本轮 `total_playouts + initial_visits`，而
 `nodes_since_movestart` 只统计本轮 playouts。参考 px0 `search.cc:908-922`。
 
