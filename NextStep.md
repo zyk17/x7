@@ -31,6 +31,9 @@ task-worker 完成。
 已移除旧 collision-only `sleep(10ms)`：它不在 px0 `SearchWorker::UpdateCounters`
 (`src/search/classic/search.cc:2331-2364`) 中，会人为降低并扭曲低节点吞吐。
 
+已对齐 tree reuse 的 stopper 统计：`total_nodes` 必须是本轮 `total_playouts + initial_visits`，而
+`nodes_since_movestart` 只统计本轮 playouts。参考 px0 `search.cc:908-922`。
+
 task worker 不直接执行 GPU 推理。它在 px0 中并行执行 gathering/processing，减少 selection、node
 extend 和 `BackendComputation::AddInput` 的 CPU 准备间隔；这能帮助持续向 GPU 提交输入，但不是 GPU
 吞吐的唯一或首要来源。持续喂卡首先依赖多个搜索 worker、真实 batch、共享 backend computation 与

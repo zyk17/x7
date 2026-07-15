@@ -396,7 +396,7 @@ pub(crate) struct SearchStopController {
 
 impl SearchStopController {
     fn populate_iteration_stats(meta: &SearchMeta, worker_state: &WorkerSearchState) -> IterationStats {
-        let root_visits = worker_state.total_playouts.load(Ordering::Acquire) as i64;
+        let total_playouts = worker_state.total_playouts.load(Ordering::Acquire) as i64;
         IterationStats {
             time_since_movestart: meta.move_start.elapsed().as_millis() as i64,
             time_since_first_batch: worker_state
@@ -404,8 +404,11 @@ impl SearchStopController {
                 .lock()
                 .expect("first batch lock")
                 .map_or(0, |first_batch| first_batch.elapsed().as_millis() as i64),
-            total_nodes: root_visits,
-            nodes_since_movestart: root_visits,
+            // px0 keeps the tree-reuse visits in `total_nodes`, while the
+            // current-search budget sees only newly completed playouts
+            // (`src/search/classic/search.cc:908-922`).
+            total_nodes: total_playouts + i64::from(meta.initial_visits),
+            nodes_since_movestart: total_playouts,
             batches_since_movestart: worker_state.total_batches.load(Ordering::Acquire) as i64,
             average_depth: {
                 let playouts = worker_state.total_playouts.load(Ordering::Acquire);
@@ -1180,6 +1183,31 @@ mod tests {
     #[test]
     fn move_orientation_keeps_px0_null_ponder_null() {
         assert!(orient_move(xiangqi_core::Move::NULL, true).is_null());
+    }
+
+    /// px0 `PopulateCommonIterationStats` includes visits retained by tree
+    /// reuse in `total_nodes`, but not in `nodes_since_movestart`
+    /// (`src/search/classic/search.cc:908-922`).
+    #[test]
+    fn iteration_stats_include_reused_root_visits() {
+        let meta = super::SearchMeta {
+            params: SearchParams::default(),
+            move_start: std::time::Instant::now(),
+            initial_visits: 17,
+            stoppers_hints: super::StoppersHints::default(),
+            search_active: true,
+            root_move_filter: Vec::new(),
+            contempt_mode: ContemptMode::Play,
+        };
+        let worker_state = super::WorkerSearchState::default();
+        worker_state
+            .total_playouts
+            .store(5, std::sync::atomic::Ordering::Release);
+
+        let stats = super::SearchStopController::populate_iteration_stats(&meta, &worker_state);
+
+        assert_eq!(stats.total_nodes, 22);
+        assert_eq!(stats.nodes_since_movestart, 5);
     }
 
     #[test]
