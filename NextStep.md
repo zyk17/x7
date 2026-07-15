@@ -90,8 +90,10 @@ phase + scoped task-thread 内，不改变 px0 的 selection、in-flight 或 bac
 2. `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334`
    - 多 SearchWorker + scoped task worker 的 fixed-visits shared-tree 回归已通过；继续对照
      `MaxConcurrentSearchers`、out-of-order backup 与 counter 时序。
-3. 在 DirectML/ONNX 下对照固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...` 与
-   backend reload；结束时 root `NInFlight=0`。
+3. DirectML release UCI 已验证固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...`、
+   backend reload，以及 `go infinite -> go nodes` / `go infinite -> position ... -> go nodes` 的旧搜索
+   静默回收。参考 `src/engine.cc:148-224`、`src/search/classic/wrapper.cc:100-140`。后续只补可观测的
+   root `NInFlight=0` 断言，不重复改变 UCI 生命周期。
 
 每次只翻译一个连续参考区间，补对应回归，再提交。raw pointer / `unsafe impl Send` 仅允许保留在
 `TaskTreeBridge`、`TaskWorkerRunner` 两个有 px0 行号和 scoped-lifetime 注释的内部类型。

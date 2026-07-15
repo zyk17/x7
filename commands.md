@@ -120,6 +120,23 @@ cargo run --release -p engin
 `ScoreType`、`UCI_ShowWDL`、`UCI_ShowEPS`、`UCI_ShowMovesLeft`。其余搜索参数仍
 是 Rust 内部 `SearchParams`，在对应 px0 option 层完整翻译前不伪造公开 UCI 选项。
 
+连续命令生命周期冒烟。按 px0 语义，前一条无限搜索被静默回收，只有最后一条 `go` 返回
+`bestmove`：
+
+```powershell
+@'
+uci
+setoption name WeightsFile value C:/projects/77xiangqi_engine/data/x7.onnx
+isready
+position startpos
+go infinite
+position startpos moves h2e2 h7e7
+go nodes 64
+wait
+quit
+'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+```
+
 `setoption` 示例：
 
 ```powershell

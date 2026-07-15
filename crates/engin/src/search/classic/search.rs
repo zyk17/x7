@@ -1141,7 +1141,9 @@ mod tests {
         {
             let mut meta = search.meta.lock().expect("meta lock");
             meta.params.minibatch_size = 4;
-            meta.params.task_workers_per_search_worker = 0;
+            meta.params.task_workers_per_search_worker = 1;
+            meta.params.minimum_work_size_for_processing = 2;
+            meta.params.minimum_work_per_task_for_processing = 1;
             meta.params.max_collision_visits = 4;
             meta.params.max_collision_visits_scaling_start = 0;
             meta.params.max_collision_visits_scaling_end = 1;

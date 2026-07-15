@@ -227,9 +227,10 @@ impl EngineController for ClassicEngine {
 
     fn set_uci_options(&mut self, options: &UciOptions) -> Result<(), EnginError> {
         self.uci_options = options.clone();
-        if let Some(search) = self.search.as_mut() {
-            Self::apply_uci_options(search, options)?;
-        }
+        // px0 snapshots `OptionsDict` into a new `SearchParams` only when a
+        // `Search` is constructed for `Go` (`search/classic/wrapper.cc:114-140`,
+        // `params.cc:688-703`). Do not abort a running search merely because a
+        // GUI changed an option; the next `go` applies this pending snapshot.
         Ok(())
     }
 
@@ -239,6 +240,11 @@ impl EngineController for ClassicEngine {
 
     fn new_game(&mut self) -> Result<(), EnginError> {
         if let Some(search) = self.search.as_mut() {
+            // px0 `ClassicSearch::NewGame` destroys its current `Search`
+            // (`src/search/classic/wrapper.cc:100-105`). Its destructor calls
+            // `Abort()` then `Wait()`, so an active infinite search cannot
+            // block `ucinewgame` forever.
+            search.abort_search()?;
             search.new_game()?;
         }
         self.set_position(STARTPOS_FEN, &[])
@@ -277,6 +283,14 @@ impl EngineController for ClassicEngine {
             responder.send_raw_response(&format!("info string cannot search: {reason}"));
             return Ok(());
         };
+        // px0 constructs a fresh `Search` for every `Go`
+        // (`src/search/classic/wrapper.cc:114-140`). Replacing its
+        // `unique_ptr` destroys the old search, which performs `Abort()` and
+        // `Wait()` (`search.cc:1055-1057`). This port keeps the long-lived
+        // ClassicSearch wrapper, so perform that lifecycle explicitly before
+        // resetting per-go state in `start_search`.
+        search.abort_search()?;
+        Self::apply_uci_options(search, &self.uci_options)?;
         search.start_search(params)?;
         Ok(())
     }
@@ -331,5 +345,65 @@ mod tests {
             .expect("display options must not replace an explicit test backend");
 
         assert!(engine.search().is_some());
+    }
+
+    #[test]
+    fn second_go_aborts_and_replaces_the_previous_search() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        let params = GoParams {
+            nodes: Some(8),
+            ..GoParams::default()
+        };
+
+        engine.go(&params, &mut responder).expect("first go");
+        engine.wait().expect("first wait");
+        let first_visits = engine.search().expect("search").total_root_visits();
+
+        engine.go(&params, &mut responder).expect("second go");
+        engine.wait().expect("second wait");
+        let second_visits = engine.search().expect("search").total_root_visits();
+
+        assert!(first_visits >= 8);
+        // The tree may be retained, trimmed, or reset by its search wrapper;
+        // only a fresh completed budget is a UCI lifecycle guarantee here.
+        assert!(second_visits >= 8);
+    }
+
+    #[test]
+    fn bare_go_initializes_startpos_before_searching() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        engine
+            .go(
+                &GoParams {
+                    nodes: Some(1),
+                    ..GoParams::default()
+                },
+                &mut responder,
+            )
+            .expect("bare go");
+        engine.wait().expect("wait");
+
+        assert!(engine.position.is_some());
+        assert!(engine.search().expect("search").total_root_visits() >= 1);
+    }
+
+    #[test]
+    fn new_game_aborts_an_infinite_search_before_resetting_the_tree() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        engine
+            .go(
+                &GoParams {
+                    infinite: true,
+                    ..GoParams::default()
+                },
+                &mut responder,
+            )
+            .expect("infinite go");
+
+        engine.new_game().expect("new game must abort the active search");
+        assert_eq!(engine.search().expect("search").total_root_visits(), 0);
     }
 }

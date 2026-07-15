@@ -14,8 +14,9 @@
 P4 尚未关闭。当前已接通真实 `124x10x9` ONNX backend、minibatch、NN cache、prefetch、
 collision、shared-tree search worker、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。
 此前 Rust 端把一个 `SearchWorker` 的可变状态错误地交给多个 task thread，已删除该不安全路径；
-因此 px0 的 task-worker 生命周期仍是 P4 未完成项。px0 共享一个 `SearchWorker`，但每个 task
-thread 独占一个 `TaskWorkspace`，并只在明确的 gathering/processing 阶段访问共享搜索状态。
+px0 task-worker 生命周期已按 scoped thread 翻译：每个 task thread 独占一个 `TaskWorkspace`，并只在
+明确的 gathering/processing tree phase 内访问共享搜索状态。受限 raw-pointer bridge 仅存在于这条
+px0 对照路径，完整约束见 `AGENTS.md`。
 
 主 UCI 使用 px0 名称 `WeightsFile` 配置 ONNX 权重，并会在下一条 `position` 前加载它。正式
 `ClassicEngine` 在权重成功加载前没有 `ClassicSearch`，不会以 `UniformBackend` 代替模型搜索。
@@ -26,6 +27,11 @@ thread 独占一个 `TaskWorkspace`，并只在明确的 gathering/processing �
 可配置的 `ContemptMode`/WDL calibration。`go nodes N` 是 px0 的 completed-iteration 下限，
 不承诺 root visits 严格等于 `N`。和 px0 一样，未先发送 `position` 的 `go` 会从 `startpos`
 初始化并加载默认权重；若权重不存在，返回明确的 `info string cannot search`。
+
+同一 UCI 会话的每次新 `go`、`position` 或 `ucinewgame` 都会先静默 `Abort + Wait` 上一次
+搜索，再启动或重置下一状态；因此 GUI 可以发送 `position -> go -> position -> go`，最后只会收到
+新搜索的 `bestmove`。这一生命周期对照 px0 `src/engine.cc:148-151,187-224` 与
+`src/search/classic/wrapper.cc:100-140`。
 
 ```text
 position startpos

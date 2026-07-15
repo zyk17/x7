@@ -44,9 +44,11 @@ stop 与真实 ONNX/DirectML 时序。
   tree phase 内访问普通 Node；`task_count=-1` 与 `exiting` 继续分开。
 - [x] 对照 `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334` 验证多 SearchWorker +
   task worker 的 tree phase、in-flight 与 counters；固定 visits 回归确认 root `NInFlight=0` 与
-  shared collision 已清空。OOO 的 task-worker 组合仍由真实 ONNX/DirectML 验收覆盖。
-- [ ] 在 DirectML/ONNX 下补固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...`、
-  backend reload 的回归；结束时 root `NInFlight=0`。
+  shared collision 已清空。OOO cache-hit 组合已启用 task worker 回归。
+- [x] 在 DirectML/ONNX 下完成固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...`、
+  backend reload 的 release UCI 冒烟。另验证 `go infinite -> go nodes` 与
+  `go infinite -> position ... -> go nodes`：旧搜索静默回收，只有最后一次 `go` 输出 `bestmove`。
+  对照 `src/engine.cc:148-224`、`src/search/classic/wrapper.cc:100-140`。
 
 ## 约束
 
