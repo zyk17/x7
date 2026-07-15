@@ -28,7 +28,7 @@ fn classic_engine_go_nodes_emits_bestmove() {
         "expected bestmove, got {:?}",
         responder.responses
     );
-    assert_eq!(engine.search().total_root_visits(), 8);
+    assert_eq!(engine.search().expect("uniform search").total_root_visits(), 8);
     let bestmove = responder
         .responses
         .iter()
@@ -49,7 +49,7 @@ fn classic_engine_movetime_runs_at_least_one_simulation() {
     uci.process_line("wait", "0.0.0").expect("wait");
     drop(uci);
 
-    assert!(engine.search().total_root_visits() >= 1);
+    assert!(engine.search().expect("uniform search").total_root_visits() >= 1);
     assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
 }
 
@@ -175,7 +175,7 @@ fn classic_engine_rejects_all_illegal_searchmoves() {
 fn unavailable_engine_does_not_return_uniform_bestmove() {
     ensure_init();
     let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::unavailable();
+    let mut engine = ClassicEngine::new();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
     uci.process_line("position startpos", "0.0.0").expect("position");
@@ -200,7 +200,7 @@ fn weights_file_enables_main_uci_onnx_search_if_local_x7_exists() {
         return;
     }
     let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::unavailable();
+    let mut engine = ClassicEngine::new();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
     uci.process_line(&format!("setoption name WeightsFile value {}", path.display()), "0.0.0")

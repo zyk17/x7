@@ -35,7 +35,7 @@ fn go_wtime_budget_emits_bestmove() {
     uci.process_line("position startpos", "0.0.0").expect("position");
     uci.process_line("go wtime 1000 winc 0", "0.0.0").expect("go wtime");
     drop(uci);
-    assert!(engine.search().total_root_visits() >= 1);
+    assert!(engine.search().expect("uniform search").total_root_visits() >= 1);
     assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
 }
 
@@ -55,7 +55,7 @@ fn position_replaces_an_infinite_search_without_racing_the_tree() {
         .expect("replace position");
     uci.process_line("go nodes 8", "0.0.0").expect("go nodes");
     drop(uci);
-    assert_eq!(engine.search().total_root_visits(), 8);
+    assert_eq!(engine.search().expect("uniform search").total_root_visits(), 8);
     assert_eq!(
         responder
             .responses

@@ -17,6 +17,10 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
 不创建搜索对象，不再用 `UniformBackend` 伪装可搜索状态。参考 px0
 `src/engine.cc:137-197,206-219` 与 `src/neural/shared_params.cc:43-80`。
 
+集成测试通过 `engine.search().expect(...)` 明确区分两类构造：`ClassicEngine::uniform()` 的测试
+后端必定有 search，正式 `ClassicEngine::new()` 则允许在权重未加载时没有 search。这样测试不会
+重新引入已废止的 `unavailable()` 占位构造，也不改变 px0 的延迟 backend 生命周期。
+
 ## P4 未完成：按 px0 重建 task-worker 生命周期
 
 此前的 Rust 实现把同一个可变 `SearchWorker` 借给 scoped task thread，导致 node index 越界和
