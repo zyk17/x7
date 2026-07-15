@@ -79,155 +79,10 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\expor
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test_policy_onnx_contract.py
 ```
 
-## 8. 引擎 ONNX 冒烟
+## 8. 当前引擎 UCI 冒烟
 
-```powershell
-cargo run --release -p engin -- --onnx-smoke data\x7.onnx
-```
-
-这条命令只验证最小推理链路，不代表 GUI 正式接入效果。
-
-## 8.1 UCI 使用正式 ONNX 权重
-
-`WeightsFile` 沿用 px0 的 UCI 名称，但本项目只接受 ONNX。权重会在下一条
-`position` 前加载：
-
-```powershell
-cargo run --release -p engin
-```
-
-```text
-uci
-setoption name WeightsFile value data/x7.onnx
-isready
-position startpos
-go nodes 1000
-```
-
-## 9. 独立 ONNX 局面评估
-
-说明：
-
-- 这是独立评估工具，不走 `engin` 主 UCI 入口
-- 同时输出：
-  - `policy_topk_legal`
-  - `wdl`
-  - `q`
-- 输入支持：
-  - 单行 `FEN`
-  - `position startpos moves ...`
-  - `position fen ... moves ...`
-
-单局面：
-
-```powershell
-cargo run --release -p engin --bin onnx_eval -- `
-  --onnx data\x7.onnx `
-  --fen "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1" `
-  --topk 8
-```
-
-批量文件：
-
-```powershell
-cargo run --release -p engin --bin onnx_eval -- `
-  --onnx data\x7.onnx `
-  --input data\eval_positions.txt `
-  --topk 8 `
-  --out data\eval_positions.ndjson
-```
-
-## 10. 引擎 bench
-
-bench CLI（与 [`main.rs`](crates/engin/src/main.rs) 一致）：
-
-- `--playouts N` — playout 上限
-- `--nodes N` — UCI nodes 口径上限（含复用树 initial_visits）
-- `--movetime MS` — 思考时间上限（毫秒）
-- `--cpuct F` — PUCT 强度
-- `--minibatch-size N` — gather batch（`0` = backend auto）
-- `--threads N` — 搜索线程（`0` = auto）
-- `--onnx PATH` / `--require-onnx` / `--fen FEN` / `--data-dir PATH`
-
-```powershell
-cargo run --release -p engin -- --bench --playouts 64 --onnx data\x7.onnx --require-onnx
-```
-
-固定 batch 对照：
-
-`MinibatchSize=16`
-
-```powershell
-cargo run --release -p engin -- --bench `
-  --onnx data\x7.onnx `
-  --require-onnx `
-  --movetime 2000 `
-  --minibatch-size 16
-```
-
-`MinibatchSize=32`
-
-```powershell
-cargo run --release -p engin -- --bench `
-  --onnx data\x7.onnx `
-  --require-onnx `
-  --movetime 2000 `
-  --minibatch-size 32
-```
-
-`MinibatchSize=64`
-
-```powershell
-cargo run --release -p engin -- --bench `
-  --onnx data\x7.onnx `
-  --require-onnx `
-  --movetime 2000 `
-  --minibatch-size 64
-```
-
-说明：
-
-- `nps` 这里按 `playouts / sec`（仅 completed playout，不含 collision / 未 backup 的 reservation）
-- UCI `nodes` 报告 `本轮 playouts + 复用树 initial_visits`（lc0 `VisitsStopper` 口径）
-- `go nodes N`：总 visits（含复用树）达到 N 时停止
-- `minibatch_size` 会写进输出 JSON，便于后续对照
-- `eval_cache.hits/misses` 使用 lookup 口径（可直接比较）
-- `eval_cache.miss_keys` 是去重后真实未命中 key 数（更接近实际 NN 负载）
-- `retry_without_playout`：预算未耗尽时 gather 返回 0 playout 的重试次数
-
-P2 root 访问分配 A/B（固定局面）建议：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\search_regression.ps1
-```
-
-重点对比输出里的：
-
-- `pv` 长度
-- `seldepth`
-- `root_moves[].visits` 分布
-
-## 11. px0 Fixed-Nodes 对拍记录
-
-这条命令分别运行本机 px0 二进制和本仓库 `engin`，为同一 FEN 和相同
-`go nodes` 采集原始 UCI transcript。它不比较 score：px0 当前读取 `pb.gz`，
-本仓库读取 ONNX，二者并非完全等价权重。重点人工对照 `nodes`、`depth`、
-`seldepth`、PV 与 `bestmove`。
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\compare_px0_trace.ps1 `
-  -Nodes 10000
-```
-
-默认写入被 Git 忽略的 `logs\trace\`。可传入不同 FEN：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\compare_px0_trace.ps1 `
-  -Nodes 10000 `
-  -Fen "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1"
-```
-
-## 12. 最小 UCI 联调
+当前引擎只提供正式 UCI stdin/stdout 入口；没有独立 ONNX evaluator、bench CLI 或 px0 trace
+对拍脚本。权重由 `WeightsFile` 在下一条 `position` 前加载。
 
 ```powershell
 @'
@@ -277,7 +132,7 @@ quit
 '@ | C:\projects\77xiangqi_engine\target\release\engin.exe
 ```
 
-## 13. 质量检查
+## 9. 质量检查
 
 ```powershell
 cargo check
