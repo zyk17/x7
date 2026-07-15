@@ -9,7 +9,6 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::Instant;
 
 use xiangqi_core::{GameResult, Move, MoveList, PositionHistory};
 
@@ -38,7 +37,6 @@ pub struct WorkerSearchState {
     pub current_best_edge: Mutex<Option<usize>>,
     pub total_playouts: AtomicU64,
     pub total_batches: AtomicU64,
-    pub first_batch: Mutex<Option<Instant>>,
     pub network_evaluations: AtomicU64,
     pub cum_depth: AtomicU64,
     pub max_depth: AtomicU16,
@@ -62,7 +60,6 @@ impl WorkerSearchState {
             current_best_edge: Mutex::new(None),
             total_playouts: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
-            first_batch: Mutex::new(None),
             network_evaluations: AtomicU64::new(0),
             cum_depth: AtomicU64::new(0),
             max_depth: AtomicU16::new(0),
@@ -75,13 +72,6 @@ impl WorkerSearchState {
 
     pub fn set_remaining_playouts(&self, value: i64) {
         self.remaining_playouts.store(value.max(0) as u64, Ordering::Release);
-    }
-
-    fn record_first_batch(&self) {
-        let mut first_batch = self.first_batch.lock().expect("first batch lock");
-        if first_batch.is_none() {
-            *first_batch = Some(Instant::now());
-        }
     }
 
     /// px0 initializes `pending_searchers_` on every `StartSearch`
@@ -1878,7 +1868,6 @@ impl<'a> SearchWorker<'a> {
         if work_done {
             self.cancel_shared_collisions();
             self.search_state.total_batches.fetch_add(1, Ordering::AcqRel);
-            self.search_state.record_first_batch();
         }
         Ok(())
     }
@@ -2083,13 +2072,14 @@ impl<'a> SearchWorker<'a> {
         // timing origin for the same reason as its UCI NPS field.
         if self.params.nps_limit > 0.0 {
             while !self.search_state.stop.load(Ordering::Acquire) {
+                // px0 obtains this through Search::GetTimeSinceFirstBatch,
+                // falling back to move-start before the watchdog has
+                // initialized `nps_start_time_`
+                // (`src/search/classic/search.cc:1213-1231`).
                 let elapsed_ms = self
-                    .search_state
-                    .first_batch
-                    .lock()
-                    .expect("first batch lock")
-                    .map(|started| started.elapsed().as_millis() as f32)
-                    .unwrap_or(0.0);
+                    .stop_controller
+                    .as_ref()
+                    .map_or(0.0, |controller| controller.nps_elapsed_or_move_start_ms() as f32);
                 if elapsed_ms <= 0.0 {
                     break;
                 }

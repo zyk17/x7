@@ -362,6 +362,10 @@ pub struct SearchOutput {
 struct SearchMeta {
     params: SearchParams,
     move_start: Instant,
+    /// px0 `Search::nps_start_time_` (`src/search/classic/search.h:185-186`).
+    /// The watchdog initializes it after the first completed playout, rather
+    /// than at worker or backend creation time.
+    nps_start_time: Option<Instant>,
     initial_visits: u32,
     stoppers_hints: StoppersHints,
     search_active: bool,
@@ -398,15 +402,20 @@ pub(crate) struct SearchStopController {
 }
 
 impl SearchStopController {
-    fn populate_iteration_stats(meta: &SearchMeta, worker_state: &WorkerSearchState) -> IterationStats {
+    fn populate_iteration_stats(meta: &mut SearchMeta, worker_state: &WorkerSearchState) -> IterationStats {
         let total_playouts = worker_state.total_playouts.load(Ordering::Acquire) as i64;
+        let time_since_first_batch = meta
+            .nps_start_time
+            .map_or(0, |started| started.elapsed().as_millis() as i64);
+        // px0 initializes `nps_start_time_` only after assembling the current
+        // stats, so this first observation still reports zero elapsed time
+        // (`src/search/classic/search.cc:908-918`).
+        if meta.nps_start_time.is_none() && total_playouts > 0 {
+            meta.nps_start_time = Some(Instant::now());
+        }
         IterationStats {
             time_since_movestart: meta.move_start.elapsed().as_millis() as i64,
-            time_since_first_batch: worker_state
-                .first_batch
-                .lock()
-                .expect("first batch lock")
-                .map_or(0, |first_batch| first_batch.elapsed().as_millis() as i64),
+            time_since_first_batch,
             // px0 keeps the tree-reuse visits in `total_nodes`, while the
             // current-search budget sees only newly completed playouts
             // (`src/search/classic/search.cc:908-922`).
@@ -426,8 +435,8 @@ impl SearchStopController {
 
     pub(crate) fn maybe_trigger_stop(&self, worker_state: &WorkerSearchState) -> bool {
         let stats = {
-            let meta = self.meta.lock().expect("meta lock");
-            Self::populate_iteration_stats(&meta, worker_state)
+            let mut meta = self.meta.lock().expect("meta lock");
+            Self::populate_iteration_stats(&mut meta, worker_state)
         };
         let mut stopper_guard = self.stopper.lock().expect("stopper lock");
         let Some(stopper) = stopper_guard.as_mut() else {
@@ -447,6 +456,17 @@ impl SearchStopController {
             self.watchdog_cv.notify_all();
         }
         should_stop
+    }
+
+    /// px0's `GetTimeSinceFirstBatch` with the `GetTimeSinceStart` fallback
+    /// used by `NodesPerSecondLimit` (`src/search/classic/search.cc:393-398,
+    /// 1213-1231`).
+    pub(crate) fn nps_elapsed_or_move_start_ms(&self) -> i64 {
+        let meta = self.meta.lock().expect("meta lock");
+        meta.nps_start_time.map_or_else(
+            || meta.move_start.elapsed().as_millis() as i64,
+            |started| started.elapsed().as_millis() as i64,
+        )
     }
 }
 
@@ -482,6 +502,7 @@ impl ClassicSearch {
         let meta = Arc::new(Mutex::new(SearchMeta {
             params: SearchParams::default(),
             move_start: Instant::now(),
+            nps_start_time: None,
             initial_visits: 0,
             stoppers_hints: StoppersHints::default(),
             search_active: false,
@@ -611,8 +632,7 @@ impl ClassicSearch {
         }
         let elapsed = meta.move_start.elapsed();
         let total_playouts = worker_state.total_playouts.load(Ordering::Acquire);
-        let first_batch = *worker_state.first_batch.lock().expect("first batch lock");
-        let nps = first_batch.and_then(|started| {
+        let nps = meta.nps_start_time.and_then(|started| {
             let elapsed_ms = started.elapsed().as_millis() as u64;
             (elapsed_ms > 0).then(|| (total_playouts.saturating_mul(1000) / elapsed_ms) as i32)
         });
@@ -670,7 +690,11 @@ impl ClassicSearch {
                 nps: nps.unwrap_or(-1),
                 eps: nps.map_or(-1, |_| {
                     let evaluations = worker_state.network_evaluations.load(Ordering::Acquire);
-                    let elapsed_ms = first_batch.expect("nps needs first batch").elapsed().as_millis() as u64;
+                    let elapsed_ms = meta
+                        .nps_start_time
+                        .expect("nps needs nps start time")
+                        .elapsed()
+                        .as_millis() as u64;
                     (evaluations.saturating_mul(1000) / elapsed_ms) as i32
                 }),
                 mate,
@@ -900,7 +924,7 @@ impl SearchBase for ClassicSearch {
                 tree.history().is_black_to_move(),
                 params.ponder,
             );
-            *self.worker_state.first_batch.lock().expect("first batch lock") = None;
+            meta.nps_start_time = None;
             meta.stoppers_hints.reset();
             self.worker_state.total_playouts.store(0, Ordering::Release);
             self.worker_state.total_batches.store(0, Ordering::Release);
@@ -1186,9 +1210,10 @@ mod tests {
     /// (`src/search/classic/search.cc:908-922`).
     #[test]
     fn iteration_stats_include_reused_root_visits() {
-        let meta = super::SearchMeta {
+        let mut meta = super::SearchMeta {
             params: SearchParams::default(),
             move_start: std::time::Instant::now(),
+            nps_start_time: None,
             initial_visits: 17,
             stoppers_hints: super::StoppersHints::default(),
             search_active: true,
@@ -1200,10 +1225,11 @@ mod tests {
             .total_playouts
             .store(5, std::sync::atomic::Ordering::Release);
 
-        let stats = super::SearchStopController::populate_iteration_stats(&meta, &worker_state);
+        let stats = super::SearchStopController::populate_iteration_stats(&mut meta, &worker_state);
 
         assert_eq!(stats.total_nodes, 22);
         assert_eq!(stats.nodes_since_movestart, 5);
+        assert!(meta.nps_start_time.is_some());
     }
 
     #[test]

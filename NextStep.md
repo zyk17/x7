@@ -36,6 +36,11 @@ watchdog 已按 px0 `Search::WatchdogThread` / `FireStopInternal` 的等待边�
 `estimated_remaining_time_ms` 限制为 `1..=100ms`。参考
 `src/search/classic/search.cc:981-1034`。这只替换固定 1ms polling，不改变时间分配或 stopper 策略。
 
+`nps_start_time` 同样归 watchdog/controller 所有：首次观测到完成 playout 后才开始计时，UCI
+`nps/eps` 与 `NodesPerSecondLimit` 都使用该时钟；在时钟尚未建立时，限速回退到 move-start。参考
+`src/search/classic/search.cc:249-264,393-398,908-918,1213-1231`。不再由 worker 在首个 backend
+batch 回写时私自设定时间原点。
+
 已对齐 tree reuse 的 stopper 统计：`total_nodes` 必须是本轮 `total_playouts + initial_visits`，而
 `nodes_since_movestart` 只统计本轮 playouts。参考 px0 `search.cc:908-922`。
 

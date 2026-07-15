@@ -23,6 +23,8 @@
 
 - [x] 按 `src/search/classic/search.cc:981-1034` 翻译 watchdog 的 counters-mutex/condition-variable
   等待与 `FireStopInternal` 唤醒；不再固定 1ms polling。
+- [x] 按 `src/search/classic/search.cc:249-264,393-398,908-918,1213-1231` 翻译
+  `nps_start_time_` 的 watchdog 初始化、UCI nps/eps 与 NPS limit 时钟归属。
 
 - [x] 按 `src/search/classic/search.h:435-445`、`search.cc:1069-1119,1464-1483` 翻译
   `task_taking_started`、claim、idle、wake、close 与重用；已补多线程唯一领取回归。
