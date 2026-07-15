@@ -10,7 +10,7 @@ Set-Location C:\projects\77xiangqi_engine
 
 - Kaggle 数据集：`pikacat/px0data`
 - 本地目录：`C:\work\px0data\{version}\`
-- 训练入口：`nn\scripts\train\train_px0.py --px0-version <version>`
+- 训练入口：`nn\scripts\train\train_px0.py --config nn\configs\<name>.yaml`
 - 如果本地已有 `training.*.gz`，直接复用
 - 如果只有 `archive.zip` / `data.bin`，自动解压整理
 - 如果目录为空，自动从 Kaggle 下载
@@ -18,109 +18,44 @@ Set-Location C:\projects\77xiangqi_engine
 ## 1. 首次准备环境
 
 ```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install kagglehub
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install -e "nn[train,dev]"
 ```
 
-## 2. 检查某个 px0 版本是否可读
+这会安装 PyTorch、ONNX、Kaggle、PyYAML、pytest 和 ruff。配置要求 `training.device: cuda` 时，
+训练不会静默降级到 CPU；只有写为 `auto` 才允许回退。
 
-```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\inspect_px0.py `
-  --px0-version 710 `
-  --max-files 8 `
-  --max-samples 256
-```
-
-## 3. 直接训练指定版本
+## 2. 用 YAML 训练
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --px0-version 710 `
-  --out data\checkpoints\x7_qmix_000_01.pt `
-  --width 160 `
-  --blocks 10 `
-  --batch-size 256 `
-  --steps 200000 `
-  --eval-every 1000 `
-  --val-batches 32 `
-  --num-workers 4 `
-  --device cuda `
-  --q-ratio 0.0
+  --config nn\configs\x7_qmix_075_01.yaml
 ```
 
-## 4. 继续训练
+配置分为 `dataset`、`model`、`training` 三段，格式参考
+`C:\Users\Administrator\projects\pxzero-training\tf\configs\example.yaml`，但只保留当前 PyTorch/PX0
+主线需要的字段。`124x10x9 -> 2062 + WDL`、纯 CNN trunk 与 loss 语义固定，不能通过配置切换。
+所有可配置字段、默认值与注释见 [nn/configs/example.yaml](C:/projects/77xiangqi_engine/nn/configs/example.yaml)。
 
-```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --px0-version 710 `
-  --out data\checkpoints\x7_qmix_000_01.pt `
-  --width 160 `
-  --blocks 10 `
-  --batch-size 256 `
-  --steps 200000 `
-  --eval-every 1000 `
-  --val-batches 32 `
-  --num-workers 4 `
-  --device cuda `
-  --q-ratio 0.0
-```
+## 3. 继续训练
 
-说明：
+再次运行同一条 YAML 命令即可。`training.out` 已存在时自动恢复；只需把 YAML 中的
+`training.steps` 调大。
 
-- `--out` 文件已存在时，脚本默认自动续训
-- 不需要再传 `--resume`
+## 4. 开启新阶段训练（从旧权重起步）
 
-## 5. 开启新阶段训练（从旧权重起步）
-
+复制 YAML，修改 `name`、`training.out`、`training.init_from`、`training.q_ratio` 和 `training.steps`。
 例如先用 `q_ratio=0.0` 训出第一阶段，再切到新的 `q_ratio`：
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --px0-version 710 `
-  --init-from data\checkpoints\x7_qmix_075_01.best.pt `
-  --out data\checkpoints\x7_qmix_025_01.pt `
-  --width 160 `
-  --blocks 10 `
-  --batch-size 256 `
-  --steps 30000 `
-  --eval-every 1000 `
-  --val-batches 32 `
-  --num-workers 4 `
-  --device cuda `
-  --q-ratio 0.25
+  --config nn\configs\x7_qmix_025_01.yaml
 ```
 
-## 6. 强制重下并重建某个版本
+## 5. 强制重下并重建某个版本
 
-```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --px0-version 710 `
-  --px0-force-download `
-  --out data\checkpoints\x7_qmix_000_01.pt `
-  --width 160 `
-  --blocks 10 `
-  --batch-size 256 `
-  --steps 200000 `
-  --eval-every 1000 `
-  --val-batches 32 `
-  --num-workers 4 `
-  --device cuda `
-  --q-ratio 0.0
-```
+把 YAML 的 `dataset.force_download` 改为 `true` 后，运行第 2 节命令；完成后改回 `false`。
 
-## 7. 如果你确实要手动生成 train/val manifest
-
-训练主线不需要这一步；只有想固定文件切分时才用：
-
-```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\split_px0_files.py `
-  --px0-version 710 `
-  --out-train data\rounds\px0_train_v1.json `
-  --out-val data\rounds\px0_val_v1.json `
-  --val-ratio 0.1 `
-  --seed 42
-```
-
-## 8. 导出 best checkpoint 为 ONNX
+## 6. 导出 best checkpoint 为 ONNX
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
@@ -138,13 +73,13 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\expor
 - `q_ratio=0.0` 表示纯最终结果监督
 - `q_ratio=1.0` 表示纯搜索监督
 
-## 9. 检查 ONNX 合约
+## 7. 检查 ONNX 合约
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test_policy_onnx_contract.py
 ```
 
-## 10. 引擎 ONNX 冒烟
+## 8. 引擎 ONNX 冒烟
 
 ```powershell
 cargo run --release -p engin -- --onnx-smoke data\x7.onnx
@@ -152,7 +87,7 @@ cargo run --release -p engin -- --onnx-smoke data\x7.onnx
 
 这条命令只验证最小推理链路，不代表 GUI 正式接入效果。
 
-## 10.1 UCI 使用正式 ONNX 权重
+## 8.1 UCI 使用正式 ONNX 权重
 
 `WeightsFile` 沿用 px0 的 UCI 名称，但本项目只接受 ONNX。权重会在下一条
 `position` 前加载：
@@ -169,7 +104,7 @@ position startpos
 go nodes 1000
 ```
 
-## 11. 独立 ONNX 局面评估
+## 9. 独立 ONNX 局面评估
 
 说明：
 
@@ -202,7 +137,7 @@ cargo run --release -p engin --bin onnx_eval -- `
   --out data\eval_positions.ndjson
 ```
 
-## 12. 引擎 bench
+## 10. 引擎 bench
 
 bench CLI（与 [`main.rs`](crates/engin/src/main.rs) 一致）：
 
@@ -272,7 +207,7 @@ powershell -ExecutionPolicy Bypass -File scripts\search_regression.ps1
 - `seldepth`
 - `root_moves[].visits` 分布
 
-## 13. px0 Fixed-Nodes 对拍记录
+## 11. px0 Fixed-Nodes 对拍记录
 
 这条命令分别运行本机 px0 二进制和本仓库 `engin`，为同一 FEN 和相同
 `go nodes` 采集原始 UCI transcript。它不比较 score：px0 当前读取 `pb.gz`，
@@ -292,7 +227,7 @@ powershell -ExecutionPolicy Bypass -File scripts\compare_px0_trace.ps1 `
   -Fen "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1"
 ```
 
-## 14. 最小 UCI 联调
+## 12. 最小 UCI 联调
 
 ```powershell
 @'
@@ -342,7 +277,7 @@ quit
 '@ | C:\projects\77xiangqi_engine\target\release\engin.exe
 ```
 
-## 15. 质量检查
+## 13. 质量检查
 
 ```powershell
 cargo check

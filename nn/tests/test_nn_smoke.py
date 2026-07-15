@@ -15,11 +15,18 @@ from nn import (
     moves_left_loss,
     policy_cross_entropy,
     policy_kld_to_weight,
-    value_q_mse_from_scalar,
+    value_q_mse_from_wdl,
     value_wdl_cross_entropy,
     visits_to_sample_weight,
     wdl_logits_to_q,
 )
+from nn.model import _load_move_vocab
+
+
+def test_policy_vocab_is_packaged_with_python_module():
+    moves = _load_move_vocab()
+    assert len(moves) == 2062
+    assert moves[0] == "a0a1"
 
 
 def test_px0_contract_shape():
@@ -89,17 +96,17 @@ def test_soft_policy_cross_entropy_masks_px0_illegal_minus_one_targets():
     assert loss.ndim == 0 and torch.isfinite(loss)
 
 
-def test_mix_wdl_targets_uses_lc0_q_ratio_semantics():
+def test_mix_wdl_targets_uses_fixed_q_ratio_semantics():
     winner = torch.tensor([[0.2, 0.3, 0.5]], dtype=torch.float32)
     search = torch.tensor([[0.7, 0.1, 0.2]], dtype=torch.float32)
     assert torch.equal(mix_wdl_targets(winner, search, q_ratio=0.0), winner)
     assert torch.equal(mix_wdl_targets(winner, search, q_ratio=1.0), search)
 
 
-def test_aux_weights_and_scalar_q_loss_are_finite():
+def test_aux_weights_and_wdl_q_loss_are_finite():
     value_logits = torch.tensor([[0.2, -0.1, 0.0]], dtype=torch.float32)
     tgt_q = torch.tensor([[0.4]], dtype=torch.float32)
     sample_weight = visits_to_sample_weight(torch.tensor([[128.0]], dtype=torch.float32))
     sample_weight = sample_weight * policy_kld_to_weight(torch.tensor([[0.7]], dtype=torch.float32))
-    loss = value_q_mse_from_scalar(value_logits, tgt_q, sample_weight=sample_weight)
+    loss = value_q_mse_from_wdl(value_logits, tgt_q, sample_weight=sample_weight)
     assert loss.ndim == 0 and torch.isfinite(loss)

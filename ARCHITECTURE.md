@@ -23,7 +23,7 @@
 
 `crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。P2 UCI、P3 tree 与 P4 的 ONNX、collision、prefetch、task-worker、多 SearchWorker tree phase、watchdog 和 WDL display 已接入。`WeightsFile` 保持 px0 的 UCI 名称，但只接受本项目 ONNX 模型，不实现 px0 的 backend registry、protobuf weight 或 autodiscover。P4 的 `SendUciInfo` 已生成深度、NPS/EPS、WDL、PV、MultiPV、ScoreType 与完整 WDL calibration display 语义。
 
-`nn/`：pxzero-training 数据/训练/导出契约的 Rust/Python 侧接入；不进入规则或搜索热路径。
+`nn/`：pxzero-training 的 `dataset / model / training` 配置布局为参考的独立 Python 训练子项目；训练从单一 YAML 启动，固定 `124x10x9 -> 2062 + WDL` 的纯 CNN 契约，不进入规则或搜索热路径。
 
 ## 翻译纪律
 

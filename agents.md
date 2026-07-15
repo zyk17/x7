@@ -24,7 +24,9 @@
 ## 模块边界
 
 - `crates/xiangqi_core`：翻译 px0 `src/chess`。
-- `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2 已完成，P3 只有搜索骨架。
+- `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2/P3 已完成，P4 的 ONNX、单/多
+  `SearchWorker`、minibatch、cache、prefetch、collision 与 shared-tree 子集已接入。task-worker 的
+  独占生命周期仍未完成，唯一准确状态以 `NextStep.md`、`TODO.md` 为准。
 - `nn/`：对齐 pxzero-training 的数据、训练和导出。
 
 不要引入：

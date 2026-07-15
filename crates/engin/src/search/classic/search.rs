@@ -212,11 +212,11 @@ fn score_from_wdl(
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum BestEdgeRank {
-    TerminalLoss,
-    TablebaseLoss,
     NonTerminal,
-    TablebaseWin,
     TerminalWin,
+    TerminalLoss,
+    TablebaseWin,
+    TablebaseLoss,
 }
 
 fn draw_score(tree: &NodeTree, params: &SearchParams, is_odd_depth: bool) -> f32 {
@@ -350,356 +350,6 @@ fn best_child_edge_is_better(
         candidate.expect("winning candidate").m() < current.expect("winning current").m()
     } else {
         candidate.expect("losing candidate").m() > current.expect("losing current").m()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Once;
-
-    use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
-
-    use super::{
-        best_child_edge, best_move, orient_move, resolve_contempt_mode, score_from_wdl, wdl_from_wl_d, wdl_rescale,
-        ContemptMode, ScoreType, SearchParams, WdlDisplayContext,
-    };
-    use crate::neural::backend::{
-        Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, UniformBackend,
-    };
-    use crate::search::classic::node::NodeTree;
-    use crate::search::SearchBase;
-    use crate::EnginError;
-
-    static INIT: Once = Once::new();
-
-    fn ensure_init() {
-        INIT.call_once(initialize_magic_bitboards);
-    }
-
-    /// Deterministic backend used to exercise px0's multi-SearchWorker
-    /// lifecycle without making the test depend on an installed ONNX runtime.
-    #[derive(Clone, Debug, Default)]
-    struct ParallelUniformBackend(UniformBackend);
-
-    impl Backend for ParallelUniformBackend {
-        fn evaluate(&self, history: &xiangqi_core::PositionHistory, legal_moves: &[xiangqi_core::Move]) -> EvalResult {
-            self.0.evaluate(history, legal_moves)
-        }
-
-        fn attributes(&self) -> BackendAttributes {
-            BackendAttributes {
-                runs_on_cpu: false,
-                suggested_num_search_threads: 2,
-                recommended_batch_size: 4,
-                maximum_batch_size: 4,
-                ..BackendAttributes::default()
-            }
-        }
-
-        fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
-            self.0.create_computation()
-        }
-
-        fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
-            self.0.cached_evaluation(position)
-        }
-    }
-
-    impl ParallelUniformBackend {
-        /// Seeds px0's NN-cache equivalent so concurrent workers exercise the
-        /// `AddInput -> FetchedImmediately -> OOO backup` path.
-        fn seed_cache(&self, position: &EvalPosition) {
-            let history = xiangqi_core::PositionHistory::from_positions(position.positions.clone());
-            self.0
-                .store_cache(position, self.0.evaluate(&history, &position.legal_moves));
-        }
-    }
-
-    /// px0 `StartThreads` keeps several search workers alive while each only
-    /// locks tree phases (`search.cc:1088-1140,1142-1211`).
-    #[test]
-    fn shared_tree_allows_two_search_workers() {
-        ensure_init();
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
-        search.set_position(&state).expect("position");
-        // This test isolates the shared SearchWorker tree boundary. Task
-        // workers have a separate lifecycle test in worker.rs.
-        search
-            .meta
-            .lock()
-            .expect("meta lock")
-            .params
-            .task_workers_per_search_worker = 0;
-
-        let (best, visits) = search.run_blocking_nodes(32);
-
-        assert!(!best.is_null());
-        assert!(visits >= 32);
-        assert_eq!(
-            search
-                .worker_state
-                .thread_count
-                .load(std::sync::atomic::Ordering::Acquire),
-            3
-        );
-    }
-
-    /// px0 allows the task-worker pipeline to run inside each SearchWorker
-    /// while other workers overlap NN computation (`search.cc:1088-1211,
-    /// 1322-1347,1494-1508,1828-1864`). Keep this bounded stress regression
-    /// on the shared-tree phase boundary.
-    #[test]
-    fn shared_tree_combines_search_and_task_workers() {
-        ensure_init();
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
-        search.set_position(&state).expect("position");
-        {
-            let mut meta = search.meta.lock().expect("meta lock");
-            meta.params.minibatch_size = 32;
-            meta.params.task_workers_per_search_worker = 1;
-            meta.params.max_collision_visits = 4;
-            meta.params.max_collision_visits_scaling_start = 0;
-            meta.params.max_collision_visits_scaling_end = 1;
-            meta.params.minimum_work_size_for_processing = 2;
-            meta.params.minimum_work_per_task_for_processing = 1;
-            meta.params.solid_tree_threshold = 1;
-        }
-
-        let (best, visits) = search.run_blocking_nodes(64);
-
-        assert!(!best.is_null());
-        assert!(visits >= 64);
-        let tree = search.tree.read().expect("tree lock");
-        let root = tree.current_head();
-        assert!(tree.node(root).has_solid_children());
-        assert_eq!(tree.node(root).n_in_flight(), 0);
-    }
-
-    /// px0 publishes cache-hit out-of-order results during gather, while other
-    /// SearchWorkers can continue their independent tree phases
-    /// (`search.cc:1268-1419,1977-1987,2109-2173`). The shared collision list
-    /// must be drained by backup and leave no root reservation behind.
-    #[test]
-    fn shared_workers_reconcile_out_of_order_cache_hits() {
-        ensure_init();
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let backend = ParallelUniformBackend::default();
-        let mut search = super::ClassicSearch::new(Box::new(backend.clone()));
-        search.set_position(&state).expect("position");
-        {
-            let tree = search.tree.read().expect("tree lock");
-            let history = tree.history();
-            backend.seed_cache(&EvalPosition {
-                positions: history.positions().to_vec(),
-                legal_moves: history.last().board().generate_legal_moves(),
-            });
-        }
-        {
-            let mut meta = search.meta.lock().expect("meta lock");
-            meta.params.minibatch_size = 4;
-            meta.params.task_workers_per_search_worker = 0;
-            meta.params.max_collision_visits = 4;
-            meta.params.max_collision_visits_scaling_start = 0;
-            meta.params.max_collision_visits_scaling_end = 1;
-        }
-
-        let (best, visits) = search.run_blocking_nodes(64);
-
-        assert!(!best.is_null());
-        assert!(visits >= 64);
-        assert!(
-            search
-                .worker_state
-                .total_batches
-                .load(std::sync::atomic::Ordering::Acquire)
-                > 0
-        );
-        assert!(
-            search
-                .worker_state
-                .total_playouts
-                .load(std::sync::atomic::Ordering::Acquire)
-                >= u64::from(visits)
-        );
-        let tree = search.tree.read().expect("tree lock");
-        assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
-        assert!(search
-            .worker_state
-            .shared_collisions
-            .lock()
-            .expect("collisions lock")
-            .is_empty());
-    }
-
-    /// px0 `DoBackupUpdateSingleNode` may solidify root while other search
-    /// workers continue selection (`search.cc:2211-2217`, `node.cc:245-288`).
-    /// The Rust arena must keep every solid child slot selectable without
-    /// producing an in-flight leak or a duplicate expansion.
-    #[test]
-    fn shared_workers_continue_through_root_solidification() {
-        ensure_init();
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
-        search.set_position(&state).expect("position");
-        {
-            let mut meta = search.meta.lock().expect("meta lock");
-            meta.params.task_workers_per_search_worker = 0;
-            meta.params.solid_tree_threshold = 1;
-        }
-
-        let (best, visits) = search.run_blocking_nodes(64);
-
-        assert!(!best.is_null());
-        assert!(visits >= 64);
-        let tree = search.tree.read().expect("tree lock");
-        let root = tree.current_head();
-        assert!(tree.node(root).has_solid_children());
-        assert_eq!(tree.node(root).n_in_flight(), 0);
-    }
-
-    #[test]
-    fn best_child_uses_prior_until_a_child_has_more_visits() {
-        ensure_init();
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let mut tree = NodeTree::default();
-        tree.reset_to_position(&state.startpos, &state.moves);
-        let root = tree.current_head();
-        let moves = state.startpos.board().generate_legal_moves();
-        tree.node_mut(root).create_edges(&moves[..2].to_vec());
-        tree.node_mut(root).edge_mut(0).set_p(0.2);
-        tree.node_mut(root).edge_mut(1).set_p(0.8);
-        assert!(tree.node_mut(root).try_start_score_update());
-        tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
-        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0, &[]), Some(1));
-
-        let child = tree.arena_mut().spawn_child(root, 0);
-        assert!(tree.node_mut(child).try_start_score_update());
-        tree.node_mut(child).finalize_score_update(0.0, 0.0, 0.0, 1);
-        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0, &[]), Some(0));
-    }
-
-    #[test]
-    fn root_filter_applies_before_the_root_has_visits() {
-        ensure_init();
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let mut tree = NodeTree::default();
-        tree.reset_to_position(&state.startpos, &state.moves);
-        let allowed = state.startpos.board().parse_move("a0a1").expect("legal root move");
-
-        assert_eq!(best_move(&tree, &SearchParams::default(), &[allowed]).0, allowed);
-    }
-
-    #[test]
-    fn move_orientation_keeps_px0_null_ponder_null() {
-        assert!(orient_move(xiangqi_core::Move::NULL, true).is_null());
-    }
-
-    #[test]
-    fn wdl_integerization_matches_px0_send_uci_info() {
-        assert_eq!(
-            wdl_from_wl_d(0.1, 0.2),
-            crate::callbacks::Wdl { w: 450, d: 200, l: 350 }
-        );
-    }
-
-    /// px0 `WDLRescale` keeps a valid WDL distribution within its numerical
-    /// guards (`src/search/classic/search.cc:202-236`).
-    #[test]
-    fn wdl_rescale_keeps_valid_distribution() {
-        let mut wl = 0.2;
-        let mut d = 0.4;
-        let mu = wdl_rescale(&mut wl, &mut d, 1.0, 0.0, 1.0, true, 10.0);
-        assert!(mu.is_finite());
-        assert!(wl.is_finite() && d.is_finite());
-        assert!((-1.0..=1.0).contains(&wl));
-        assert!((0.0..=1.0).contains(&d));
-    }
-
-    #[test]
-    fn play_contempt_resolves_like_px0_start_search() {
-        assert_eq!(
-            resolve_contempt_mode(ContemptMode::Play, true, false, false),
-            ContemptMode::None
-        );
-        assert_eq!(
-            resolve_contempt_mode(ContemptMode::Play, false, false, false),
-            ContemptMode::White
-        );
-        assert_eq!(
-            resolve_contempt_mode(ContemptMode::Play, false, true, false),
-            ContemptMode::Black
-        );
-        assert_eq!(
-            resolve_contempt_mode(ContemptMode::Play, false, false, true),
-            ContemptMode::Black
-        );
-    }
-
-    #[test]
-    fn score_type_q_matches_px0_scaled_q() {
-        let mut wl = 0.1;
-        let mut d = 0.2;
-        assert_eq!(
-            score_from_wdl(
-                ScoreType::Q,
-                &mut wl,
-                &mut d,
-                0.1234,
-                true,
-                WdlDisplayContext {
-                    params: &SearchParams::default(),
-                    contempt_mode: ContemptMode::None,
-                    root_is_black: false,
-                },
-            ),
-            1234
-        );
-    }
-
-    /// px0 applies `WDLEvalObjectivity` only to the display-side contempt
-    /// diff, after the search-side WDL was already backed up
-    /// (`src/search/classic/search.cc:279-291`).
-    #[test]
-    fn wdl_eval_objectivity_controls_display_contempt_only() {
-        let mut params = SearchParams {
-            wdl_rescale_diff: 0.2,
-            ..SearchParams::default()
-        };
-        let mut subjective_wl = 0.1;
-        let mut subjective_d = 0.4;
-        score_from_wdl(
-            ScoreType::Q,
-            &mut subjective_wl,
-            &mut subjective_d,
-            0.0,
-            true,
-            WdlDisplayContext {
-                params: &params,
-                contempt_mode: ContemptMode::White,
-                root_is_black: false,
-            },
-        );
-
-        params.wdl_eval_objectivity = 0.0;
-        let mut objective_wl = 0.1;
-        let mut objective_d = 0.4;
-        score_from_wdl(
-            ScoreType::Q,
-            &mut objective_wl,
-            &mut objective_d,
-            0.0,
-            true,
-            WdlDisplayContext {
-                params: &params,
-                contempt_mode: ContemptMode::White,
-                root_is_black: false,
-            },
-        );
-
-        assert_ne!(subjective_wl, objective_wl);
-        assert_ne!(subjective_d, objective_d);
     }
 }
 
@@ -1286,5 +936,355 @@ impl SearchBase for ClassicSearch {
         self.bestmove_is_sent.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
         self.wait_search()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Once;
+
+    use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
+
+    use super::{
+        best_child_edge, best_move, orient_move, resolve_contempt_mode, score_from_wdl, wdl_from_wl_d, wdl_rescale,
+        ContemptMode, ScoreType, SearchParams, WdlDisplayContext,
+    };
+    use crate::neural::backend::{
+        Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, UniformBackend,
+    };
+    use crate::search::classic::node::NodeTree;
+    use crate::search::SearchBase;
+    use crate::EnginError;
+
+    static INIT: Once = Once::new();
+
+    fn ensure_init() {
+        INIT.call_once(initialize_magic_bitboards);
+    }
+
+    /// Deterministic backend used to exercise px0's multi-SearchWorker
+    /// lifecycle without making the test depend on an installed ONNX runtime.
+    #[derive(Clone, Debug, Default)]
+    struct ParallelUniformBackend(UniformBackend);
+
+    impl Backend for ParallelUniformBackend {
+        fn evaluate(&self, history: &xiangqi_core::PositionHistory, legal_moves: &[xiangqi_core::Move]) -> EvalResult {
+            self.0.evaluate(history, legal_moves)
+        }
+
+        fn attributes(&self) -> BackendAttributes {
+            BackendAttributes {
+                runs_on_cpu: false,
+                suggested_num_search_threads: 2,
+                recommended_batch_size: 4,
+                maximum_batch_size: 4,
+                ..BackendAttributes::default()
+            }
+        }
+
+        fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
+            self.0.create_computation()
+        }
+
+        fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
+            self.0.cached_evaluation(position)
+        }
+    }
+
+    impl ParallelUniformBackend {
+        /// Seeds px0's NN-cache equivalent so concurrent workers exercise the
+        /// `AddInput -> FetchedImmediately -> OOO backup` path.
+        fn seed_cache(&self, position: &EvalPosition) {
+            let history = xiangqi_core::PositionHistory::from_positions(position.positions.clone());
+            self.0
+                .store_cache(position, self.0.evaluate(&history, &position.legal_moves));
+        }
+    }
+
+    /// px0 `StartThreads` keeps several search workers alive while each only
+    /// locks tree phases (`search.cc:1088-1140,1142-1211`).
+    #[test]
+    fn shared_tree_allows_two_search_workers() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
+        search.set_position(&state).expect("position");
+        // This test isolates the shared SearchWorker tree boundary. Task
+        // workers have a separate lifecycle test in worker.rs.
+        search
+            .meta
+            .lock()
+            .expect("meta lock")
+            .params
+            .task_workers_per_search_worker = 0;
+
+        let (best, visits) = search.run_blocking_nodes(32);
+
+        assert!(!best.is_null());
+        assert!(visits >= 32);
+        assert_eq!(
+            search
+                .worker_state
+                .thread_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            3
+        );
+    }
+
+    /// This covers shared SearchWorker tree phases with configured task work.
+    /// The current task queue is synchronous; px0's independent task-worker
+    /// pipeline remains an explicit P4 follow-up (`search.cc:1088-1211,
+    /// 1322-1347,1494-1508,1828-1864`).
+    #[test]
+    fn shared_tree_handles_configured_task_work_synchronously() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
+        search.set_position(&state).expect("position");
+        {
+            let mut meta = search.meta.lock().expect("meta lock");
+            meta.params.minibatch_size = 32;
+            meta.params.task_workers_per_search_worker = 1;
+            meta.params.max_collision_visits = 4;
+            meta.params.max_collision_visits_scaling_start = 0;
+            meta.params.max_collision_visits_scaling_end = 1;
+            meta.params.minimum_work_size_for_processing = 2;
+            meta.params.minimum_work_per_task_for_processing = 1;
+            meta.params.solid_tree_threshold = 1;
+        }
+
+        let (best, visits) = search.run_blocking_nodes(64);
+
+        assert!(!best.is_null());
+        assert!(visits >= 64);
+        let tree = search.tree.read().expect("tree lock");
+        let root = tree.current_head();
+        assert!(tree.node(root).has_solid_children());
+        assert_eq!(tree.node(root).n_in_flight(), 0);
+    }
+
+    /// px0 publishes cache-hit out-of-order results during gather, while other
+    /// SearchWorkers can continue their independent tree phases
+    /// (`search.cc:1268-1419,1977-1987,2109-2173`). The shared collision list
+    /// must be drained by backup and leave no root reservation behind.
+    #[test]
+    fn shared_workers_reconcile_out_of_order_cache_hits() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let backend = ParallelUniformBackend::default();
+        let mut search = super::ClassicSearch::new(Box::new(backend.clone()));
+        search.set_position(&state).expect("position");
+        {
+            let tree = search.tree.read().expect("tree lock");
+            let history = tree.history();
+            backend.seed_cache(&EvalPosition {
+                positions: history.positions().to_vec(),
+                legal_moves: history.last().board().generate_legal_moves(),
+            });
+        }
+        {
+            let mut meta = search.meta.lock().expect("meta lock");
+            meta.params.minibatch_size = 4;
+            meta.params.task_workers_per_search_worker = 0;
+            meta.params.max_collision_visits = 4;
+            meta.params.max_collision_visits_scaling_start = 0;
+            meta.params.max_collision_visits_scaling_end = 1;
+        }
+
+        let (best, visits) = search.run_blocking_nodes(64);
+
+        assert!(!best.is_null());
+        assert!(visits >= 64);
+        assert!(
+            search
+                .worker_state
+                .total_batches
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+        );
+        assert!(
+            search
+                .worker_state
+                .total_playouts
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= u64::from(visits)
+        );
+        let tree = search.tree.read().expect("tree lock");
+        assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
+        assert!(search
+            .worker_state
+            .shared_collisions
+            .lock()
+            .expect("collisions lock")
+            .is_empty());
+    }
+
+    /// px0 `DoBackupUpdateSingleNode` may solidify root while other search
+    /// workers continue selection (`search.cc:2211-2217`, `node.cc:245-288`).
+    /// The Rust arena must keep every solid child slot selectable without
+    /// producing an in-flight leak or a duplicate expansion.
+    #[test]
+    fn shared_workers_continue_through_root_solidification() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
+        search.set_position(&state).expect("position");
+        {
+            let mut meta = search.meta.lock().expect("meta lock");
+            meta.params.task_workers_per_search_worker = 0;
+            meta.params.solid_tree_threshold = 1;
+        }
+
+        let (best, visits) = search.run_blocking_nodes(64);
+
+        assert!(!best.is_null());
+        assert!(visits >= 64);
+        let tree = search.tree.read().expect("tree lock");
+        let root = tree.current_head();
+        assert!(tree.node(root).has_solid_children());
+        assert_eq!(tree.node(root).n_in_flight(), 0);
+    }
+
+    #[test]
+    fn best_child_uses_prior_until_a_child_has_more_visits() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let moves = state.startpos.board().generate_legal_moves();
+        tree.node_mut(root).create_edges(&moves[..2].to_vec());
+        tree.node_mut(root).edge_mut(0).set_p(0.2);
+        tree.node_mut(root).edge_mut(1).set_p(0.8);
+        assert!(tree.node_mut(root).try_start_score_update());
+        tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
+        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0, &[]), Some(1));
+
+        let child = tree.arena_mut().spawn_child(root, 0);
+        assert!(tree.node_mut(child).try_start_score_update());
+        tree.node_mut(child).finalize_score_update(0.0, 0.0, 0.0, 1);
+        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0, &[]), Some(0));
+    }
+
+    #[test]
+    fn root_filter_applies_before_the_root_has_visits() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let allowed = state.startpos.board().parse_move("a0a1").expect("legal root move");
+
+        assert_eq!(best_move(&tree, &SearchParams::default(), &[allowed]).0, allowed);
+    }
+
+    #[test]
+    fn move_orientation_keeps_px0_null_ponder_null() {
+        assert!(orient_move(xiangqi_core::Move::NULL, true).is_null());
+    }
+
+    #[test]
+    fn wdl_integerization_matches_px0_send_uci_info() {
+        assert_eq!(
+            wdl_from_wl_d(0.1, 0.2),
+            crate::callbacks::Wdl { w: 450, d: 200, l: 350 }
+        );
+    }
+
+    /// px0 `WDLRescale` keeps a valid WDL distribution within its numerical
+    /// guards (`src/search/classic/search.cc:202-236`).
+    #[test]
+    fn wdl_rescale_keeps_valid_distribution() {
+        let mut wl = 0.2;
+        let mut d = 0.4;
+        let mu = wdl_rescale(&mut wl, &mut d, 1.0, 0.0, 1.0, true, 10.0);
+        assert!(mu.is_finite());
+        assert!(wl.is_finite() && d.is_finite());
+        assert!((-1.0..=1.0).contains(&wl));
+        assert!((0.0..=1.0).contains(&d));
+    }
+
+    #[test]
+    fn play_contempt_resolves_like_px0_start_search() {
+        assert_eq!(
+            resolve_contempt_mode(ContemptMode::Play, true, false, false),
+            ContemptMode::None
+        );
+        assert_eq!(
+            resolve_contempt_mode(ContemptMode::Play, false, false, false),
+            ContemptMode::White
+        );
+        assert_eq!(
+            resolve_contempt_mode(ContemptMode::Play, false, true, false),
+            ContemptMode::Black
+        );
+        assert_eq!(
+            resolve_contempt_mode(ContemptMode::Play, false, false, true),
+            ContemptMode::Black
+        );
+    }
+
+    #[test]
+    fn score_type_q_matches_px0_scaled_q() {
+        let mut wl = 0.1;
+        let mut d = 0.2;
+        assert_eq!(
+            score_from_wdl(
+                ScoreType::Q,
+                &mut wl,
+                &mut d,
+                0.1234,
+                true,
+                WdlDisplayContext {
+                    params: &SearchParams::default(),
+                    contempt_mode: ContemptMode::None,
+                    root_is_black: false,
+                },
+            ),
+            1234
+        );
+    }
+
+    /// px0 applies `WDLEvalObjectivity` only to the display-side contempt
+    /// diff, after the search-side WDL was already backed up
+    /// (`src/search/classic/search.cc:279-291`).
+    #[test]
+    fn wdl_eval_objectivity_controls_display_contempt_only() {
+        let mut params = SearchParams {
+            wdl_rescale_diff: 0.2,
+            ..SearchParams::default()
+        };
+        let mut subjective_wl = 0.1;
+        let mut subjective_d = 0.4;
+        score_from_wdl(
+            ScoreType::Q,
+            &mut subjective_wl,
+            &mut subjective_d,
+            0.0,
+            true,
+            WdlDisplayContext {
+                params: &params,
+                contempt_mode: ContemptMode::White,
+                root_is_black: false,
+            },
+        );
+
+        params.wdl_eval_objectivity = 0.0;
+        let mut objective_wl = 0.1;
+        let mut objective_d = 0.4;
+        score_from_wdl(
+            ScoreType::Q,
+            &mut objective_wl,
+            &mut objective_d,
+            0.0,
+            true,
+            WdlDisplayContext {
+                params: &params,
+                contempt_mode: ContemptMode::White,
+                root_is_black: false,
+            },
+        );
+
+        assert_ne!(subjective_wl, objective_wl);
+        assert_ne!(subjective_d, objective_d);
     }
 }

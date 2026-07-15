@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
+from importlib.resources import files
 
 import torch
 import torch.nn as nn
@@ -46,9 +46,11 @@ def _knight_move(start: str, direction: tuple[int, int]) -> str | None:
 
 
 def _load_move_vocab() -> list[str]:
-    repo_root = Path(__file__).resolve().parents[3]
-    moves_path = repo_root / "crates" / "engin" / "src" / "move_vocab.txt"
-    moves = [line.strip() for line in moves_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    moves = [
+        line.strip()
+        for line in files("nn").joinpath("px0_policy_moves.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     if len(moves) != 2062:
         raise ValueError(f"unexpected move vocab size: {len(moves)}")
     return moves
@@ -402,7 +404,7 @@ def value_wdl_cross_entropy(
     return err
 
 
-def value_q_mse_from_scalar(
+def value_q_mse_from_wdl(
     pred_value: torch.Tensor,
     tgt_q: torch.Tensor,
     *,
@@ -473,21 +475,6 @@ def visits_to_sample_weight(visits: torch.Tensor) -> torch.Tensor:
     scale = math.log1p(256.0)
     weight = torch.log1p(visits) / scale
     return weight.clamp_(min=0.25, max=2.0)
-
-
-def visits_to_q_ratio(
-    visits: torch.Tensor,
-    *,
-    q_ratio: float,
-    scale: float = 512.0,
-) -> torch.Tensor:
-    if scale <= 0.0:
-        raise ValueError("scale 须为正数")
-    if visits.ndim == 1:
-        visits = visits.unsqueeze(1)
-    visits = visits.clamp_min(0.0)
-    trust = torch.log1p(visits) / math.log1p(float(scale))
-    return float(q_ratio) * trust.clamp_(min=0.0, max=1.0)
 
 
 def policy_kld_to_weight(policy_kld: torch.Tensor) -> torch.Tensor:

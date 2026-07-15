@@ -16,19 +16,19 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 NN_ROOT = Path(__file__).resolve().parents[2]
-REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(NN_ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nn.dataset_px0 import Px0ChunkDataset, Px0DatasetConfig
-from nn.px0_kaggle import DEFAULT_PX0_ROOT, ensure_px0_version
+from nn.px0_kaggle import ensure_px0_version
+from nn.train_config import load_train_config
 from nn.model import (
     PolicyResNet,
     mix_wdl_targets,
     moves_left_loss,
     policy_kld_to_weight,
     soft_policy_cross_entropy,
-    value_q_mse_from_scalar,
+    value_q_mse_from_wdl,
     value_wdl_cross_entropy,
     visits_to_sample_weight,
 )
@@ -42,35 +42,7 @@ MOVES_LEFT_AUX_WEIGHT = 0.15
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Train small policy/value model on PX0 v6 chunks")
-    ap.add_argument("--px0-version", default=None, help="Kaggle px0data version; if set, auto prepare local chunks")
-    ap.add_argument("--px0-root", type=Path, default=DEFAULT_PX0_ROOT)
-    ap.add_argument("--px0-val-ratio", type=float, default=0.1)
-    ap.add_argument("--px0-seed", type=int, default=42)
-    ap.add_argument("--px0-force-download", action="store_true")
-    ap.add_argument("--train-glob", action="append", default=None, help="glob for training chunk files")
-    ap.add_argument("--val-glob", action="append", default=None, help="glob for validation chunk files")
-    ap.add_argument("--train-list", type=Path, default=None, help="JSON file list for training chunks")
-    ap.add_argument("--val-list", type=Path, default=None, help="JSON file list for validation chunks")
-    ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--init-from", type=Path, default=None, help="initialize model weights from an existing checkpoint")
-    ap.add_argument("--width", type=int, default=160)
-    ap.add_argument("--blocks", type=int, default=10)
-    ap.add_argument("--in-planes", type=int, default=124)
-    ap.add_argument("--num-moves", type=int, default=2062)
-    ap.add_argument("--batch-size", type=int, default=256)
-    ap.add_argument("--steps", type=int, default=2000)
-    ap.add_argument("--eval-every", type=int, default=200)
-    ap.add_argument("--val-batches", type=int, default=32)
-    ap.add_argument("--train-max-files", type=int, default=0)
-    ap.add_argument("--val-max-files", type=int, default=0)
-    ap.add_argument("--train-limit-samples", type=int, default=0)
-    ap.add_argument("--val-limit-samples", type=int, default=0)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--value-loss-weight", type=float, default=1.0)
-    ap.add_argument("--q-ratio", type=float, default=0.0)
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--num-workers", type=int, default=default_num_workers())
+    ap.add_argument("--config", type=Path, required=True, help="唯一训练配置 YAML")
     return ap
 
 
@@ -79,22 +51,24 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--width 须为正数且能被 4 整除")
     if int(args.blocks) <= 0:
         raise SystemExit("--blocks 须为正整数")
-    if args.px0_version:
-        if any([args.train_list, args.val_list, args.train_glob, args.val_glob]):
-            raise SystemExit("使用 --px0-version 时，不要再传 --train-* / --val-*")
-        if not (0.0 < float(args.px0_val_ratio) < 1.0):
-            raise SystemExit("--px0-val-ratio 须在 (0,1) 内")
-    else:
-        train_sources = int(bool(args.train_list)) + int(bool(args.train_glob))
-        val_sources = int(bool(args.val_list)) + int(bool(args.val_glob))
-        if train_sources != 1:
-            raise SystemExit("训练数据需要二选一：--train-glob 或 --train-list")
-        if val_sources != 1:
-            raise SystemExit("验证数据需要二选一：--val-glob 或 --val-list")
+    if not str(args.px0_version).strip():
+        raise SystemExit("dataset.px0_version 不能为空")
+    if not (0.0 < float(args.px0_val_ratio) < 1.0):
+        raise SystemExit("dataset.val_ratio 须在 (0,1) 内")
     if not (0.0 <= float(args.q_ratio) <= 1.0):
         raise SystemExit("--q-ratio 须在 [0,1] 内")
     if args.init_from is not None and not Path(args.init_from).is_file():
         raise SystemExit(f"--init-from 文件不存在: {args.init_from}")
+
+
+def resolve_device(requested: str) -> torch.device:
+    """Resolve an explicit training device without silently changing a run."""
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("training.device=cuda，但 torch.cuda.is_available() 为 False；改为 cpu 或 auto 才会回退")
+    return device
 
 
 def take_logits_and_value(
@@ -111,36 +85,11 @@ def take_logits_and_value(
     raise TypeError(f"unexpected model output len={len(output)}")
 
 
-def validate_existing_output_checkpoint(
-    ckpt: dict,
-    *,
-    args: argparse.Namespace,
-    train_files: list[Path],
-    val_files: list[Path],
-) -> None:
+def validate_existing_output_checkpoint(ckpt: dict) -> None:
     if ckpt.get("trunk_kind") is not None and str(ckpt.get("trunk_kind")) != "katago_cnn_v1":
         raise SystemExit("--out 已存在，但不是当前 katago_cnn_v1 架构；请换新输出文件重新训练")
     if ckpt.get("moves_left_head") is not None and not bool(ckpt.get("moves_left_head", False)):
         raise SystemExit("--out 已存在，但不含当前 moves_left 辅助头；请换新输出文件重新训练")
-    # expected_q_ratio = float(args.q_ratio)
-    # got_q_ratio = ckpt.get("q_ratio")
-    # if got_q_ratio is not None and abs(float(got_q_ratio) - expected_q_ratio) > 1e-9:
-    #     raise SystemExit(
-    #         f"--out 已存在，但其中 checkpoint q_ratio={float(got_q_ratio):.6f}，"
-    #         f"当前命令 q_ratio={expected_q_ratio:.6f}；请换新输出文件或改用 --init-from 开启新阶段训练"
-    #     )
-    # prev_train_files = ckpt.get("train_files")
-    # prev_val_files = ckpt.get("val_files")
-    # current_train_files = [str(p.resolve()) for p in train_files]
-    # current_val_files = [str(p.resolve()) for p in val_files]
-    # if prev_train_files is not None and list(prev_train_files) != current_train_files:
-    #     raise SystemExit(
-    #         "--out 已存在，但 train_files 与 checkpoint 不一致；请换新输出文件或改用 --init-from"
-    #     )
-    # if prev_val_files is not None and list(prev_val_files) != current_val_files:
-    #     raise SystemExit(
-    #         "--out 已存在，但 val_files 与 checkpoint 不一致；请换新输出文件或改用 --init-from"
-    #     )
 
 
 def make_sample_weight(search_visits: torch.Tensor, policy_kld: torch.Tensor) -> torch.Tensor:
@@ -186,7 +135,7 @@ def run_val(
                 sample_weight=sample_weight,
             )
             value_ce = value_wdl_cross_entropy(pred_value, target_value, sample_weight=sample_weight)
-            value_q = value_q_mse_from_scalar(pred_value, search_q, sample_weight=sample_weight)
+            value_q = value_q_mse_from_wdl(pred_value, search_q, sample_weight=sample_weight)
             moves_left = (
                 moves_left_loss(pred_moves_left, plies_left, sample_weight=sample_weight)
                 if pred_moves_left is not None
@@ -218,43 +167,35 @@ def run_val(
 
 
 def build_dataset_configs(args: argparse.Namespace) -> tuple[Px0DatasetConfig, Px0DatasetConfig]:
-    if args.px0_version:
-        prepared = ensure_px0_version(
-            args.px0_version,
-            root=args.px0_root,
-            val_ratio=float(args.px0_val_ratio),
-            seed=int(args.px0_seed),
-            force_download=bool(args.px0_force_download),
-        )
-        train_list = prepared.train_manifest
-        val_list = prepared.val_manifest
-    else:
-        train_list = args.train_list.resolve() if args.train_list else None
-        val_list = args.val_list.resolve() if args.val_list else None
+    prepared = ensure_px0_version(
+        args.px0_version,
+        root=args.px0_root,
+        val_ratio=float(args.px0_val_ratio),
+        seed=int(args.px0_seed),
+        force_download=bool(args.px0_force_download),
+    )
     train_cfg = Px0DatasetConfig(
-        patterns=tuple(args.train_glob or ()),
-        file_list_path=train_list,
+        file_list_path=prepared.train_manifest,
         shuffle_files=True,
-        max_files=int(args.train_max_files),
-        limit_samples=int(args.train_limit_samples),
     )
     val_cfg = Px0DatasetConfig(
-        patterns=tuple(args.val_glob or ()),
-        file_list_path=val_list,
+        file_list_path=prepared.val_manifest,
         shuffle_files=False,
-        max_files=int(args.val_max_files),
-        limit_samples=int(args.val_limit_samples),
     )
     return train_cfg, val_cfg
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    cli = build_parser().parse_args()
+    try:
+        args = load_train_config(cli.config)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     validate_args(args)
     random.seed(TRAIN_SEED)
     torch.manual_seed(TRAIN_SEED)
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     print(f"torch {torch.__version__} | cuda.is_available={torch.cuda.is_available()} | device={device}")
 
     train_cfg, val_cfg = build_dataset_configs(args)
@@ -264,13 +205,16 @@ def main() -> None:
     train_loader = DataLoader(
         train_ds,
         batch_size=int(args.batch_size),
-        num_workers=int(args.num_workers),
+        num_workers=default_num_workers() if args.num_workers is None else int(args.num_workers),
         pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=int(args.batch_size),
-        num_workers=max(0, min(2, int(args.num_workers))),
+        num_workers=max(
+            0,
+            min(2, default_num_workers() if args.num_workers is None else int(args.num_workers)),
+        ),
         pin_memory=device.type == "cuda",
     )
 
@@ -291,12 +235,7 @@ def main() -> None:
 
     if args.out.is_file():
         ckpt = torch.load(args.out, map_location=device)
-        validate_existing_output_checkpoint(
-            ckpt,
-            args=args,
-            train_files=train_ds.files,
-            val_files=val_ds.files,
-        )
+        validate_existing_output_checkpoint(ckpt)
         model.load_state_dict(ckpt["model"], strict=True)
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
@@ -323,11 +262,10 @@ def main() -> None:
         f"width={int(args.width)} blocks={int(args.blocks)} "
         f"q_ratio={float(args.q_ratio):.3f}"
     )
-    if args.px0_version:
-        print(
-            f"px0_kaggle: version={args.px0_version} root={args.px0_root.resolve()} "
-            f"val_ratio={float(args.px0_val_ratio):.3f}"
-        )
+    print(
+        f"px0_kaggle: version={args.px0_version} root={args.px0_root.resolve()} "
+        f"val_ratio={float(args.px0_val_ratio):.3f} config={args.config_path}"
+    )
 
     train_iter = iter(train_loader)
     for step in range(start_step + 1, int(args.steps) + 1):
@@ -361,7 +299,7 @@ def main() -> None:
             sample_weight=sample_weight,
         )
         value_ce = value_wdl_cross_entropy(pred_value, target_value, sample_weight=sample_weight)
-        value_q = value_q_mse_from_scalar(pred_value, search_q, sample_weight=sample_weight)
+        value_q = value_q_mse_from_wdl(pred_value, search_q, sample_weight=sample_weight)
         moves_left = moves_left_loss(pred_moves_left, plies_left, sample_weight=sample_weight)
         loss = (
             policy_loss
@@ -412,14 +350,12 @@ def main() -> None:
                 "q_ratio": float(args.q_ratio),
                 "completed_steps": step,
                 "best_val_loss": min(best_val, val_loss),
-                "train_glob": list(args.train_glob or ()),
-                "val_glob": list(args.val_glob or ()),
-                "train_list": str(args.train_list.resolve()) if args.train_list else None,
-                "val_list": str(args.val_list.resolve()) if args.val_list else None,
-                "px0_version": str(args.px0_version) if args.px0_version else None,
-                "px0_root": str(args.px0_root.resolve()) if args.px0_version else None,
-                "px0_val_ratio": float(args.px0_val_ratio) if args.px0_version else None,
-                "px0_seed": int(args.px0_seed) if args.px0_version else None,
+                "config_path": str(args.config_path),
+                "run_name": str(args.name),
+                "px0_version": str(args.px0_version),
+                "px0_root": str(args.px0_root.resolve()),
+                "px0_val_ratio": float(args.px0_val_ratio),
+                "px0_seed": int(args.px0_seed),
                 "train_files": [str(p) for p in train_ds.files],
                 "val_files": [str(p) for p in val_ds.files],
                 "batch_size": int(args.batch_size),

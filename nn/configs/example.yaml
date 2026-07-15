@@ -1,0 +1,51 @@
+# X7 PX0 训练配置模板。
+# 训练入口只接受：python scripts/train/train_px0.py --config <this-file>
+# 路径相对于启动命令所在目录解析；仓库根目录启动时，data/... 即为仓库 data/。
+
+# 仅写入 checkpoint 元数据和日志，建议与 training.out 的文件名一致。
+name: x7_qmix_075_01
+
+dataset:
+  # Kaggle pikacat/px0data 的版本号；本地目录为 C:/work/px0data/{version}/。
+  px0_version: "710"
+  # 本地版本缓存根目录。目录已有完整 manifest/chunk 时不访问 Kaggle。
+  px0_root: "C:/work/px0data"
+  # 固定文件级 train/validation 切分中 validation 的比例，必须在 (0, 1)。
+  val_ratio: 0.10
+  # 文件切分随机种子。改变它会生成另一份 train/validation manifest。
+  seed: 42
+  # true 会删除此版本已准备的 chunk/archive/manifest 后重新下载；通常保持 false。
+  force_download: false
+
+model:
+  # trunk 通道数。当前 baseline 是 160；必须为正且能被 4 整除。
+  width: 160
+  # pre-activation/global-pooling residual block 数。当前 baseline 是 10。
+  blocks: 10
+
+training:
+  # 训练 checkpoint。文件存在时自动从其中的 optimizer/model/step 续训。
+  out: "data/checkpoints/x7_qmix_075_01.pt"
+  # 新阶段可选：只加载模型权重，不加载 optimizer/step。使用时必须换新的 out。
+  # init_from: "data/checkpoints/x7_qmix_000_01.best.pt"
+  # 总训练 step，不是本次增加的 step。续训时必须大于 checkpoint 的 completed_steps。
+  steps: 200000
+  # 每个 optimizer step 的样本数。
+  batch_size: 256
+  # 每隔多少 step 跑一次 validation 并写 checkpoint。
+  eval_every: 1000
+  # 每次 validation 最多读取多少 batch；控制验证耗时，不改变训练集。
+  val_batches: 32
+  # AdamW 初始学习率；调度为固定 warmup 后 cosine decay 到 1e-5。
+  lr: 0.001
+  # AdamW weight decay。
+  weight_decay: 0.0001
+  # WDL cross-entropy 在总 loss 中的系数；policy 系数固定为 1.0。
+  value_loss_weight: 1.0
+  # 固定 qMix：0.0 = winner WDL，1.0 = search WDL，中间值线性混合。
+  # 一个 checkpoint 内保持固定；切阶段时复制 YAML、设置 init_from 和新的 out。
+  q_ratio: 0.75
+  # cuda: 必须有 CUDA，缺失即失败；cpu: 强制 CPU；auto: CUDA 不可用时允许回退 CPU。
+  device: cuda
+  # DataLoader worker 数。null 使用平台默认值；Windows 本机常用 4。
+  num_workers: 4

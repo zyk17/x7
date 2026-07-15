@@ -83,15 +83,37 @@ impl SearchResponder for UciResponderForwarder {
 
 /// px0 `Engine` 的 P3 子集：搜索 + UCI controller。
 pub struct ClassicEngine {
-    search: ClassicSearch,
+    // px0 `Engine` owns a search built by its factory (`src/engine.cc:137-151`).
+    // The Rust port only has an ONNX factory, which can fail while a UCI
+    // process is already alive; `None` means that factory has not produced a
+    // usable search. It is deliberately not a UniformBackend fallback.
+    search: Option<ClassicSearch>,
     uci_forwarder: Arc<UciResponderForwarder>,
     position: Option<GameState>,
-    unavailable_reason: Option<String>,
-    uci_weights_file: Option<String>,
+    uci_options: UciOptions,
+    manages_weights_file: bool,
+    backend_error: Option<String>,
     loaded_weights_file: Option<String>,
 }
 
 impl ClassicEngine {
+    /// px0 `Engine::Engine` + `Engine::UpdateBackendConfig`
+    /// (`src/engine.cc:137-167`), with the ONNX factory deferred until
+    /// `SetPosition`. This is the formal UCI constructor.
+    pub fn new() -> Self {
+        Self {
+            search: None,
+            uci_forwarder: Arc::new(UciResponderForwarder {
+                responder: Mutex::new(None),
+            }),
+            position: None,
+            uci_options: UciOptions::populate_defaults(),
+            manages_weights_file: true,
+            backend_error: None,
+            loaded_weights_file: None,
+        }
+    }
+
     pub fn with_backend(backend: Box<dyn Backend>) -> Self {
         let uci_forwarder = Arc::new(UciResponderForwarder {
             responder: Mutex::new(None),
@@ -99,79 +121,91 @@ impl ClassicEngine {
         let mut search = ClassicSearch::new(backend);
         search.set_uci_responder(Arc::clone(&uci_forwarder) as Arc<dyn SearchResponder>);
         Self {
-            search,
+            search: Some(search),
             uci_forwarder,
             position: None,
-            unavailable_reason: None,
-            uci_weights_file: None,
+            uci_options: UciOptions::populate_defaults(),
+            manages_weights_file: false,
+            backend_error: None,
             loaded_weights_file: None,
         }
     }
 
-    /// px0 `Engine::UpdateBackendConfig` (`src/engine.cc:153-167`) creates a
-    /// real backend before search. P4 has no UCI weights configuration yet;
-    /// callers can still create the validated ONNX backend directly.
+    /// Explicit backend construction for tests and direct callers. Formal UCI
+    /// startup uses `new` and receives its model through `WeightsFile`.
     pub fn from_onnx_file(path: impl AsRef<std::path::Path>) -> Result<Self, EnginError> {
         Ok(Self::with_backend(Box::new(OnnxBackend::from_file(path)?)))
     }
 
-    /// px0 configures a real backend before search (`src/engine.cc:153-167`).
-    /// Main UCI must not silently search with the UniformBackend test stub.
-    pub fn unavailable() -> Self {
-        let uci_forwarder = Arc::new(UciResponderForwarder {
-            responder: Mutex::new(None),
-        });
-        let mut search = ClassicSearch::new(Box::new(UniformBackend::default()));
-        search.set_uci_responder(Arc::clone(&uci_forwarder) as Arc<dyn SearchResponder>);
-        Self {
-            search,
-            uci_forwarder,
-            position: None,
-            unavailable_reason: Some("WeightsFile is not configured".into()),
-            uci_weights_file: None,
-            loaded_weights_file: None,
-        }
-    }
-
+    /// Deterministic test-only constructor. It never participates in the
+    /// formal UCI `WeightsFile` lifecycle.
     pub fn uniform() -> Self {
         Self::with_backend(Box::new(UniformBackend::default()))
     }
 
-    pub fn search(&self) -> &ClassicSearch {
-        &self.search
+    pub fn search(&self) -> Option<&ClassicSearch> {
+        self.search.as_ref()
     }
 
-    /// px0 `Engine::UpdateBackendConfig` (`src/engine.cc:153-167`) restricted
-    /// to this port's single formal ONNX backend. px0's backend registry and
-    /// protobuf weight discovery are intentionally not reproduced here.
+    /// px0 `Engine::UpdateBackendConfig` (`src/engine.cc:153-167`), restricted
+    /// to this port's single formal ONNX backend. A failed factory result
+    /// removes the old search, so a changed/broken `WeightsFile` cannot keep
+    /// searching with stale weights.
     fn update_backend_config(&mut self) -> Result<(), EnginError> {
-        let Some(path) = self.uci_weights_file.as_deref() else {
-            self.loaded_weights_file = None;
-            self.unavailable_reason = Some("WeightsFile is not configured".into());
+        if !self.manages_weights_file {
             return Ok(());
-        };
+        }
+        // Snapshot the OptionsDict value before stopping/replacing search.
+        // px0's `std::string` option value is likewise stable for the whole
+        // `UpdateBackendConfig` call (`src/engine.cc:153-167`).
+        let path = self.uci_options.weights_file.trim().to_string();
         if path.is_empty() {
+            self.stop_and_drop_search()?;
             self.loaded_weights_file = None;
-            self.unavailable_reason = Some("WeightsFile is not configured".into());
+            self.backend_error = Some("WeightsFile is not configured".into());
             return Ok(());
         }
-        if self.loaded_weights_file.as_deref() == Some(path) {
+        if self.loaded_weights_file.as_deref() == Some(path.as_str()) && self.search.is_some() {
             return Ok(());
         }
-        self.search.abort_search()?;
-        match OnnxBackend::from_file(path) {
+
+        self.stop_and_drop_search()?;
+        match OnnxBackend::from_file(&path) {
             Ok(backend) => {
-                self.search.set_backend(Box::new(backend))?;
-                self.loaded_weights_file = Some(path.to_string());
-                self.unavailable_reason = None;
+                let mut search = ClassicSearch::new(Box::new(backend));
+                search.set_uci_responder(Arc::clone(&self.uci_forwarder) as Arc<dyn SearchResponder>);
+                Self::apply_uci_options(&mut search, &self.uci_options)?;
+                self.search = Some(search);
+                self.loaded_weights_file = Some(path.clone());
+                self.backend_error = None;
                 Ok(())
             }
             Err(error) => {
                 self.loaded_weights_file = None;
-                self.unavailable_reason = Some(format!("cannot load WeightsFile {path}: {error}"));
+                self.backend_error = Some(format!("cannot load WeightsFile {path}: {error}"));
                 Ok(())
             }
         }
+    }
+
+    /// px0 applies all options through its shared `OptionsDict` before a
+    /// search starts (`src/engine.cc:153-167`, `search/classic/params.cc:688-703`).
+    fn apply_uci_options(search: &mut ClassicSearch, options: &UciOptions) -> Result<(), EnginError> {
+        search.set_uci_info_options(
+            options.multi_pv,
+            options.per_pv_counters,
+            options.score_type,
+            options.nodes_per_second_limit,
+        )?;
+        search.set_wdl_options(options)
+    }
+
+    /// px0 `Engine::EnsureSearchStopped` (`src/engine.cc:149-151`).
+    fn stop_and_drop_search(&mut self) -> Result<(), EnginError> {
+        if let Some(mut search) = self.search.take() {
+            search.abort_search()?;
+        }
+        Ok(())
     }
 }
 
@@ -185,26 +219,18 @@ impl EngineController for ClassicEngine {
         // order, so finish the active search while the non-owning forwarder is
         // still registered; aborting here would suppress a finite search's
         // required final bestmove (`search.cc:1019-1041`).
-        let _ = self.search.finish_for_responder_drop();
+        if let Some(search) = self.search.as_mut() {
+            let _ = search.finish_for_responder_drop();
+        }
         self.uci_forwarder.unregister(responder);
     }
 
     fn set_uci_options(&mut self, options: &UciOptions) -> Result<(), EnginError> {
-        // px0 always owns a configured backend manager. `ClassicEngine::uniform`
-        // is deliberately test-only, so an unrelated UCI display option must
-        // not turn its supplied backend into an empty WeightsFile request.
-        // Formal `ClassicEngine::unavailable` starts with `None` and remains
-        // unavailable until an actual px0-named WeightsFile is provided.
-        if self.uci_weights_file.is_some() || !options.weights_file.is_empty() {
-            self.uci_weights_file = Some(options.weights_file.clone());
+        self.uci_options = options.clone();
+        if let Some(search) = self.search.as_mut() {
+            Self::apply_uci_options(search, options)?;
         }
-        self.search.set_uci_info_options(
-            options.multi_pv,
-            options.per_pv_counters,
-            options.score_type,
-            options.nodes_per_second_limit,
-        )?;
-        self.search.set_wdl_options(options)
+        Ok(())
     }
 
     fn ensure_ready(&mut self) -> Result<(), EnginError> {
@@ -212,7 +238,9 @@ impl EngineController for ClassicEngine {
     }
 
     fn new_game(&mut self) -> Result<(), EnginError> {
-        self.search.new_game()?;
+        if let Some(search) = self.search.as_mut() {
+            search.new_game()?;
+        }
         self.set_position(STARTPOS_FEN, &[])
     }
 
@@ -220,29 +248,36 @@ impl EngineController for ClassicEngine {
         // px0 `Engine::SetPosition` first calls `EnsureSearchStopped()`
         // (`src/engine.cc:187-197`).  The old worker owns mutable tree state;
         // replacing it before all worker threads joined is a UCI race.
-        self.search.abort_search()?;
+        if let Some(search) = self.search.as_mut() {
+            search.abort_search()?;
+        }
         // px0 `Engine::SetPosition` updates backend configuration after
         // stopping search and before making the new `GameState`
         // (`src/engine.cc:187-197`). Retrying here also handles a file that
         // appeared after an earlier failed `setoption`.
-        if self.uci_weights_file.is_some() {
-            self.update_backend_config()?;
-        }
+        self.update_backend_config()?;
         let state = GameState::from_fen_moves(fen, moves)?;
-        self.search.set_position(&state)?;
+        if let Some(search) = self.search.as_mut() {
+            search.set_position(&state)?;
+        }
         self.position = Some(state);
         Ok(())
     }
 
     fn go(&mut self, params: &GoParams, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
-        if let Some(reason) = &self.unavailable_reason {
-            responder.send_raw_response(&format!("info string cannot search: {reason}"));
-            return Ok(());
-        }
+        // px0 `Engine::Go` initializes a missing position through `NewGame`
+        // before calling `StartSearch` (`src/engine.cc:206-219`). NewGame in
+        // turn runs SetPosition and UpdateBackendConfig, so checking the
+        // backend first would incorrectly reject a valid bare `go` command.
         if self.position.is_none() {
             self.new_game()?;
         }
-        self.search.start_search(params)?;
+        let Some(search) = self.search.as_mut() else {
+            let reason = self.backend_error.as_deref().unwrap_or("WeightsFile is not configured");
+            responder.send_raw_response(&format!("info string cannot search: {reason}"));
+            return Ok(());
+        };
+        search.start_search(params)?;
         Ok(())
     }
 
@@ -251,11 +286,50 @@ impl EngineController for ClassicEngine {
     }
 
     fn wait(&mut self) -> Result<(), EnginError> {
-        self.search.wait_search()
+        match self.search.as_mut() {
+            Some(search) => search.wait_search(),
+            None => Ok(()),
+        }
     }
 
     fn stop(&mut self, _responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
-        self.search.stop_search()?;
+        if let Some(search) = self.search.as_mut() {
+            search.stop_search()?;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::uci_loop::VecUciResponder;
+
+    #[test]
+    fn deferred_engine_never_searches_with_uniform_when_weights_are_missing() {
+        let mut engine = ClassicEngine::new();
+        let mut responder = VecUciResponder::default();
+
+        engine
+            .go(&GoParams::default(), &mut responder)
+            .expect("missing weights is a UCI status, not an engine error");
+
+        assert!(engine.search().is_none());
+        assert_eq!(
+            responder.responses,
+            vec!["info string cannot search: WeightsFile is not configured"]
+        );
+    }
+
+    #[test]
+    fn explicit_test_backend_ignores_empty_weights_file_option() {
+        let mut engine = ClassicEngine::uniform();
+        let options = UciOptions::populate_defaults();
+
+        engine
+            .set_uci_options(&options)
+            .expect("display options must not replace an explicit test backend");
+
+        assert!(engine.search().is_some());
     }
 }

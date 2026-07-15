@@ -1,9 +1,8 @@
 //! px0 `src/search/classic/search.h:201-448` 的 P4 worker。
 //!
-//! P3 仍由 `SearchSession` 单线程直连 `Backend::evaluate()`。
-//! P4 worker 七阶段流水线、碰撞和单个 SearchWorker 内的 task-worker
-//! 生命周期已按 px0 源码逐函数翻译；多 SearchWorker 的 tree access
-//! boundary 仍未完成。
+//! P4 worker 七阶段流水线、碰撞和 task queue 数据结构已按 px0 源码翻译。
+//! px0 task worker 独占 `SearchWorker` 的并发生命周期尚未翻译；正式搜索
+//! 因而禁用 task split，队列只供后续实现和直接单测使用。
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -246,31 +245,6 @@ impl DerefMut for WorkerTree<'_> {
     }
 }
 
-/// px0 lets task threads operate on subtrees already made disjoint by
-/// `PickNodesToExtendTask` while the owning search worker retains the tree
-/// boundary (`src/search/classic/search.cc:1494-1508,1828-1864`). Rust cannot
-/// express that runtime-disjoint borrowing through ordinary `&mut` aliases.
-/// This pointer is therefore confined to `SearchWorker::run_blocking`, whose
-/// task lifecycle joins every thread before the worker is dropped.
-#[derive(Clone, Copy)]
-struct TaskWorkerPtr<'a> {
-    worker: *mut SearchWorker<'a>,
-}
-
-// SAFETY: `run_tasks` only accesses a task's disjoint subtree, task workspace,
-// and minibatch range. The owner waits for every queued task before a later
-// phase may reuse those regions, exactly as px0 does at search.cc:1494-1508.
-unsafe impl Send for TaskWorkerPtr<'_> {}
-
-impl<'a> TaskWorkerPtr<'a> {
-    /// # Safety
-    /// Inherits the scoped/disjoint-subtree contract documented on
-    /// `TaskWorkerPtr`.
-    unsafe fn run(self, tid: usize) {
-        unsafe { (&mut *self.worker).run_tasks(tid) }
-    }
-}
-
 /// px0 `SearchWorker::PickTask` (`src/search/classic/search.h:367-393`).
 /// A gathering task owns a disjoint subtree root; a processing task owns a
 /// non-overlapping minibatch range.
@@ -334,9 +308,9 @@ pub struct PickTaskQueue {
     task_count: AtomicIsize,
     tasks_taken: AtomicUsize,
     completed_tasks: AtomicUsize,
-    // px0 keeps `task_count_ == -1` between iterations while persistent task
-    // workers sleep. Only `exiting_` makes that sentinel terminate a worker
-    // (`search.cc:1097-1119`, `search.h:435-445`).
+    // This is px0's `task_count_ == -1` sentinel (`search.cc:1097-1119`,
+    // `search.h:435-445`). It is retained for the future independent worker
+    // lifecycle; the current production bridge consumes tasks synchronously.
     exiting: AtomicBool,
     task_added: Condvar,
 }
@@ -423,8 +397,8 @@ impl PickTaskQueue {
     }
 
     /// px0 `task_count_.store(-1)` after `GatherMinibatch`
-    /// (`src/search/classic/search.cc:1182-1185`). This idles persistent task
-    /// workers; it does not destroy them.
+    /// (`src/search/classic/search.cc:1182-1185`). It is a no-op for worker
+    /// lifetime today because production task execution is synchronous.
     pub fn idle(&self) {
         self.task_count.store(-1, Ordering::Release);
         self.task_added.notify_all();
@@ -514,7 +488,6 @@ pub struct SearchWorker<'a> {
     task_queue: PickTaskQueue,
     task_workspaces: Vec<TaskWorkspace>,
     picking_workspace: TaskWorkspace,
-    task_threads_active: bool,
 }
 
 impl<'a> SearchWorker<'a> {
@@ -630,20 +603,12 @@ impl<'a> SearchWorker<'a> {
         if target_minibatch_size == 0 {
             target_minibatch_size = 1;
         }
-        let mut task_workers = params.task_workers_per_search_worker;
-        if task_workers < 0 {
-            if backend.attributes().runs_on_cpu {
-                task_workers = 0;
-            } else {
-                let working_threads =
-                    std::cmp::max(search_state.thread_count.load(Ordering::Acquire).saturating_sub(1), 1);
-                task_workers = std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .saturating_div(working_threads)
-                    .saturating_sub(1)
-                    .min(4) as i32;
-            }
-        }
+        // px0 resolves `TaskWorkers=-1` to real independent SearchWorker
+        // instances here (`src/search/classic/search.h:205-233`). That
+        // ownership/lifetime has not been translated. Do not turn the
+        // requested count into synchronous task splitting: it adds work while
+        // falsely presenting the px0 parallel pipeline as active.
+        let task_workers = 0;
         let task_workspaces = (0..usize::try_from(task_workers).expect("non-negative task worker count"))
             .map(|_| TaskWorkspace::default())
             .collect();
@@ -669,7 +634,6 @@ impl<'a> SearchWorker<'a> {
             task_queue: PickTaskQueue::default(),
             task_workspaces,
             picking_workspace: TaskWorkspace::default(),
-            task_threads_active: false,
         }
     }
 
@@ -680,8 +644,8 @@ impl<'a> SearchWorker<'a> {
             return Ok(());
         }
         let gather_result = self.with_tree(|worker| worker.gather_minibatch());
-        // px0 idles persistent task workers before the backend phase; they
-        // remain available for `ResetTasks` in the next gather.
+        // Preserve px0's task-count phase boundary before backend work
+        // (`search.cc:1182-1185`). There are no independent task threads yet.
         self.task_queue.idle();
         if let Err(error) = gather_result {
             self.release_searcher_permit();
@@ -815,33 +779,12 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::RunBlocking` (`src/search/classic/search.h:235-249`).
     ///
-    /// A search worker owns its reusable computation, task workspaces, and
-    /// history for the whole search, not merely for one iteration.
+    /// px0 task workers are independent `SearchWorker` objects. That
+    /// ownership boundary has not been translated yet, so queued work remains
+    /// on the owning worker's private workspaces. This avoids aliasing one
+    /// mutable Rust worker through multiple raw pointers.
     pub fn run_blocking(&mut self) -> Result<(), EnginError> {
-        if self.task_workers <= 0 {
-            return self.run_blocking_without_task_threads();
-        }
-
-        self.task_threads_active = true;
-        let task_workers = usize::try_from(self.task_workers).expect("positive task worker count");
-        let worker = TaskWorkerPtr { worker: self as *mut _ };
-        let result = std::thread::scope(|scope| {
-            for tid in 0..task_workers {
-                let task_worker = worker;
-                scope.spawn(move || {
-                    // SAFETY: see `TaskWorkerPtr` and `run_tasks`.
-                    unsafe { task_worker.run(tid) }
-                });
-            }
-            let result = self.run_blocking_without_task_threads();
-            // The scoped threads must see `exiting_` before scope exit joins
-            // them. This is px0 destruction timing, not the per-iteration
-            // `idle()` sentinel above.
-            self.task_queue.close();
-            result
-        });
-        self.task_threads_active = false;
-        result
+        self.run_blocking_without_task_threads()
     }
 
     fn run_blocking_without_task_threads(&mut self) -> Result<(), EnginError> {
@@ -915,8 +858,9 @@ impl<'a> SearchWorker<'a> {
             }
             // px0 `search.cc:1322-1347`: split the initial contiguous work
             // ranges into processing tasks, retaining the final range for the
-            // main worker. `RunBlocking` owns persistent task workers; direct
-            // unit-test entry points consume the same queue synchronously.
+            // main worker. The queue shape is translated, but this Rust port
+            // currently consumes it synchronously until px0's independent
+            // SearchWorker-per-task ownership is implemented.
             let mut main_start = new_start;
             let mut needs_wait = false;
             if self.task_workers > 0
@@ -1059,9 +1003,9 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::RunTasks` (`src/search/classic/search.cc:1069-1140`).
     ///
-    /// This synchronous form is retained only for direct unit-test entry
-    /// points that do not call `RunBlocking`. The normal search path uses the
-    /// persistent loop below with the same dispatch semantics.
+    /// The queue is consumed by its owning worker until px0's independent
+    /// task-worker SearchWorker ownership is translated. This is not a
+    /// persistent task-thread implementation.
     fn run_queued_tasks(&mut self, workspace: &mut TaskWorkspace) -> Result<(), EnginError> {
         while let Some((task_id, task)) = self.task_queue.take() {
             let results = match task.kind {
@@ -1088,71 +1032,18 @@ impl<'a> SearchWorker<'a> {
         Ok(())
     }
 
-    /// px0 `SearchWorker::RunTasks` (`src/search/classic/search.cc:1069-1140`).
-    ///
-    /// # Safety
-    /// The caller is `run_blocking`'s scoped task-thread lifetime. `PickTask`
-    /// only publishes non-overlapping subtree/range work, and the owning
-    /// worker waits for completion before advancing the corresponding phase
-    /// (`search.cc:1494-1508,1322-1347`).
-    unsafe fn run_tasks(&mut self, tid: usize) {
-        while let Some((task_id, task)) = self.task_queue.take_blocking() {
-            // SAFETY: each persistent task thread owns exactly one workspace;
-            // `tid` is assigned once by `run_blocking` and never reused by a
-            // second task thread.
-            let workspace = unsafe { &mut *self.task_workspaces.as_mut_ptr().add(tid) };
-            let results = match task.kind {
-                PickTaskKind::Gathering => {
-                    let mut results = Vec::new();
-                    if self
-                        .pick_nodes_to_extend_task_with_workspace(
-                            task.start.expect("gathering task start"),
-                            task.base_depth,
-                            task.collision_limit,
-                            &task.moves_to_base,
-                            &mut results,
-                            workspace,
-                            false,
-                        )
-                        .is_err()
-                    {
-                        self.search_state.stop.store(true, Ordering::Release);
-                        Vec::new()
-                    } else {
-                        results
-                    }
-                }
-                PickTaskKind::Processing => {
-                    if self
-                        .process_picked_task(task.start_idx, task.end_idx, workspace)
-                        .is_err()
-                    {
-                        self.search_state.stop.store(true, Ordering::Release);
-                    }
-                    Vec::new()
-                }
-            };
-            self.task_queue.complete(task_id, results);
-        }
-    }
-
-    /// px0's main worker waits for persistent task workers; direct unit tests
-    /// keep the synchronous bridge because they do not enter `run_blocking`.
+    /// px0 waits for independent task workers here (`search.cc:1494-1508`).
+    /// Until that ownership model is translated, consume queued work locally.
     fn wait_for_queued_tasks(&mut self) -> Result<(), EnginError> {
-        if self.task_threads_active {
-            self.task_queue.wait();
-            Ok(())
-        } else {
-            self.run_tasks_synchronously()?;
-            self.task_queue.wait();
-            Ok(())
-        }
+        self.run_tasks_synchronously()?;
+        self.task_queue.wait();
+        Ok(())
     }
 
     /// px0 task workers keep an independent workspace for their entire
-    /// `SearchWorker` lifetime (`src/search/classic/search.h:205-233`). This
-    /// synchronous bridge exercises the same ownership for direct unit tests
-    /// that intentionally do not enter the persistent thread loop.
+    /// `SearchWorker` lifetime (`src/search/classic/search.h:205-233`). Until
+    /// that worker ownership is translated, this bridge reuses one workspace
+    /// without concurrent access.
     fn run_tasks_synchronously(&mut self) -> Result<(), EnginError> {
         if self.task_workspaces.is_empty() {
             let mut workspace = std::mem::take(&mut self.picking_workspace);
@@ -2274,12 +2165,10 @@ mod tests {
         }
     }
 
-    /// px0 creates task threads in `SearchWorker`'s constructor and keeps
-    /// them alive through `RunBlocking` (`search.h:205-249`).  This verifies
-    /// the Rust worker uses that path instead of the direct-test synchronous
-    /// bridge, then closes every task thread before returning.
+    /// A configured task-worker count must preserve the complete search path
+    /// until the Rust port has px0's independent worker ownership model.
     #[test]
-    fn run_blocking_uses_and_closes_persistent_task_workers() {
+    fn untranslated_task_workers_are_disabled_for_gpu_backends() {
         ensure_init();
         let mut tree = NodeTree::default();
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -2301,6 +2190,8 @@ mod tests {
         let search_state = Arc::new(WorkerSearchState::new(Arc::clone(&stop), i64::MAX));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
 
+        assert_eq!(worker.task_workers, 0);
+
         std::thread::scope(|scope| {
             let state = Arc::clone(&search_state);
             let stop = Arc::clone(&stop);
@@ -2311,7 +2202,7 @@ mod tests {
                 }
                 stop.store(true, Ordering::Release);
             });
-            worker.run_blocking().expect("persistent task-worker search");
+            worker.run_blocking().expect("task-work search");
             stopper.join().expect("stopper thread");
         });
 
