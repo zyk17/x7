@@ -18,6 +18,9 @@
 
 ## P4：task-worker 生命周期，未完成
 
+当前：task split 保持禁用；先以多 `SearchWorker` + minibatch/cache/prefetch/backend computation
+验证 GPU 主线。task worker 是后续减少 CPU gather/process 间隔的优化，不是本阶段的前置条件。
+
 - [x] 按 `src/search/classic/search.h:435-445`、`search.cc:1069-1119,1464-1483` 翻译
   `task_taking_started`、claim、idle、wake、close 与重用；已补多线程唯一领取回归。
 - [ ] 按 `src/search/classic/search.h:205-249,357-448, search.cc:1122-1140,1268-1508` 翻译一个 `SearchWorker` + 每 task thread
