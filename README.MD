@@ -11,7 +11,7 @@
 - `C:\Users\Administrator\projects\px0`
 - `C:\Users\Administrator\projects\pxzero-training`
 
-P4 尚未关闭。当前已接通真实 `124x10x9` ONNX backend、minibatch、prefetch、collision、
+P4 已收口。当前已接通真实 `124x10x9` ONNX backend、minibatch、prefetch、collision、
 shared-tree search worker、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。正式 ONNX 已由
 px0 `MemCache` 风格的 `CachingBackend` 包裹：按局面 hash 查找、以合法着数量防碰撞、batch 完成后写入、
 `ucinewgame` 清空；默认 `NNCacheSize=2000000`。

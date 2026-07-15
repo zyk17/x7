@@ -19,19 +19,15 @@
 - P1-P3 进入 P4 前复核：`cargo test --release -p xiangqi_core`（22 项 px0 规则/history 对拍）、
   `cargo test -p engin --lib`（79 项 P2/P3/controller/tree/UCT 回归）与 UCI/P4 生命周期集成测试已通过。
 
-## P4：task-worker 生命周期，未完成
+## P4：task-worker 生命周期，已完成
 
-当前：GPU task split 已接通；CPU 保持 px0 `task_workers_=0`。下一步验证多 SearchWorker、OOO、
-stop 与真实 ONNX/DirectML 时序。
+GPU task split 已接通；CPU 保持 px0 `task_workers_=0`。多 SearchWorker、OOO、stop 与真实
+ONNX/DirectML 时序已有回归和 release 冒烟。
 
 - [x] 翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为正式 ONNX 的
   `CachingBackend` wrapper：当前局面 hash 为 key、合法着数量防碰撞、cache miss 仅在
   `ComputeBlocking` 后写入、`ucinewgame` 清 cache；`NNCacheSize` 默认/范围为
   `src/neural/shared_params.cc:63-82` 的 `2000000` / `0..999999999`。
-
-- [ ] 翻译 px0 `src/search/classic/stoppers/common.cc:118-186`、`stoppers/simple.cc:74-126` 及其
-  对应测试后，再开放 `go wtime/btime/winc/binc/movestogo`。当前仅支持逐函数已对齐的
-  `go nodes`、`go movetime`、`go infinite`；`depth`、`mate`、`ponder` 同样明确拒绝，不能静默降级。
 
 - [x] 按 `src/search/classic/search.cc:981-1034` 翻译 watchdog 的 counters-mutex/condition-variable
   等待与 `FireStopInternal` 唤醒；不再固定 1ms polling。
@@ -61,6 +57,13 @@ stop 与真实 ONNX/DirectML 时序。
   backend reload 的 release UCI 冒烟。另验证 `go infinite -> go nodes` 与
   `go infinite -> position ... -> go nodes`：旧搜索静默回收，只有最后一次 `go` 输出 `bestmove`。
   对照 `src/engine.cc:148-224`、`src/search/classic/wrapper.cc:100-140`。
+
+## 后续：完整 UCI 时间管理（不阻塞 P4）
+
+- [ ] 先翻译 px0 `src/search/classic/stoppers/factory.cc:44-115` 的 `MoveOverheadMs`、
+  `TimeManager` 配置解析及默认 `legacy` 选择；不能把 `simple` 单独当作 px0 默认。
+- [ ] 在 factory 已对齐后，按被选 manager 的连续区间翻译 `legacy.cc`（默认）及其测试；只有届时
+  才开放 `go wtime/btime/winc/binc/movestogo`。`simple.cc:37-132` 只是显式选择 simple 时的分支。
 
 ## 约束
 

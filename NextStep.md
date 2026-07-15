@@ -37,7 +37,7 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
 后端必定有 search，正式 `ClassicEngine::new()` 则允许在权重未加载时没有 search。这样测试不会
 重新引入已废止的 `unavailable()` 占位构造，也不改变 px0 的延迟 backend 生命周期。
 
-## P4 未完成：按 px0 重建 task-worker 生命周期
+## P4：task-worker 生命周期已收口
 
 此前的 Rust 实现把同一个可变 `SearchWorker` 借给 scoped task thread，导致 node index 越界和
 poisoned tree lock。现已改为受限 `TaskTreeBridge`：只有 scoped task thread 可通过 active phase
@@ -103,7 +103,12 @@ phase + scoped task-thread 内，不改变 px0 的 selection、in-flight 或 bac
 机制，不承载任何搜索策略或节点语义。参考 px0 的 `nodes_mutex_` 使用边界
 `src/search/classic/search.cc:1142-1211,1494-1508`。
 
-下一步必须逐函数翻译，不补写并发捷径：
+P4 已按下列区间收口；不再为了时钟管理改变 task-worker 或 backend 流水线。
+完整 `wtime/btime` 需先整体翻译 px0 `stoppers/factory.cc:44-115` 的 TimeManager 选择与默认
+`legacy`，再翻译被选择的 manager，不能只拿 `simple.cc` 替代默认行为。这是后续独立 UCI
+完整性任务，不属于 P4 搜索并发基建。
+
+P4 已完成的逐函数翻译点：
 
 1. 已完成队列原子状态机：`src/search/classic/search.h:435-445`、
    `src/search/classic/search.cc:1069-1119,1464-1483`。
