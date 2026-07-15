@@ -24,12 +24,13 @@
 ## 模块边界
 
 - `crates/xiangqi_core`：翻译 px0 `src/chess`。
-- `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2/P3 已完成，P4 的 ONNX、单/多
-  `SearchWorker`、minibatch、MemCache、prefetch、collision、shared-tree 与 scoped task-worker 主线已接入。
+- `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2/P3 已完成，P4 的 ONNX、
+  单 worker、minibatch、MemCache、prefetch、collision、shared-tree 与 watchdog 主线已接入。GPU
+  task-worker 仍未完成，当前必须保持 `task_workers=0`。
   正式 ONNX 必须经 `CachingBackend`，其 key/collision guard/回填时序只能对照
   `px0/src/neural/memcache.cc:38-190` 修改。
-  task worker 共享一个 `SearchWorker`，但每个 task thread 独占一个 `TaskWorkspace`；唯一准确状态以
-  `NextStep.md`、`TODO.md` 为准。
+  停用的 `TaskTreeBridge` / `TaskWorkerRunner` 不是可用实现；后续只能以无别名的数据所有权重译
+  px0 task 生命周期。唯一准确状态以 `NextStep.md`、`TODO.md` 为准。
 - `nn/`：对齐 pxzero-training 的数据、训练和导出。
 
 不要引入：
@@ -37,10 +38,10 @@
 - 多套正式训练格式
 - 未经 px0 对照的抽象、参数或启发式
 
-`unsafe` 例外：仅 P4 task-worker 可使用受限 raw-pointer bridge，对照
-`src/search/classic/search.h:205-244,435-445` 与 `search.cc:1069-1140,1485-1508,1828-1897`。
-它必须是 scoped-thread 生命周期、显式 active tree phase、`WaitForTasks` 后清空指针；不得扩散到
-棋规、UCI、网络后端或任意未标注 px0 对照的代码。
+禁止为 P4 task-worker 使用 raw pointer、`unsafe impl Send` 或跨线程共享 `&mut SearchWorker`。
+此前这条翻译在真实 ONNX 下重复 `ExtendNode`，已停用。只有先在 `NextStep.md`/`TODO.md` 记录与
+px0 `src/search/classic/search.h:205-244,348-445`、`search.cc:1069-1508` 对应的无别名所有权方案，
+并补齐真实 ONNX 回归后，才可讨论最小必要的 `unsafe`。
 
 ## 依赖与关键路径
 
