@@ -18,7 +18,9 @@
 
 ## P4：task-worker 生命周期，未完成
 
-- [ ] 按 `src/search/classic/search.h:205-249,357-448` 翻译一个 `SearchWorker` + 每 task thread
+- [x] 按 `src/search/classic/search.h:435-445`、`search.cc:1069-1119,1464-1483` 翻译
+  `task_taking_started`、claim、idle、wake、close 与重用；已补多线程唯一领取回归。
+- [ ] 按 `src/search/classic/search.h:205-249,357-448, search.cc:1122-1140,1268-1508` 翻译一个 `SearchWorker` + 每 task thread
   一个独占 `TaskWorkspace` 的 px0 所有权关系；禁止共享 Rust `&mut SearchWorker` 或 workspace。
 - [ ] 按 `src/search/classic/search.cc:1069-1140,1268-1508` 翻译 task queue 的领取、执行、
   gathering/processing 回写和 `WaitForTasks`。

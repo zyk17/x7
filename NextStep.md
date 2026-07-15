@@ -25,11 +25,13 @@ task-worker 完成。
 
 下一步必须逐函数翻译，不补写并发捷径：
 
-1. `src/search/classic/search.h:205-249,357-448`
-   - 翻译 px0 的一个 `SearchWorker` + 每 task thread 一个 `TaskWorkspace` 的关系；不得共享
+1. 已完成队列原子状态机：`src/search/classic/search.h:435-445`、
+   `src/search/classic/search.cc:1069-1119,1464-1483`。
+   - `task_taking_started`、task claim、idle、wake、close 与重用已在
+     `crates/engin/src/search/classic/worker.rs` 对照实现并有多线程领取回归。
+2. `src/search/classic/search.h:205-249,357-448`、`search.cc:1122-1140,1268-1508`
+   - 继续翻译一个 `SearchWorker` + 每 task thread 一个 `TaskWorkspace` 的执行关系；不得共享
      Rust `&mut SearchWorker`，也不得把一个 workspace 交给多个 task thread。
-2. `src/search/classic/search.cc:1069-1140,1268-1508`
-   - 翻译 `RunTasks`、任务领取、gathering/processing 分派、完成和等待。
 3. `src/search/classic/search.cc:1828-1897`
    - 翻译 task split 和 `ResetTasks`；`task_count=-1` 只表示 idle，`exiting` 才关闭线程。
 4. `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334`

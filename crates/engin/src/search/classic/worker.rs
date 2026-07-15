@@ -301,11 +301,15 @@ impl PickTask {
 }
 
 /// px0 task queue state (`src/search/classic/search.h:435-445`,
-/// `search.cc:1464-1483`). Task execution is wired separately.
+/// `search.cc:1069-1140,1464-1483`). Task execution is wired separately.
 #[derive(Default)]
 pub struct PickTaskQueue {
     tasks: Mutex<Vec<PickTask>>,
     task_count: AtomicIsize,
+    /// px0 `task_taking_started_`: a tiny claim lock around the task index.
+    /// Rust keeps task storage behind a mutex, but retains this separate state
+    /// so `take_blocking()` follows px0's acquire/spin/sleep lifecycle.
+    task_taking_started: AtomicBool,
     tasks_taken: AtomicUsize,
     completed_tasks: AtomicUsize,
     // This is px0's `task_count_ == -1` sentinel (`search.cc:1097-1119`,
@@ -321,6 +325,7 @@ impl PickTaskQueue {
     /// px0 `SearchWorker::ResetTasks` (`src/search/classic/search.cc:1466-1473`).
     pub fn reset(&self) {
         self.task_count.store(0, Ordering::Release);
+        self.task_taking_started.store(false, Ordering::Release);
         self.tasks_taken.store(0, Ordering::Release);
         self.completed_tasks.store(0, Ordering::Release);
         let mut tasks = self.tasks.lock().expect("pick task queue lock");
@@ -354,13 +359,22 @@ impl PickTaskQueue {
             if task_count < 0 || taken >= task_count as usize {
                 return None;
             }
+
             if self
-                .tasks_taken
-                .compare_exchange_weak(taken, taken + 1, Ordering::AcqRel, Ordering::Acquire)
+                .task_taking_started
+                .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                break taken;
+                let taken = self.tasks_taken.load(Ordering::Acquire);
+                let task_count = self.task_count.load(Ordering::Acquire);
+                if task_count >= 0 && taken < task_count as usize {
+                    let index = self.tasks_taken.fetch_add(1, Ordering::AcqRel);
+                    self.task_taking_started.store(false, Ordering::Release);
+                    break index;
+                }
+                self.task_taking_started.store(false, Ordering::Release);
             }
+            std::hint::spin_loop();
         };
         self.tasks.lock().expect("pick task queue lock").get(index).map(|task| {
             (
@@ -411,6 +425,7 @@ impl PickTaskQueue {
     /// after `close()` sets `exiting`; otherwise they sleep until `reset/push`
     /// publishes the next iteration's work.
     pub fn take_blocking(&self) -> Option<(usize, PickTask)> {
+        let mut spins = 0usize;
         loop {
             if let Some(task) = self.take() {
                 return Some(task);
@@ -418,11 +433,24 @@ impl PickTaskQueue {
             if self.exiting.load(Ordering::Acquire) {
                 return None;
             }
+
+            if self.task_count.load(Ordering::Acquire) != -1 {
+                spins += 1;
+                if spins >= 512 {
+                    std::thread::yield_now();
+                    spins = 0;
+                } else {
+                    std::hint::spin_loop();
+                }
+                continue;
+            }
+
+            spins = 0;
             let tasks = self.tasks.lock().expect("pick task queue lock");
             if self.exiting.load(Ordering::Acquire) {
                 return None;
             }
-            if self.tasks_taken.load(Ordering::Acquire) < self.task_count.load(Ordering::Acquire).max(0) as usize {
+            if self.task_count.load(Ordering::Acquire) != -1 {
                 continue;
             }
             drop(self.task_added.wait(tasks).expect("pick task queue wait"));
@@ -2610,6 +2638,35 @@ mod tests {
         let waiter = std::thread::spawn(move || waiter_queue.take_blocking());
         closing_queue.close();
         assert!(waiter.join().expect("closing worker").is_none());
+    }
+
+    /// px0 serializes the `tasks_taken_` increment with
+    /// `task_taking_started_`, so parallel runners cannot claim one task twice
+    /// (`src/search/classic/search.cc:1076-1093`).
+    #[test]
+    fn pick_task_queue_claims_each_published_task_once() {
+        let queue = Arc::new(PickTaskQueue::default());
+        queue.reset();
+        for index in 0..32 {
+            assert!(queue.push(PickTask::processing(index, index + 1)));
+        }
+
+        let claimed = Arc::new(Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let queue = Arc::clone(&queue);
+                let claimed = Arc::clone(&claimed);
+                scope.spawn(move || {
+                    while let Some((index, _)) = queue.take() {
+                        claimed.lock().expect("claimed task lock").push(index);
+                    }
+                });
+            }
+        });
+
+        let mut claimed = claimed.lock().expect("claimed task lock").clone();
+        claimed.sort_unstable();
+        assert_eq!(claimed, (0..32).collect::<Vec<_>>());
     }
 
     /// px0 sets `task_count_ = -1` after one gather without destroying its
