@@ -38,6 +38,7 @@
 ```powershell
 cd nn
 python -m pip install -e ".[train,dev]"
+Copy-Item configs/example.yaml configs/x7_qmix_075_01.yaml
 python scripts/train/train_px0.py --config configs/x7_qmix_075_01.yaml
 ```
 
@@ -49,7 +50,7 @@ python scripts/train/train_px0.py --config configs/x7_qmix_075_01.yaml
 
 输入 `124x10x9`、policy `2062`、WDL value、辅助 moves-left head 和现有 loss 都不是可配置项，避免训练契约漂移。配置内相对路径按启动目录解析。
 完整字段、默认值和注释见 [configs/example.yaml](C:/projects/77xiangqi_engine/nn/configs/example.yaml)；实际实验应复制
-该文件后改名，而不是直接改示例文件。
+该文件后改名，而不是直接改示例文件。除 `example.yaml` 外的 `configs/*.yaml` 都是本地实验文件，不进入 Git。
 
 导出 ONNX 同样只依赖该 Python 包：
 

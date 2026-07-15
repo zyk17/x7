@@ -27,6 +27,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install -e "nn[t
 ## 2. 用 YAML 训练
 
 ```powershell
+Copy-Item nn\configs\example.yaml nn\configs\x7_qmix_075_01.yaml
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
   --config nn\configs\x7_qmix_075_01.yaml
 ```
@@ -35,6 +36,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 `C:\Users\Administrator\projects\pxzero-training\tf\configs\example.yaml`，但只保留当前 PyTorch/PX0
 主线需要的字段。`124x10x9 -> 2062 + WDL`、纯 CNN trunk 与 loss 语义固定，不能通过配置切换。
 所有可配置字段、默认值与注释见 [nn/configs/example.yaml](C:/projects/77xiangqi_engine/nn/configs/example.yaml)。
+`example.yaml` 是唯一提交到 Git 的配置文件；复制出的实验 YAML 被忽略。
 
 ## 3. 继续训练
 

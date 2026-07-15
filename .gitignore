@@ -49,6 +49,10 @@ pgns/
 *.ckpt
 *.safetensors
 
+# 训练实验配置；仓库只保留有完整注释的模板。
+/nn/configs/*.yaml
+!/nn/configs/example.yaml
+
 # --- 日志与临时文件 ---
 *.log
 *.tmp
