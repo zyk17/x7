@@ -21,6 +21,10 @@
 当前：GPU task split 已接通；CPU 保持 px0 `task_workers_=0`。下一步验证多 SearchWorker、OOO、
 stop 与真实 ONNX/DirectML 时序。
 
+- [ ] 逐段翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为真实 ONNX 的
+  `CachingBackend` wrapper：以当前局面 hash 为 key、保留合法着数量防碰撞、缓存 miss 仅在
+  `ComputeBlocking` 后写入、`ucinewgame` 清 cache。不要把测试用 `UniformBackend` cache 当作正式实现。
+
 - [x] 按 `src/search/classic/search.cc:981-1034` 翻译 watchdog 的 counters-mutex/condition-variable
   等待与 `FireStopInternal` 唤醒；不再固定 1ms polling。
 - [x] 按 `src/search/classic/search.cc:249-264,393-398,908-918,1213-1231` 翻译

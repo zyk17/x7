@@ -73,6 +73,11 @@ GPU task-worker 测试已确认 helper 实际领取任务并在固定 visits 后
 
 `WorkerTree` 已收为显式 tree-phase 借用：direct 单测树和共享生产树均在 `with_tree` /
 `with_tree_read` 中临时借出 `NodeTree`，selection、processing、fetch、backup 都把该借用逐层传入。
+
+真实 ONNX 尚未拥有 px0 `CreateMemCache` wrapper。现有 `UniformBackend` 的 cache 仅为测试与对拍，
+不能据此宣称线上 NN cache 已完成。下一翻译点固定为 px0 `src/neural/memcache.h:34-45` 与
+`memcache.cc:38-190`：缓存 key 是当前局面 hash，合法着数量用于保护碰撞，cache miss 必须在
+`ComputeBlocking` 后回填，`Engine::NewGame` 清 cache。
 这对应 px0 `nodes_mutex_` 的 phase 边界（`src/search/classic/search.cc:1142-1211,1494-1508`），并删除了
 此前 `active: *mut NodeTree` 的无边界访问桥接；当前 `TaskTreeBridge` 将 raw pointer 限定在 active
 phase + scoped task-thread 内，不改变 px0 的 selection、in-flight 或 backup 算法。

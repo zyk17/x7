@@ -11,8 +11,9 @@
 - `C:\Users\Administrator\projects\px0`
 - `C:\Users\Administrator\projects\pxzero-training`
 
-P4 尚未关闭。当前已接通真实 `124x10x9` ONNX backend、minibatch、NN cache、prefetch、
-collision、shared-tree search worker、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。
+P4 尚未关闭。当前已接通真实 `124x10x9` ONNX backend、minibatch、prefetch、collision、
+shared-tree search worker、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。真实 ONNX 的
+px0 `MemCache` wrapper 尚未翻译；当前 cache 仅存在于 `UniformBackend` 测试路径，不能当作线上功能。
 此前 Rust 端把一个 `SearchWorker` 的可变状态错误地交给多个 task thread，已删除该不安全路径；
 px0 task-worker 生命周期已按 scoped thread 翻译：每个 task thread 独占一个 `TaskWorkspace`，并只在
 明确的 gathering/processing tree phase 内访问共享搜索状态。受限 raw-pointer bridge 仅存在于这条

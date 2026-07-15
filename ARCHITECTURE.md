@@ -13,7 +13,8 @@
 3. `engin/mcts`：px0 `src/search` 的 classic worker 主线；minibatch、collision、scoped
    task-worker、prefetch、tree reuse、watchdog 与多 worker tree phase 已接线。每个 task thread
    独占一个 `TaskWorkspace`，仅在 active tree phase 内访问共享搜索状态。
-4. px0 已有的 NN cache、prefetch、tree reuse 与并发；后续改动只能在明确引用的 px0 语义上继续。
+4. prefetch、tree reuse 与并发已接线；真实 ONNX 的 px0 `MemCache` 仍待翻译。后续改动只能在明确
+   引用的 px0 语义上继续。
 5. `pxzero-training`：数据、训练与 ONNX 导出契约。
 
 只有 px0 主线翻译完成并有对拍测试后，才允许比较 lc0 或 KataGo，并将明确记录的差异作为独立优化事项。
