@@ -2,11 +2,14 @@
 //!
 //! P4 worker 七阶段流水线、碰撞和 task queue 数据结构已按 px0 源码翻译。
 //! px0 task thread 共享一个 `SearchWorker`，但各自独占 `TaskWorkspace`。
-//! 其跨 task 的 `nodes_mutex_` 持锁语义尚未安全翻译；正式搜索因而禁用
-//! task split，队列只供后续实现和直接单测使用。
+//! Rust 以受限 `TaskTreeBridge` 翻译 px0 跨 task 的 `nodes_mutex_` phase；
+//! 不安全访问只存在于该 bridge 与 scoped task-thread 生命周期内。
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::marker::PhantomData;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicPtr, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 use parking_lot::RwLock;
 
@@ -185,6 +188,56 @@ impl<'a> WorkerTree<'a> {
     }
 }
 
+/// px0 task threads access `Search::nodes_mutex_` through their owning
+/// `SearchWorker` while the main worker retains that lock
+/// (`src/search/classic/search.cc:1485-1508,1551-1897`). Rust cannot express
+/// that cross-thread borrowed guard directly, so this bridge is the sole raw
+/// tree pointer in classic search. A phase is active only while the main
+/// worker waits for every queued task; task work never outlives the phase.
+struct TaskTreeBridge {
+    active: AtomicPtr<NodeTree>,
+}
+
+impl TaskTreeBridge {
+    fn activate(self: &Arc<Self>, tree: &mut NodeTree) -> TaskTreePhase {
+        let ptr = ptr::from_mut(tree);
+        let previous = self.active.swap(ptr, Ordering::AcqRel);
+        assert!(
+            previous.is_null() || previous == ptr,
+            "nested task tree phase changed tree"
+        );
+        TaskTreePhase {
+            bridge: Arc::clone(self),
+            previous,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must be a px0 task worker claimed from this worker's queue.
+    /// The main worker holds the matching tree phase until `PickTaskQueue::wait`
+    /// observes all queued tasks complete. The task split in
+    /// `search.cc:1828-1897` supplies the logical non-overlap required by px0.
+    unsafe fn with_active_tree<R>(&self, operation: impl FnOnce(&mut NodeTree) -> R) -> R {
+        let tree = self.active.load(Ordering::Acquire);
+        assert!(!tree.is_null(), "px0 task ran outside its tree phase");
+        // SAFETY: documented above; the caller is a task claimed during the
+        // matching active phase and the owner waits before clearing it.
+        unsafe { operation(&mut *tree) }
+    }
+}
+
+struct TaskTreePhase {
+    bridge: Arc<TaskTreeBridge>,
+    previous: *mut NodeTree,
+}
+
+impl Drop for TaskTreePhase {
+    fn drop(&mut self) {
+        self.bridge.active.store(self.previous, Ordering::Release);
+    }
+}
+
 /// px0 `SearchWorker::PickTask` (`src/search/classic/search.h:367-393`).
 /// A gathering task owns a disjoint subtree root; a processing task owns a
 /// non-overlapping minibatch range.
@@ -253,8 +306,8 @@ pub struct PickTaskQueue {
     tasks_taken: AtomicUsize,
     completed_tasks: AtomicUsize,
     // This is px0's `task_count_ == -1` sentinel (`search.cc:1097-1119`,
-    // `search.h:435-445`). It is retained for the future independent worker
-    // lifecycle; the current production bridge consumes tasks synchronously.
+    // `search.h:435-445`). Persistent scoped task threads sleep on it between
+    // iterations and only exit after `close()` sets `exiting`.
     exiting: AtomicBool,
     task_added: Condvar,
 }
@@ -351,8 +404,8 @@ impl PickTaskQueue {
     }
 
     /// px0 `task_count_.store(-1)` after `GatherMinibatch`
-    /// (`src/search/classic/search.cc:1182-1185`). It is a no-op for worker
-    /// lifetime today because production task execution is synchronous.
+    /// (`src/search/classic/search.cc:1182-1185`). Persistent task threads
+    /// sleep after this publication until the next `reset/push` cycle.
     pub fn idle(&self) {
         self.task_count.store(-1, Ordering::Release);
         self.task_added.notify_all();
@@ -460,6 +513,38 @@ pub struct SearchWorker<'a> {
     task_queue: PickTaskQueue,
     task_workspaces: Vec<TaskWorkspace>,
     picking_workspace: TaskWorkspace,
+    task_tree: Arc<TaskTreeBridge>,
+    task_error: Arc<Mutex<Option<EnginError>>>,
+    /// Counts tasks actually claimed by scoped px0 task workers. It is kept
+    /// private to validate lifecycle progress, not exposed as a search stat.
+    task_thread_executions: AtomicUsize,
+}
+
+/// px0 task threads hold a raw `SearchWorker*` for the worker lifetime
+/// (`src/search/classic/search.h:221-244`). Scoped Rust threads guarantee the
+/// pointer cannot outlive `SearchWorker::run_blocking`; all actual access is
+/// limited to px0's queued gathering/processing phase.
+#[derive(Clone, Copy)]
+struct TaskWorkerRunner<'worker> {
+    worker: *mut SearchWorker<'worker>,
+    marker: PhantomData<&'worker mut SearchWorker<'worker>>,
+}
+
+// SAFETY: `TaskWorkerRunner` is only passed to `thread::scope` from
+// `SearchWorker::run_blocking`. Its pointee outlives the scope. Concurrent
+// access is restricted to the px0 task queue ranges and `TaskTreeBridge`
+// phase documented above; backend computation is `Send + Sync` by contract.
+unsafe impl Send for TaskWorkerRunner<'_> {}
+
+impl<'worker> TaskWorkerRunner<'worker> {
+    /// # Safety
+    ///
+    /// See `TaskWorkerRunner` and `SearchWorker::run_tasks`.
+    unsafe fn run(self, task_id: usize) -> Result<(), EnginError> {
+        // SAFETY: the scoped thread is joined before the owning worker returns
+        // from `run_blocking`; phase-local tree access is mediated separately.
+        unsafe { (&mut *self.worker).run_tasks(task_id) }
+    }
 }
 
 impl<'a> SearchWorker<'a> {
@@ -575,12 +660,25 @@ impl<'a> SearchWorker<'a> {
         if target_minibatch_size == 0 {
             target_minibatch_size = 1;
         }
-        // px0 resolves `TaskWorkers=-1` and starts task threads here
-        // (`src/search/classic/search.h:205-233`). Those threads share this
-        // SearchWorker while owning separate TaskWorkspaces. Rust has not yet
-        // translated px0's cross-task nodes_mutex_ lifetime safely, so do not
-        // turn the requested count into synchronous task splitting.
-        let task_workers = 0;
+        // px0 `SearchWorker` resolves its task-worker count at construction
+        // (`src/search/classic/search.h:210-224`). CPU backends keep this at
+        // zero; GPU backends default to at most four helpers per search worker.
+        let task_workers = if params.task_workers_per_search_worker < 0 {
+            if backend.attributes().runs_on_cpu {
+                0
+            } else {
+                let working_threads = search_state
+                    .thread_count
+                    .load(Ordering::Acquire)
+                    .saturating_sub(1)
+                    .max(1);
+                let available = thread::available_parallelism().map_or(1, usize::from);
+                i32::try_from((available / working_threads).saturating_sub(1).min(4))
+                    .expect("px0 task worker count fits i32")
+            }
+        } else {
+            params.task_workers_per_search_worker
+        };
         let task_workspaces = (0..usize::try_from(task_workers).expect("non-negative task worker count"))
             .map(|_| TaskWorkspace::default())
             .collect();
@@ -607,6 +705,11 @@ impl<'a> SearchWorker<'a> {
             task_queue: PickTaskQueue::default(),
             task_workspaces,
             picking_workspace: TaskWorkspace::default(),
+            task_tree: Arc::new(TaskTreeBridge {
+                active: AtomicPtr::new(ptr::null_mut()),
+            }),
+            task_error: Arc::new(Mutex::new(None)),
+            task_thread_executions: AtomicUsize::new(0),
         }
     }
 
@@ -775,13 +878,42 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::RunBlocking` (`src/search/classic/search.h:235-249`).
     ///
-    /// px0 task threads share this `SearchWorker` and each own one
-    /// `TaskWorkspace`. That tree-phase ownership boundary has not been
-    /// translated yet, so queued work remains on the owning worker's private
-    /// workspace. This avoids aliasing one mutable Rust worker through raw
-    /// pointers.
+    /// GPU workers keep px0-style scoped task threads for this worker's search
+    /// lifetime. Each thread owns a `TaskWorkspace`; the only shared mutable
+    /// path is the explicitly active `TaskTreeBridge` phase.
     pub fn run_blocking(&mut self) -> Result<(), EnginError> {
-        self.run_blocking_without_task_threads()
+        if self.task_workers == 0 {
+            return self.run_blocking_without_task_threads();
+        }
+
+        let runner = TaskWorkerRunner {
+            worker: self as *mut Self,
+            marker: PhantomData,
+        };
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(self.task_workspaces.len());
+            for task_id in 0..self.task_workspaces.len() {
+                handles.push(scope.spawn(move || {
+                    // SAFETY: `runner` is scoped to `self`, and its only
+                    // accesses are the px0 task phases documented on
+                    // `TaskWorkerRunner` and `TaskTreeBridge`.
+                    unsafe { runner.run(task_id) }
+                }));
+            }
+
+            let mut result = self.run_blocking_without_task_threads();
+            self.task_queue.close();
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if result.is_ok() => result = Err(error),
+                    Ok(Err(_)) => {}
+                    Err(_) if result.is_ok() => result = Err(EnginError::Uci("px0 task worker panicked".into())),
+                    Err(_) => {}
+                }
+            }
+            result
+        })
     }
 
     fn run_blocking_without_task_threads(&mut self) -> Result<(), EnginError> {
@@ -791,6 +923,84 @@ impl<'a> SearchWorker<'a> {
                 break Ok(());
             }
         })()
+    }
+
+    /// px0 `SearchWorker::RunTasks` (`src/search/classic/search.cc:1069-1140`).
+    ///
+    /// # Safety
+    ///
+    /// Invoked only by `TaskWorkerRunner` inside `run_blocking`'s scoped
+    /// threads. The queue gives each task a unique workspace and the main
+    /// worker keeps `TaskTreeBridge` active until `PickTaskQueue::wait`.
+    unsafe fn run_tasks(&mut self, task_id: usize) -> Result<(), EnginError> {
+        while let Some((queue_id, task)) = self.task_queue.take_blocking() {
+            self.task_thread_executions.fetch_add(1, Ordering::Relaxed);
+            let prior_error = self.task_error.lock().expect("task error lock").clone();
+            if prior_error.is_some() {
+                self.task_queue.complete(queue_id, Vec::new());
+                // A failed sibling must still drain every published task so
+                // the main px0 `WaitForTasks` phase cannot spin forever. The
+                // owner observes the first stored error immediately after the
+                // wait and aborts the iteration.
+                continue;
+            }
+
+            let mut workspace = std::mem::take(self.task_workspaces.get_mut(task_id).expect("px0 task workspace"));
+            let result = match task.kind {
+                PickTaskKind::Gathering => {
+                    let mut results = Vec::new();
+                    let task_tree = Arc::clone(&self.task_tree);
+                    // SAFETY: the queue task was claimed during an active
+                    // `TaskTreeBridge` phase, which is held until completion.
+                    unsafe {
+                        task_tree.with_active_tree(|tree| {
+                            self.pick_nodes_to_extend_task_with_workspace(
+                                tree,
+                                task.start.expect("gathering task start"),
+                                task.base_depth,
+                                task.collision_limit,
+                                &task.moves_to_base,
+                                &mut results,
+                                &mut workspace,
+                                false,
+                            )
+                        })
+                    }
+                    .map(|()| results)
+                }
+                PickTaskKind::Processing => {
+                    let task_tree = Arc::clone(&self.task_tree);
+                    // SAFETY: processing owns a disjoint minibatch range and
+                    // runs during the same active tree phase as px0.
+                    unsafe {
+                        task_tree.with_active_tree(|tree| {
+                            self.process_picked_task_in_tree(tree, task.start_idx, task.end_idx, &mut workspace)
+                        })
+                    }
+                    .map(|()| Vec::new())
+                }
+            };
+            *self.task_workspaces.get_mut(task_id).expect("px0 task workspace") = workspace;
+
+            match result {
+                Ok(results) => self.task_queue.complete(queue_id, results),
+                Err(error) => {
+                    let mut task_error = self.task_error.lock().expect("task error lock");
+                    if task_error.is_none() {
+                        *task_error = Some(error.clone());
+                    }
+                    drop(task_error);
+                    self.task_queue.complete(queue_id, Vec::new());
+                    // Keep draining published work; see the prior-error path
+                    // above. Returning here would strand later queue entries.
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn take_task_error(&self) -> Option<EnginError> {
+        self.task_error.lock().expect("task error lock").take()
     }
 
     /// px0 `SearchWorker::InitializeIteration` (`search.cc:1233-1266`)。
@@ -805,6 +1015,7 @@ impl<'a> SearchWorker<'a> {
         self.computation = Some(self.backend.create_computation()?);
         self.minibatch.clear();
         self.minibatch.reserve(2 * self.target_minibatch_size);
+        *self.task_error.lock().expect("task error lock") = None;
         self.history = tree.history().clone();
         self.played_history_len = self.history.len();
         Ok(())
@@ -816,6 +1027,10 @@ impl<'a> SearchWorker<'a> {
     }
 
     fn gather_minibatch_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
+        // px0 holds `nodes_mutex_` across gathering, task processing and the
+        // corresponding `WaitForTasks` (`search.cc:1268-1508`). Keep the raw
+        // bridge active for exactly that same dynamic extent.
+        let _task_tree_phase = self.task_tree.activate(tree);
         let root = tree.current_head();
         let cur_n = tree.node(root).n();
         let remaining_n = self.latest_time_manager_hints.estimated_remaining_playouts();
@@ -863,9 +1078,8 @@ impl<'a> SearchWorker<'a> {
             }
             // px0 `search.cc:1322-1347`: split the initial contiguous work
             // ranges into processing tasks, retaining the final range for the
-            // main worker. The queue shape is translated, but this Rust port
-            // currently consumes it synchronously until px0's independent
-            // SearchWorker-per-task ownership is implemented.
+            // main worker. Scoped task threads consume the queued ranges while
+            // the enclosing px0 tree phase remains active.
             let mut main_start = new_start;
             let mut needs_wait = false;
             if self.task_workers > 0
@@ -994,6 +1208,9 @@ impl<'a> SearchWorker<'a> {
         if collision_limit == 0 {
             return Ok(());
         }
+        // Direct callers (primarily unit tests) do not have the outer gather
+        // phase. Nested activation restores the enclosing pointer unchanged.
+        let _task_tree_phase = self.task_tree.activate(tree);
         // px0 `SearchWorker::PickNodesToExtend` begins every gather with
         // `ResetTasks` (`src/search/classic/search.cc:1485-1492`).
         self.task_queue.reset();
@@ -1053,17 +1270,20 @@ impl<'a> SearchWorker<'a> {
     }
 
     /// px0 waits for independent task workers here (`search.cc:1494-1508`).
-    /// Until that ownership model is translated, consume queued work locally.
+    /// CPU workers have none and retain the direct synchronous path.
     fn wait_for_queued_tasks_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        self.run_tasks_synchronously_in_tree(tree)?;
+        if self.task_workers == 0 {
+            self.run_tasks_synchronously_in_tree(tree)?;
+        }
         self.task_queue.wait();
+        if let Some(error) = self.take_task_error() {
+            return Err(error);
+        }
         Ok(())
     }
 
-    /// px0 task workers keep an independent workspace for their entire
-    /// `SearchWorker` lifetime (`src/search/classic/search.h:205-233`). Until
-    /// that worker ownership is translated, this bridge reuses one workspace
-    /// without concurrent access.
+    /// CPU fallback for px0 `TaskWorkers=0`: run queued work on the owning
+    /// workspace without creating task threads.
     fn run_tasks_synchronously_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
         if self.task_workspaces.is_empty() {
             let mut workspace = std::mem::take(&mut self.picking_workspace);
@@ -2205,10 +2425,10 @@ mod tests {
         }
     }
 
-    /// A configured task-worker count must preserve the complete search path
-    /// until the Rust port has px0's independent worker ownership model.
+    /// px0 starts GPU task workers from the configured count and keeps them
+    /// alive for the parent `SearchWorker` lifetime (`search.h:205-244`).
     #[test]
-    fn untranslated_task_workers_are_disabled_for_gpu_backends() {
+    fn gpu_task_workers_run_and_leave_no_in_flight_visits() {
         ensure_init();
         let mut tree = NodeTree::default();
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -2230,7 +2450,7 @@ mod tests {
         let search_state = Arc::new(WorkerSearchState::new(Arc::clone(&stop)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
 
-        assert_eq!(worker.task_workers, 0);
+        assert_eq!(worker.task_workers, 1);
 
         std::thread::scope(|scope| {
             let state = Arc::clone(&search_state);
@@ -2247,6 +2467,7 @@ mod tests {
         });
 
         assert!(search_state.total_playouts.load(Ordering::Acquire) >= 16);
+        assert!(worker.task_thread_executions.load(Ordering::Acquire) > 0);
         assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
     }
 

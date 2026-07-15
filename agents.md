@@ -25,15 +25,20 @@
 
 - `crates/xiangqi_core`：翻译 px0 `src/chess`。
 - `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2/P3 已完成，P4 的 ONNX、单/多
-  `SearchWorker`、minibatch、cache、prefetch、collision 与 shared-tree 子集已接入。task-worker 的
-  生命周期仍未完成：px0 共享一个 `SearchWorker`，而每个 task thread 独占一个 `TaskWorkspace`。
-  唯一准确状态以 `NextStep.md`、`TODO.md` 为准。
+  `SearchWorker`、minibatch、cache、prefetch、collision、shared-tree 与 scoped task-worker 主线已接入。
+  task worker 共享一个 `SearchWorker`，但每个 task thread 独占一个 `TaskWorkspace`；唯一准确状态以
+  `NextStep.md`、`TODO.md` 为准。
 - `nn/`：对齐 pxzero-training 的数据、训练和导出。
 
 不要引入：
 
 - 多套正式训练格式
 - 未经 px0 对照的抽象、参数或启发式
+
+`unsafe` 例外：仅 P4 task-worker 可使用受限 raw-pointer bridge，对照
+`src/search/classic/search.h:205-244,435-445` 与 `search.cc:1069-1140,1485-1508,1828-1897`。
+它必须是 scoped-thread 生命周期、显式 active tree phase、`WaitForTasks` 后清空指针；不得扩散到
+棋规、UCI、网络后端或任意未标注 px0 对照的代码。
 
 ## 依赖与关键路径
 

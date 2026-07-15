@@ -24,13 +24,16 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
 ## P4 未完成：按 px0 重建 task-worker 生命周期
 
 此前的 Rust 实现把同一个可变 `SearchWorker` 借给 scoped task thread，导致 node index 越界和
-poisoned tree lock。该路径已移除，正式搜索当前禁用 task split，不能再称为 px0
-task-worker 完成。
+poisoned tree lock。现已改为受限 `TaskTreeBridge`：只有 scoped task thread 可通过 active phase
+访问 `NodeTree`，主 worker 在 `WaitForTasks` 前持续持有对应 tree phase。参考 px0
+`src/search/classic/search.h:205-244,435-445`、`search.cc:1069-1140,1485-1508,1828-1897`。
 
 ### 当前决策
 
-当前保持安全基线：正式搜索继续禁用 task split（等价于 px0 CPU backend 的 `task_workers_=0`
-分支），优先验证多个 `SearchWorker`、minibatch、cache、prefetch 与 backend computation 的主线。
+CPU backend 保持 px0 `task_workers_=0` 分支；GPU backend 在 `TaskWorkersPerSearchWorker=-1` 时按
+px0 `search.h:210-224` 解析为每个 SearchWorker 最多四个 helper，并以 scoped thread 生命周期运行。
+现阶段优先验证 task split、多个 `SearchWorker`、minibatch、cache、prefetch 与 backend computation
+的组合时序。
 
 collision-only `sleep(10ms)` 保持与 px0 一致：它位于 `SearchWorker::UpdateCounters`
 (`src/search/classic/search.cc:2337-2351`)，只在一次 iteration 完全没有非 collision 工作时退避。
@@ -63,16 +66,16 @@ stopper 现在也遵守 px0 的 root-first-visit gate：root 尚无访问时只�
 task worker 不直接执行 GPU 推理。它在 px0 中并行执行 gathering/processing，减少 selection、node
 extend 和 `BackendComputation::AddInput` 的 CPU 准备间隔；这能帮助持续向 GPU 提交输入，但不是 GPU
 吞吐的唯一或首要来源。持续喂卡首先依赖多个搜索 worker、真实 batch、共享 backend computation 与
-backend 的异步调度。安全 tree-phase 重构完成前，不以 task worker 作为当前性能验收前提。
+backend 的异步调度。task worker 已接通，但 DirectML/ONNX 的实际吞吐仍须单独验收。
 
-当前测试不再把 `TaskWorkersPerSearchWorker` 的请求误称为已执行的同步 split；运行时会明确解析为
-`0`，直到安全 task-worker 生命周期落地。
+GPU task-worker 测试已确认 helper 实际领取任务并在固定 visits 后清空 root `NInFlight`；这不是
+同步 split。默认 task-worker 数和 CPU fallback 均按 px0 `search.h:210-224`。
 
 `WorkerTree` 已收为显式 tree-phase 借用：direct 单测树和共享生产树均在 `with_tree` /
 `with_tree_read` 中临时借出 `NodeTree`，selection、processing、fetch、backup 都把该借用逐层传入。
 这对应 px0 `nodes_mutex_` 的 phase 边界（`src/search/classic/search.cc:1142-1211,1494-1508`），并删除了
-此前 `active: *mut NodeTree` 的隐式访问桥接；它是后续安全连接真实 task workers 的前置条件，不改变
-px0 的 selection、in-flight 或 backup 算法。
+此前 `active: *mut NodeTree` 的无边界访问桥接；当前 `TaskTreeBridge` 将 raw pointer 限定在 active
+phase + scoped task-thread 内，不改变 px0 的 selection、in-flight 或 backup 算法。
 
 共享 `NodeTree` 的通用 `RwLock` 已采用 `parking_lot`，替代标准库会 poison 的锁接口；这只承担锁
 机制，不承载任何搜索策略或节点语义。参考 px0 的 `nodes_mutex_` 使用边界
@@ -84,16 +87,13 @@ px0 的 selection、in-flight 或 backup 算法。
    `src/search/classic/search.cc:1069-1119,1464-1483`。
    - `task_taking_started`、task claim、idle、wake、close 与重用已在
      `crates/engin/src/search/classic/worker.rs` 对照实现并有多线程领取回归。
-2. `src/search/classic/search.h:205-249,357-448`、`search.cc:1122-1140,1268-1508`
-   - 继续翻译一个 `SearchWorker` + 每 task thread 一个 `TaskWorkspace` 的执行关系；不得共享
-     Rust `&mut SearchWorker`，也不得把一个 workspace 交给多个 task thread。
-3. `src/search/classic/search.cc:1828-1897`
-   - 翻译 task split 和 `ResetTasks`；`task_count=-1` 只表示 idle，`exiting` 才关闭线程。
-4. `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334`
+2. `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334`
    - 对照 `MaxConcurrentSearchers`、tree phase、out-of-order backup 与 counter 时序。
+3. 在 DirectML/ONNX 下对照固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...` 与
+   backend reload；结束时 root `NInFlight=0`。
 
-每次只翻译一个连续参考区间，补对应回归，再提交。禁止重新引入原始指针或 `unsafe impl Send` 来
-跨线程共享一个 `SearchWorker`。
+每次只翻译一个连续参考区间，补对应回归，再提交。raw pointer / `unsafe impl Send` 仅允许保留在
+`TaskTreeBridge`、`TaskWorkerRunner` 两个有 px0 行号和 scoped-lifetime 注释的内部类型。
 
 ### 已确认的前置缺口
 
@@ -102,16 +102,16 @@ px0 `Node` 本身不是原子对象；`PickNodesToExtend` 在 `search.cc:1494-15
 本身只是 `std::unique_lock<std::shared_timed_mutex>` 的包装（`src/utils/mutex.h:93-125`）：px0 依赖
 task split 后的逻辑不重叠，让 task thread 在主线程持锁期间直接修改普通 `Node`。Rust 当前
 `NodeTree` 同样是普通可变对象，且 `WorkerTree` 只能在一个 worker 的 tree phase 中临时激活。
-因此，真实 task thread 接线前必须先逐函数建立能表达“主线程独占 phase + 已切分子任务”的安全所有权；
-不能通过 `*mut SearchWorker`、`unsafe impl Send`、每次任务重新拿全树锁，或把任务同步执行来伪造
-px0 task-worker。
+因此，真实 task thread 已通过“主线程独占 phase + 已切分子任务”的受限 bridge 接线。它使用
+`*mut SearchWorker` 和 `unsafe impl Send`，但只存在于 scoped thread 生命周期，且 `WaitForTasks`
+完成前不清空 active tree pointer；不得扩大该例外或改为每次任务全树锁。
 
 这不是仅把 `Vec<Box<Node>>` 改成线程安全容器就能解决的问题。px0 自己声明 `Edge_Iterator` 和
 `VisitedNode_Iterator` 非线程安全（`src/search/classic/node.h:423-436,547-551`），而
 `Edge_Iterator::Actualize` 又明确允许其他 task 在 iterator 调用间隙创建 sibling
 （`src/search/classic/node.h:485-525`）。此外 twofold 修正会沿 parent 链回写
-（`src/search/classic/search.cc:1510-1550`）。Rust 端必须先把这些读写操作收成可验证的 phase API，
-再连接 task thread；不得以每节点锁替换后假定算法已经等价。
+（`src/search/classic/search.cc:1510-1550`）。Rust 端以 active tree phase 保留该外部同步契约；
+不得以每节点锁替换后假定算法已经等价。
 
 ## 验收
 

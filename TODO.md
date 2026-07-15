@@ -18,8 +18,8 @@
 
 ## P4：task-worker 生命周期，未完成
 
-当前：task split 保持禁用；先以多 `SearchWorker` + minibatch/cache/prefetch/backend computation
-验证 GPU 主线。task worker 是后续减少 CPU gather/process 间隔的优化，不是本阶段的前置条件。
+当前：GPU task split 已接通；CPU 保持 px0 `task_workers_=0`。下一步验证多 SearchWorker、OOO、
+stop 与真实 ONNX/DirectML 时序。
 
 - [x] 按 `src/search/classic/search.cc:981-1034` 翻译 watchdog 的 counters-mutex/condition-variable
   等待与 `FireStopInternal` 唤醒；不再固定 1ms polling。
@@ -36,18 +36,12 @@
 - [x] 按 `src/search/classic/search.cc:1142-1211,1494-1508` 将 Rust `NodeTree` 收为显式
   tree-phase 借用，删除 `active: *mut NodeTree`；direct 与 shared tree 均通过同一安全边界进入
   selection/process/fetch/backup。
-- [ ] 按 `src/search/classic/search.h:205-249,357-448, search.cc:1122-1140,1268-1508` 翻译一个 `SearchWorker` + 每 task thread
-  一个独占 `TaskWorkspace` 的 px0 所有权关系；禁止共享 Rust `&mut SearchWorker` 或 workspace。
-- [ ] 先对照 `src/search/classic/search.cc:1494-1501`、`src/search/classic/node.h:127-330` 与
-  `src/utils/mutex.h:93-125` 建立 Rust 的安全 tree-phase 所有权边界：px0 的普通 `Node` 依赖
-  已切分任务的逻辑不重叠，不得以 raw pointer、全树锁串行化或同步执行伪造。
-- [ ] 在接入 task thread 前对照 `src/search/classic/node.h:423-525,547-610` 与
-  `src/search/classic/search.cc:1510-1550`，把 iterator/sibling actualize 和 twofold parent
-  回写收成可验证的 Rust phase API；不能仅以每节点 mutex 宣称语义等价。
-- [ ] 按 `src/search/classic/search.cc:1069-1140,1268-1508` 翻译 task queue 的领取、执行、
-  gathering/processing 回写和 `WaitForTasks`。
-- [ ] 按 `src/search/classic/search.cc:1828-1897` 翻译 split、idle、退出和 join；
-  `task_count=-1` 与 `exiting` 必须分开。
+- [x] 按 `src/search/classic/search.h:205-249,357-448, search.cc:1069-1140,1268-1508` 翻译一个
+  `SearchWorker` + 每 task thread 一个独占 `TaskWorkspace` 的 lifecycle、gathering/processing
+  回写与 `WaitForTasks`；GPU 回归确认 helper 实际领取任务。
+- [x] 按 `src/search/classic/search.cc:1494-1501,1828-1897`、`src/search/classic/node.h:423-525,547-610`
+  与 `src/utils/mutex.h:93-125` 建立受限 `TaskTreeBridge`：只允许 scoped task thread 在 active
+  tree phase 内访问普通 Node；`task_count=-1` 与 `exiting` 继续分开。
 - [ ] 对照 `src/search/classic/search.cc:1142-1231,1977-2008,2109-2334` 验证多 SearchWorker +
   task worker 的 tree phase、in-flight、OOO 与 counters。
 - [ ] 在 DirectML/ONNX 下补固定 nodes、`go infinite -> stop -> wait`、`position ... moves ...`、
