@@ -367,7 +367,6 @@ struct SearchMeta {
     /// than at worker or backend creation time.
     nps_start_time: Option<Instant>,
     initial_visits: u32,
-    stoppers_hints: StoppersHints,
     search_active: bool,
     /// px0 `Search::root_move_filter_` (`src/search/classic/search.h:168-171`).
     /// It is reconstructed from legal UCI `searchmoves` for every search.
@@ -433,7 +432,7 @@ impl SearchStopController {
         }
     }
 
-    pub(crate) fn maybe_trigger_stop(&self, worker_state: &WorkerSearchState) -> bool {
+    pub(crate) fn maybe_trigger_stop(&self, worker_state: &WorkerSearchState, hints: &mut StoppersHints) -> bool {
         let stats = {
             let mut meta = self.meta.lock().expect("meta lock");
             Self::populate_iteration_stats(&mut meta, worker_state)
@@ -449,15 +448,12 @@ impl SearchStopController {
         let Some(stopper) = stopper_guard.as_mut() else {
             return false;
         };
-        let mut meta = self.meta.lock().expect("meta lock");
-        let mut hints = meta.stoppers_hints.clone();
-        // px0 resets shared hints before every stopper pass; individual
-        // stoppers then reduce the estimates (`search.cc:596-610`,
-        // `stoppers/timemgr.cc:60-66`).
+        // px0 resets the caller-owned hints before every stopper pass. A
+        // SearchWorker retains its own hints for gathering, while the
+        // watchdog owns a separate copy for its wait deadline
+        // (`search.h:368-369`, `search.cc:596-610,981-1017`).
         hints.reset();
-        let should_stop = stopper.should_stop(&stats, &mut hints);
-        worker_state.set_remaining_playouts(hints.estimated_remaining_playouts());
-        meta.stoppers_hints = hints;
+        let should_stop = stopper.should_stop(&stats, hints);
         if should_stop {
             worker_state.stop.store(true, Ordering::Release);
             self.watchdog_cv.notify_all();
@@ -511,7 +507,6 @@ impl ClassicSearch {
             move_start: Instant::now(),
             nps_start_time: None,
             initial_visits: 0,
-            stoppers_hints: StoppersHints::default(),
             search_active: false,
             root_move_filter: Vec::new(),
             contempt_mode: ContemptMode::None,
@@ -753,69 +748,75 @@ impl ClassicSearch {
         // px0 starts a watchdog before search workers (`search.cc:874-896`).
         // It owns the terminal bestmove response; workers only advance tree
         // state and may request a stop through SearchStopController.
-        handles.push(thread::spawn(move || loop {
-            watchdog_stop_controller.maybe_trigger_stop(&watchdog_worker_state);
-            if !watchdog_stop.load(Ordering::Acquire) {
-                if let Some(responder) = &responder {
-                    // Keep px0's tree-before-current-best lock order. Backup
-                    // updates current_best_edge while holding the tree phase.
-                    let tree = watchdog_tree.read().expect("tree lock");
-                    let meta = watchdog_meta.lock().expect("meta lock");
-                    let edge = *watchdog_worker_state.current_best_edge.lock().expect("best edge lock");
-                    if edge.is_some() {
-                        if let Some(output) =
-                            ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
-                        {
-                            let info = output.infos.first().expect("root best edge has info");
-                            let mut last = live_info.lock().expect("live info lock");
-                            if edge != last.edge
-                                || info.depth != last.depth
-                                || info.seldepth != last.seldepth
-                                || last.time + 5_000 < info.time
+        handles.push(thread::spawn(move || {
+            // px0 `Search::WatchdogThread` owns a separate hints instance
+            // from every SearchWorker (`search.cc:981-1017`).
+            let mut watchdog_hints = StoppersHints::default();
+            loop {
+                watchdog_stop_controller.maybe_trigger_stop(&watchdog_worker_state, &mut watchdog_hints);
+                if !watchdog_stop.load(Ordering::Acquire) {
+                    if let Some(responder) = &responder {
+                        // Keep px0's tree-before-current-best lock order. Backup
+                        // updates current_best_edge while holding the tree phase.
+                        let tree = watchdog_tree.read().expect("tree lock");
+                        let meta = watchdog_meta.lock().expect("meta lock");
+                        let edge = *watchdog_worker_state.current_best_edge.lock().expect("best edge lock");
+                        if edge.is_some() {
+                            if let Some(output) =
+                                ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
                             {
-                                responder.output_thinking_info(&output.infos);
-                                last.edge = edge;
-                                last.depth = info.depth;
-                                last.seldepth = info.seldepth;
-                                last.time = info.time;
+                                let info = output.infos.first().expect("root best edge has info");
+                                let mut last = live_info.lock().expect("live info lock");
+                                if edge != last.edge
+                                    || info.depth != last.depth
+                                    || info.seldepth != last.seldepth
+                                    || last.time + 5_000 < info.time
+                                {
+                                    responder.output_thinking_info(&output.infos);
+                                    last.edge = edge;
+                                    last.depth = info.depth;
+                                    last.seldepth = info.seldepth;
+                                    last.time = info.time;
+                                }
                             }
                         }
                     }
                 }
-            }
-            if watchdog_stop.load(Ordering::Acquire)
-                && ok_to_respond_bestmove.load(Ordering::Acquire)
-                && watchdog_worker_state.total_playouts.load(Ordering::Acquire) > 0
-                && bestmove_is_sent
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                if let Some(responder) = &responder {
-                    let tree = watchdog_tree.read().expect("tree lock");
-                    let meta = watchdog_meta.lock().expect("meta lock");
-                    if let Some(output) = ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
-                    {
-                        responder.output_thinking_info(&output.infos);
-                        responder.output_best_move(&output.bestmove);
+                if watchdog_stop.load(Ordering::Acquire)
+                    && ok_to_respond_bestmove.load(Ordering::Acquire)
+                    && watchdog_worker_state.total_playouts.load(Ordering::Acquire) > 0
+                    && bestmove_is_sent
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    if let Some(responder) = &responder {
+                        let tree = watchdog_tree.read().expect("tree lock");
+                        let meta = watchdog_meta.lock().expect("meta lock");
+                        if let Some(output) =
+                            ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
+                        {
+                            responder.output_thinking_info(&output.infos);
+                            responder.output_best_move(&output.bestmove);
+                        }
                     }
+                    break;
                 }
-                break;
+                if bestmove_is_sent.load(Ordering::Acquire) {
+                    break;
+                }
+                // px0 `Search::WatchdogThread` waits on `watchdog_cv_` using
+                // `counters_mutex_`, with a 1..=100 ms timeout
+                // (`src/search/classic/search.cc:981-1017`). This avoids a
+                // fixed polling loop while preserving an upper bound for
+                // wakeups when an external event is missed.
+                let meta = watchdog_meta.lock().expect("meta lock");
+                let remaining_ms = watchdog_hints.estimated_remaining_time_ms().clamp(1, 100) as u64;
+                let _ = watchdog_cv
+                    .wait_timeout_while(meta, Duration::from_millis(remaining_ms), |_| {
+                        !watchdog_stop.load(Ordering::Acquire)
+                    })
+                    .expect("meta lock");
             }
-            if bestmove_is_sent.load(Ordering::Acquire) {
-                break;
-            }
-            // px0 `Search::WatchdogThread` waits on `watchdog_cv_` using
-            // `counters_mutex_`, with a 1..=100 ms timeout
-            // (`src/search/classic/search.cc:981-1017`). This avoids a
-            // fixed polling loop while preserving an upper bound for
-            // wakeups when an external event is missed.
-            let meta = watchdog_meta.lock().expect("meta lock");
-            let remaining_ms = meta.stoppers_hints.estimated_remaining_time_ms().clamp(1, 100) as u64;
-            let _ = watchdog_cv
-                .wait_timeout_while(meta, Duration::from_millis(remaining_ms), |_| {
-                    !watchdog_stop.load(Ordering::Acquire)
-                })
-                .expect("meta lock");
         }));
         for _ in 0..thread_count {
             let tree = Arc::clone(&tree);
@@ -932,7 +933,6 @@ impl SearchBase for ClassicSearch {
                 params.ponder,
             );
             meta.nps_start_time = None;
-            meta.stoppers_hints.reset();
             self.worker_state.total_playouts.store(0, Ordering::Release);
             self.worker_state.total_batches.store(0, Ordering::Release);
             self.worker_state.network_evaluations.store(0, Ordering::Release);
@@ -949,22 +949,8 @@ impl SearchBase for ClassicSearch {
             // (`src/search/classic/wrapper.cc:126-150`), so its cached root
             // edge never crosses a UCI search boundary.
             *self.worker_state.current_best_edge.lock().expect("best edge lock") = None;
-            // px0 constructs a new SearchWorker for each StartSearch. Its
-            // first gather therefore sees default `latest_time_manager_hints_`;
-            // the stopper publishes the actual `go nodes` remaining budget
-            // only after the first completed iteration
-            // (`src/search/classic/search.cc:908-922,1268-1284`). Reset the
-            // persistent Rust worker state to that same default so a previous
-            // search cannot leak its remaining budget into this one.
-            self.worker_state
-                .set_remaining_playouts(meta.stoppers_hints.estimated_remaining_playouts());
             let chain = build_search_stoppers(params, tree.history(), false);
             *self.stopper.lock().expect("stopper lock") = Some(chain);
-            if nodes.is_none() {
-                if let Some(ms) = params.movetime {
-                    meta.stoppers_hints.update_estimated_remaining_time_ms(ms);
-                }
-            }
         }
 
         self.start_threads(0)?;
@@ -1227,7 +1213,6 @@ mod tests {
             move_start: std::time::Instant::now(),
             nps_start_time: None,
             initial_visits: 17,
-            stoppers_hints: super::StoppersHints::default(),
             search_active: true,
             root_move_filter: Vec::new(),
             contempt_mode: ContemptMode::Play,

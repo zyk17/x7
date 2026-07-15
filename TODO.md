@@ -25,8 +25,9 @@
   等待与 `FireStopInternal` 唤醒；不再固定 1ms polling。
 - [x] 按 `src/search/classic/search.cc:249-264,393-398,908-918,1213-1231` 翻译
   `nps_start_time_` 的 watchdog 初始化、UCI nps/eps 与 NPS limit 时钟归属。
-- [x] 按 `src/search/classic/search.cc:874-896,908-922,1268-1284` 重置每轮搜索的
-  remaining-playouts hint；首轮不得提前套用 `go nodes` 或沿用上轮预算。
+- [x] 按 `src/search/classic/search.h:368-369, search.cc:596-610,908-922,981-1017,1268-1284`
+  将 `latest_time_manager_hints_` 收为 SearchWorker-local、watchdog-local 两份；不得跨 worker
+  共享 remaining-playouts hint。
 - [x] 按 `src/search/classic/search.cc:596-610` 加入 root-first-visit stopper gate；未扩展根节点
   不能被 budget stopper 提前结束。
 

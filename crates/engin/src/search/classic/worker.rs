@@ -18,6 +18,7 @@ use crate::EnginError;
 use super::node::{NodeTree, Terminal};
 use super::params::{ContemptMode, SearchParams};
 use super::search::{best_child_edge, wdl_rescale, SearchStopController};
+use super::stoppers::StoppersHints;
 
 /// px0 `Search` 中与 worker 相关的计数子集 (`search.h:49-200`)。
 #[derive(Debug)]
@@ -28,7 +29,6 @@ pub struct WorkerSearchState {
     pub pending_searchers: AtomicI32,
     /// px0 `Search::backend_waiting_counter_` (`search.h:181-182`).
     pub backend_waiting_counter: AtomicI32,
-    pub remaining_playouts: AtomicU64,
     pub thread_count: AtomicUsize,
     pub shared_collisions: Mutex<Vec<(usize, u32)>>,
     /// px0 `Search::current_best_edge_` (`search.h:174`, `search.cc:2212-2249`).
@@ -49,12 +49,11 @@ impl Default for WorkerSearchState {
 }
 
 impl WorkerSearchState {
-    pub fn new(stop: Arc<AtomicBool>, remaining_playouts: i64) -> Self {
+    pub fn new(stop: Arc<AtomicBool>, _remaining_playouts: i64) -> Self {
         Self {
             stop,
             pending_searchers: AtomicI32::new(1),
             backend_waiting_counter: AtomicI32::new(0),
-            remaining_playouts: AtomicU64::new(remaining_playouts.max(0) as u64),
             thread_count: AtomicUsize::new(1),
             shared_collisions: Mutex::new(Vec::new()),
             current_best_edge: Mutex::new(None),
@@ -64,14 +63,6 @@ impl WorkerSearchState {
             cum_depth: AtomicU64::new(0),
             max_depth: AtomicU16::new(0),
         }
-    }
-
-    pub fn remaining_playouts(&self) -> i64 {
-        self.remaining_playouts.load(Ordering::Acquire) as i64
-    }
-
-    pub fn set_remaining_playouts(&self, value: i64) {
-        self.remaining_playouts.store(value.max(0) as u64, Ordering::Release);
     }
 
     /// px0 initializes `pending_searchers_` on every `StartSearch`
@@ -503,6 +494,10 @@ pub struct SearchWorker<'a> {
     max_out_of_order: usize,
     task_workers: i32,
     number_out_of_order: usize,
+    /// px0 `SearchWorker::latest_time_manager_hints_`
+    /// (`src/search/classic/search.h:368-369`). Each search worker owns this
+    /// value; it must not be shared with other gather loops.
+    latest_time_manager_hints: StoppersHints,
     played_history_len: usize,
     task_queue: PickTaskQueue,
     task_workspaces: Vec<TaskWorkspace>,
@@ -650,6 +645,7 @@ impl<'a> SearchWorker<'a> {
             max_out_of_order,
             task_workers,
             number_out_of_order: 0,
+            latest_time_manager_hints: StoppersHints::default(),
             task_queue: PickTaskQueue::default(),
             task_workspaces,
             picking_workspace: TaskWorkspace::default(),
@@ -833,7 +829,7 @@ impl<'a> SearchWorker<'a> {
     pub fn gather_minibatch(&mut self) -> Result<(), EnginError> {
         let root = self.tree.current_head();
         let cur_n = self.tree.node(root).n();
-        let remaining_n = self.search_state.remaining_playouts();
+        let remaining_n = self.latest_time_manager_hints.estimated_remaining_playouts();
         let nodes = cur_n.min(remaining_n.max(0) as u32) as i64;
         let mut collisions_left = self.params.collisions_left(nodes);
         self.number_out_of_order = 0;
@@ -1269,7 +1265,9 @@ impl<'a> SearchWorker<'a> {
                                 .node(current_idx)
                                 .child(edge_idx)
                                 .map_or(0, |child_idx| self.tree.node(child_idx).n());
-                            if self.search_state.remaining_playouts() < i64::from(best_node_n) - i64::from(edge_n) {
+                            if self.latest_time_manager_hints.estimated_remaining_playouts()
+                                < i64::from(best_node_n) - i64::from(edge_n)
+                            {
                                 continue;
                             }
                         }
@@ -2057,7 +2055,7 @@ impl<'a> SearchWorker<'a> {
     /// px0 `SearchWorker::UpdateCounters` (`search.cc:2331-2364`).
     pub fn update_counters(&mut self) -> Result<(), EnginError> {
         if let Some(controller) = &self.stop_controller {
-            controller.maybe_trigger_stop(self.search_state);
+            controller.maybe_trigger_stop(self.search_state, &mut self.latest_time_manager_hints);
         }
         // px0 deliberately backs off when an iteration only found collisions
         // (`src/search/classic/search.cc:2337-2351`). Such an iteration does
