@@ -17,7 +17,7 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
 不创建搜索对象，不再用 `UniformBackend` 伪装可搜索状态。参考 px0
 `src/engine.cc:137-197,206-219` 与 `src/neural/shared_params.cc:43-80`。
 
-## P4 未完成：按 px0 重建 task-worker 所有权
+## P4 未完成：按 px0 重建 task-worker 生命周期
 
 此前的 Rust 实现把同一个可变 `SearchWorker` 借给 scoped task thread，导致 node index 越界和
 poisoned tree lock。该路径已移除，正式搜索当前禁用 task split，不能再称为 px0
@@ -26,7 +26,8 @@ task-worker 完成。
 下一步必须逐函数翻译，不补写并发捷径：
 
 1. `src/search/classic/search.h:205-249,357-448`
-   - 定义一个 task worker 独占的 worker/workspace/context；不得共享 `&mut SearchWorker`。
+   - 翻译 px0 的一个 `SearchWorker` + 每 task thread 一个 `TaskWorkspace` 的关系；不得共享
+     Rust `&mut SearchWorker`，也不得把一个 workspace 交给多个 task thread。
 2. `src/search/classic/search.cc:1069-1140,1268-1508`
    - 翻译 `RunTasks`、任务领取、gathering/processing 分派、完成和等待。
 3. `src/search/classic/search.cc:1828-1897`

@@ -11,7 +11,8 @@
    `NetworkAsBackendComputation`。P4 的真实 history、124-plane 编码、policy 映射、ONNX batch 和
    `WeightsFile -> OnnxBackend` 子集已接入。
 3. `engin/mcts`：px0 `src/search` 的 classic worker 主线；minibatch、collision、task-worker、
-   prefetch、tree reuse、watchdog 与多 worker tree phase 已接线。
+   prefetch、tree reuse、watchdog 与多 worker tree phase 已接线。P4 task worker 仍待翻译：px0
+   的多个 task thread 共享一个 `SearchWorker`，但每个 thread 独占一个 `TaskWorkspace`。
 4. px0 已有的 NN cache、prefetch、tree reuse 与并发；后续改动只能在明确引用的 px0 语义上继续。
 5. `pxzero-training`：数据、训练与 ONNX 导出契约。
 

@@ -14,7 +14,8 @@
 P4 尚未关闭。当前已接通真实 `124x10x9` ONNX backend、minibatch、NN cache、prefetch、
 collision、shared-tree search worker、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。
 此前 Rust 端把一个 `SearchWorker` 的可变状态错误地交给多个 task thread，已删除该不安全路径；
-因此 px0 的“每个 task worker 独占其 `SearchWorker`/workspace”的生命周期仍是 P4 未完成项。
+因此 px0 的 task-worker 生命周期仍是 P4 未完成项。px0 共享一个 `SearchWorker`，但每个 task
+thread 独占一个 `TaskWorkspace`，并只在明确的 gathering/processing 阶段访问共享搜索状态。
 
 主 UCI 使用 px0 名称 `WeightsFile` 配置 ONNX 权重，并会在下一条 `position` 前加载它。正式
 `ClassicEngine` 在权重成功加载前没有 `ClassicSearch`，不会以 `UniformBackend` 代替模型搜索。
