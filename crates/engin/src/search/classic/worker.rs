@@ -2696,7 +2696,7 @@ mod tests {
     }
 
     #[test]
-    fn gathering_uses_px0_processing_task_ranges() {
+    fn gathering_processes_full_batch_without_task_workers() {
         ensure_init();
         let mut tree = NodeTree::default();
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -2713,16 +2713,13 @@ mod tests {
         let backend = UniformBackend::default();
         let params = SearchParams {
             minibatch_size: 32,
-            task_workers_per_search_worker: 1,
-            minimum_work_size_for_processing: 2,
-            minimum_work_per_task_for_processing: 1,
             out_of_order_eval: false,
             ..SearchParams::default()
         };
         let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)), i64::MAX);
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.initialize_iteration().expect("init");
-        worker.gather_minibatch().expect("gather processing tasks");
+        worker.gather_minibatch().expect("gather full batch");
 
         assert!(worker.minibatch.len() >= 2);
         assert!(worker.computation.as_ref().expect("computation").used_batch_size() >= 2);

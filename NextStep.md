@@ -39,6 +39,9 @@ extend 和 `BackendComputation::AddInput` 的 CPU 准备间隔；这能帮助持
 吞吐的唯一或首要来源。持续喂卡首先依赖多个搜索 worker、真实 batch、共享 backend computation 与
 backend 的异步调度。安全 tree-phase 重构完成前，不以 task worker 作为当前性能验收前提。
 
+当前测试不再把 `TaskWorkersPerSearchWorker` 的请求误称为已执行的同步 split；运行时会明确解析为
+`0`，直到安全 task-worker 生命周期落地。
+
 下一步必须逐函数翻译，不补写并发捷径：
 
 1. 已完成队列原子状态机：`src/search/classic/search.h:435-445`、

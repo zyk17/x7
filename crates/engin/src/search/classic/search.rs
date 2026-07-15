@@ -1034,38 +1034,6 @@ mod tests {
         );
     }
 
-    /// This covers shared SearchWorker tree phases with configured task work.
-    /// The current task queue is synchronous; px0's independent task-worker
-    /// pipeline remains an explicit P4 follow-up (`search.cc:1088-1211,
-    /// 1322-1347,1494-1508,1828-1864`).
-    #[test]
-    fn shared_tree_handles_configured_task_work_synchronously() {
-        ensure_init();
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
-        search.set_position(&state).expect("position");
-        {
-            let mut meta = search.meta.lock().expect("meta lock");
-            meta.params.minibatch_size = 32;
-            meta.params.task_workers_per_search_worker = 1;
-            meta.params.max_collision_visits = 4;
-            meta.params.max_collision_visits_scaling_start = 0;
-            meta.params.max_collision_visits_scaling_end = 1;
-            meta.params.minimum_work_size_for_processing = 2;
-            meta.params.minimum_work_per_task_for_processing = 1;
-            meta.params.solid_tree_threshold = 1;
-        }
-
-        let (best, visits) = search.run_blocking_nodes(64);
-
-        assert!(!best.is_null());
-        assert!(visits >= 64);
-        let tree = search.tree.read().expect("tree lock");
-        let root = tree.current_head();
-        assert!(tree.node(root).has_solid_children());
-        assert_eq!(tree.node(root).n_in_flight(), 0);
-    }
-
     /// px0 publishes cache-hit out-of-order results during gather, while other
     /// SearchWorkers can continue their independent tree phases
     /// (`search.cc:1268-1419,1977-1987,2109-2173`). The shared collision list
