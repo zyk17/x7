@@ -68,6 +68,12 @@ backend 的异步调度。安全 tree-phase 重构完成前，不以 task worker
 当前测试不再把 `TaskWorkersPerSearchWorker` 的请求误称为已执行的同步 split；运行时会明确解析为
 `0`，直到安全 task-worker 生命周期落地。
 
+`WorkerTree` 已收为显式 tree-phase 借用：direct 单测树和共享生产树均在 `with_tree` /
+`with_tree_read` 中临时借出 `NodeTree`，selection、processing、fetch、backup 都把该借用逐层传入。
+这对应 px0 `nodes_mutex_` 的 phase 边界（`src/search/classic/search.cc:1142-1211,1494-1508`），并删除了
+此前 `active: *mut NodeTree` 的隐式访问桥接；它是后续安全连接真实 task workers 的前置条件，不改变
+px0 的 selection、in-flight 或 backup 算法。
+
 下一步必须逐函数翻译，不补写并发捷径：
 
 1. 已完成队列原子状态机：`src/search/classic/search.h:435-445`、

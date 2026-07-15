@@ -5,8 +5,6 @@
 //! 其跨 task 的 `nodes_mutex_` 持锁语义尚未安全翻译；正式搜索因而禁用
 //! task split，队列只供后续实现和直接单测使用。
 
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -155,75 +153,33 @@ struct TaskWorkspace {
     history: PositionHistory,
 }
 
-/// px0 keeps node addresses stable while `SearchWorker` only holds
-/// `nodes_mutex_` for the tree phases (`search.cc:1142-1211,1494-1508`).
-/// Direct storage serves focused unit tests; shared storage is the production
-/// `ClassicSearch` path. `active` is non-null only while that tree write lock is
-/// held by the owning search worker.
+/// px0 keeps `nodes_mutex_` across each tree phase
+/// (`search.cc:1142-1211,1494-1508`). Rust represents that boundary by
+/// borrowing the tree explicitly for every phase instead of storing an active
+/// raw pointer inside `SearchWorker`.
 enum TreeStorage<'a> {
-    Direct(PhantomData<&'a mut NodeTree>),
+    Direct(&'a mut NodeTree),
     Shared(Arc<RwLock<NodeTree>>),
+    /// Only installed while `SearchWorker::with_tree*` moves a direct or
+    /// shared tree out of the worker. No operation can observe this state.
+    Detached,
 }
 
 struct WorkerTree<'a> {
     storage: TreeStorage<'a>,
-    active: *mut NodeTree,
 }
 
 impl<'a> WorkerTree<'a> {
     fn direct(tree: &'a mut NodeTree) -> Self {
-        let active = tree as *mut NodeTree;
         Self {
-            storage: TreeStorage::Direct(PhantomData),
-            active,
+            storage: TreeStorage::Direct(tree),
         }
     }
 
     fn shared(tree: Arc<RwLock<NodeTree>>) -> Self {
         Self {
             storage: TreeStorage::Shared(tree),
-            active: std::ptr::null_mut(),
         }
-    }
-
-    fn shared_tree(&self) -> Option<Arc<RwLock<NodeTree>>> {
-        match &self.storage {
-            TreeStorage::Direct(_) => None,
-            TreeStorage::Shared(tree) => Some(Arc::clone(tree)),
-        }
-    }
-
-    fn activate(&mut self, tree: &mut NodeTree) {
-        debug_assert!(matches!(self.storage, TreeStorage::Shared(_)));
-        debug_assert!(self.active.is_null());
-        self.active = tree;
-    }
-
-    fn deactivate(&mut self) {
-        if matches!(self.storage, TreeStorage::Shared(_)) {
-            self.active = std::ptr::null_mut();
-        }
-    }
-}
-
-impl Deref for WorkerTree<'_> {
-    type Target = NodeTree;
-
-    fn deref(&self) -> &Self::Target {
-        assert!(!self.active.is_null(), "px0 tree access outside a tree phase");
-        // SAFETY: direct storage owns the exclusive borrow. Shared storage is
-        // activated only while `with_tree` holds its mutex. Task workers run
-        // only on disjoint work published during that same phase.
-        unsafe { &*self.active }
-    }
-}
-
-impl DerefMut for WorkerTree<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        assert!(!self.active.is_null(), "px0 tree mutation outside a tree phase");
-        // SAFETY: see Deref. The owning worker waits for all task work before
-        // releasing the shared-tree phase.
-        unsafe { &mut *self.active }
     }
 }
 
@@ -654,11 +610,11 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::ExecuteOneIteration` (`search.cc:1142-1231`)。
     pub fn execute_one_iteration(&mut self) -> Result<(), EnginError> {
-        self.with_tree(|worker| worker.initialize_iteration())?;
+        self.initialize_iteration()?;
         if !self.acquire_searcher_permit() {
             return Ok(());
         }
-        let gather_result = self.with_tree(|worker| worker.gather_minibatch());
+        let gather_result = self.gather_minibatch();
         // Preserve px0's task-count phase boundary before backend work
         // (`search.cc:1182-1185`). There are no independent task threads yet.
         self.task_queue.idle();
@@ -676,7 +632,7 @@ impl<'a> SearchWorker<'a> {
         // read-only prefetch phase (`search.cc:1977-1987`). Keep that write
         // boundary so another SearchWorker cannot begin backup/cancellation
         // between this iteration's gather and collision hand-off.
-        self.with_tree(|worker| worker.collect_collisions())?;
+        self.with_tree(|worker, tree| worker.collect_collisions_in_tree(tree))?;
         let prefetch_result = self.with_tree_read(|worker, tree| worker.maybe_prefetch_into_cache(tree));
         self.release_searcher_permit();
         if let Err(error) = prefetch_result {
@@ -690,36 +646,59 @@ impl<'a> SearchWorker<'a> {
             .backend_waiting_counter
             .fetch_sub(1, Ordering::Relaxed);
         compute_result?;
-        self.with_tree(|worker| {
-            worker.fetch_minibatch_results()?;
-            worker.do_backup_update()
+        self.with_tree(|worker, tree| {
+            worker.fetch_minibatch_results_in_tree(tree)?;
+            worker.do_backup_update_in_tree(tree)
         })?;
         self.update_counters()
     }
 
-    /// Runs one px0 tree phase. In direct test storage this is a no-op; the
-    /// production shared-tree path holds the mutex only for that phase.
-    fn with_tree<R>(&mut self, operation: impl FnOnce(&mut Self) -> R) -> R {
-        let Some(tree) = self.tree.shared_tree() else {
-            return operation(self);
-        };
-        let mut tree = tree.write().expect("tree lock");
-        self.tree.activate(&mut tree);
-        let result = operation(self);
-        self.tree.deactivate();
-        result
+    /// Runs one px0 exclusive `nodes_mutex_` phase. `NodeTree` is an explicit
+    /// borrow, so neither direct tests nor the shared production tree need an
+    /// active raw-pointer bridge.
+    fn with_tree<R>(&mut self, operation: impl FnOnce(&mut Self, &mut NodeTree) -> R) -> R {
+        let storage = std::mem::replace(&mut self.tree.storage, TreeStorage::Detached);
+        match storage {
+            TreeStorage::Direct(tree) => {
+                let result = operation(self, tree);
+                self.tree.storage = TreeStorage::Direct(tree);
+                result
+            }
+            TreeStorage::Shared(shared) => {
+                let mut tree = shared.write().expect("tree lock");
+                let result = operation(self, &mut tree);
+                drop(tree);
+                self.tree.storage = TreeStorage::Shared(shared);
+                result
+            }
+            TreeStorage::Detached => panic!("px0 tree access outside a tree phase"),
+        }
     }
 
     /// px0 `MaybePrefetchIntoCache` reads its tree under `SharedLock`, while
     /// cache submission remains private to the worker (`search.cc:1989-2007`).
     fn with_tree_read<R>(&mut self, operation: impl FnOnce(&mut Self, &NodeTree) -> R) -> R {
-        let Some(tree) = self.tree.shared_tree() else {
-            // Direct test storage owns the tree for the worker lifetime.
-            let tree = unsafe { &*self.tree.active };
-            return operation(self, tree);
-        };
-        let tree = tree.read().expect("tree lock");
-        operation(self, &tree)
+        let storage = std::mem::replace(&mut self.tree.storage, TreeStorage::Detached);
+        match storage {
+            TreeStorage::Direct(tree) => {
+                let result = operation(self, tree);
+                self.tree.storage = TreeStorage::Direct(tree);
+                result
+            }
+            TreeStorage::Shared(shared) => {
+                let tree = shared.read().expect("tree lock");
+                let result = operation(self, &tree);
+                drop(tree);
+                self.tree.storage = TreeStorage::Shared(shared);
+                result
+            }
+            TreeStorage::Detached => panic!("px0 tree access outside a tree phase"),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_tree_for_test<R>(&mut self, operation: impl FnOnce(&mut NodeTree) -> R) -> R {
+        self.with_tree(|_, tree| operation(tree))
     }
 
     /// px0 `ExecuteOneIteration` permit acquisition
@@ -783,7 +762,7 @@ impl<'a> SearchWorker<'a> {
 
     /// 单线程测试入口：重复执行 iteration 直到 root N 达标。
     pub fn run_until_root_visits(&mut self, target: u32) -> Result<(), EnginError> {
-        while self.with_tree(|worker| worker.tree.node(worker.tree.current_head()).n()) < target {
+        while self.with_tree_read(|_, tree| tree.node(tree.current_head()).n()) < target {
             if self.search_state.stop.load(Ordering::Acquire) {
                 break;
             }
@@ -814,21 +793,29 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::InitializeIteration` (`search.cc:1233-1266`)。
     pub fn initialize_iteration(&mut self) -> Result<(), EnginError> {
+        self.with_tree(|worker, tree| worker.initialize_iteration_in_tree(tree))
+    }
+
+    fn initialize_iteration_in_tree(&mut self, tree: &NodeTree) -> Result<(), EnginError> {
         // px0 resets the previous computation before asking the backend for a
         // replacement, allowing backend-owned buffers to be recycled.
         self.computation = None;
         self.computation = Some(self.backend.create_computation()?);
         self.minibatch.clear();
         self.minibatch.reserve(2 * self.target_minibatch_size);
-        self.history = self.tree.history().clone();
+        self.history = tree.history().clone();
         self.played_history_len = self.history.len();
         Ok(())
     }
 
     /// px0 `SearchWorker::GatherMinibatch` (`search.cc:1268-1363`) 单线程子集。
     pub fn gather_minibatch(&mut self) -> Result<(), EnginError> {
-        let root = self.tree.current_head();
-        let cur_n = self.tree.node(root).n();
+        self.with_tree(|worker, tree| worker.gather_minibatch_in_tree(tree))
+    }
+
+    fn gather_minibatch_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
+        let root = tree.current_head();
+        let cur_n = tree.node(root).n();
         let remaining_n = self.latest_time_manager_hints.estimated_remaining_playouts();
         let nodes = cur_n.min(remaining_n.max(0) as u32) as i64;
         let mut collisions_left = self.params.collisions_left(nodes);
@@ -864,7 +851,7 @@ impl<'a> SearchWorker<'a> {
             let pick_budget = collisions_left
                 .min(self.target_minibatch_size as i32 - minibatch_size as i32)
                 .min(self.max_out_of_order as i32 - self.number_out_of_order as i32);
-            self.pick_nodes_to_extend(pick_budget.max(0) as u32)?;
+            self.pick_nodes_to_extend_in_tree(tree, pick_budget.max(0) as u32)?;
             let mut picked_visits = 0usize;
             for item in &self.minibatch[new_start..] {
                 if !item.is_collision {
@@ -914,11 +901,12 @@ impl<'a> SearchWorker<'a> {
             }
 
             let mut workspace = std::mem::take(&mut self.picking_workspace);
-            let process_result = self.process_picked_task(main_start, self.minibatch.len(), &mut workspace);
+            let process_result =
+                self.process_picked_task_in_tree(tree, main_start, self.minibatch.len(), &mut workspace);
             self.picking_workspace = workspace;
             process_result?;
             if needs_wait {
-                self.wait_for_queued_tasks()?;
+                self.wait_for_queued_tasks_in_tree(tree)?;
             }
 
             let mut some_ooo = false;
@@ -936,10 +924,10 @@ impl<'a> SearchWorker<'a> {
                         let node_idx = self.minibatch[i].node_idx;
                         let multivisit = self.minibatch[i].multivisit;
                         let mut node = node_idx;
-                        while let Some(parent) = self.tree.node(node).parent() {
-                            self.tree.node_mut(parent).cancel_score_update(multivisit);
+                        while let Some(parent) = tree.node(node).parent() {
+                            tree.node_mut(parent).cancel_score_update(multivisit);
                             node = parent;
-                            if node == self.tree.current_head() {
+                            if node == tree.current_head() {
                                 break;
                             }
                         }
@@ -949,7 +937,7 @@ impl<'a> SearchWorker<'a> {
                         // reconciling collisions in GatherMinibatch
                         // (`search.cc:1372-1393`), not in ProcessPickedTask.
                         let item = self.minibatch[i].clone();
-                        self.do_backup_update_single_node(&item);
+                        self.do_backup_update_single_node_in_tree(tree, &item);
                         self.minibatch.remove(i);
                         minibatch_size = minibatch_size.saturating_sub(1);
                         self.number_out_of_order += 1;
@@ -974,10 +962,10 @@ impl<'a> SearchWorker<'a> {
                 };
                 if extra > 0 {
                     let mut node = node_idx;
-                    while let Some(parent) = self.tree.node(node).parent() {
-                        self.tree.node_mut(parent).increment_n_in_flight(extra);
+                    while let Some(parent) = tree.node(node).parent() {
+                        tree.node_mut(parent).increment_n_in_flight(extra);
                         node = parent;
-                        if node == self.tree.current_head() {
+                        if node == tree.current_head() {
                             break;
                         }
                     }
@@ -995,7 +983,12 @@ impl<'a> SearchWorker<'a> {
     }
 
     /// px0 `SearchWorker::PickNodesToExtend` (`search.cc:1485-1508`) 单线程子集。
+    #[cfg(test)]
     fn pick_nodes_to_extend(&mut self, collision_limit: u32) -> Result<(), EnginError> {
+        self.with_tree(|worker, tree| worker.pick_nodes_to_extend_in_tree(tree, collision_limit))
+    }
+
+    fn pick_nodes_to_extend_in_tree(&mut self, tree: &mut NodeTree, collision_limit: u32) -> Result<(), EnginError> {
         if collision_limit == 0 {
             return Ok(());
         }
@@ -1003,16 +996,20 @@ impl<'a> SearchWorker<'a> {
         // `ResetTasks` (`src/search/classic/search.cc:1485-1492`).
         self.task_queue.reset();
         let mut receiver = std::mem::take(&mut self.minibatch);
-        let result = self.pick_nodes_to_extend_task(
-            self.tree.current_head(),
+        let mut workspace = std::mem::take(&mut self.picking_workspace);
+        let result = self.pick_nodes_to_extend_task_with_workspace(
+            tree,
+            tree.current_head(),
             0,
             collision_limit,
             &MoveList::new(),
             &mut receiver,
+            &mut workspace,
             true,
         );
+        self.picking_workspace = workspace;
         self.minibatch = receiver;
-        self.wait_for_queued_tasks()?;
+        self.wait_for_queued_tasks_in_tree(tree)?;
         self.task_queue.drain_results_into(&mut self.minibatch);
         result
     }
@@ -1022,12 +1019,17 @@ impl<'a> SearchWorker<'a> {
     /// The queue is consumed by its owning worker until px0's independent
     /// task-worker SearchWorker ownership is translated. This is not a
     /// persistent task-thread implementation.
-    fn run_queued_tasks(&mut self, workspace: &mut TaskWorkspace) -> Result<(), EnginError> {
+    fn run_queued_tasks_in_tree(
+        &mut self,
+        tree: &mut NodeTree,
+        workspace: &mut TaskWorkspace,
+    ) -> Result<(), EnginError> {
         while let Some((task_id, task)) = self.task_queue.take() {
             let results = match task.kind {
                 PickTaskKind::Gathering => {
                     let mut results = Vec::new();
                     self.pick_nodes_to_extend_task_with_workspace(
+                        tree,
                         task.start.expect("gathering task start"),
                         task.base_depth,
                         task.collision_limit,
@@ -1039,7 +1041,7 @@ impl<'a> SearchWorker<'a> {
                     results
                 }
                 PickTaskKind::Processing => {
-                    self.process_picked_task(task.start_idx, task.end_idx, workspace)?;
+                    self.process_picked_task_in_tree(tree, task.start_idx, task.end_idx, workspace)?;
                     Vec::new()
                 }
             };
@@ -1050,8 +1052,8 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 waits for independent task workers here (`search.cc:1494-1508`).
     /// Until that ownership model is translated, consume queued work locally.
-    fn wait_for_queued_tasks(&mut self) -> Result<(), EnginError> {
-        self.run_tasks_synchronously()?;
+    fn wait_for_queued_tasks_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
+        self.run_tasks_synchronously_in_tree(tree)?;
         self.task_queue.wait();
         Ok(())
     }
@@ -1060,17 +1062,22 @@ impl<'a> SearchWorker<'a> {
     /// `SearchWorker` lifetime (`src/search/classic/search.h:205-233`). Until
     /// that worker ownership is translated, this bridge reuses one workspace
     /// without concurrent access.
-    fn run_tasks_synchronously(&mut self) -> Result<(), EnginError> {
+    fn run_tasks_synchronously_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
         if self.task_workspaces.is_empty() {
             let mut workspace = std::mem::take(&mut self.picking_workspace);
-            let result = self.run_queued_tasks(&mut workspace);
+            let result = self.run_queued_tasks_in_tree(tree, &mut workspace);
             self.picking_workspace = workspace;
             return result;
         }
         let mut workspace = std::mem::take(&mut self.task_workspaces[0]);
-        let result = self.run_queued_tasks(&mut workspace);
+        let result = self.run_queued_tasks_in_tree(tree, &mut workspace);
         self.task_workspaces[0] = workspace;
         result
+    }
+
+    #[cfg(test)]
+    fn run_queued_tasks(&mut self, workspace: &mut TaskWorkspace) -> Result<(), EnginError> {
+        self.with_tree(|worker, tree| worker.run_queued_tasks_in_tree(tree, workspace))
     }
 
     /// px0 `PickNodesToExtendTask` (`src/search/classic/search.cc:1551-1897`)
@@ -1079,29 +1086,6 @@ impl<'a> SearchWorker<'a> {
     /// `task_workers_ == 0` 时 px0 仍使用同一显式 DFS/path-backtrack
     /// 状态机；不要把它替换成递归逐 child 调用，否则 collision 内的策略前缀
     /// 和 visit 分配会发生漂移。
-    fn pick_nodes_to_extend_task(
-        &mut self,
-        root_idx: usize,
-        base_depth: u16,
-        collision_limit: u32,
-        moves_to_base: &[Move],
-        receiver: &mut Vec<NodeToProcess>,
-        is_root: bool,
-    ) -> Result<(), EnginError> {
-        let mut workspace = std::mem::take(&mut self.picking_workspace);
-        let result = self.pick_nodes_to_extend_task_with_workspace(
-            root_idx,
-            base_depth,
-            collision_limit,
-            moves_to_base,
-            receiver,
-            &mut workspace,
-            is_root,
-        );
-        self.picking_workspace = workspace;
-        result
-    }
-
     /// px0 `SearchWorker::PickNodesToExtendTask`
     /// (`src/search/classic/search.cc:1551-1827`).
     ///
@@ -1114,6 +1098,7 @@ impl<'a> SearchWorker<'a> {
     )]
     fn pick_nodes_to_extend_task_with_workspace(
         &mut self,
+        tree: &mut NodeTree,
         root_idx: usize,
         base_depth: u16,
         collision_limit: u32,
@@ -1144,8 +1129,8 @@ impl<'a> SearchWorker<'a> {
         let (current_best_edge, best_node_n) = if is_root {
             let best_edge = *self.search_state.current_best_edge.lock().expect("best edge lock");
             let best_n = best_edge
-                .and_then(|edge_idx| self.tree.node(root_idx).child(edge_idx))
-                .map_or(0, |child_idx| self.tree.node(child_idx).n());
+                .and_then(|edge_idx| tree.node(root_idx).child(edge_idx))
+                .map_or(0, |child_idx| tree.node(child_idx).n());
             (best_edge, best_n)
         } else {
             (None, 0)
@@ -1166,8 +1151,8 @@ impl<'a> SearchWorker<'a> {
                         .expect("selected parent edge")
                 };
 
-                if self.tree.node(current_idx).n() == 0 || self.tree.node(current_idx).is_terminal() {
-                    if is_root_node && self.tree.node_mut(current_idx).try_start_score_update() {
+                if tree.node(current_idx).n() == 0 || tree.node(current_idx).is_terminal() {
+                    if is_root_node && tree.node_mut(current_idx).try_start_score_update() {
                         cur_limit -= 1;
                         receiver.push(NodeToProcess::visit(
                             current_idx,
@@ -1189,25 +1174,24 @@ impl<'a> SearchWorker<'a> {
                         ));
                         completed_visits += cur_limit;
                     }
-                    node_idx = self.tree.node(current_idx).parent();
+                    node_idx = tree.node(current_idx).parent();
                     workspace.current_path.pop();
                     continue;
                 }
 
                 if is_root_node {
-                    self.tree.node_mut(current_idx).increment_n_in_flight(cur_limit);
+                    tree.node_mut(current_idx).increment_n_in_flight(cur_limit);
                 }
 
                 // px0 `search.cc:1657-1671`: normally a bounded policy prefix
                 // is sufficient. With `searchmoves`, px0 must copy every root
                 // edge because an allowed move can be outside that prefix.
                 let max_needed = if is_root_node && !self.root_move_filter.is_empty() {
-                    self.tree.node(current_idx).num_edges()
+                    tree.node(current_idx).num_edges()
                 } else {
-                    self.tree
-                        .node(current_idx)
+                    tree.node(current_idx)
                         .num_edges()
-                        .min(self.tree.node(current_idx).n_started() as usize + cur_limit as usize + 2)
+                        .min(tree.node(current_idx).n_started() as usize + cur_limit as usize + 2)
                 };
                 let mut visits = workspace.vtp_buffer.pop().unwrap_or_default();
                 visits.clear();
@@ -1217,23 +1201,26 @@ impl<'a> SearchWorker<'a> {
 
                 // px0 `search.cc:1675-1724`: snapshot policy, child utility,
                 // and in-flight visit counters for this tree level.
-                let draw_score =
-                    self.draw_score((workspace.current_path.len() + base_depth as usize).is_multiple_of(2));
-                let cpuct = super::uct::compute_cpuct(self.params, self.tree.node(current_idx).n(), is_root_node);
-                let puct_mult = cpuct * (self.tree.node(current_idx).children_visits().max(1) as f32).sqrt();
+                let draw_score = Self::draw_score_for_tree(
+                    tree,
+                    self.params,
+                    (workspace.current_path.len() + base_depth as usize).is_multiple_of(2),
+                );
+                let cpuct = super::uct::compute_cpuct(self.params, tree.node(current_idx).n(), is_root_node);
+                let puct_mult = cpuct * (tree.node(current_idx).children_visits().max(1) as f32).sqrt();
                 let fpu = super::uct::get_fpu(
                     self.params,
-                    self.tree.node(current_idx),
-                    self.tree.arena(),
+                    tree.node(current_idx),
+                    tree.arena(),
                     is_root_node,
                     draw_score,
                 );
                 for edge_idx in 0..max_needed {
-                    workspace.current_policy[edge_idx] = self.tree.node(current_idx).edge(edge_idx).get_p();
+                    workspace.current_policy[edge_idx] = tree.node(current_idx).edge(edge_idx).get_p();
                     workspace.current_utility[edge_idx] = f32::NEG_INFINITY;
                 }
                 for edge_idx in 0..max_needed {
-                    let edge = self.tree.edge_and_node(current_idx, edge_idx);
+                    let edge = tree.edge_and_node(current_idx, edge_idx);
                     workspace.current_n_started[edge_idx] = edge.n_started();
                     workspace.current_utility[edge_idx] = edge
                         .child()
@@ -1260,11 +1247,10 @@ impl<'a> SearchWorker<'a> {
                         // cached edge itself is always retained so a batch
                         // can still make progress.
                         if is_root_node && Some(edge_idx) != current_best_edge {
-                            let edge_n = self
-                                .tree
+                            let edge_n = tree
                                 .node(current_idx)
                                 .child(edge_idx)
-                                .map_or(0, |child_idx| self.tree.node(child_idx).n());
+                                .map_or(0, |child_idx| tree.node(child_idx).n());
                             if self.latest_time_manager_hints.estimated_remaining_playouts()
                                 < i64::from(best_node_n) - i64::from(edge_n)
                             {
@@ -1277,7 +1263,7 @@ impl<'a> SearchWorker<'a> {
                             && !self.root_move_filter.is_empty()
                             && !self
                                 .root_move_filter
-                                .contains(&self.tree.node(current_idx).edge(edge_idx).mv)
+                                .contains(&tree.node(current_idx).edge(edge_idx).mv)
                         {
                             continue;
                         }
@@ -1312,35 +1298,35 @@ impl<'a> SearchWorker<'a> {
                     workspace.visits_to_perform.last_mut().expect("visits")[best_idx] += new_visits;
                     cur_limit -= new_visits;
 
-                    let child_idx = self
-                        .tree
+                    let child_idx = tree
                         .node(current_idx)
                         .child(best_idx)
-                        .unwrap_or_else(|| self.tree.arena_mut().spawn_child(current_idx, best_idx));
+                        .unwrap_or_else(|| tree.arena_mut().spawn_child(current_idx, best_idx));
                     // px0 `search.cc:1791-1794`: a tree-reused two-fold
                     // terminal may have been reached before the new root.
-                    self.ensure_node_twofold_correct_for_depth(
+                    self.ensure_node_twofold_correct_for_depth_in_tree(
+                        tree,
                         child_idx,
                         workspace.current_path.len() as u16 + base_depth,
                     );
-                    if self.tree.node_mut(child_idx).try_start_score_update() {
+                    if tree.node_mut(child_idx).try_start_score_update() {
                         workspace.current_n_started[best_idx] += 1;
                         let remaining_visits = new_visits - 1;
-                        if self.tree.node(child_idx).n() > 0 && !self.tree.node(child_idx).is_terminal() {
-                            self.tree.node_mut(child_idx).increment_n_in_flight(remaining_visits);
+                        if tree.node(child_idx).n() > 0 && !tree.node(child_idx).is_terminal() {
+                            tree.node_mut(child_idx).increment_n_in_flight(remaining_visits);
                             workspace.current_n_started[best_idx] += remaining_visits;
                         }
                         workspace.current_score[best_idx] = workspace.current_utility[best_idx]
                             + workspace.current_policy[best_idx] * puct_mult
                                 / (1 + workspace.current_n_started[best_idx]) as f32;
-                        if self.tree.node(child_idx).n() == 0 || self.tree.node(child_idx).is_terminal() {
+                        if tree.node(child_idx).n() == 0 || tree.node(child_idx).is_terminal() {
                             workspace.visits_to_perform.last_mut().expect("visits")[best_idx] -= 1;
                             let mut item = NodeToProcess::visit(
                                 child_idx,
                                 (workspace.current_path.len() + 1 + base_depth as usize) as u16,
                             );
                             item.moves_to_visit = workspace.moves_to_path.clone();
-                            item.moves_to_visit.push(self.tree.node(current_idx).edge(best_idx).mv);
+                            item.moves_to_visit.push(tree.node(current_idx).edge(best_idx).mv);
                             receiver.push(item);
                             completed_visits += 1;
                         }
@@ -1377,16 +1363,15 @@ impl<'a> SearchWorker<'a> {
                             {
                                 continue;
                             }
-                            let child_idx = self
-                                .tree
+                            let child_idx = tree
                                 .node(current_idx)
                                 .child(edge_idx)
-                                .unwrap_or_else(|| self.tree.arena_mut().spawn_child(current_idx, edge_idx));
-                            if self.tree.node(child_idx).n() == 0 || self.tree.node(child_idx).is_terminal() {
+                                .unwrap_or_else(|| tree.arena_mut().spawn_child(current_idx, edge_idx));
+                            if tree.node(child_idx).n() == 0 || tree.node(child_idx).is_terminal() {
                                 continue;
                             }
                             let mut moves_to_base = workspace.moves_to_path.clone();
-                            moves_to_base.push(self.tree.node(current_idx).edge(edge_idx).mv);
+                            moves_to_base.push(tree.node(current_idx).edge(edge_idx).mv);
                             let task = PickTask::gathering(
                                 child_idx,
                                 (workspace.current_path.len() + base_depth as usize) as u16,
@@ -1411,7 +1396,7 @@ impl<'a> SearchWorker<'a> {
                     if workspace.visits_to_perform.last().expect("visits")[edge_idx] == 0 {
                         continue;
                     }
-                    let mv = self.tree.node(current_idx).edge(edge_idx).mv;
+                    let mv = tree.node(current_idx).edge(edge_idx).mv;
                     if workspace.moves_to_path.len() != workspace.current_path.len() + base_depth as usize {
                         workspace.moves_to_path.push(mv);
                     } else {
@@ -1420,17 +1405,16 @@ impl<'a> SearchWorker<'a> {
                     *workspace.current_path.last_mut().expect("path entry") = edge_idx as isize;
                     workspace.current_path.push(-1);
                     node_idx = Some(
-                        self.tree
-                            .node(current_idx)
+                        tree.node(current_idx)
                             .child(edge_idx)
-                            .unwrap_or_else(|| self.tree.arena_mut().spawn_child(current_idx, edge_idx)),
+                            .unwrap_or_else(|| tree.arena_mut().spawn_child(current_idx, edge_idx)),
                     );
                     found_child = true;
                     break;
                 }
             }
             if !found_child {
-                node_idx = self.tree.node(current_idx).parent();
+                node_idx = tree.node(current_idx).parent();
                 workspace.moves_to_path.pop();
                 workspace.current_path.pop();
                 workspace
@@ -1444,8 +1428,8 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::EnsureNodeTwoFoldCorrectForDepth`
     /// (`src/search/classic/search.cc:1510-1550`)。
-    fn ensure_node_twofold_correct_for_depth(&mut self, child_idx: usize, depth: u16) {
-        let child = self.tree.node(child_idx);
+    fn ensure_node_twofold_correct_for_depth_in_tree(&mut self, tree: &mut NodeTree, child_idx: usize, depth: u16) {
+        let child = tree.node(child_idx);
         if !child.is_twofold_terminal() || depth as f32 >= child.m() {
             return;
         }
@@ -1457,9 +1441,8 @@ impl<'a> SearchWorker<'a> {
         let mut node_idx = Some(child_idx);
         let mut depth_counter = 0u16;
         while let Some(current_idx) = node_idx {
-            let parent = self.tree.node(current_idx).parent();
-            self.tree
-                .node_mut(current_idx)
+            let parent = tree.node(current_idx).parent();
+            tree.node_mut(current_idx)
                 .revert_terminal_visits(wl, d, m + depth_counter as f32, terminal_visits);
             depth_counter += 1;
             if depth_counter > depth {
@@ -1467,17 +1450,33 @@ impl<'a> SearchWorker<'a> {
             }
             node_idx = parent;
         }
-        self.tree.make_not_terminal(child_idx);
+        tree.make_not_terminal(child_idx);
+    }
+
+    #[cfg(test)]
+    fn ensure_node_twofold_correct_for_depth(&mut self, child_idx: usize, depth: u16) {
+        self.with_tree(|worker, tree| worker.ensure_node_twofold_correct_for_depth_in_tree(tree, child_idx, depth));
     }
 
     /// px0 `SearchWorker::ProcessPickedTask` (`src/search/classic/search.cc:1423-1462`)。
+    #[cfg(test)]
     fn process_picked_task(
         &mut self,
         start_idx: usize,
         end_idx: usize,
         workspace: &mut TaskWorkspace,
     ) -> Result<(), EnginError> {
-        workspace.history = self.tree.history().clone();
+        self.with_tree(|worker, tree| worker.process_picked_task_in_tree(tree, start_idx, end_idx, workspace))
+    }
+
+    fn process_picked_task_in_tree(
+        &mut self,
+        tree: &mut NodeTree,
+        start_idx: usize,
+        end_idx: usize,
+        workspace: &mut TaskWorkspace,
+    ) -> Result<(), EnginError> {
+        workspace.history = tree.history().clone();
         for i in start_idx..end_idx {
             // px0 immediately skips collisions here. They only carry an
             // in-flight reservation and must not enter terminal/cache OOO
@@ -1488,14 +1487,13 @@ impl<'a> SearchWorker<'a> {
             let node_idx = self.minibatch[i].node_idx;
             let depth = self.minibatch[i].depth;
             let moves_to_visit = std::mem::take(&mut self.minibatch[i].moves_to_visit);
-            let is_terminal = self.tree.node(node_idx).is_terminal();
+            let is_terminal = tree.node(node_idx).is_terminal();
             if self.minibatch[i].is_extendable(is_terminal) {
-                self.extend_node(node_idx, depth, &moves_to_visit, &mut workspace.history)?;
-                if !self.tree.node(node_idx).is_terminal() {
+                self.extend_node_in_tree(tree, node_idx, depth, &moves_to_visit, &mut workspace.history)?;
+                if !tree.node(node_idx).is_terminal() {
                     let position = EvalPosition {
                         positions: workspace.history.positions().to_vec(),
-                        legal_moves: self
-                            .tree
+                        legal_moves: tree
                             .node(node_idx)
                             .edges()
                             .iter()
@@ -1513,9 +1511,9 @@ impl<'a> SearchWorker<'a> {
                 }
             }
             if self.params.out_of_order_eval
-                && self.minibatch[i].can_eval_out_of_order(self.tree.node(node_idx).is_terminal())
+                && self.minibatch[i].can_eval_out_of_order(tree.node(node_idx).is_terminal())
             {
-                self.fetch_single_node_result(i)?;
+                self.fetch_single_node_result_in_tree(tree, i)?;
                 self.minibatch[i].ooo_completed = true;
             }
         }
@@ -1523,6 +1521,7 @@ impl<'a> SearchWorker<'a> {
     }
 
     /// px0 `SearchWorker::ExtendNode` (`src/search/classic/search.cc:1899-1974`)。
+    #[cfg(test)]
     fn extend_node(
         &mut self,
         node_idx: usize,
@@ -1530,7 +1529,18 @@ impl<'a> SearchWorker<'a> {
         moves_to_node: &[Move],
         history: &mut PositionHistory,
     ) -> Result<(), EnginError> {
-        let root = self.tree.current_head();
+        self.with_tree(|worker, tree| worker.extend_node_in_tree(tree, node_idx, depth, moves_to_node, history))
+    }
+
+    fn extend_node_in_tree(
+        &mut self,
+        tree: &mut NodeTree,
+        node_idx: usize,
+        depth: u16,
+        moves_to_node: &[Move],
+        history: &mut PositionHistory,
+    ) -> Result<(), EnginError> {
+        let root = tree.current_head();
         history.trim(self.played_history_len);
         for mv in moves_to_node {
             history.append(*mv);
@@ -1538,7 +1548,7 @@ impl<'a> SearchWorker<'a> {
         let board = history.last().board();
         let legal_moves = board.generate_legal_moves();
         if legal_moves.is_empty() {
-            self.tree.make_terminal(
+            tree.make_terminal(
                 node_idx,
                 if history.is_black_to_move() {
                     GameResult::WhiteWon
@@ -1552,8 +1562,7 @@ impl<'a> SearchWorker<'a> {
         }
         if node_idx != root {
             if history.last().repetitions() >= 2 {
-                self.tree
-                    .make_terminal(node_idx, history.rule_judge(), 0.0, Terminal::EndOfGame);
+                tree.make_terminal(node_idx, history.rule_judge(), 0.0, Terminal::EndOfGame);
                 return Ok(());
             }
             // px0 `search.cc:1930-1959`: an initial repetition can be a
@@ -1568,8 +1577,7 @@ impl<'a> SearchWorker<'a> {
                 let cycle_length = history.last().cycle_length();
                 let result = history.rule_judge();
                 if result == GameResult::Draw {
-                    self.tree
-                        .make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
+                    tree.make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
                     return Ok(());
                 }
 
@@ -1590,24 +1598,22 @@ impl<'a> SearchWorker<'a> {
                         }
                     }
                     if idx2 == idx && history.last().rule60_ply() < 120 {
-                        self.tree
-                            .make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
+                        tree.make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
                         return Ok(());
                     }
                 }
             }
             if !board.has_mating_material() || history.last().rule60_ply() >= 120 {
-                self.tree
-                    .make_terminal(node_idx, GameResult::Draw, 0.0, Terminal::EndOfGame);
+                tree.make_terminal(node_idx, GameResult::Draw, 0.0, Terminal::EndOfGame);
                 return Ok(());
             }
         }
-        self.tree.node_mut(node_idx).create_edges(&legal_moves);
+        tree.node_mut(node_idx).create_edges(&legal_moves);
         Ok(())
     }
 
     /// px0 `SearchWorker::CollectCollisions` (`search.cc:1977-1987`)。
-    pub fn collect_collisions(&mut self) -> Result<(), EnginError> {
+    fn collect_collisions_in_tree(&mut self, _tree: &mut NodeTree) -> Result<(), EnginError> {
         for item in &self.minibatch {
             if item.is_collision {
                 self.search_state
@@ -1654,8 +1660,9 @@ impl<'a> SearchWorker<'a> {
         }
     }
 
-    fn draw_score(&self, is_odd_depth: bool) -> f32 {
-        Self::draw_score_for_tree(&self.tree, self.params, is_odd_depth)
+    #[cfg(test)]
+    fn draw_score(&mut self, is_odd_depth: bool) -> f32 {
+        self.with_tree_read(|worker, tree| Self::draw_score_for_tree(tree, worker.params, is_odd_depth))
     }
 
     /// px0 `PrefetchIntoCache` (`search.cc:2010-2099`)。
@@ -1779,23 +1786,27 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::FetchMinibatchResults` (`search.cc:2109-2156`)。
     pub fn fetch_minibatch_results(&mut self) -> Result<(), EnginError> {
+        self.with_tree(|worker, tree| worker.fetch_minibatch_results_in_tree(tree))
+    }
+
+    fn fetch_minibatch_results_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
         for i in 0..self.minibatch.len() {
-            self.fetch_single_node_result(i)?;
+            self.fetch_single_node_result_in_tree(tree, i)?;
         }
         Ok(())
     }
 
     /// px0 `SearchWorker::FetchSingleNodeResult` (`search.cc:2117-2154`)。
-    fn fetch_single_node_result(&mut self, index: usize) -> Result<(), EnginError> {
+    fn fetch_single_node_result_in_tree(&mut self, tree: &mut NodeTree, index: usize) -> Result<(), EnginError> {
         if self.minibatch[index].is_collision {
             return Ok(());
         }
         let node_idx = self.minibatch[index].node_idx;
         if !self.minibatch[index].nn_queried {
             self.minibatch[index].eval = EvalResult {
-                wl: self.tree.node(node_idx).wl(),
-                d: self.tree.node(node_idx).d(),
-                m: self.tree.node(node_idx).m(),
+                wl: tree.node(node_idx).wl(),
+                d: tree.node(node_idx).d(),
+                m: tree.node(node_idx).m(),
                 policies: Vec::new(),
             };
             return Ok(());
@@ -1818,7 +1829,7 @@ impl<'a> SearchWorker<'a> {
         if self.params.wdl_rescale_ratio != 1.0
             || (self.params.wdl_rescale_diff != 0.0 && self.params.contempt_mode != ContemptMode::None)
         {
-            let root_stm = (self.params.contempt_mode == ContemptMode::Black) == self.tree.history().is_black_to_move();
+            let root_stm = (self.params.contempt_mode == ContemptMode::Black) == tree.history().is_black_to_move();
             let sign = if root_stm ^ (self.minibatch[index].depth % 2 == 1) {
                 1.0
             } else {
@@ -1838,13 +1849,13 @@ impl<'a> SearchWorker<'a> {
                 self.params.wdl_max_s,
             );
         }
-        if self.tree.node(node_idx).n() == 0 {
+        if tree.node(node_idx).n() == 0 {
             for (edge_idx, policy) in eval.policies.iter().enumerate() {
-                self.tree.node_mut(node_idx).edge_mut(edge_idx).set_p(*policy);
+                tree.node_mut(node_idx).edge_mut(edge_idx).set_p(*policy);
             }
             // px0 sorts the just-initialized policy before any child node can
             // be spawned (`node.cc:291-298`, `search.cc:2145-2153`).
-            self.tree.node_mut(node_idx).sort_edges();
+            tree.node_mut(node_idx).sort_edges();
         }
         self.minibatch[index].eval = eval;
         Ok(())
@@ -1852,6 +1863,10 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::DoBackupUpdate` (`search.cc:2158-2258`) 单线程子集。
     pub fn do_backup_update(&mut self) -> Result<(), EnginError> {
+        self.with_tree(|worker, tree| worker.do_backup_update_in_tree(tree))
+    }
+
+    fn do_backup_update_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
         let mut work_done = self.number_out_of_order > 0;
         let items: Vec<_> = self
             .minibatch
@@ -1860,31 +1875,32 @@ impl<'a> SearchWorker<'a> {
             .cloned()
             .collect();
         for item in items {
-            self.do_backup_update_single_node(&item);
+            self.do_backup_update_single_node_in_tree(tree, &item);
             work_done = true;
         }
         if work_done {
-            self.cancel_shared_collisions();
+            self.cancel_shared_collisions_in_tree(tree);
             self.search_state.total_batches.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
     }
 
     /// px0 `Search::CancelSharedCollisions` (`search.cc:1044-1053`).
-    fn cancel_shared_collisions(&mut self) {
+    fn cancel_shared_collisions_in_tree(&mut self, tree: &mut NodeTree) {
         let collisions = std::mem::take(&mut *self.search_state.shared_collisions.lock().expect("collisions lock"));
         for (node_idx, multivisit) in collisions {
-            let mut current = self.tree.node(node_idx).parent();
+            let mut current = tree.node(node_idx).parent();
             while let Some(node_idx) = current {
-                self.tree.node_mut(node_idx).cancel_score_update(multivisit);
-                current = self.tree.node(node_idx).parent();
+                tree.node_mut(node_idx).cancel_score_update(multivisit);
+                current = tree.node(node_idx).parent();
             }
         }
     }
 
     /// px0 `SearchWorker::MaybeSetBounds` (`search.cc:2229-2289`).
-    fn maybe_set_bounds(
+    fn maybe_set_bounds_in_tree(
         &mut self,
+        tree: &mut NodeTree,
         parent_idx: usize,
         m: f32,
         n_to_fix: &mut u32,
@@ -1897,12 +1913,8 @@ impl<'a> SearchWorker<'a> {
         let mut lower = GameResult::BlackWon;
         let mut upper = GameResult::BlackWon;
 
-        for edge_idx in 0..self.tree.node(parent_idx).num_edges() {
-            let child = self
-                .tree
-                .node(parent_idx)
-                .child(edge_idx)
-                .map(|idx| self.tree.node(idx));
+        for edge_idx in 0..tree.node(parent_idx).num_edges() {
+            let child = tree.node(parent_idx).child(edge_idx).map(|idx| tree.node(idx));
             let edge_lower = child.map_or(GameResult::BlackWon, |node| node.lower_bound());
             let edge_upper = child.map_or(GameResult::WhiteWon, |node| node.upper_bound());
             lower = lower.max(edge_lower);
@@ -1923,7 +1935,7 @@ impl<'a> SearchWorker<'a> {
             return false;
         }
         if lower == upper {
-            let parent = self.tree.node(parent_idx);
+            let parent = tree.node(parent_idx);
             *n_to_fix = parent.n();
             debug_assert!(*n_to_fix > 0);
             let current_v = parent.wl();
@@ -1935,7 +1947,7 @@ impl<'a> SearchWorker<'a> {
             } else {
                 m
             } + 1.0;
-            self.tree.make_terminal(
+            tree.make_terminal(
                 parent_idx,
                 result,
                 plies_left,
@@ -1945,81 +1957,89 @@ impl<'a> SearchWorker<'a> {
                     Terminal::EndOfGame
                 },
             );
-            let parent = self.tree.node(parent_idx);
+            let parent = tree.node(parent_idx);
             *v_delta = -(parent.wl() - current_v);
             *d_delta = parent.d() - current_d;
             *m_delta = parent.m() - current_m;
         } else {
-            self.tree
-                .node_mut(parent_idx)
-                .set_bounds(upper.negate(), lower.negate());
+            tree.node_mut(parent_idx).set_bounds(upper.negate(), lower.negate());
         }
         true
     }
 
     /// px0 `SearchWorker::DoBackupUpdateSingleNode` (`search.cc:2175-2289`).
+    #[cfg(test)]
     fn do_backup_update_single_node(&mut self, item: &NodeToProcess) {
+        self.with_tree(|worker, tree| worker.do_backup_update_single_node_in_tree(tree, item));
+    }
+
+    fn do_backup_update_single_node_in_tree(&mut self, tree: &mut NodeTree, item: &NodeToProcess) {
         let mut node_idx = item.node_idx;
         let mut v = item.eval.wl;
         let mut d = item.eval.d;
         let mut m = item.eval.m;
-        let root = self.tree.current_head();
+        let root = tree.current_head();
         let mut update_parent_bounds =
-            self.params.sticky_endgames && self.tree.node(node_idx).is_terminal() && self.tree.node(node_idx).n() == 0;
+            self.params.sticky_endgames && tree.node(node_idx).is_terminal() && tree.node(node_idx).n() == 0;
         let mut n_to_fix = 0;
         let mut v_delta = 0.0;
         let mut d_delta = 0.0;
         let mut m_delta = 0.0;
         loop {
-            if self.tree.node(node_idx).is_terminal() {
-                v = self.tree.node(node_idx).wl();
-                d = self.tree.node(node_idx).d();
-                m = self.tree.node(node_idx).m();
+            if tree.node(node_idx).is_terminal() {
+                v = tree.node(node_idx).wl();
+                d = tree.node(node_idx).d();
+                m = tree.node(node_idx).m();
             }
-            self.tree
-                .node_mut(node_idx)
-                .finalize_score_update(v, d, m, item.multivisit);
-            if n_to_fix > 0 && !self.tree.node(node_idx).is_terminal() {
-                self.tree
-                    .node_mut(node_idx)
+            tree.node_mut(node_idx).finalize_score_update(v, d, m, item.multivisit);
+            if n_to_fix > 0 && !tree.node(node_idx).is_terminal() {
+                tree.node_mut(node_idx)
                     .adjust_for_terminal(v_delta, d_delta, m_delta, n_to_fix);
             }
             // px0 solidifies a sufficiently visited node after its score is
             // finalized. The root best-edge cache stores an edge iterator, so
             // refresh it if root solidification changed that representation
             // (`search.cc:2211-2217`, `node.cc:245-288`).
-            if self.tree.node(node_idx).n() >= self.params.solid_tree_threshold
-                && self.tree.make_solid(node_idx)
+            if tree.node(node_idx).n() >= self.params.solid_tree_threshold
+                && tree.make_solid(node_idx)
                 && node_idx == root
             {
                 *self.search_state.current_best_edge.lock().expect("best edge lock") =
-                    best_child_edge(&self.tree, root, self.params, 0, self.root_move_filter);
+                    best_child_edge(tree, root, self.params, 0, self.root_move_filter);
             }
             if node_idx == root {
                 break;
             }
-            let parent = self.tree.node(node_idx).parent().expect("non-root has parent");
+            let parent = tree.node(node_idx).parent().expect("non-root has parent");
             let old_update_parent_bounds = update_parent_bounds;
-            if self.tree.node(parent).is_terminal() {
+            if tree.node(parent).is_terminal() {
                 n_to_fix = 0;
             }
             update_parent_bounds = update_parent_bounds
                 && parent != root
-                && !self.tree.node(parent).is_terminal()
-                && self.maybe_set_bounds(parent, m, &mut n_to_fix, &mut v_delta, &mut d_delta, &mut m_delta);
+                && !tree.node(parent).is_terminal()
+                && self.maybe_set_bounds_in_tree(
+                    tree,
+                    parent,
+                    m,
+                    &mut n_to_fix,
+                    &mut v_delta,
+                    &mut d_delta,
+                    &mut m_delta,
+                );
             // px0 refreshes the root cache only when a terminal bound may
             // have changed the candidate or a non-cached child catches up in
             // visits (`search.cc:2241-2249`). This avoids a full root sort on
             // every backup while preserving the selection pruning invariant.
             if parent == root {
                 let cached_edge = *self.search_state.current_best_edge.lock().expect("best edge lock");
-                let cached_node = cached_edge.and_then(|edge_idx| self.tree.node(root).child(edge_idx));
-                let cached_n = cached_node.map_or(0, |child_idx| self.tree.node(child_idx).n());
-                if (old_update_parent_bounds && self.tree.node(node_idx).is_terminal())
-                    || (cached_node != Some(node_idx) && cached_n <= self.tree.node(node_idx).n())
+                let cached_node = cached_edge.and_then(|edge_idx| tree.node(root).child(edge_idx));
+                let cached_n = cached_node.map_or(0, |child_idx| tree.node(child_idx).n());
+                if (old_update_parent_bounds && tree.node(node_idx).is_terminal())
+                    || (cached_node != Some(node_idx) && cached_n <= tree.node(node_idx).n())
                 {
                     *self.search_state.current_best_edge.lock().expect("best edge lock") =
-                        best_child_edge(&self.tree, root, self.params, 0, self.root_move_filter);
+                        best_child_edge(tree, root, self.params, 0, self.root_move_filter);
                 }
             }
             node_idx = parent;
@@ -2248,7 +2268,7 @@ mod tests {
         // `PickNodesToExtendTask` always reserves the path before handing an
         // item to ProcessPickedTask (`px0 search.cc:1613-1636`).  Keep this
         // focused OOO test on that post-selection contract.
-        assert!(worker.tree.node_mut(root).try_start_score_update());
+        assert!(worker.with_tree_for_test(|tree| tree.node_mut(root).try_start_score_update()));
         worker.minibatch.push(NodeToProcess::visit(root, 1));
         let mut workspace = TaskWorkspace::default();
         worker.process_picked_task(0, 1, &mut workspace).expect("ooo terminal");
@@ -2310,7 +2330,7 @@ mod tests {
         let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.initialize_iteration().expect("init");
-        assert!(worker.tree.node_mut(root).try_start_score_update());
+        assert!(worker.with_tree_for_test(|tree| tree.node_mut(root).try_start_score_update()));
         worker.minibatch.push(NodeToProcess::visit(root, 1));
 
         let mut workspace = TaskWorkspace::default();
@@ -2352,10 +2372,10 @@ mod tests {
         worker.gather_minibatch().expect("gather cache hit");
 
         assert_eq!(worker.number_out_of_order, 1);
-        assert_eq!(worker.tree.node(root).n(), 1);
+        assert_eq!(worker.with_tree_for_test(|tree| tree.node(root).n()), 1);
         // px0 keeps gathering after the OOO backup, so the next ordinary leaf
         // is already reserved by the time this phase returns.
-        assert!(worker.tree.node(root).n_in_flight() > 0);
+        assert!(worker.with_tree_for_test(|tree| tree.node(root).n_in_flight() > 0));
         assert!(worker.minibatch.iter().all(|item| !item.ooo_completed));
     }
 
@@ -2372,9 +2392,9 @@ mod tests {
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.run_until_root_visits(2).expect("two root visits");
 
-        let root = worker.tree.current_head();
+        let root = worker.with_tree_for_test(|tree| tree.current_head());
         let edge = *search_state.current_best_edge.lock().expect("best edge lock");
-        assert!(edge.is_some_and(|edge_idx| edge_idx < worker.tree.node(root).num_edges()));
+        assert!(edge.is_some_and(|edge_idx| edge_idx < worker.with_tree_for_test(|tree| tree.node(root).num_edges())));
     }
 
     #[test]
@@ -2457,11 +2477,17 @@ mod tests {
 
         // px0 `MaybeSetBounds` does not terminalize root, but it turns this
         // non-root forced child into a sticky loss for its side to move.
-        assert!(!worker.tree.node(root).is_terminal());
-        assert!(worker.tree.node(parent).is_terminal());
-        assert!((worker.tree.node(parent).wl() + 1.0).abs() < f32::EPSILON);
-        assert_eq!(worker.tree.node(parent).lower_bound(), GameResult::BlackWon);
-        assert_eq!(worker.tree.node(parent).upper_bound(), GameResult::BlackWon);
+        assert!(!worker.with_tree_for_test(|tree| tree.node(root).is_terminal()));
+        assert!(worker.with_tree_for_test(|tree| tree.node(parent).is_terminal()));
+        assert!((worker.with_tree_for_test(|tree| tree.node(parent).wl()) + 1.0).abs() < f32::EPSILON);
+        assert_eq!(
+            worker.with_tree_for_test(|tree| tree.node(parent).lower_bound()),
+            GameResult::BlackWon
+        );
+        assert_eq!(
+            worker.with_tree_for_test(|tree| tree.node(parent).upper_bound()),
+            GameResult::BlackWon
+        );
     }
 
     #[test]
@@ -2535,7 +2561,7 @@ mod tests {
             ..SearchParams::default()
         };
         let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
-        let worker = SearchWorker::new(&mut tree, &backend, &params, &state);
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
 
         assert!((worker.draw_score(false) - 0.25).abs() < f32::EPSILON);
         assert!((worker.draw_score(true) + 0.25).abs() < f32::EPSILON);
@@ -2735,9 +2761,9 @@ mod tests {
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
         worker.ensure_node_twofold_correct_for_depth(child, 1);
 
-        assert!(!worker.tree.node(child).is_terminal());
-        assert_eq!(worker.tree.node(child).n(), 0);
-        assert_eq!(worker.tree.node(root).n(), 0);
+        assert!(!worker.with_tree_for_test(|tree| tree.node(child).is_terminal()));
+        assert_eq!(worker.with_tree_for_test(|tree| tree.node(child).n()), 0);
+        assert_eq!(worker.with_tree_for_test(|tree| tree.node(root).n()), 0);
     }
 
     #[test]
@@ -2769,7 +2795,7 @@ mod tests {
             .extend_node(child, 5, &moves, &mut history)
             .expect("extend twofold leaf");
 
-        assert!(worker.tree.node(child).is_twofold_terminal());
-        assert!((worker.tree.node(child).m() - 4.0).abs() < f32::EPSILON);
+        assert!(worker.with_tree_for_test(|tree| tree.node(child).is_twofold_terminal()));
+        assert!((worker.with_tree_for_test(|tree| tree.node(child).m()) - 4.0).abs() < f32::EPSILON);
     }
 }

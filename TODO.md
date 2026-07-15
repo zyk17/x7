@@ -33,6 +33,9 @@
 
 - [x] 按 `src/search/classic/search.h:435-445`、`search.cc:1069-1119,1464-1483` 翻译
   `task_taking_started`、claim、idle、wake、close 与重用；已补多线程唯一领取回归。
+- [x] 按 `src/search/classic/search.cc:1142-1211,1494-1508` 将 Rust `NodeTree` 收为显式
+  tree-phase 借用，删除 `active: *mut NodeTree`；direct 与 shared tree 均通过同一安全边界进入
+  selection/process/fetch/backup。
 - [ ] 按 `src/search/classic/search.h:205-249,357-448, search.cc:1122-1140,1268-1508` 翻译一个 `SearchWorker` + 每 task thread
   一个独占 `TaskWorkspace` 的 px0 所有权关系；禁止共享 Rust `&mut SearchWorker` 或 workspace。
 - [ ] 先对照 `src/search/classic/search.cc:1494-1501` 与 `src/search/classic/node.h:127-330` 建立
