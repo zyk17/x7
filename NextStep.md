@@ -31,6 +31,11 @@ task-worker 完成。
 collision-only `sleep(10ms)` 保持与 px0 一致：它位于 `SearchWorker::UpdateCounters`
 (`src/search/classic/search.cc:2337-2351`)，只在一次 iteration 完全没有非 collision 工作时退避。
 
+watchdog 已按 px0 `Search::WatchdogThread` / `FireStopInternal` 的等待边界收口：`meta` mutex
+对应 `counters_mutex_`，stopper 触发或 UCI `stop/abort` 都通知 `watchdog_cv`，空闲等待按
+`estimated_remaining_time_ms` 限制为 `1..=100ms`。参考
+`src/search/classic/search.cc:981-1034`。这只替换固定 1ms polling，不改变时间分配或 stopper 策略。
+
 已对齐 tree reuse 的 stopper 统计：`total_nodes` 必须是本轮 `total_playouts + initial_visits`，而
 `nodes_since_movestart` 只统计本轮 playouts。参考 px0 `search.cc:908-922`。
 

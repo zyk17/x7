@@ -1,7 +1,7 @@
 //! px0 `src/search/classic/search.h:49-260`、`search.cc:426-808,874-1055`、`wrapper.cc:53-141`。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -392,6 +392,9 @@ struct LiveInfoState {
 pub(crate) struct SearchStopController {
     meta: Arc<Mutex<SearchMeta>>,
     stopper: Arc<Mutex<Option<ChainedSearchStopper>>>,
+    /// px0 wakes its watchdog immediately after `FireStopInternal`
+    /// (`src/search/classic/search.cc:981-1025`).
+    watchdog_cv: Arc<Condvar>,
 }
 
 impl SearchStopController {
@@ -441,6 +444,7 @@ impl SearchStopController {
         meta.stoppers_hints = hints;
         if should_stop {
             worker_state.stop.store(true, Ordering::Release);
+            self.watchdog_cv.notify_all();
         }
         should_stop
     }
@@ -454,6 +458,10 @@ pub struct ClassicSearch {
     stop: Arc<AtomicBool>,
     stopper: Arc<Mutex<Option<ChainedSearchStopper>>>,
     stop_controller: Arc<SearchStopController>,
+    /// px0 `Search::watchdog_cv_` (`src/search/classic/search.h:132-151`).
+    /// It shares `meta`'s mutex, the Rust equivalent of px0's
+    /// `counters_mutex_` pairing in `WatchdogThread`.
+    watchdog_cv: Arc<Condvar>,
     /// px0 `SearchBase::uci_responder_` (`src/search/search.h:45-99`). The
     /// engine installs its forwarder before UCI starts a search; worker-side
     /// watchdog output is added in the following P4 translation point.
@@ -481,6 +489,7 @@ impl ClassicSearch {
             contempt_mode: ContemptMode::None,
         }));
         let stopper = Arc::new(Mutex::new(None));
+        let watchdog_cv = Arc::new(Condvar::new());
         Self {
             tree: Arc::new(RwLock::new(NodeTree::default())),
             worker_state: Arc::new(WorkerSearchState::new(Arc::clone(&stop), i64::MAX)),
@@ -488,7 +497,12 @@ impl ClassicSearch {
             backend: Arc::from(backend),
             stop,
             stopper: Arc::clone(&stopper),
-            stop_controller: Arc::new(SearchStopController { meta, stopper }),
+            stop_controller: Arc::new(SearchStopController {
+                meta,
+                stopper,
+                watchdog_cv: Arc::clone(&watchdog_cv),
+            }),
+            watchdog_cv,
             responder: None,
             ok_to_respond_bestmove: Arc::new(AtomicBool::new(true)),
             bestmove_is_sent: Arc::new(AtomicBool::new(false)),
@@ -702,6 +716,7 @@ impl ClassicSearch {
         let watchdog_meta = Arc::clone(&meta);
         let watchdog_stop = Arc::clone(&stop);
         let watchdog_stop_controller = Arc::clone(&stop_controller);
+        let watchdog_cv = Arc::clone(&self.watchdog_cv);
         let live_info = Arc::clone(&self.live_info);
         let has_wdl = self.backend.attributes().has_wdl;
         // px0 starts a watchdog before search workers (`search.cc:874-896`).
@@ -758,7 +773,18 @@ impl ClassicSearch {
             if bestmove_is_sent.load(Ordering::Acquire) {
                 break;
             }
-            thread::sleep(Duration::from_millis(1));
+            // px0 `Search::WatchdogThread` waits on `watchdog_cv_` using
+            // `counters_mutex_`, with a 1..=100 ms timeout
+            // (`src/search/classic/search.cc:981-1017`). This avoids a
+            // fixed polling loop while preserving an upper bound for
+            // wakeups when an external event is missed.
+            let meta = watchdog_meta.lock().expect("meta lock");
+            let remaining_ms = meta.stoppers_hints.estimated_remaining_time_ms().clamp(1, 100) as u64;
+            let _ = watchdog_cv
+                .wait_timeout_while(meta, Duration::from_millis(remaining_ms), |_| {
+                    !watchdog_stop.load(Ordering::Acquire)
+                })
+                .expect("meta lock");
         }));
         for _ in 0..thread_count {
             let tree = Arc::clone(&tree);
@@ -930,6 +956,7 @@ impl SearchBase for ClassicSearch {
         // for an otherwise silent infinite search (`search.cc:1019-1025`).
         self.ok_to_respond_bestmove.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
+        self.watchdog_cv.notify_all();
         Ok(())
     }
 
@@ -938,6 +965,7 @@ impl SearchBase for ClassicSearch {
         // (`search.cc:1027-1033`).
         self.bestmove_is_sent.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
+        self.watchdog_cv.notify_all();
         self.wait_search()
     }
 }
