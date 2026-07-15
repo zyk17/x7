@@ -28,8 +28,8 @@ task-worker 完成。
 当前保持安全基线：正式搜索继续禁用 task split（等价于 px0 CPU backend 的 `task_workers_=0`
 分支），优先验证多个 `SearchWorker`、minibatch、cache、prefetch 与 backend computation 的主线。
 
-已移除旧 collision-only `sleep(10ms)`：它不在 px0 `SearchWorker::UpdateCounters`
-(`src/search/classic/search.cc:2331-2364`) 中，会人为降低并扭曲低节点吞吐。
+collision-only `sleep(10ms)` 保持与 px0 一致：它位于 `SearchWorker::UpdateCounters`
+(`src/search/classic/search.cc:2337-2351`)，只在一次 iteration 完全没有非 collision 工作时退避。
 
 已对齐 tree reuse 的 stopper 统计：`total_nodes` 必须是本轮 `total_playouts + initial_visits`，而
 `nodes_since_movestart` 只统计本轮 playouts。参考 px0 `search.cc:908-922`。
