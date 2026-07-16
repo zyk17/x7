@@ -25,10 +25,10 @@
 
 - `crates/xiangqi_core`：翻译 px0 `src/chess`。
 - `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2/P3 已完成，P4 的 ONNX、
-  单 worker、minibatch、MemCache、prefetch、collision、shared-tree 与 watchdog 主线已接入。GPU
-  task-worker 当前停用：px0 `TaskWorkers` 解析保留，但旧 scoped gather/processing bridge 在真实 ONNX
-  长 `go movetime` 中会停止推进，现已删除；正式运行必须保持 `active_task_workers=0`。`NodeArena` 已收为
-  外层 tree phase 管理的安全 `Vec<Box<Node>>`，first-extend gate 不是后台并发正确性的充分证明。
+  minibatch、MemCache、prefetch、collision、shared-tree、watchdog 与常驻 processing task-worker 已接入。
+  px0 `TaskWorkers` 创建的 Rust task 只拥有 extension 输入/workspace/result；主 worker 在 `WaitForTasks`
+  后独占 tree/backend phase。旧 scoped gather/processing bridge 在真实 ONNX 长 `go movetime` 中会停止推进，
+  已删除。`NodeArena` 保持外层 owner tree phase 管理的安全 `Vec<Box<Node>>`；task 不得直接借用它。
   正式 ONNX 必须经 `CachingBackend`，其 key/collision guard/回填时序只能对照
   `px0/src/neural/memcache.cc:38-190` 修改。
   已删除的 `TaskTreeBridge` / `TaskWorkerRunner` 不是可用实现；task 生命周期以现有
@@ -40,9 +40,9 @@
 - 多套正式训练格式
 - 未经 px0 对照的抽象、参数或启发式
 
-P4 task-worker 禁止 raw pointer、`unsafe impl Send` 和跨线程共享 `&mut SearchWorker`、minibatch、backend
-computation 或任何 workspace。后续常驻 worker 只能逐段翻译 px0 的 task 生命周期，并以 owned task/result/
-workspace 与外层 tree phase API 建立边界。未扩展 node 必须保留 `TryStartScoreUpdate` CAS 语义。修改该路径前必须在
+P4 task-worker 禁止 raw pointer、`unsafe impl Send` 和跨线程共享 `&mut SearchWorker`、`NodeTree`、minibatch、backend
+computation 或任何 workspace。常驻 processing worker 只允许逐段翻译 px0 的 task 生命周期，并以 owned task/result/
+workspace 与 owner tree phase API 建立边界。未扩展 node 必须保留 `TryStartScoreUpdate` CAS 语义。修改该路径前必须在
 `NextStep.md`/`TODO.md` 标明 px0
 `src/search/classic/search.h:205-244,348-445`、`search.cc:1069-1508` 的对应区间，并补齐固定 visits、
 `go movetime`、stop/wait、`NInFlight==0` 与真实 ONNX 回归。不得以整树锁串行化 task worker。
