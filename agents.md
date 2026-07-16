@@ -26,13 +26,13 @@
 - `crates/xiangqi_core`：翻译 px0 `src/chess`。
 - `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2/P3 已完成，P4 的 ONNX、
   单 worker、minibatch、MemCache、prefetch、collision、shared-tree 与 watchdog 主线已接入。GPU
-  task-worker 当前停用：px0 `TaskWorkers` 解析保留，但 scoped gather/processing task phase 在真实 ONNX
-  长 `go movetime` 中会停止推进，正式运行必须保持 `active_task_workers=0`。`NodeArena` 的稳定分配入口、
-  first-extend gate 与 child slot 不是并发正确性的充分证明；后续修改不得绕过这些边界。
+  task-worker 当前停用：px0 `TaskWorkers` 解析保留，但旧 scoped gather/processing bridge 在真实 ONNX
+  长 `go movetime` 中会停止推进，现已删除；正式运行必须保持 `active_task_workers=0`。`NodeArena` 已收为
+  外层 tree phase 管理的安全 `Vec<Box<Node>>`，first-extend gate 不是后台并发正确性的充分证明。
   正式 ONNX 必须经 `CachingBackend`，其 key/collision guard/回填时序只能对照
   `px0/src/neural/memcache.cc:38-190` 修改。
   已删除的 `TaskTreeBridge` / `TaskWorkerRunner` 不是可用实现；task 生命周期以现有
-  `PickTaskQueue` / `TaskRunner` / scoped tree phase 为准。唯一准确状态以 `NextStep.md`、`TODO.md` 为准。
+  `PickTaskQueue` / `TaskRunner` 与同步 tree phase 为准。唯一准确状态以 `NextStep.md`、`TODO.md` 为准。
 - `nn/`：对齐 pxzero-training 的数据、训练和导出。
 
 不要引入：
@@ -40,11 +40,10 @@
 - 多套正式训练格式
 - 未经 px0 对照的抽象、参数或启发式
 
-P4 task-worker 允许最小、可审计的 `unsafe`，但只能逐段翻译 px0 的 tree phase：scoped raw pointer 仅可
-指向当前 gather/processing phase 独占的 `NodeTree`，每个线程只能拥有独立 `TaskRunner`/workspace 与已领取的
-`PickTask`。禁止跨线程共享 `&mut SearchWorker`、minibatch、backend computation 或任何 workspace。
-`NodeArena` 的 Vec metadata 只能经 allocation lock 修改；未扩展 node 必须由 `TryStartScoreUpdate` CAS 独占，
-child 必须经 slot reservation 发布。修改该路径前必须在 `NextStep.md`/`TODO.md` 标明 px0
+P4 task-worker 禁止 raw pointer、`unsafe impl Send` 和跨线程共享 `&mut SearchWorker`、minibatch、backend
+computation 或任何 workspace。后续常驻 worker 只能逐段翻译 px0 的 task 生命周期，并以 owned task/result/
+workspace 与外层 tree phase API 建立边界。未扩展 node 必须保留 `TryStartScoreUpdate` CAS 语义。修改该路径前必须在
+`NextStep.md`/`TODO.md` 标明 px0
 `src/search/classic/search.h:205-244,348-445`、`search.cc:1069-1508` 的对应区间，并补齐固定 visits、
 `go movetime`、stop/wait、`NInFlight==0` 与真实 ONNX 回归。不得以整树锁串行化 task worker。
 px0 `nodes_mutex_` 的主线程持锁/task 线程直接读写模型不能按字面作为 Rust alias 模型搬运；必须先保住
