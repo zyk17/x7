@@ -176,6 +176,11 @@ NodeTree` 借给多个 runner 后仍声称是安全的逐行翻译。P4 后台 t
 `src/search/classic/search.h:205-224`。当前已按该数值规划 gather/processing split，但 `WaitForTasks` 仍由
 owner 同步 drain；下一步才将该 drain 替换为 scoped task threads。
 
+第十五步已完成：task queue 已补齐 scoped phase 的 `publish -> wait -> seal -> exhaust` 协议；worker 在主
+DFS 尚可发布 gathering task 时等待，seal 后只在已领取任务全部耗尽才退出。参考
+`src/search/classic/search.cc:1069-1140,1485-1508`。当前同步 drain 也复用该协议，因此行为不变；下一步可在
+同一协议下替换为真实 scoped task threads。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

@@ -5,7 +5,6 @@
 //! 所有权拆开；后台 tree phase 仍在逐段重译。
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
-#[cfg(test)]
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 
@@ -266,12 +265,15 @@ struct PickTaskQueue {
     task_taking_started: AtomicBool,
     tasks_taken: AtomicUsize,
     completed_tasks: AtomicUsize,
+    /// Scoped Rust task phases seal after their producer has finished
+    /// publishing work. This maps px0's long-lived worker sleep boundary
+    /// (`search.cc:1069-1124`) without making a task thread persistent yet.
+    phase_sealed: AtomicBool,
     // This is px0's `task_count_ == -1` sentinel (`search.cc:1097-1119`,
     // `search.h:435-445`). The active Rust path consumes it synchronously;
     // blocking sleep/exit remains test-only until task ownership is complete.
     #[cfg(test)]
     exiting: AtomicBool,
-    #[cfg(test)]
     task_added: Condvar,
 }
 
@@ -284,6 +286,7 @@ impl PickTaskQueue {
         self.task_taking_started.store(false, Ordering::Release);
         self.tasks_taken.store(0, Ordering::Release);
         self.completed_tasks.store(0, Ordering::Release);
+        self.phase_sealed.store(false, Ordering::Release);
         let mut tasks = self.tasks.lock().expect("pick task queue lock");
         tasks.clear();
         // px0 reserves `MAX_TASKS` every reset because task workers retain
@@ -303,7 +306,6 @@ impl PickTaskQueue {
         tasks.push(Some(task));
         drop(tasks);
         self.task_count.fetch_add(1, Ordering::AcqRel);
-        #[cfg(test)]
         self.task_added.notify_all();
         true
     }
@@ -357,12 +359,38 @@ impl PickTaskQueue {
         }
     }
 
+    /// px0 `RunTasks` waits for tasks while the main gather producer is still
+    /// walking the tree (`src/search/classic/search.cc:1069-1124,1485-1508`).
+    /// A scoped Rust worker exits only after the producer seals this phase and
+    /// every published task has been claimed.
+    fn take_until_phase_sealed(&self) -> Option<ClaimedTask> {
+        loop {
+            if let Some(task) = self.take() {
+                return Some(task);
+            }
+            if self.phase_sealed.load(Ordering::Acquire) {
+                return None;
+            }
+            let tasks = self.tasks.lock().expect("pick task queue lock");
+            if self.phase_sealed.load(Ordering::Acquire) {
+                return None;
+            }
+            drop(self.task_added.wait(tasks).expect("pick task queue wait"));
+        }
+    }
+
+    /// Completes the producer side of one scoped task phase. Existing tasks
+    /// remain claimable; idle workers may exit only after they are exhausted.
+    fn seal_phase(&self) {
+        self.phase_sealed.store(true, Ordering::Release);
+        self.task_added.notify_all();
+    }
+
     /// px0 `task_count_.store(-1)` after `GatherMinibatch`
     /// (`src/search/classic/search.cc:1182-1185`). Persistent task threads
     /// sleep after this publication until the next `reset/push` cycle.
     fn idle(&self) {
         self.task_count.store(-1, Ordering::Release);
-        #[cfg(test)]
         self.task_added.notify_all();
     }
 
@@ -1220,7 +1248,7 @@ impl<'a> SearchWorker<'a> {
     /// task-worker SearchWorker ownership is translated. This is not a
     /// persistent task-thread implementation.
     fn run_queued_tasks_in_tree(&mut self, tree: &mut NodeTree, runner: &mut TaskRunner) -> Result<(), EnginError> {
-        while let Some(mut claimed) = self.task_phase.queue.take() {
+        while let Some(mut claimed) = self.task_phase.queue.take_until_phase_sealed() {
             match claimed.task.kind {
                 PickTaskKind::Gathering => {
                     let context = self.selection_context();
@@ -1252,6 +1280,7 @@ impl<'a> SearchWorker<'a> {
     /// drains the queue on its owner until the scoped tree-phase workers are
     /// enabled.
     fn wait_for_queued_tasks_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
+        self.task_phase.queue.seal_phase();
         self.run_tasks_synchronously_in_tree(tree)?;
         self.task_phase.queue.wait();
         Ok(())
@@ -1271,6 +1300,7 @@ impl<'a> SearchWorker<'a> {
         let mut runner = TaskRunner {
             workspace: std::mem::take(workspace),
         };
+        self.task_phase.queue.seal_phase();
         let result = self.with_tree(|worker, tree| worker.run_queued_tasks_in_tree(tree, &mut runner));
         *workspace = runner.workspace;
         result
@@ -2996,6 +3026,30 @@ mod tests {
         let waiter = std::thread::spawn(move || waiter_queue.take_blocking());
         closing_queue.close();
         assert!(waiter.join().expect("closing worker").is_none());
+    }
+
+    /// px0 task threads stay available while the main gather walk publishes
+    /// work, then leave the scoped phase once publication is sealed
+    /// (`search.cc:1069-1124,1485-1508`).
+    #[test]
+    fn pick_task_queue_waits_for_phase_publish_then_seal() {
+        let queue = Arc::new(PickTaskQueue::default());
+        queue.reset();
+        let worker_queue = Arc::clone(&queue);
+        let worker = std::thread::spawn(move || {
+            let mut completed = 0;
+            while let Some(task) = worker_queue.take_until_phase_sealed() {
+                worker_queue.complete(task);
+                completed += 1;
+            }
+            completed
+        });
+
+        queue.push(PickTask::processing(0, 1));
+        queue.seal_phase();
+
+        assert_eq!(worker.join().expect("scoped task worker"), 1);
+        queue.wait();
     }
 
     /// px0 serializes the `tasks_taken_` increment with
