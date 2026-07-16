@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "xiangqi-review-nn"
+name = "x7-nn"
 version = "0.2.0"
 description = "Chinese chess px0-style policy/value training and ONNX export"
 readme = "README.md"
