@@ -1,5 +1,7 @@
 //! px0 `src/search/classic/node.h:84-260`、`node.cc:161-373,465-543`。
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use xiangqi_core::{GameResult, Move, MoveList, Position, PositionHistory};
 
 /// px0 `Node::Terminal` (`node.h:132`)。
@@ -92,7 +94,7 @@ impl<'a> EdgeAndNode<'a> {
 }
 
 /// px0 `Node` 统计与树结构（单线程：children 与 edges 平行索引）。
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Node {
     parent: Option<usize>,
     edge_index: u16,
@@ -109,11 +111,11 @@ pub struct Node {
     d: f32,
     m: f32,
     // How many completed visits this node had.
-    n: u32,
+    n: AtomicU32,
     // (AKA virtual loss.) How many threads currently process this node (started
     // but not finished). This value is added to n during selection which node
     // to pick in MCTS, and also when selecting the best move.
-    n_in_flight: u32,
+    n_in_flight: AtomicU32,
     // px0 `solid_children_` (`node.h:253-255,329-330`). In C++ this changes
     // `child_` from a sibling list into a contiguous Node array. The Rust arena
     // already gives every child a stable allocation, so the equivalent state is
@@ -134,9 +136,29 @@ impl Default for Node {
             wl: 0.0,
             d: 0.0,
             m: 0.0,
-            n: 0,
-            n_in_flight: 0,
+            n: AtomicU32::new(0),
+            n_in_flight: AtomicU32::new(0),
             solid_children: false,
+        }
+    }
+}
+
+impl Clone for Node {
+    fn clone(&self) -> Self {
+        Self {
+            parent: self.parent,
+            edge_index: self.edge_index,
+            edges: self.edges.clone(),
+            children: self.children.clone(),
+            terminal: self.terminal,
+            lower_bound: self.lower_bound,
+            upper_bound: self.upper_bound,
+            wl: self.wl,
+            d: self.d,
+            m: self.m,
+            n: AtomicU32::new(self.n()),
+            n_in_flight: AtomicU32::new(self.n_in_flight()),
+            solid_children: self.solid_children,
         }
     }
 }
@@ -162,21 +184,22 @@ impl Node {
         self.edges.len()
     }
 
-    pub const fn n(&self) -> u32 {
-        self.n
+    pub fn n(&self) -> u32 {
+        self.n.load(Ordering::Acquire)
     }
 
-    pub const fn n_in_flight(&self) -> u32 {
-        self.n_in_flight
+    pub fn n_in_flight(&self) -> u32 {
+        self.n_in_flight.load(Ordering::Acquire)
     }
 
     pub fn n_started(&self) -> u32 {
-        self.n + self.n_in_flight
+        self.n().saturating_add(self.n_in_flight())
     }
 
     pub fn children_visits(&self) -> u32 {
-        if self.n > 0 {
-            self.n - 1
+        let n = self.n();
+        if n > 0 {
+            n - 1
         } else {
             0
         }
@@ -271,22 +294,31 @@ impl Node {
     }
 
     /// px0 `Node::TryStartScoreUpdate` (`node.cc:348-352`)。
-    pub fn try_start_score_update(&mut self) -> bool {
-        if self.n == 0 && self.n_in_flight > 0 {
-            return false;
+    pub fn try_start_score_update(&self) -> bool {
+        loop {
+            let completed = self.n.load(Ordering::Acquire);
+            let in_flight = self.n_in_flight.load(Ordering::Acquire);
+            if completed == 0 && in_flight > 0 {
+                return false;
+            }
+            if self
+                .n_in_flight
+                .compare_exchange_weak(in_flight, in_flight + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
         }
-        self.n_in_flight += 1;
-        true
     }
 
     /// px0 `Node::CancelScoreUpdate` (`node.cc:354`)。
     pub fn cancel_score_update(&mut self, multivisit: u32) {
-        self.n_in_flight -= multivisit;
+        self.n_in_flight.fetch_sub(multivisit, Ordering::AcqRel);
     }
 
     /// px0 `Node::IncrementNInFlight` (`node.cc:346`)。
-    pub fn increment_n_in_flight(&mut self, count: u32) {
-        self.n_in_flight += count;
+    pub fn increment_n_in_flight(&self, count: u32) {
+        self.n_in_flight.fetch_add(count, Ordering::AcqRel);
     }
 
     /// px0 `Node::CopyPolicy` (`node.cc:378-384`)。
@@ -299,11 +331,12 @@ impl Node {
 
     /// px0 `Node::FinalizeScoreUpdate` (`node.cc:356-366`)。
     pub fn finalize_score_update(&mut self, v: f32, d: f32, m: f32, multivisit: u32) {
-        self.wl += multivisit as f32 * (v - self.wl) / (self.n + multivisit) as f32;
-        self.d += multivisit as f32 * (d - self.d) / (self.n + multivisit) as f32;
-        self.m += multivisit as f32 * (m - self.m) / (self.n + multivisit) as f32;
-        self.n += multivisit;
-        self.n_in_flight -= multivisit;
+        let n = self.n.load(Ordering::Acquire);
+        self.wl += multivisit as f32 * (v - self.wl) / (n + multivisit) as f32;
+        self.d += multivisit as f32 * (d - self.d) / (n + multivisit) as f32;
+        self.m += multivisit as f32 * (m - self.m) / (n + multivisit) as f32;
+        self.n.store(n + multivisit, Ordering::Release);
+        self.n_in_flight.fetch_sub(multivisit, Ordering::AcqRel);
     }
 
     /// px0 `Node::AdjustForTerminal` (`src/search/classic/node.cc:368-373`).
@@ -312,8 +345,9 @@ impl Node {
     /// already accumulated average by `multivisit / n`, rather than adding a
     /// new visit. `MaybeSetBounds` supplies the exact delta to apply.
     pub fn adjust_for_terminal(&mut self, v: f32, d: f32, m: f32, multivisit: u32) {
-        debug_assert!(self.n >= multivisit);
-        let n = self.n as f32;
+        let n = self.n();
+        debug_assert!(n >= multivisit);
+        let n = n as f32;
         self.wl += multivisit as f32 * v / n;
         self.d += multivisit as f32 * d / n;
         self.m += multivisit as f32 * m / n;
@@ -325,19 +359,19 @@ impl Node {
     /// repetition. In that case those inherited terminal visits are no longer
     /// valid and must be removed before the node is extended again.
     pub fn revert_terminal_visits(&mut self, v: f32, d: f32, m: f32, multivisit: u32) {
-        let new_n = self.n as i64 - multivisit as i64;
+        let new_n = self.n() as i64 - multivisit as i64;
         if new_n <= 0 {
             self.wl = 0.0;
             self.d = 1.0;
             self.m = 0.0;
-            self.n = 0;
+            self.n.store(0, Ordering::Release);
             return;
         }
         let new_n = new_n as f32;
         self.wl -= multivisit as f32 * (v - self.wl) / new_n;
         self.d -= multivisit as f32 * (d - self.d) / new_n;
         self.m -= multivisit as f32 * (m - self.m) / new_n;
-        self.n = new_n as u32;
+        self.n.store(new_n as u32, Ordering::Release);
     }
 
     /// px0 `Node::MakeTerminal` (`node.cc:300-317`)。
@@ -367,21 +401,22 @@ impl Node {
     /// px0 `Node::MakeNotTerminal` (`node.cc:319-341`)。
     fn make_not_terminal(&mut self, child_stats: &[(u32, f32, f32)]) {
         self.terminal = Terminal::NonTerminal;
-        self.n = 0;
+        let mut n = 0;
         if !self.edges.is_empty() {
-            self.n = 1;
+            n = 1;
             self.wl = 0.0;
             self.d = 0.0;
             for &(child_n, child_wl, child_d) in child_stats {
                 if child_n > 0 {
-                    self.n += child_n;
+                    n += child_n;
                     self.wl += -child_wl * child_n as f32;
                     self.d += child_d * child_n as f32;
                 }
             }
-            self.wl /= self.n as f32;
-            self.d /= self.n as f32;
+            self.wl /= n as f32;
+            self.d /= n as f32;
         }
+        self.n.store(n, Ordering::Release);
     }
 
     pub fn set_bounds(&mut self, lower: GameResult, upper: GameResult) {
@@ -394,7 +429,7 @@ impl Node {
         for (idx, child) in self.children.iter().enumerate() {
             if child
                 .and_then(|child_idx| arena.get(child_idx))
-                .is_some_and(|node| node.n > 0)
+                .is_some_and(|node| node.n() > 0)
             {
                 sum += self.edges[idx].get_p();
             }
@@ -520,7 +555,7 @@ impl NodeTree {
             .into_iter()
             .map(|child| {
                 let node = self.node(child);
-                (node.n, node.wl, node.d)
+                (node.n(), node.wl, node.d)
             })
             .collect::<Vec<_>>();
         self.node_mut(node_idx).make_not_terminal(&child_stats);
@@ -693,6 +728,33 @@ mod tests {
         assert_eq!(node.n(), 2);
         assert!((node.wl() - 0.25).abs() < 1e-6);
         assert_eq!(node.n_in_flight(), 0);
+    }
+
+    /// px0 `Node::TryStartScoreUpdate` rejects a second in-flight visit for
+    /// an unexpanded node (`src/search/classic/node.cc:348-352`). Rust keeps
+    /// that rule atomic so gathering tasks cannot both win the first extend.
+    #[test]
+    fn first_score_update_has_one_concurrent_winner() {
+        let node = std::sync::Arc::new(Node::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let node = std::sync::Arc::clone(&node);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                node.try_start_score_update()
+            }));
+        }
+        assert_eq!(
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().ok())
+                .filter(|started| *started)
+                .count(),
+            1
+        );
+        assert_eq!(node.n_in_flight(), 1);
     }
 
     #[test]

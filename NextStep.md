@@ -220,6 +220,12 @@ phase 的 task-root claim，并按 px0 parent 链拒绝同 root 或祖先/后代
 split 的隐含前提变成回归，且失败时不清零父 DFS 的 visit budget；它不能解决普通 `NodeArena` 的 `Vec` 分配
 和非原子 node 字段并发写入，因此不能据此解除 `active_task_workers=0`。
 
+第二十二步（first-extend 原子性）已完成：`Node::n_ / n_in_flight_` 已改为原子 load/CAS/fetch 操作；
+`TryStartScoreUpdate` 精确保留 px0 的 `n == 0 && n_in_flight > 0` 拒绝规则，8 个并发 caller 对未扩展
+node 只能产生一个成功者。参考 `src/search/classic/node.cc:346-365`。backup 的 WL/D/M 仍在
+`WaitForTasks` 后由主 worker 写入，符合 px0 phase 时序；下一步只处理 child slot/arena allocation 的
+唯一创建，不能因为 n/in-flight 已原子化而提前开启 task worker。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

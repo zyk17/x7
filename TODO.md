@@ -109,6 +109,10 @@ seal/join 后合并 results。
 可以共存，但 duplicate/ancestor/descendant root 必须拒绝，且 handoff 不得清零父 DFS budget。该回归只证明
 task split，不让 `Vec<Box<Node>>` 或 `Node` 的非原子统计变成可并发访问。
 
+已将 `Node::TryStartScoreUpdate` 的 first-extend gate 收为原子 CAS，参考
+`src/search/classic/node.cc:346-365`；并发回归保证一个未扩展 node 只有一个 in-flight winner。WL/D/M
+仍保持 px0 的 `WaitForTasks` 后主 worker backup 时序；`NodeArena` child allocation 尚未并发安全。
+
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占
   minibatch/computation/counters；禁止共享 `&mut SearchWorker`。
