@@ -669,6 +669,16 @@ struct ExtendContext {
     two_fold_draws: bool,
 }
 
+/// Owned, tree-independent outcome of px0 `ExtendNode`
+/// (`src/search/classic/search.cc:1899-1974`). It is the boundary consumed
+/// by persistent task workers: rules and move generation happen off-tree,
+/// while the owner applies this result to the selected node.
+#[derive(Debug)]
+enum ExtensionResult {
+    Edges(MoveList),
+    Terminal(GameResult, f32, Terminal),
+}
+
 /// Inputs used by px0 `ProcessPickedTask` and `FetchSingleNodeResult`
 /// (`src/search/classic/search.cc:1423-1462,2117-2154`). The minibatch range
 /// itself remains separately and exclusively borrowed by the caller.
@@ -1944,6 +1954,21 @@ impl<'a> SearchWorker<'a> {
         history: &mut PositionHistory,
     ) -> Result<(), EnginError> {
         let root = tree.current_head();
+        let result = Self::evaluate_extension(context, node_idx == root, depth, moves_to_node, history);
+        match result {
+            ExtensionResult::Edges(moves) => tree.node_mut(node_idx).create_edges(&moves),
+            ExtensionResult::Terminal(result, plies, terminal) => tree.make_terminal(node_idx, result, plies, terminal),
+        }
+        Ok(())
+    }
+
+    fn evaluate_extension(
+        context: ExtendContext,
+        is_root: bool,
+        depth: u16,
+        moves_to_node: &[Move],
+        history: &mut PositionHistory,
+    ) -> ExtensionResult {
         history.trim(context.played_history_len);
         for mv in moves_to_node {
             history.append(*mv);
@@ -1951,8 +1976,7 @@ impl<'a> SearchWorker<'a> {
         let board = history.last().board();
         let legal_moves = board.generate_legal_moves();
         if legal_moves.is_empty() {
-            tree.make_terminal(
-                node_idx,
+            return ExtensionResult::Terminal(
                 if history.is_black_to_move() {
                     GameResult::WhiteWon
                 } else {
@@ -1961,12 +1985,10 @@ impl<'a> SearchWorker<'a> {
                 0.0,
                 Terminal::EndOfGame,
             );
-            return Ok(());
         }
-        if node_idx != root {
+        if !is_root {
             if history.last().repetitions() >= 2 {
-                tree.make_terminal(node_idx, history.rule_judge(), 0.0, Terminal::EndOfGame);
-                return Ok(());
+                return ExtensionResult::Terminal(history.rule_judge(), 0.0, Terminal::EndOfGame);
             }
             // px0 `search.cc:1930-1959`: an initial repetition can be a
             // forced two-fold result only after the complete cycle is inside
@@ -1980,8 +2002,7 @@ impl<'a> SearchWorker<'a> {
                 let cycle_length = history.last().cycle_length();
                 let result = history.rule_judge();
                 if result == GameResult::Draw {
-                    tree.make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
-                    return Ok(());
+                    return ExtensionResult::Terminal(result, cycle_length as f32, Terminal::TwoFold);
                 }
 
                 let mut idx = history.len() - 1;
@@ -2001,18 +2022,15 @@ impl<'a> SearchWorker<'a> {
                         }
                     }
                     if idx2 == idx && history.last().rule60_ply() < 120 {
-                        tree.make_terminal(node_idx, result, cycle_length as f32, Terminal::TwoFold);
-                        return Ok(());
+                        return ExtensionResult::Terminal(result, cycle_length as f32, Terminal::TwoFold);
                     }
                 }
             }
             if !board.has_mating_material() || history.last().rule60_ply() >= 120 {
-                tree.make_terminal(node_idx, GameResult::Draw, 0.0, Terminal::EndOfGame);
-                return Ok(());
+                return ExtensionResult::Terminal(GameResult::Draw, 0.0, Terminal::EndOfGame);
             }
         }
-        tree.node_mut(node_idx).create_edges(&legal_moves);
-        Ok(())
+        ExtensionResult::Edges(legal_moves)
     }
 
     /// px0 `SearchWorker::CollectCollisions` (`search.cc:1977-1987`)。

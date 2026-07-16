@@ -48,6 +48,9 @@ Rust 当前的 `NodeTree` 需要独占 `&mut` 借用，且 `Node` 的 WDL、term
 
 1. `SearchWorker` 构造/析构时创建、停止和回收常驻 task worker。
 2. task 只拥有 task、workspace 和 result；主 worker 独占 minibatch、backend computation、计数器与 UCI 生命周期。
+   task 不能直接借用或锁住 `NodeTree`：它以 owned 的 `NodeToProcess + moves/history` 输入计算规则终局与合法着法，
+   返回 extension result；主 worker 在 `WaitForTasks` 后独占写回 node、提交 backend input。这是 Rust 对 px0
+   `ProcessPickedTask` (`search.cc:1423-1462`) tree phase 的无别名边界。
 3. gathering 仅处理不重叠 subtree，processing 仅处理不重叠 minibatch range。
 4. `WaitForTasks` 返回后才允许 collision、NN、fetch、backup 进入下一阶段。
 5. 以真实 x7 ONNX/DirectML 验证固定 nodes、长 `movetime`、`stop -> wait`、`position ... moves ...`，并验证所有节点的 `NInFlight == 0`。

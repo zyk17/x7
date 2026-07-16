@@ -20,7 +20,8 @@
 
 - [ ] 按 `src/search/classic/search.h:205-244,348-445` 与
   `search.cc:1069-1140,1322-1362,1423-1508,1551-1897` 先定义安全的 tree-phase 所有权边界。
-  不得使用 raw pointer、`unsafe impl Send`、共享 `&mut SearchWorker` 或整树锁串行化。
+  不得使用 raw pointer、`unsafe impl Send`、共享 `&mut SearchWorker` 或整树锁串行化。task 仅消费 owned
+  selection input/history 并产出 extension result；主 worker 在 `WaitForTasks` 后独占写回 tree、提交 backend input。
 - [ ] 在上述边界成立后，翻译 px0 的常驻 `task_threads_`、`task_workspaces_`、`RunTasks`、`WaitForTasks`。
 - [ ] 补真实 x7 ONNX/DirectML 回归：固定 nodes、长 `movetime`、`stop -> wait`、
   `position ... moves ...` 与所有节点 `NInFlight == 0`。
