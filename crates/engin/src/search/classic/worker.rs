@@ -683,6 +683,56 @@ impl<'a> SearchWorker<'a> {
         }
     }
 
+    /// px0 `GatherMinibatch` processing task split
+    /// (`src/search/classic/search.cc:1322-1362`). Every queued range ends
+    /// before the returned main range, so the caller can prove mutable
+    /// minibatch ownership is disjoint before any task is run.
+    fn split_processing_tasks(
+        queue: &PickTaskQueue,
+        params: &SearchParams,
+        task_workers: i32,
+        minibatch: &[NodeToProcess],
+        new_start: usize,
+        non_collisions: usize,
+    ) -> (usize, bool) {
+        let mut main_start = new_start;
+        if task_workers <= 0
+            || non_collisions
+                < usize::try_from(params.minimum_work_size_for_processing)
+                    .expect("px0 MinimumProcessingWork is non-negative")
+        {
+            return (main_start, false);
+        }
+
+        let min_per_task = usize::try_from(params.minimum_work_per_task_for_processing)
+            .expect("px0 MinimumPerTaskProcessing is non-negative");
+        assert!(min_per_task > 0, "px0 MinimumPerTaskProcessing is positive");
+        let task_workers = usize::try_from(task_workers).expect("positive task worker count");
+        let num_tasks = (non_collisions / min_per_task).clamp(2, task_workers + 1);
+        let per_worker = non_collisions / num_tasks;
+        queue.reset();
+        let mut found = 0usize;
+        let mut queued = 0usize;
+        for (index, item) in minibatch.iter().enumerate().skip(new_start) {
+            if item.is_collision {
+                continue;
+            }
+            found += 1;
+            if found == per_worker {
+                if !queue.push(PickTask::processing(main_start, index + 1)) {
+                    break;
+                }
+                main_start = index + 1;
+                found = 0;
+                queued += 1;
+                if queued == num_tasks - 1 {
+                    break;
+                }
+            }
+        }
+        (main_start, queued > 0)
+    }
+
     /// px0 `SearchWorker::ExecuteOneIteration` (`search.cc:1142-1231`)。
     pub fn execute_one_iteration(&mut self) -> Result<(), EnginError> {
         self.initialize_iteration()?;
@@ -940,41 +990,14 @@ impl<'a> SearchWorker<'a> {
             // ranges into processing tasks, retaining the final range for the
             // main worker. Scoped task threads consume the queued ranges while
             // the enclosing px0 tree phase remains active.
-            let mut main_start = new_start;
-            let mut needs_wait = false;
-            if self.task_workers > 0
-                && picked_visits
-                    >= usize::try_from(self.params.minimum_work_size_for_processing)
-                        .expect("px0 MinimumProcessingWork is non-negative")
-            {
-                let min_per_task = usize::try_from(self.params.minimum_work_per_task_for_processing)
-                    .expect("px0 MinimumPerTaskProcessing is non-negative");
-                assert!(min_per_task > 0, "px0 MinimumPerTaskProcessing is positive");
-                let task_workers = usize::try_from(self.task_workers).expect("positive task worker count");
-                let num_tasks = (picked_visits / min_per_task).clamp(2, task_workers + 1);
-                let per_worker = picked_visits / num_tasks;
-                self.task_phase.queue.reset();
-                let mut found = 0usize;
-                let mut queued = 0usize;
-                for index in new_start..self.iteration.minibatch.len() {
-                    if self.iteration.minibatch[index].is_collision {
-                        continue;
-                    }
-                    found += 1;
-                    if found == per_worker {
-                        if !self.task_phase.queue.push(PickTask::processing(main_start, index + 1)) {
-                            break;
-                        }
-                        main_start = index + 1;
-                        found = 0;
-                        queued += 1;
-                        if queued == num_tasks - 1 {
-                            break;
-                        }
-                    }
-                }
-                needs_wait = queued > 0;
-            }
+            let (main_start, needs_wait) = Self::split_processing_tasks(
+                &self.task_phase.queue,
+                self.params,
+                self.task_workers,
+                &self.iteration.minibatch,
+                new_start,
+                picked_visits,
+            );
 
             let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
             let process_result =
@@ -2854,6 +2877,41 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].node_idx, 11);
         assert_eq!(results[0].depth, 3);
+    }
+
+    /// px0 splits processing work into contiguous, non-overlapping ranges and
+    /// leaves the final suffix for the main worker (`search.cc:1322-1362`).
+    #[test]
+    fn processing_task_ranges_are_disjoint_from_main_suffix() {
+        let queue = PickTaskQueue::default();
+        let params = SearchParams {
+            minimum_work_size_for_processing: 2,
+            minimum_work_per_task_for_processing: 2,
+            ..SearchParams::default()
+        };
+        let minibatch = vec![
+            NodeToProcess::visit(0, 1),
+            NodeToProcess::collision(1, 1, 1, 1),
+            NodeToProcess::visit(2, 1),
+            NodeToProcess::visit(3, 1),
+            NodeToProcess::collision(4, 1, 1, 1),
+            NodeToProcess::visit(5, 1),
+            NodeToProcess::visit(6, 1),
+            NodeToProcess::visit(7, 1),
+        ];
+
+        let (main_start, needs_wait) = SearchWorker::split_processing_tasks(&queue, &params, 2, &minibatch, 0, 6);
+        assert!(needs_wait);
+
+        let mut ranges = Vec::new();
+        while let Some(claimed) = queue.take() {
+            ranges.push((claimed.task.start_idx, claimed.task.end_idx));
+            queue.complete(claimed);
+        }
+        assert_eq!(ranges, vec![(0, 3), (3, 6)]);
+        assert!(ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+        assert!(ranges.last().is_some_and(|range| range.1 <= main_start));
+        assert_eq!(main_start, 6);
     }
 
     /// px0 sets `task_count_ = -1` after one gather without destroying its

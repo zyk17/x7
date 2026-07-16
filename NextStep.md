@@ -137,6 +137,10 @@ twofold 回退改为纯 tree helper，对应 `search.cc:1510-1550`。
 的 range 操作；computation 以共享 `BackendComputation` 引用进入，task 只能回写自身 item。参考 px0
 `src/search/classic/search.cc:1423-1462,2109-2156`。tree 写入范围仍须在启用后台 task 前证明不重叠。
 
+第七步已完成：`GatherMinibatch` 的 processing split 已成为纯 range 规划，严格对应 px0
+`src/search/classic/search.cc:1322-1362`。回归验证混合 collision batch 的 queued ranges 互不重叠，且均在
+main suffix 之前；这只证明 minibatch 所有权，未证明 gathering task 的 tree 子树写入范围。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体
