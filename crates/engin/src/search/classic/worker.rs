@@ -1175,14 +1175,23 @@ impl<'a> SearchWorker<'a> {
                 picked_visits,
             );
 
-            let mut workspace = std::mem::take(&mut self.task_phase.main_runner.workspace);
-            let process_result =
-                self.process_picked_task_in_tree(tree, main_start, self.iteration.minibatch.len(), &mut workspace);
-            self.task_phase.main_runner.workspace = workspace;
+            let mut runner = std::mem::take(&mut self.task_phase.main_runner);
+            let process_result = if needs_wait && self.task_workers > 0 {
+                self.run_processing_phase_scoped_in_tree(tree, main_start, &mut runner)
+            } else {
+                let result = self.process_picked_task_in_tree(
+                    tree,
+                    main_start,
+                    self.iteration.minibatch.len(),
+                    &mut runner.workspace,
+                );
+                if needs_wait {
+                    self.wait_for_queued_tasks_in_tree(tree)?;
+                }
+                result
+            };
+            self.task_phase.main_runner = runner;
             process_result?;
-            if needs_wait {
-                self.wait_for_queued_tasks_in_tree(tree)?;
-            }
 
             let mut some_ooo = false;
             for item in &self.iteration.minibatch[new_start..] {
@@ -1480,6 +1489,75 @@ impl<'a> SearchWorker<'a> {
         if let Some(error) = first_error.lock().expect("task error lock").take() {
             return Err(error);
         }
+        Ok(())
+    }
+
+    /// px0 starts processing task threads before the main worker processes the
+    /// final minibatch suffix (`src/search/classic/search.cc:1322-1362`).
+    /// `split_processing_tasks` proves every queue range ends before
+    /// `main_start`, so task runners and the main runner receive disjoint
+    /// `NodeToProcess` slices for this scoped tree phase.
+    fn run_processing_phase_scoped_in_tree(
+        &mut self,
+        tree: &mut NodeTree,
+        main_start: usize,
+        main_runner: &mut TaskRunner,
+    ) -> Result<(), EnginError> {
+        let task_workers = usize::try_from(self.task_workers).expect("positive px0 task worker count");
+        let processing = ProcessingContext {
+            params: self.params,
+            computation: self.iteration.computation.as_deref(),
+            extend: ExtendContext {
+                played_history_len: self.played_history_len,
+                two_fold_draws: self.params.two_fold_draws,
+            },
+        };
+        let queue = &self.task_phase.queue;
+        let tree = ScopedTaskTree::from_tree(tree);
+        let minibatch = ScopedMinibatch::from_items(&mut self.iteration.minibatch);
+        let minibatch_len = self.iteration.minibatch.len();
+        let first_error = Mutex::new(None);
+        let processing = &processing;
+        let first_error = &first_error;
+
+        let main_result = std::thread::scope(|scope| {
+            for _ in 0..task_workers {
+                scope.spawn(move || {
+                    let mut runner = TaskRunner::default();
+                    while let Some(claimed) = queue.take_until_phase_sealed() {
+                        debug_assert_eq!(claimed.task.kind, PickTaskKind::Processing);
+                        // SAFETY: the split helper proved task ranges disjoint
+                        // from one another and from the main suffix.
+                        let result = unsafe {
+                            let range = minibatch.range_mut(claimed.task.start_idx, claimed.task.end_idx);
+                            tree.with_mut(|tree| runner.run_processing_range(processing, tree, range))
+                        };
+                        if let Err(error) = result {
+                            let mut first = first_error.lock().expect("task error lock");
+                            if first.is_none() {
+                                *first = Some(error);
+                            }
+                        }
+                        queue.complete(claimed);
+                    }
+                });
+            }
+
+            // SAFETY: `[main_start, minibatch_len)` is the suffix retained by
+            // px0's main worker, outside all published processing ranges.
+            let result = unsafe {
+                let range = minibatch.range_mut(main_start, minibatch_len);
+                tree.with_mut(|tree| main_runner.run_processing_range(processing, tree, range))
+            };
+            queue.seal_phase();
+            result
+        });
+
+        main_result?;
+        if let Some(error) = first_error.lock().expect("task error lock").take() {
+            return Err(error);
+        }
+        self.task_phase.queue.wait();
         Ok(())
     }
 

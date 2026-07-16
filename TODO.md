@@ -97,7 +97,10 @@ CPU/GPU 与硬件线程公式推导。当前仅据此做 split，`WaitForTasks` 
 实现 px0 主 DFS 与 task 的持续并行消费；下一步需固定 ONNX 回归后将 spawn 前移。
 已将 gathering scope 前移到主 `PickNodesToExtendTask` producer phase，参考
 `src/search/classic/search.cc:1069-1140,1485-1508,1828-1864`：task runners 等待 queue，主 DFS 发布子树，
-seal/join 后合并 results。processing 的 main suffix 与 task range 仍未同时运行。
+seal/join 后合并 results。
+已将 processing scope 前移到 split 点，参考 `src/search/classic/search.cc:1322-1362,1423-1462`：后台 runners
+消费不重叠 range，同时 main runner 处理最终 suffix，seal/join 后继续 OOO/backup。P4 pipeline 的结构翻译
+至此收口；下一步只补真实 ONNX/DirectML 固定 visits、movetime、stop/wait、`NInFlight==0` 回归，不再扩结构。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占

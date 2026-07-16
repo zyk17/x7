@@ -192,6 +192,12 @@ queue，主 DFS 可持续发布 gathering 子树，随后 seal/join 并按 px0 �
 `src/search/classic/search.cc:1069-1140,1485-1508,1828-1864`。processing split 仍在主 suffix 结束后才
 启动 task scope，是下一步唯一未对齐的 pipeline 时序。
 
+第十八步已完成：processing scope 已前移到 px0 的 split 点：后台 runners 消费已发布的非重叠 range，同时
+main runner 处理最终 suffix，随后 seal/join。参考 `src/search/classic/search.cc:1322-1362,1423-1462`。至此
+P4 的 gather/processing task 时序、queue lifecycle、独立 workspace、task result merge 与 raw tree-phase
+边界均已翻译；下一步只做真实 ONNX/DirectML 固定 visits、movetime、stop/wait 与 `NInFlight==0` 回归，
+不再继续扩结构。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体
