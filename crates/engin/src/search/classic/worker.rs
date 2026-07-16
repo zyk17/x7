@@ -1312,6 +1312,10 @@ impl<'a> SearchWorker<'a> {
                 );
                 let cpuct = super::uct::compute_cpuct(context.params, tree.node(current_idx).n(), is_root_node);
                 let puct_mult = cpuct * (tree.node(current_idx).children_visits().max(1) as f32).sqrt();
+                // The formal x7 ONNX contract has no moves-left head. px0
+                // constructs the disabled `MEvaluator()` in this case, whose
+                // visited and default M utilities are both zero
+                // (`search.cc:60-114,1596,1680-1692`).
                 let fpu = super::uct::get_fpu(
                     context.params,
                     tree.node(current_idx),

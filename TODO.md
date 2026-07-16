@@ -15,6 +15,8 @@
 - P4 legacy 时钟预算：`src/search/classic/stoppers/factory.cc:44-115`、`legacy.cc:43-174`、
   `stoppers.cc:39-129`、`common.cc:118-165`；已支持 `MoveOverheadMs`、`Slowmover` 与
   `go wtime/btime/winc/binc/movestogo`，不暴露未翻译的其他 time manager。
+- 正式 x7 ONNX 不含 moves-left head；selection 因此严格走 px0 禁用 `MEvaluator()` 的 WDL-only
+  分支，M utility 为零，参考 `src/search/classic/search.cc:60-114,1596,1680-1692`。
 - 正式 UCI `WeightsFile` 生命周期：`src/engine.cc:137-197,206-219`，没有权重时明确拒绝搜索，
   不回退到 `UniformBackend`。
 - NN 训练入口：参考 `pxzero-training/tf/train.py:110-126`、`tf/configs/example.yaml:4-31`，已收为

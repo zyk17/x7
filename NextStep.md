@@ -145,6 +145,10 @@ main suffix 之前；这只证明 minibatch 所有权，未证明 gathering task
 参考 `src/search/classic/search.h:348-365,441-445`。当前仅有 main runner；未来每个后台 task runner 必须自带
 workspace，不能共享主 runner 的 history/path scratch。
 
+第九步已完成：正式 x7 ONNX 没有 moves-left head，因此 selection 按 px0 在
+`backend_attributes_.has_mlh == false` 时构造禁用的 `MEvaluator()`；访问过与未访问 child 的 M utility
+均为零，不能留下隐式的 moves-left 启发式。参考 `src/search/classic/search.cc:60-114,1596,1680-1692`。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体
