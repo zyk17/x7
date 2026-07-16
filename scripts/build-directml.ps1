@@ -15,7 +15,6 @@ $ModelPath = if ($ModelPath) { $ModelPath } else { Join-Path $repoRoot "data\x7.
 $BundleDir = if ($BundleDir) { $BundleDir } else { Join-Path $repoRoot "bundle" }
 $model = (Resolve-Path -LiteralPath $ModelPath).Path
 $bundle = [System.IO.Path]::GetFullPath($BundleDir)
-$RUSTFLAGS="-C target-cpu=native"
 
 function Copy-ResolvedFile {
     param(
