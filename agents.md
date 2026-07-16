@@ -29,7 +29,7 @@
   task-worker 仍未完成，当前必须保持 `task_workers=0`。
   正式 ONNX 必须经 `CachingBackend`，其 key/collision guard/回填时序只能对照
   `px0/src/neural/memcache.cc:38-190` 修改。
-  停用的 `TaskTreeBridge` / `TaskWorkerRunner` 不是可用实现；后续只能以无别名的数据所有权重译
+  已删除的 `TaskTreeBridge` / `TaskWorkerRunner` 不是可用实现；后续只能以无别名的数据所有权重译
   px0 task 生命周期。唯一准确状态以 `NextStep.md`、`TODO.md` 为准。
 - `nn/`：对齐 pxzero-training 的数据、训练和导出。
 
