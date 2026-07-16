@@ -181,6 +181,12 @@ DFS 尚可发布 gathering task 时等待，seal 后只在已领取任务全部�
 `src/search/classic/search.cc:1069-1140,1485-1508`。当前同步 drain 也复用该协议，因此行为不变；下一步可在
 同一协议下替换为真实 scoped task threads。
 
+第十六步已完成：已接入 scoped task threads。每个 thread 独占 `TaskRunner`，从 queue 领取 task；tree 与
+processing range 通过仅在 scope 内有效的 raw pointer 传入，主 worker 在 join 前不再访问它们。参考
+`src/search/classic/search.cc:1069-1140,1322-1362,1485-1508`。当前 scope 在 producer seal 后启动，因此已
+验证 task 执行/回填生命周期，但尚未达到 px0 “主 DFS 发布时 task 已并行消费”的持续流水线；下一步只能在
+固定 ONNX 回归后把 spawn 前移到 gathering/processing producer phase。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

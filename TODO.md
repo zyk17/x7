@@ -91,6 +91,10 @@ CPU/GPU 与硬件线程公式推导。当前仅据此做 split，`WaitForTasks` 
 必须满足 `AGENTS.md` 的 raw-pointer tree phase 与真实 ONNX 回归约束。
 已完成 scoped task queue phase 协议，参考 `src/search/classic/search.cc:1069-1140,1485-1508`：主 DFS 可持续
 发布 task，seal 后 worker 才在队列耗尽时退出。当前同步 drain 复用该协议；下一步替换为 scoped task threads。
+已接入 scoped task threads：每线程独占 `TaskRunner`，task/result 留在 queue；tree 与不重叠 processing range
+只在 scope 内以审计过的 raw pointer 访问，参考
+`src/search/classic/search.cc:1069-1140,1322-1362,1485-1508`。当前在 producer seal 后才启动 scope，尚未
+实现 px0 主 DFS 与 task 的持续并行消费；下一步需固定 ONNX 回归后将 spawn 前移。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占
