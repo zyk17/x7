@@ -27,7 +27,8 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
    `search.h:205-244,348-445` 的常驻 `task_threads_ / task_workspaces_`。禁止每个 phase 临时 spawn。
 4. 随后对照 `search.cc:1899-1906`，复用 worker/task 的 `PositionHistory`（`Trim + Append`），删除每轮、
    每 range 和 ONNX 编码前的完整 history clone。
-5. 最后处理 `NodeArena` 的单全局 allocation lock、容量预留与 `RESERVED_CHILD` 的 release-mode 无限自旋。
+5. 最后只保留 `NodeArena::get(&self)` 的跨线程引用证明；`RESERVED_CHILD` 不是 px0 语义，已经删除，
+   单 worker child 创建现在严格受 `&mut NodeTree` 的 tree-phase 边界约束。
 
 本节优先级高于下方所有“task-worker 已启用/已收口”的历史记录；历史记录仅保留故障演进，不是当前状态。
 
@@ -35,11 +36,12 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
 并在取得锁后重新检查 terminal 状态。该锁只保护 `search.cc:1517-1541` 的 ancestor rewrite，不解除
 `active_task_workers=0` 门控。
 
-第二、四项的单 worker 子集已完成：`NodeArena::get_mut_unchecked(&self)` 已删除，普通搜索只能由真实
+第二、四、五项的单 worker 子集已完成：`NodeArena::get_mut_unchecked(&self)` 已删除，普通搜索只能由真实
 `&mut NodeTree` 取得可变节点；allocation 也不再进入 `RwLock` 写锁。`SearchWorker` 与主 task workspace
 在构造期复制根 history，之后按照 px0 `search.cc:1899-1906` 仅 `Trim + Append`；workspace 只在根 history
-发生变化时保留容量地覆盖。未来 task-worker 仍须证明 `NodeArena::get(&self)` 的裸引用读取与所有并发写之间
-无别名，不能把这两个子集误认为 task-worker 已安全。
+发生变化时保留容量地覆盖。原先的 `RESERVED_CHILD`/spin-loop 是 Rust 自造并发语义，已替换为 px0
+`GetOrSpawnNode` 的 tree-phase 独占创建。未来 task-worker 仍须证明 `NodeArena::get(&self)` 的裸引用读取与
+所有并发写之间无别名，不能把这些子集误认为 task-worker 已安全。
 
 ## P1-P3 进入 P4 前复核（2026-07-15）
 

@@ -28,8 +28,8 @@
 ## P4：px0 classic task-worker 重新门控
 
 单 worker/minibatch/OOO/cache/stop 已在真实 ONNX/DirectML 回归。`TaskWorkers` 按 px0 解析，但不再
-实际启用：真实 ONNX 的长 `go movetime` 可复现 scoped task phase 停顿。`NodeArena` allocation lock、
-first-extend CAS 和 child-slot reservation 不能证明 task 对 ancestors/terminal/bounds 的并发写安全。
+实际启用：真实 ONNX 的长 `go movetime` 可复现 scoped task phase 停顿。node 统计 atomics、first-extend CAS
+和 child 创建的 tree-phase 边界，仍不能证明 task 对 ancestors/terminal/bounds 的并发写安全。
 
 - [x] 对照 `src/search/classic/search.cc:1510-1550`，为 twofold ancestor rollback 建立 px0 等价的 per-worker
   task 互斥；锁后重新检查 terminal 状态，避免等待期间重复回滚。
@@ -43,8 +43,9 @@ first-extend CAS 和 child-slot reservation 不能证明 task 对 ancestors/term
 - [x] 对照 `src/search/classic/search.cc:1233-1241,1899-1906`，复用 SearchWorker/main workspace 的 history：
   初始化一次根 history，后续 range 只 `Trim + Append`；根变化时才保留容量地覆盖。`EvalPosition`/ONNX batch
   的跨接口拥有权复制仍待 backend I/O 收口后单独审查。
-- [ ] 对照 `src/search/classic/node.h:468-525`，处理 child reservation 的 release-mode 无限等待，并为 NodeArena
-  设定明确容量策略。
+- [x] 对照 `src/search/classic/node.h:468-525`，删除非 px0 的 `RESERVED_CHILD` 原子 reservation 和 release
+  spin-loop；child 只在 `&mut NodeTree` 的 px0 tree phase 创建或复用。`Vec<Box<Node>>` 使节点地址在 metadata
+  扩容中稳定，无需伪造 px0 未使用的固定节点容量。
 
 - [x] 翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为正式 ONNX 的
   `CachingBackend` wrapper：当前局面 hash 为 key、合法着数量防碰撞、cache miss 仅在
