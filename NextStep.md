@@ -110,6 +110,11 @@ P4 的单 worker/minibatch/OOO/cache/stopper 主线可用，但 GPU task-worker 
 再翻译 px0 `search.h:205-244,435-445` 和 `search.cc:1069-1508`；不得重新启用当前 `&mut SearchWorker`
 跨线程别名版本。
 
+第一步已完成：Rust 的 `IterationState` 已独占封装 px0 `minibatch_`、`computation_` 与
+`number_out_of_order_`（`src/search/classic/search.h:419-427`），其生命周期限定为
+`InitializeIteration -> UpdateCounters`，仍只由主 worker 写入。下一步不是启用线程，而是把
+`PickTask` 的输入、workspace 与结果变成可移动的独占值，再证明 px0 processing range 不重叠。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

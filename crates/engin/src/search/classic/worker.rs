@@ -446,6 +446,19 @@ struct TaskPhaseState {
     main_workspace: TaskWorkspace,
 }
 
+/// px0 `SearchWorker` 每轮迭代状态（`src/search/classic/search.h:419-427`）。
+///
+/// `minibatch_`、`computation_` 和 `number_out_of_order_` 的生命周期只跨越
+/// 一次 `InitializeIteration -> UpdateCounters`。在 task worker 的 Rust 所有权
+/// 尚未完成翻译前，它们只由主搜索线程持有，不能通过 `SearchWorker` 别名暴露给
+/// task。
+#[derive(Default)]
+struct IterationState {
+    minibatch: Vec<NodeToProcess>,
+    computation: Option<Box<dyn BackendComputation>>,
+    number_out_of_order: usize,
+}
+
 /// px0 `SearchWorker` (`src/search/classic/search.h:203-448`)。
 pub struct SearchWorker<'a> {
     tree: WorkerTree<'a>,
@@ -456,13 +469,11 @@ pub struct SearchWorker<'a> {
     /// px0 `Search::root_move_filter_` consumed by
     /// `PickNodesToExtendTask` (`search.cc:1592-1595,1737-1740`).
     root_move_filter: &'a [Move],
-    minibatch: Vec<NodeToProcess>,
-    computation: Option<Box<dyn BackendComputation>>,
+    iteration: IterationState,
     history: PositionHistory,
     target_minibatch_size: usize,
     max_out_of_order: usize,
     task_workers: i32,
-    number_out_of_order: usize,
     /// px0 `SearchWorker::latest_time_manager_hints_`
     /// (`src/search/classic/search.h:368-369`). Each search worker owns this
     /// value; it must not be shared with other gather loops.
@@ -605,12 +616,10 @@ impl<'a> SearchWorker<'a> {
             search_state,
             stop_controller,
             root_move_filter,
-            minibatch: Vec::new(),
-            computation: None,
+            iteration: IterationState::default(),
             target_minibatch_size,
             max_out_of_order,
             task_workers,
-            number_out_of_order: 0,
             latest_time_manager_hints: StoppersHints::default(),
             task_phase: TaskPhaseState::default(),
         }
@@ -806,10 +815,10 @@ impl<'a> SearchWorker<'a> {
     fn initialize_iteration_in_tree(&mut self, tree: &NodeTree) -> Result<(), EnginError> {
         // px0 resets the previous computation before asking the backend for a
         // replacement, allowing backend-owned buffers to be recycled.
-        self.computation = None;
-        self.computation = Some(self.backend.create_computation()?);
-        self.minibatch.clear();
-        self.minibatch.reserve(2 * self.target_minibatch_size);
+        self.iteration.computation = None;
+        self.iteration.computation = Some(self.backend.create_computation()?);
+        self.iteration.minibatch.clear();
+        self.iteration.minibatch.reserve(2 * self.target_minibatch_size);
         self.history = tree.history().clone();
         self.played_history_len = self.history.len();
         Ok(())
@@ -826,12 +835,14 @@ impl<'a> SearchWorker<'a> {
         let remaining_n = self.latest_time_manager_hints.estimated_remaining_playouts();
         let nodes = cur_n.min(remaining_n.max(0) as u32) as i64;
         let mut collisions_left = self.params.collisions_left(nodes);
-        self.number_out_of_order = 0;
+        self.iteration.number_out_of_order = 0;
 
         let mut minibatch_size = 0usize;
-        while minibatch_size < self.target_minibatch_size && self.number_out_of_order < self.max_out_of_order {
+        while minibatch_size < self.target_minibatch_size && self.iteration.number_out_of_order < self.max_out_of_order
+        {
             if minibatch_size > 0
                 && self
+                    .iteration
                     .computation
                     .as_ref()
                     .map_or(0, |computation| computation.used_batch_size())
@@ -845,6 +856,7 @@ impl<'a> SearchWorker<'a> {
             // With one search worker this is deliberately a no-op.
             if minibatch_size > 0
                 && self
+                    .iteration
                     .computation
                     .as_ref()
                     .map_or(0, |computation| computation.used_batch_size())
@@ -854,13 +866,13 @@ impl<'a> SearchWorker<'a> {
                 return Ok(());
             }
 
-            let new_start = self.minibatch.len();
+            let new_start = self.iteration.minibatch.len();
             let pick_budget = collisions_left
                 .min(self.target_minibatch_size as i32 - minibatch_size as i32)
-                .min(self.max_out_of_order as i32 - self.number_out_of_order as i32);
+                .min(self.max_out_of_order as i32 - self.iteration.number_out_of_order as i32);
             self.pick_nodes_to_extend_in_tree(tree, pick_budget.max(0) as u32)?;
             let mut picked_visits = 0usize;
-            for item in &self.minibatch[new_start..] {
+            for item in &self.iteration.minibatch[new_start..] {
                 if !item.is_collision {
                     minibatch_size += 1;
                     picked_visits += 1;
@@ -886,8 +898,8 @@ impl<'a> SearchWorker<'a> {
                 self.task_phase.queue.reset();
                 let mut found = 0usize;
                 let mut queued = 0usize;
-                for index in new_start..self.minibatch.len() {
-                    if self.minibatch[index].is_collision {
+                for index in new_start..self.iteration.minibatch.len() {
+                    if self.iteration.minibatch[index].is_collision {
                         continue;
                     }
                     found += 1;
@@ -908,7 +920,7 @@ impl<'a> SearchWorker<'a> {
 
             let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
             let process_result =
-                self.process_picked_task_in_tree(tree, main_start, self.minibatch.len(), &mut workspace);
+                self.process_picked_task_in_tree(tree, main_start, self.iteration.minibatch.len(), &mut workspace);
             self.task_phase.main_workspace = workspace;
             process_result?;
             if needs_wait {
@@ -916,19 +928,19 @@ impl<'a> SearchWorker<'a> {
             }
 
             let mut some_ooo = false;
-            for item in &self.minibatch[new_start..] {
+            for item in &self.iteration.minibatch[new_start..] {
                 if item.ooo_completed {
                     some_ooo = true;
                     break;
                 }
             }
             if some_ooo {
-                let mut i = self.minibatch.len();
+                let mut i = self.iteration.minibatch.len();
                 while i > new_start {
                     i -= 1;
-                    if self.minibatch[i].is_collision {
-                        let node_idx = self.minibatch[i].node_idx;
-                        let multivisit = self.minibatch[i].multivisit;
+                    if self.iteration.minibatch[i].is_collision {
+                        let node_idx = self.iteration.minibatch[i].node_idx;
+                        let multivisit = self.iteration.minibatch[i].multivisit;
                         let mut node = node_idx;
                         while let Some(parent) = tree.node(node).parent() {
                             tree.node_mut(parent).cancel_score_update(multivisit);
@@ -937,16 +949,16 @@ impl<'a> SearchWorker<'a> {
                                 break;
                             }
                         }
-                        self.minibatch.remove(i);
-                    } else if self.minibatch[i].ooo_completed {
+                        self.iteration.minibatch.remove(i);
+                    } else if self.iteration.minibatch[i].ooo_completed {
                         // px0 backs up completed out-of-order entries while
                         // reconciling collisions in GatherMinibatch
                         // (`search.cc:1372-1393`), not in ProcessPickedTask.
-                        let item = self.minibatch[i].clone();
+                        let item = self.iteration.minibatch[i].clone();
                         self.do_backup_update_single_node_in_tree(tree, &item);
-                        self.minibatch.remove(i);
+                        self.iteration.minibatch.remove(i);
                         minibatch_size = minibatch_size.saturating_sub(1);
-                        self.number_out_of_order += 1;
+                        self.iteration.number_out_of_order += 1;
                     }
                 }
             }
@@ -955,12 +967,12 @@ impl<'a> SearchWorker<'a> {
             // gather produced no independent NN leaf. A root collision may be
             // safely enlarged to its precomputed `maxvisit` bound, updating
             // every ancestor's in-flight count before it is shared.
-            for index in new_start..self.minibatch.len() {
-                if !self.minibatch[index].is_collision {
+            for index in new_start..self.iteration.minibatch.len() {
+                if !self.iteration.minibatch[index].is_collision {
                     continue;
                 }
                 let (node_idx, extra) = {
-                    let item = &mut self.minibatch[index];
+                    let item = &mut self.iteration.minibatch[index];
                     let desired = item.maxvisit.min(collisions_left.max(0) as u32);
                     let extra = desired.saturating_sub(item.multivisit);
                     item.multivisit += extra;
@@ -976,7 +988,7 @@ impl<'a> SearchWorker<'a> {
                         }
                     }
                 }
-                collisions_left -= self.minibatch[index].multivisit as i32;
+                collisions_left -= self.iteration.minibatch[index].multivisit as i32;
                 if collisions_left <= 0 || self.search_state.stop.load(Ordering::Acquire) {
                     return Ok(());
                 }
@@ -1001,7 +1013,7 @@ impl<'a> SearchWorker<'a> {
         // px0 `SearchWorker::PickNodesToExtend` begins every gather with
         // `ResetTasks` (`src/search/classic/search.cc:1485-1492`).
         self.task_phase.queue.reset();
-        let mut receiver = std::mem::take(&mut self.minibatch);
+        let mut receiver = std::mem::take(&mut self.iteration.minibatch);
         let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
         let result = self.pick_nodes_to_extend_task_with_workspace(
             tree,
@@ -1014,9 +1026,9 @@ impl<'a> SearchWorker<'a> {
             true,
         );
         self.task_phase.main_workspace = workspace;
-        self.minibatch = receiver;
+        self.iteration.minibatch = receiver;
         self.wait_for_queued_tasks_in_tree(tree)?;
-        self.task_phase.queue.drain_results_into(&mut self.minibatch);
+        self.task_phase.queue.drain_results_into(&mut self.iteration.minibatch);
         result
     }
 
@@ -1481,14 +1493,14 @@ impl<'a> SearchWorker<'a> {
             // px0 immediately skips collisions here. They only carry an
             // in-flight reservation and must not enter terminal/cache OOO
             // evaluation (`search.cc:1429-1432`).
-            if self.minibatch[i].is_collision {
+            if self.iteration.minibatch[i].is_collision {
                 continue;
             }
-            let node_idx = self.minibatch[i].node_idx;
-            let depth = self.minibatch[i].depth;
-            let moves_to_visit = std::mem::take(&mut self.minibatch[i].moves_to_visit);
+            let node_idx = self.iteration.minibatch[i].node_idx;
+            let depth = self.iteration.minibatch[i].depth;
+            let moves_to_visit = std::mem::take(&mut self.iteration.minibatch[i].moves_to_visit);
             let is_terminal = tree.node(node_idx).is_terminal();
-            if self.minibatch[i].is_extendable(is_terminal) {
+            if self.iteration.minibatch[i].is_extendable(is_terminal) {
                 self.extend_node_in_tree(tree, node_idx, depth, &moves_to_visit, &mut workspace.history)?;
                 if !tree.node(node_idx).is_terminal() {
                     let position = EvalPosition {
@@ -1501,20 +1513,21 @@ impl<'a> SearchWorker<'a> {
                             .collect::<MoveList>(),
                     };
                     let (result, ticket) = self
+                        .iteration
                         .computation
                         .as_ref()
                         .ok_or(EnginError::PortIncomplete("P4 ProcessPickedTask without computation"))?
                         .add_input(position)?;
-                    self.minibatch[i].nn_queried = true;
-                    self.minibatch[i].is_cache_hit = result == AddInputResult::FetchedImmediately;
-                    self.minibatch[i].eval_ticket = Some(ticket);
+                    self.iteration.minibatch[i].nn_queried = true;
+                    self.iteration.minibatch[i].is_cache_hit = result == AddInputResult::FetchedImmediately;
+                    self.iteration.minibatch[i].eval_ticket = Some(ticket);
                 }
             }
             if self.params.out_of_order_eval
-                && self.minibatch[i].can_eval_out_of_order(tree.node(node_idx).is_terminal())
+                && self.iteration.minibatch[i].can_eval_out_of_order(tree.node(node_idx).is_terminal())
             {
                 self.fetch_single_node_result_in_tree(tree, i)?;
-                self.minibatch[i].ooo_completed = true;
+                self.iteration.minibatch[i].ooo_completed = true;
             }
         }
         Ok(())
@@ -1614,7 +1627,7 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::CollectCollisions` (`search.cc:1977-1987`)。
     fn collect_collisions_in_tree(&mut self, _tree: &mut NodeTree) -> Result<(), EnginError> {
-        for item in &self.minibatch {
+        for item in &self.iteration.minibatch {
             if item.is_collision {
                 self.search_state
                     .shared_collisions
@@ -1634,6 +1647,7 @@ impl<'a> SearchWorker<'a> {
             return Ok(());
         }
         let used = self
+            .iteration
             .computation
             .as_ref()
             .map_or(0, |computation| computation.used_batch_size());
@@ -1692,7 +1706,7 @@ impl<'a> SearchWorker<'a> {
                 return Ok(1);
             }
             let legal_moves = self.history.last().board().generate_legal_moves();
-            if let Some(computation) = self.computation.as_mut() {
+            if let Some(computation) = self.iteration.computation.as_mut() {
                 let _ = computation.add_input(EvalPosition {
                     positions: self.history.positions().to_vec(),
                     legal_moves,
@@ -1776,7 +1790,7 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::RunNNComputation` (`search.cc:2103-2107`)。
     pub fn run_nn_computation(&mut self) -> Result<(), EnginError> {
-        if let Some(computation) = self.computation.as_mut() {
+        if let Some(computation) = self.iteration.computation.as_mut() {
             if computation.used_batch_size() > 0 {
                 computation.compute_blocking()?;
             }
@@ -1790,7 +1804,7 @@ impl<'a> SearchWorker<'a> {
     }
 
     fn fetch_minibatch_results_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        for i in 0..self.minibatch.len() {
+        for i in 0..self.iteration.minibatch.len() {
             self.fetch_single_node_result_in_tree(tree, i)?;
         }
         Ok(())
@@ -1798,12 +1812,12 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::FetchSingleNodeResult` (`search.cc:2117-2154`)。
     fn fetch_single_node_result_in_tree(&mut self, tree: &mut NodeTree, index: usize) -> Result<(), EnginError> {
-        if self.minibatch[index].is_collision {
+        if self.iteration.minibatch[index].is_collision {
             return Ok(());
         }
-        let node_idx = self.minibatch[index].node_idx;
-        if !self.minibatch[index].nn_queried {
-            self.minibatch[index].eval = EvalResult {
+        let node_idx = self.iteration.minibatch[index].node_idx;
+        if !self.iteration.minibatch[index].nn_queried {
+            self.iteration.minibatch[index].eval = EvalResult {
                 wl: tree.node(node_idx).wl(),
                 d: tree.node(node_idx).d(),
                 m: tree.node(node_idx).m(),
@@ -1811,10 +1825,11 @@ impl<'a> SearchWorker<'a> {
             };
             return Ok(());
         }
-        let ticket = self.minibatch[index]
+        let ticket = self.iteration.minibatch[index]
             .eval_ticket
             .ok_or(EnginError::PortIncomplete("P4 FetchSingleNodeResult missing ticket"))?;
         let mut eval = self
+            .iteration
             .computation
             .as_mut()
             .ok_or(EnginError::PortIncomplete(
@@ -1830,7 +1845,7 @@ impl<'a> SearchWorker<'a> {
             || (self.params.wdl_rescale_diff != 0.0 && self.params.contempt_mode != ContemptMode::None)
         {
             let root_stm = (self.params.contempt_mode == ContemptMode::Black) == tree.history().is_black_to_move();
-            let sign = if root_stm ^ (self.minibatch[index].depth % 2 == 1) {
+            let sign = if root_stm ^ (self.iteration.minibatch[index].depth % 2 == 1) {
                 1.0
             } else {
                 -1.0
@@ -1857,7 +1872,7 @@ impl<'a> SearchWorker<'a> {
             // be spawned (`node.cc:291-298`, `search.cc:2145-2153`).
             tree.node_mut(node_idx).sort_edges();
         }
-        self.minibatch[index].eval = eval;
+        self.iteration.minibatch[index].eval = eval;
         Ok(())
     }
 
@@ -1867,8 +1882,9 @@ impl<'a> SearchWorker<'a> {
     }
 
     fn do_backup_update_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        let mut work_done = self.number_out_of_order > 0;
+        let mut work_done = self.iteration.number_out_of_order > 0;
         let items: Vec<_> = self
+            .iteration
             .minibatch
             .iter()
             .filter(|item| !item.is_collision)
@@ -2085,7 +2101,8 @@ impl<'a> SearchWorker<'a> {
         // (`src/search/classic/search.cc:2337-2351`). Such an iteration does
         // not advance the tree; immediately spinning again only competes with
         // the worker that owns the useful in-flight work.
-        let work_done = self.number_out_of_order > 0 || self.minibatch.iter().any(|item| !item.is_collision);
+        let work_done =
+            self.iteration.number_out_of_order > 0 || self.iteration.minibatch.iter().any(|item| !item.is_collision);
         if !work_done {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -2276,10 +2293,10 @@ mod tests {
         // item to ProcessPickedTask (`px0 search.cc:1613-1636`).  Keep this
         // focused OOO test on that post-selection contract.
         assert!(worker.with_tree_for_test(|tree| tree.node_mut(root).try_start_score_update()));
-        worker.minibatch.push(NodeToProcess::visit(root, 1));
+        worker.iteration.minibatch.push(NodeToProcess::visit(root, 1));
         let mut workspace = TaskWorkspace::default();
         worker.process_picked_task(0, 1, &mut workspace).expect("ooo terminal");
-        assert!(worker.minibatch[0].ooo_completed);
+        assert!(worker.iteration.minibatch[0].ooo_completed);
     }
 
     /// px0 `ProcessPickedTask` skips a collision before checking its terminal
@@ -2302,15 +2319,15 @@ mod tests {
         let search_state = WorkerSearchState::new(stop);
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.initialize_iteration().expect("init");
-        worker.minibatch.push(NodeToProcess::collision(root, 1, 1, 1));
+        worker.iteration.minibatch.push(NodeToProcess::collision(root, 1, 1, 1));
 
         let mut workspace = TaskWorkspace::default();
         worker
             .process_picked_task(0, 1, &mut workspace)
             .expect("skip collision");
 
-        assert!(!worker.minibatch[0].ooo_completed);
-        assert!(!worker.minibatch[0].nn_queried);
+        assert!(!worker.iteration.minibatch[0].ooo_completed);
+        assert!(!worker.iteration.minibatch[0].nn_queried);
     }
 
     /// px0 immediately fetches a cache-hit leaf during `ProcessPickedTask`,
@@ -2338,17 +2355,25 @@ mod tests {
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
         worker.initialize_iteration().expect("init");
         assert!(worker.with_tree_for_test(|tree| tree.node_mut(root).try_start_score_update()));
-        worker.minibatch.push(NodeToProcess::visit(root, 1));
+        worker.iteration.minibatch.push(NodeToProcess::visit(root, 1));
 
         let mut workspace = TaskWorkspace::default();
         worker
             .process_picked_task(0, 1, &mut workspace)
             .expect("cache-hit OOO evaluation");
 
-        assert!(worker.minibatch[0].ooo_completed);
-        assert!(worker.minibatch[0].is_cache_hit);
-        assert_eq!(worker.computation.as_ref().expect("computation").used_batch_size(), 0);
-        assert_eq!(worker.minibatch[0].eval.policies.len(), legal_moves.len());
+        assert!(worker.iteration.minibatch[0].ooo_completed);
+        assert!(worker.iteration.minibatch[0].is_cache_hit);
+        assert_eq!(
+            worker
+                .iteration
+                .computation
+                .as_ref()
+                .expect("computation")
+                .used_batch_size(),
+            0
+        );
+        assert_eq!(worker.iteration.minibatch[0].eval.policies.len(), legal_moves.len());
     }
 
     /// px0 removes an OOO cache result from the minibatch only after its
@@ -2378,12 +2403,12 @@ mod tests {
 
         worker.gather_minibatch().expect("gather cache hit");
 
-        assert_eq!(worker.number_out_of_order, 1);
+        assert_eq!(worker.iteration.number_out_of_order, 1);
         assert_eq!(worker.with_tree_for_test(|tree| tree.node(root).n()), 1);
         // px0 keeps gathering after the OOO backup, so the next ordinary leaf
         // is already reserved by the time this phase returns.
         assert!(worker.with_tree_for_test(|tree| tree.node(root).n_in_flight() > 0));
-        assert!(worker.minibatch.iter().all(|item| !item.ooo_completed));
+        assert!(worker.iteration.minibatch.iter().all(|item| !item.ooo_completed));
     }
 
     #[test]
@@ -2447,7 +2472,7 @@ mod tests {
         let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let root = tree.current_head();
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
-        worker.minibatch.push(NodeToProcess::collision(root, 1, 1, 1));
+        worker.iteration.minibatch.push(NodeToProcess::collision(root, 1, 1, 1));
 
         let started = Instant::now();
         worker.update_counters().expect("collision-only update");
@@ -2512,6 +2537,7 @@ mod tests {
         let root_moves = worker.history.last().board().generate_legal_moves();
         worker.history.append(root_moves[0]);
         worker
+            .iteration
             .computation
             .as_mut()
             .expect("computation")
@@ -2553,7 +2579,15 @@ mod tests {
 
         assert_eq!(spent, 1);
         assert_eq!(worker.history.len(), worker.played_history_len);
-        assert_eq!(worker.computation.as_ref().expect("computation").used_batch_size(), 1);
+        assert_eq!(
+            worker
+                .iteration
+                .computation
+                .as_ref()
+                .expect("computation")
+                .used_batch_size(),
+            1
+        );
     }
 
     #[test]
@@ -2603,6 +2637,7 @@ mod tests {
         worker.pick_nodes_to_extend(1).expect("pick nodes");
 
         let visit = worker
+            .iteration
             .minibatch
             .iter()
             .find(|item| !item.is_collision)
@@ -2636,11 +2671,14 @@ mod tests {
         let mut workspace = TaskWorkspace::default();
 
         worker.run_queued_tasks(&mut workspace).expect("run gathering task");
-        worker.task_phase.queue.drain_results_into(&mut worker.minibatch);
+        worker
+            .task_phase
+            .queue
+            .drain_results_into(&mut worker.iteration.minibatch);
 
-        assert_eq!(worker.minibatch.len(), 1);
-        assert!(!worker.minibatch[0].is_collision);
-        assert_eq!(worker.minibatch[0].moves_to_visit, vec![mv]);
+        assert_eq!(worker.iteration.minibatch.len(), 1);
+        assert!(!worker.iteration.minibatch[0].is_collision);
+        assert_eq!(worker.iteration.minibatch[0].moves_to_visit, vec![mv]);
     }
 
     #[test]
@@ -2745,8 +2783,16 @@ mod tests {
         worker.initialize_iteration().expect("init");
         worker.gather_minibatch().expect("gather full batch");
 
-        assert!(worker.minibatch.len() >= 2);
-        assert!(worker.computation.as_ref().expect("computation").used_batch_size() >= 2);
+        assert!(worker.iteration.minibatch.len() >= 2);
+        assert!(
+            worker
+                .iteration
+                .computation
+                .as_ref()
+                .expect("computation")
+                .used_batch_size()
+                >= 2
+        );
     }
 
     #[test]

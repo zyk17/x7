@@ -55,6 +55,9 @@ task split 不可用：此前 Rust raw-pointer 版本会让两个 task 重复扩
 
 ## 后续：P4 task-worker 的安全所有权翻译
 
+已完成前置收口：`IterationState` 独占保存主 worker 的 minibatch/computation/out-of-order 计数，参考
+`src/search/classic/search.h:419-427`；这不改变 `task_workers_=0`，也尚未把任何搜索数据交给 task。
+
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占
   minibatch/computation/counters；禁止共享 `&mut SearchWorker`。
