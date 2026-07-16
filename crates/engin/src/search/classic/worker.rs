@@ -175,7 +175,7 @@ impl TaskWorkspace {
 /// px0 keeps `nodes_mutex_` across each tree phase
 /// (`search.cc:1142-1211,1494-1508`). Rust represents that boundary by
 /// borrowing the tree explicitly for every phase instead of storing an active
-/// raw pointer inside `SearchWorker`.
+/// tree borrow inside `SearchWorker`.
 enum TreeStorage<'a> {
     Direct(&'a mut NodeTree),
     Shared(Arc<RwLock<NodeTree>>),
@@ -440,8 +440,8 @@ impl PickTaskQueue {
 
     /// px0 `RunTasks` waits for tasks while the main gather producer is still
     /// walking the tree (`src/search/classic/search.cc:1069-1124,1485-1508`).
-    /// A scoped Rust worker exits only after the producer seals this phase and
-    /// every published task has been claimed.
+    /// A future persistent Rust worker may exit only after the producer seals
+    /// this phase and every published task has been claimed.
     fn take_until_phase_sealed(&self) -> Option<ClaimedTask> {
         loop {
             if let Some(task) = self.take() {
@@ -458,8 +458,8 @@ impl PickTaskQueue {
         }
     }
 
-    /// Completes the producer side of one scoped task phase. Existing tasks
-    /// remain claimable; idle workers may exit only after they are exhausted.
+    /// Completes the producer side of one task phase. Existing tasks remain
+    /// claimable; future idle workers may exit only after they are exhausted.
     fn seal_phase(&self) {
         self.phase_sealed.store(true, Ordering::Release);
         self.task_added.notify_all();
@@ -610,55 +610,6 @@ impl TaskRunner {
     }
 }
 
-/// px0 lends `nodes_mutex_`'s gather/processing phase to `RunTasks`
-/// (`src/search/classic/search.cc:1069-1140,1485-1508`). Rust cannot express
-/// that C++ mutable alias with ordinary references, so this pointer is valid
-/// only inside `run_tasks_scoped_in_tree`: the owner joins every task thread
-/// before it accesses the tree again.
-#[derive(Clone, Copy)]
-struct ScopedTaskTree(*mut NodeTree);
-
-// Safety: constructed from the caller's exclusive tree phase and consumed
-// only by scoped task threads. No pointer may escape the scope or coexist with
-// main-worker tree access. px0 reference: `search.cc:1485-1508`.
-unsafe impl Send for ScopedTaskTree {}
-
-impl ScopedTaskTree {
-    fn from_tree(tree: &mut NodeTree) -> Self {
-        Self(tree)
-    }
-
-    unsafe fn with_mut<R>(self, operation: impl FnOnce(&mut NodeTree) -> R) -> R {
-        // SAFETY: upheld by the scoped tree-phase contract on `ScopedTaskTree`.
-        unsafe { operation(&mut *self.0) }
-    }
-}
-
-/// px0 processing tasks own disjoint `[start_idx, end_idx)` portions of
-/// `minibatch_` (`src/search/classic/search.cc:1322-1362`). The split helper
-/// and its regression test prove these ranges do not overlap.
-#[derive(Clone, Copy)]
-struct ScopedMinibatch(*mut NodeToProcess, usize);
-
-// Safety: only `split_processing_tasks` creates concurrent work ranges; the
-// main suffix is processed by the owner after task threads join.
-unsafe impl Send for ScopedMinibatch {}
-
-impl ScopedMinibatch {
-    fn from_items(items: &mut [NodeToProcess]) -> Self {
-        Self(items.as_mut_ptr(), items.len())
-    }
-
-    unsafe fn range_mut<'a>(self, start: usize, end: usize) -> &'a mut [NodeToProcess] {
-        assert!(
-            start <= end && end <= self.1,
-            "px0 processing range is in minibatch bounds"
-        );
-        // SAFETY: caller supplies a range created by `split_processing_tasks`.
-        unsafe { std::slice::from_raw_parts_mut(self.0.add(start), end - start) }
-    }
-}
-
 /// px0 `SearchWorker` 每轮迭代状态（`src/search/classic/search.h:419-427`）。
 ///
 /// `minibatch_`、`computation_` 和 `number_out_of_order_` 的生命周期只跨越
@@ -728,9 +679,8 @@ pub struct SearchWorker<'a> {
     /// task-thread activation.
     task_workers: i32,
     /// Production activation gate. The configured px0 count is retained for
-    /// diagnostics, but real ONNX `go movetime` currently deadlocks in the
-    /// scoped raw-pointer path. Keep this at zero until the Rust node-aliasing
-    /// proof matches px0's `nodes_mutex_` tree phase.
+    /// diagnostics. Keep this at zero until a persistent Rust task ownership
+    /// model matches px0's `nodes_mutex_` tree phase.
     active_task_workers: i32,
     /// px0 `SearchWorker::latest_time_manager_hints_`
     /// (`src/search/classic/search.h:368-369`). Each search worker owns this
@@ -877,10 +827,9 @@ impl<'a> SearchWorker<'a> {
             max_out_of_order,
             task_workers,
             // px0 `SearchWorker` starts persistent task threads in its
-            // constructor (`search.h:205-244`). The scoped Rust substitute is
-            // not equivalent: a real ONNX long-time search stalls while a task
-            // phase is active. Preserve the parsed value above, but never
-            // activate this incomplete translation in production.
+            // constructor (`search.h:205-244`). Rust has no equivalent yet;
+            // preserve the parsed value above, but never activate it in
+            // production.
             active_task_workers: 0,
             latest_time_manager_hints: StoppersHints::default(),
             task_phase,
@@ -1062,7 +1011,7 @@ impl<'a> SearchWorker<'a> {
 
     /// Runs one px0 exclusive `nodes_mutex_` phase. `NodeTree` is an explicit
     /// borrow, so neither direct tests nor the shared production tree need an
-    /// active raw-pointer bridge.
+    /// an escaped tree borrow.
     fn with_tree<R>(&mut self, operation: impl FnOnce(&mut Self, &mut NodeTree) -> R) -> R {
         let storage = std::mem::replace(&mut self.tree.storage, TreeStorage::Detached);
         match storage {
@@ -1181,8 +1130,9 @@ impl<'a> SearchWorker<'a> {
     /// px0 `SearchWorker::RunBlocking` (`src/search/classic/search.h:235-249`).
     ///
     /// px0 `SearchWorker::RunBlocking` (`search.h:235-249`). Task splitting
-    /// follows the configured px0 count; until scoped task threads are enabled
-    /// the owner consumes those tasks synchronously at `WaitForTasks`.
+    /// follows the configured px0 count; until persistent task threads are
+    /// translated the owner consumes those tasks synchronously at
+    /// `WaitForTasks`.
     pub fn run_blocking(&mut self) -> Result<(), EnginError> {
         self.run_blocking_without_task_threads()
     }
@@ -1269,8 +1219,8 @@ impl<'a> SearchWorker<'a> {
             }
             // px0 `search.cc:1322-1347`: split the initial contiguous work
             // ranges into processing tasks, retaining the final range for the
-            // main worker. Scoped task threads consume the queued ranges while
-            // the enclosing px0 tree phase remains active.
+            // main worker. The active Rust path drains queued ranges on the
+            // owner while preserving px0's phase order.
             let (main_start, needs_wait) = Self::split_processing_tasks(
                 &self.task_phase.queue,
                 self.params,
@@ -1281,20 +1231,15 @@ impl<'a> SearchWorker<'a> {
             );
 
             let mut runner = std::mem::take(&mut self.task_phase.main_runner);
-            let process_result = if needs_wait && self.active_task_workers > 0 {
-                self.run_processing_phase_scoped_in_tree(tree, main_start, &mut runner)
-            } else {
-                let result = self.process_picked_task_in_tree(
-                    tree,
-                    main_start,
-                    self.iteration.minibatch.len(),
-                    &mut runner.workspace,
-                );
-                if needs_wait {
-                    self.wait_for_queued_tasks_in_tree(tree)?;
-                }
-                result
-            };
+            let process_result = self.process_picked_task_in_tree(
+                tree,
+                main_start,
+                self.iteration.minibatch.len(),
+                &mut runner.workspace,
+            );
+            if needs_wait {
+                self.wait_for_queued_tasks_in_tree(tree)?;
+            }
             self.task_phase.main_runner = runner;
             process_result?;
 
@@ -1386,109 +1331,23 @@ impl<'a> SearchWorker<'a> {
         self.task_phase.queue.reset();
         let mut receiver = std::mem::take(&mut self.iteration.minibatch);
         let mut runner = std::mem::take(&mut self.task_phase.main_runner);
-        let result = if self.active_task_workers == 0 {
-            let context = self.selection_context();
-            Self::pick_nodes_to_extend_task_with_workspace(
-                &context,
-                tree,
-                tree.current_head(),
-                0,
-                collision_limit,
-                &MoveList::new(),
-                &mut receiver,
-                &mut runner.workspace,
-                true,
-            )
-        } else {
-            self.run_gathering_phase_scoped_in_tree(tree, collision_limit, &mut receiver, &mut runner)
-        };
+        let context = self.selection_context();
+        let result = Self::pick_nodes_to_extend_task_with_workspace(
+            &context,
+            tree,
+            tree.current_head(),
+            0,
+            collision_limit,
+            &MoveList::new(),
+            &mut receiver,
+            &mut runner.workspace,
+            true,
+        );
         self.task_phase.main_runner = runner;
         self.iteration.minibatch = receiver;
-        if self.active_task_workers == 0 {
-            self.wait_for_queued_tasks_in_tree(tree)?;
-        } else {
-            self.task_phase.queue.wait();
-        }
+        self.wait_for_queued_tasks_in_tree(tree)?;
         self.task_phase.queue.drain_results_into(&mut self.iteration.minibatch);
         result
-    }
-
-    /// px0 starts `RunTasks` before the main `PickNodesToExtendTask` walks the
-    /// tree, then waits before merging task results (`src/search/classic/
-    /// search.cc:1069-1140,1485-1508`). The scoped translation preserves that
-    /// ordering without sharing `SearchWorker` or task workspaces.
-    fn run_gathering_phase_scoped_in_tree(
-        &mut self,
-        tree: &mut NodeTree,
-        collision_limit: u32,
-        receiver: &mut Vec<NodeToProcess>,
-        main_runner: &mut TaskRunner,
-    ) -> Result<(), EnginError> {
-        let task_workers = usize::try_from(self.active_task_workers).expect("positive px0 task worker count");
-        let context = SelectionContext {
-            params: self.params,
-            search_state: self.search_state,
-            root_move_filter: self.root_move_filter,
-            latest_time_manager_hints: self.latest_time_manager_hints.clone(),
-            task_workers: self.active_task_workers,
-            task_queue: &self.task_phase.queue,
-            twofold_correction_lock: &self.twofold_correction_lock,
-        };
-        let queue = &self.task_phase.queue;
-        let tree = ScopedTaskTree::from_tree(tree);
-        let first_error = Mutex::new(None);
-        let context = &context;
-        let first_error = &first_error;
-
-        let main_result = std::thread::scope(|scope| {
-            for _ in 0..task_workers {
-                scope.spawn(move || {
-                    let mut runner = TaskRunner::default();
-                    while let Some(mut claimed) = queue.take_until_phase_sealed() {
-                        debug_assert_eq!(claimed.task.kind, PickTaskKind::Gathering);
-                        // SAFETY: the main DFS and these task runners execute
-                        // only inside this px0 tree phase; join completes
-                        // before the owner reuses `NodeTree`.
-                        let result = unsafe {
-                            tree.with_mut(|tree| runner.run_gathering_task(context, tree, &mut claimed.task))
-                        };
-                        if let Err(error) = result {
-                            let mut first = first_error.lock().expect("task error lock");
-                            if first.is_none() {
-                                *first = Some(error);
-                            }
-                        }
-                        queue.complete(claimed);
-                    }
-                });
-            }
-
-            // SAFETY: exactly the same scoped px0 tree phase as the runners.
-            // The queue is sealed immediately after this producer returns.
-            let result = unsafe {
-                tree.with_mut(|tree| {
-                    Self::pick_nodes_to_extend_task_with_workspace(
-                        context,
-                        tree,
-                        tree.current_head(),
-                        0,
-                        collision_limit,
-                        &MoveList::new(),
-                        receiver,
-                        &mut main_runner.workspace,
-                        true,
-                    )
-                })
-            };
-            queue.seal_phase();
-            result
-        });
-
-        main_result?;
-        if let Some(error) = first_error.lock().expect("task error lock").take() {
-            return Err(error);
-        }
-        Ok(())
     }
 
     /// px0 `SearchWorker::RunTasks` (`src/search/classic/search.cc:1069-1140`).
@@ -1524,161 +1383,15 @@ impl<'a> SearchWorker<'a> {
         Ok(())
     }
 
-    /// px0 `SearchWorker::RunTasks` (`src/search/classic/search.cc:1069-1140`).
-    ///
-    /// This is the scoped Rust translation of px0's task-thread phase. Task
-    /// runners own their scratch space, the queue owns claimed task/result
-    /// records, and the main worker joins all threads before it resumes tree
-    /// access. The raw pointers are confined to this phase; see
-    /// `ScopedTaskTree` and `ScopedMinibatch`.
-    fn run_tasks_scoped_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        debug_assert!(self.active_task_workers > 0);
-        let task_workers = usize::try_from(self.active_task_workers).expect("positive px0 task worker count");
-        let selection = SelectionContext {
-            params: self.params,
-            search_state: self.search_state,
-            root_move_filter: self.root_move_filter,
-            latest_time_manager_hints: self.latest_time_manager_hints.clone(),
-            task_workers: self.active_task_workers,
-            task_queue: &self.task_phase.queue,
-            twofold_correction_lock: &self.twofold_correction_lock,
-        };
-        let processing = ProcessingContext {
-            params: self.params,
-            computation: self.iteration.computation.as_deref(),
-            extend: ExtendContext {
-                played_history_len: self.played_history_len,
-                two_fold_draws: self.params.two_fold_draws,
-            },
-        };
-        let queue = &self.task_phase.queue;
-        let tree = ScopedTaskTree::from_tree(tree);
-        let minibatch = ScopedMinibatch::from_items(&mut self.iteration.minibatch);
-        let first_error = Mutex::new(None);
-        let selection = &selection;
-        let processing = &processing;
-        let first_error = &first_error;
-
-        std::thread::scope(|scope| {
-            for _ in 0..task_workers {
-                scope.spawn(move || {
-                    let mut runner = TaskRunner::default();
-                    while let Some(mut claimed) = queue.take_until_phase_sealed() {
-                        let result = match claimed.task.kind {
-                            PickTaskKind::Gathering => {
-                                // SAFETY: `ScopedTaskTree` is valid for this
-                                // entire scope; the main worker is waiting.
-                                unsafe {
-                                    tree.with_mut(|tree| runner.run_gathering_task(selection, tree, &mut claimed.task))
-                                }
-                            }
-                            PickTaskKind::Processing => {
-                                // SAFETY: processing ranges were split before
-                                // publication; see `ScopedMinibatch`.
-                                unsafe {
-                                    let range = minibatch.range_mut(claimed.task.start_idx, claimed.task.end_idx);
-                                    tree.with_mut(|tree| runner.run_processing_range(processing, tree, range))
-                                }
-                            }
-                        };
-                        if let Err(error) = result {
-                            let mut first = first_error.lock().expect("task error lock");
-                            if first.is_none() {
-                                *first = Some(error);
-                            }
-                        }
-                        queue.complete(claimed);
-                    }
-                });
-            }
-        });
-
-        if let Some(error) = first_error.lock().expect("task error lock").take() {
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// px0 starts processing task threads before the main worker processes the
-    /// final minibatch suffix (`src/search/classic/search.cc:1322-1362`).
-    /// `split_processing_tasks` proves every queue range ends before
-    /// `main_start`, so task runners and the main runner receive disjoint
-    /// `NodeToProcess` slices for this scoped tree phase.
-    fn run_processing_phase_scoped_in_tree(
-        &mut self,
-        tree: &mut NodeTree,
-        main_start: usize,
-        main_runner: &mut TaskRunner,
-    ) -> Result<(), EnginError> {
-        let task_workers = usize::try_from(self.active_task_workers).expect("positive px0 task worker count");
-        let processing = ProcessingContext {
-            params: self.params,
-            computation: self.iteration.computation.as_deref(),
-            extend: ExtendContext {
-                played_history_len: self.played_history_len,
-                two_fold_draws: self.params.two_fold_draws,
-            },
-        };
-        let queue = &self.task_phase.queue;
-        let tree = ScopedTaskTree::from_tree(tree);
-        let minibatch = ScopedMinibatch::from_items(&mut self.iteration.minibatch);
-        let minibatch_len = self.iteration.minibatch.len();
-        let first_error = Mutex::new(None);
-        let processing = &processing;
-        let first_error = &first_error;
-
-        let main_result = std::thread::scope(|scope| {
-            for _ in 0..task_workers {
-                scope.spawn(move || {
-                    let mut runner = TaskRunner::default();
-                    while let Some(claimed) = queue.take_until_phase_sealed() {
-                        debug_assert_eq!(claimed.task.kind, PickTaskKind::Processing);
-                        // SAFETY: the split helper proved task ranges disjoint
-                        // from one another and from the main suffix.
-                        let result = unsafe {
-                            let range = minibatch.range_mut(claimed.task.start_idx, claimed.task.end_idx);
-                            tree.with_mut(|tree| runner.run_processing_range(processing, tree, range))
-                        };
-                        if let Err(error) = result {
-                            let mut first = first_error.lock().expect("task error lock");
-                            if first.is_none() {
-                                *first = Some(error);
-                            }
-                        }
-                        queue.complete(claimed);
-                    }
-                });
-            }
-
-            // SAFETY: `[main_start, minibatch_len)` is the suffix retained by
-            // px0's main worker, outside all published processing ranges.
-            let result = unsafe {
-                let range = minibatch.range_mut(main_start, minibatch_len);
-                tree.with_mut(|tree| main_runner.run_processing_range(processing, tree, range))
-            };
-            queue.seal_phase();
-            result
-        });
-
-        main_result?;
-        if let Some(error) = first_error.lock().expect("task error lock").take() {
-            return Err(error);
-        }
-        self.task_phase.queue.wait();
-        Ok(())
-    }
-
     /// px0 waits for independent task workers here (`search.cc:1494-1508`).
-    /// The current ownership translation retains px0's split decision but
-    /// drains the queue on its owner until the scoped tree-phase workers are
-    /// enabled.
+    ///
+    /// The active Rust path drains the queue on its owner. The old scoped
+    /// pointer bridge was removed because it was not a px0-equivalent task
+    /// lifetime and could stall a real ONNX search. A future persistent-worker
+    /// translation must use owned tasks/workspaces and this tree-phase API.
     fn wait_for_queued_tasks_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
         self.task_phase.queue.seal_phase();
-        if self.active_task_workers == 0 {
-            self.run_tasks_synchronously_in_tree(tree)?;
-        } else {
-            self.run_tasks_scoped_in_tree(tree)?;
-        }
+        self.run_tasks_synchronously_in_tree(tree)?;
         self.task_phase.queue.wait();
         Ok(())
     }
@@ -2900,8 +2613,8 @@ mod tests {
     }
 
     /// Keep px0's configured count visible while the production activation
-    /// gate remains closed. Real ONNX `go movetime` covers the scoped tree
-    /// implementation's missing aliasing proof; see `NextStep.md`.
+    /// gate remains closed. Real ONNX `go movetime` covered the deleted scoped
+    /// bridge's missing aliasing proof; see `NextStep.md`.
     #[test]
     fn gpu_backend_keeps_requested_task_worker_count_diagnostic_only() {
         ensure_init();
@@ -3504,7 +3217,7 @@ mod tests {
     }
 
     /// px0 task threads stay available while the main gather walk publishes
-    /// work, then leave the scoped phase once publication is sealed
+    /// work, then leave the task phase once publication is sealed
     /// (`search.cc:1069-1124,1485-1508`).
     #[test]
     fn pick_task_queue_waits_for_phase_publish_then_seal() {
@@ -3523,7 +3236,7 @@ mod tests {
         queue.push(PickTask::processing(0, 1));
         queue.seal_phase();
 
-        assert_eq!(worker.join().expect("scoped task worker"), 1);
+        assert_eq!(worker.join().expect("task worker state machine"), 1);
         queue.wait();
     }
 

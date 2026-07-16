@@ -17,6 +17,10 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
 `active_task_workers` 已重新固定为 `0`；`task_workers` 仍只保留 px0 `search.h:205-224` 的配置解析，
 不得把它当成已启用的并发搜索。
 
+此前的 scoped raw-pointer bridge（以及其 `unsafe impl Send`）已从代码删除。下方关于“已接入 scoped task
+threads / child reservation / allocation lock”的第十六至第二十四步仅是故障历史，已被本节和 `TODO.md` 的当前
+计划取代，不能作为实现依据。
+
 本轮 1:1 审查确认的阻塞项，按修复顺序如下：
 
 1. 先翻译 px0 `search.cc:1510-1550` 的 twofold 回滚互斥。Rust 当前会由 task 同时回写同一祖先链，缺少
@@ -140,8 +144,8 @@ FIFO 淘汰（`src/utils/cache.h:35-57,69-105,214-230`），但仍原子地保�
 机制，不承载任何搜索策略或节点语义。参考 px0 的 `nodes_mutex_` 使用边界
 `src/search/classic/search.cc:1142-1211,1494-1508`。
 
-P4 的单 worker/minibatch/OOO/cache/stopper 主线可用。GPU task-worker 的 scoped raw-pointer 结构仍保留为
-翻译对象，但真实 ONNX 的 `go infinite -> stop` 回归已复现重复 `ExtendNode`；因此运行时激活门固定为
+P4 的单 worker/minibatch/OOO/cache/stopper 主线可用。旧 GPU task-worker scoped raw-pointer 结构已删除；
+真实 ONNX 的 `go infinite -> stop` 曾复现重复 `ExtendNode`，因此运行时激活门固定为
 `active_task_workers=0`，而 UCI/px0 的 `TaskWorkers` 解析仍保留作诊断。不能把当前后台路径称为完成对齐。
 下一步必须逐行核实 `PickNodesToExtendTask` 的 in-flight/collision 互斥，参考 px0
 `search.cc:1551-1897`，并用真实 ONNX 覆盖固定 visits、movetime 与 stop/wait，回归稳定前不得解除门控。

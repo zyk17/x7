@@ -31,6 +31,9 @@
 实际启用：真实 ONNX 的长 `go movetime` 可复现 scoped task phase 停顿。node 统计 atomics、first-extend CAS
 和 child 创建的 tree-phase 边界，仍不能证明 task 对 ancestors/terminal/bounds 的并发写安全。
 
+旧 scoped raw-pointer bridge 已删除；下方任何“已接入 scoped task threads / 已解除 gate”的历史条目均已失效，
+只以本节未勾选的常驻 worker 重译任务为准。
+
 - [x] 对照 `src/search/classic/search.cc:1510-1550`，为 twofold ancestor rollback 建立 px0 等价的 per-worker
   task 互斥；锁后重新检查 terminal 状态，避免等待期间重复回滚。
 - [x] 移除 `NodeArena::get_mut_unchecked(&self) -> &mut Node`；正常单 worker 路径仅通过 `&mut NodeTree`
