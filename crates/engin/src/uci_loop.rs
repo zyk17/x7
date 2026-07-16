@@ -213,8 +213,8 @@ pub trait StringUciResponder: UciResponder {
 
     /// px0 `StringUciResponder::SendId` (`uciloop.cc:274-277`)。
     fn send_id(&mut self, version: &str) {
-        self.send_raw_response(&format!("id name Px0 v{version}"));
-        self.send_raw_response("id author The PXZero Authors.");
+        self.send_raw_response(&format!("id name x7 v{version}"));
+        self.send_raw_response("id author 7.");
     }
 }
 
@@ -1009,7 +1009,7 @@ mod tests {
             .expect("position"));
         assert!(uci.process_line("go depth 4", "1.2.3").expect("go"));
         drop(uci);
-        assert_eq!(responder.responses[0], "id name Px0 v1.2.3");
+        assert_eq!(responder.responses[0], "id name x7 v1.2.3");
         assert_eq!(responder.responses.last().unwrap(), "readyok");
         assert_eq!(engine.go_count, 1);
         assert_eq!(engine.position.unwrap().moves.len(), 1);

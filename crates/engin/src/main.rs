@@ -1,5 +1,4 @@
 //! px0 UCI stdin/stdout entry with P4 classic search.
-
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 
