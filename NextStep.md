@@ -129,6 +129,10 @@ task owner 前，不把该测试机制伪装成后台 task worker，也不让它
 hints 与 task queue（`src/search/classic/search.cc:1551-1897`）；它不含 minibatch/backend/其他 workspace。
 twofold 回退改为纯 tree helper，对应 `search.cc:1510-1550`。
 
+第五步已完成：`ExtendNode` 只接收复制的 `ExtendContext`、tree 与 task workspace history，不再借用可变
+`SearchWorker`。该 context 仅含 px0 `ExtendNode` 使用的 root-history 长度和 twofold 开关，参考
+`src/search/classic/search.cc:1899-1974`；这为 processing range 的独占传递消除了一个 worker 别名来源。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

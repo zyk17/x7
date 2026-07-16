@@ -486,6 +486,15 @@ struct SelectionContext<'a> {
     task_queue: &'a PickTaskQueue,
 }
 
+/// Inputs used by px0 `ExtendNode` (`src/search/classic/search.cc:1899-1974`).
+/// They are copied from the worker so node extension never needs a mutable
+/// `SearchWorker` borrow.
+#[derive(Clone, Copy)]
+struct ExtendContext {
+    played_history_len: usize,
+    two_fold_draws: bool,
+}
+
 /// px0 `SearchWorker` (`src/search/classic/search.h:203-448`)。
 pub struct SearchWorker<'a> {
     tree: WorkerTree<'a>,
@@ -1530,6 +1539,10 @@ impl<'a> SearchWorker<'a> {
         end_idx: usize,
         workspace: &mut TaskWorkspace,
     ) -> Result<(), EnginError> {
+        let extend_context = ExtendContext {
+            played_history_len: self.played_history_len,
+            two_fold_draws: self.params.two_fold_draws,
+        };
         workspace.history = tree.history().clone();
         for i in start_idx..end_idx {
             // px0 immediately skips collisions here. They only carry an
@@ -1543,7 +1556,14 @@ impl<'a> SearchWorker<'a> {
             let moves_to_visit = std::mem::take(&mut self.iteration.minibatch[i].moves_to_visit);
             let is_terminal = tree.node(node_idx).is_terminal();
             if self.iteration.minibatch[i].is_extendable(is_terminal) {
-                self.extend_node_in_tree(tree, node_idx, depth, &moves_to_visit, &mut workspace.history)?;
+                Self::extend_node_in_tree(
+                    extend_context,
+                    tree,
+                    node_idx,
+                    depth,
+                    &moves_to_visit,
+                    &mut workspace.history,
+                )?;
                 if !tree.node(node_idx).is_terminal() {
                     let position = EvalPosition {
                         positions: workspace.history.positions().to_vec(),
@@ -1584,11 +1604,23 @@ impl<'a> SearchWorker<'a> {
         moves_to_node: &[Move],
         history: &mut PositionHistory,
     ) -> Result<(), EnginError> {
-        self.with_tree(|worker, tree| worker.extend_node_in_tree(tree, node_idx, depth, moves_to_node, history))
+        self.with_tree(|worker, tree| {
+            Self::extend_node_in_tree(
+                ExtendContext {
+                    played_history_len: worker.played_history_len,
+                    two_fold_draws: worker.params.two_fold_draws,
+                },
+                tree,
+                node_idx,
+                depth,
+                moves_to_node,
+                history,
+            )
+        })
     }
 
     fn extend_node_in_tree(
-        &mut self,
+        context: ExtendContext,
         tree: &mut NodeTree,
         node_idx: usize,
         depth: u16,
@@ -1596,7 +1628,7 @@ impl<'a> SearchWorker<'a> {
         history: &mut PositionHistory,
     ) -> Result<(), EnginError> {
         let root = tree.current_head();
-        history.trim(self.played_history_len);
+        history.trim(context.played_history_len);
         for mv in moves_to_node {
             history.append(*mv);
         }
@@ -1626,7 +1658,7 @@ impl<'a> SearchWorker<'a> {
             // when tree reuse moves the root into that cycle.
             if history.last().repetitions() == 1
                 && depth.saturating_sub(1) >= 4
-                && self.params.two_fold_draws
+                && context.two_fold_draws
                 && u32::from(depth.saturating_sub(1)) >= history.last().cycle_length()
             {
                 let cycle_length = history.last().cycle_length();
