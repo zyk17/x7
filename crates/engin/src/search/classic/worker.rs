@@ -5,8 +5,10 @@
 //! 所有权拆开；后台 tree phase 仍在逐段重译。
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use parking_lot::RwLock;
 
@@ -579,6 +581,7 @@ impl Default for TaskWorkspace {
 struct TaskPhaseState {
     queue: PickTaskQueue,
     main_runner: TaskRunner,
+    processing_pool: Option<ProcessingTaskPool>,
 }
 
 /// px0 keeps one `TaskWorkspace` per `RunTasks` thread plus a separate
@@ -631,8 +634,7 @@ impl TaskRunner {
 ///
 /// `minibatch_`、`computation_` 和 `number_out_of_order_` 的生命周期只跨越
 /// 一次 `InitializeIteration -> UpdateCounters`。在 task worker 的 Rust 所有权
-/// 尚未完成翻译前，它们只由主搜索线程持有，不能通过 `SearchWorker` 别名暴露给
-/// task。
+/// 它们只由主搜索线程持有，不能通过 `SearchWorker` 别名暴露给 task。
 #[derive(Default)]
 struct IterationState {
     minibatch: Vec<NodeToProcess>,
@@ -679,6 +681,144 @@ enum ExtensionResult {
     Terminal(GameResult, f32, Terminal),
 }
 
+/// Owned work submitted to one persistent px0 processing task worker.
+///
+/// px0 `ProcessPickedTask` (`src/search/classic/search.cc:1423-1462`) runs
+/// under `nodes_mutex_`. Rust cannot lend its mutable `NodeTree` to a
+/// persistent thread, so the worker receives only the immutable leaf path and
+/// root history. It returns rule/move-generation results; the owning search
+/// worker performs the corresponding node write and NN submission after
+/// `WaitForTasks`.
+struct ExtensionTask {
+    claimed: ClaimedTask,
+    root_history: PositionHistory,
+    extend: ExtendContext,
+    root_idx: usize,
+    items: Vec<ExtensionTaskItem>,
+}
+
+struct ExtensionTaskItem {
+    minibatch_index: usize,
+    node_idx: usize,
+    depth: u16,
+    moves_to_visit: MoveList,
+}
+
+struct ExtensionTaskOutput {
+    minibatch_index: usize,
+    node_idx: usize,
+    result: ExtensionResult,
+    history: PositionHistory,
+}
+
+struct CompletedExtensionTask {
+    claimed: ClaimedTask,
+    outputs: Vec<ExtensionTaskOutput>,
+}
+
+enum ProcessingTaskCommand {
+    Run(ExtensionTask),
+    Shutdown,
+}
+
+/// px0 `task_threads_` / `task_workspaces_` (`src/search/classic/search.h:441-445`).
+///
+/// The standard-library channel supplies only the generic task transport.
+/// Search semantics remain in `ExtensionTask` and the owner-side result
+/// application below. The receiver mutex is held only while taking one task;
+/// workers execute their private `TaskWorkspace` without a shared tree lock.
+struct ProcessingTaskPool {
+    commands: Sender<ProcessingTaskCommand>,
+    completed: Receiver<CompletedExtensionTask>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl ProcessingTaskPool {
+    fn new(worker_count: usize) -> Self {
+        let (commands, command_receiver) = mpsc::channel();
+        let (completed_sender, completed) = mpsc::channel();
+        let command_receiver = Arc::new(Mutex::new(command_receiver));
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let commands = Arc::clone(&command_receiver);
+            let completed = completed_sender.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut workspace = TaskWorkspace::default();
+                loop {
+                    let command = commands.lock().expect("task command lock").recv();
+                    match command {
+                        Ok(ProcessingTaskCommand::Run(task)) => {
+                            let completed_task = Self::run_extension_task(task, &mut workspace);
+                            if completed.send(completed_task).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(ProcessingTaskCommand::Shutdown) | Err(_) => return,
+                    }
+                }
+            }));
+        }
+        Self {
+            commands,
+            completed,
+            workers,
+        }
+    }
+
+    fn submit(&self, task: ExtensionTask) -> Result<(), EnginError> {
+        self.commands
+            .send(ProcessingTaskCommand::Run(task))
+            .map_err(|_| EnginError::Uci("P4 processing task worker stopped".to_owned()))
+    }
+
+    fn wait_for(&self, count: usize) -> Result<Vec<CompletedExtensionTask>, EnginError> {
+        let mut completed = Vec::with_capacity(count);
+        for _ in 0..count {
+            completed.push(
+                self.completed
+                    .recv()
+                    .map_err(|_| EnginError::Uci("P4 processing task worker stopped".to_owned()))?,
+            );
+        }
+        Ok(completed)
+    }
+
+    fn run_extension_task(task: ExtensionTask, workspace: &mut TaskWorkspace) -> CompletedExtensionTask {
+        let mut outputs = Vec::with_capacity(task.items.len());
+        for item in task.items {
+            workspace.reset_history_to_root(&task.root_history);
+            let result = SearchWorker::evaluate_extension(
+                task.extend,
+                item.node_idx == task.root_idx,
+                item.depth,
+                &item.moves_to_visit,
+                &mut workspace.history,
+            );
+            outputs.push(ExtensionTaskOutput {
+                minibatch_index: item.minibatch_index,
+                node_idx: item.node_idx,
+                result,
+                history: workspace.history.clone(),
+            });
+        }
+        CompletedExtensionTask {
+            claimed: task.claimed,
+            outputs,
+        }
+    }
+}
+
+impl Drop for ProcessingTaskPool {
+    fn drop(&mut self) {
+        for _ in &self.workers {
+            let _ = self.commands.send(ProcessingTaskCommand::Shutdown);
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Inputs used by px0 `ProcessPickedTask` and `FetchSingleNodeResult`
 /// (`src/search/classic/search.cc:1423-1462,2117-2154`). The minibatch range
 /// itself remains separately and exclusively borrowed by the caller.
@@ -705,9 +845,8 @@ pub struct SearchWorker<'a> {
     /// px0-resolved configuration, retained for diagnostics and future
     /// task-thread activation.
     task_workers: i32,
-    /// Production activation gate. The configured px0 count is retained for
-    /// diagnostics. Keep this at zero until a persistent Rust task ownership
-    /// model matches px0's `nodes_mutex_` tree phase.
+    /// Active persistent processing workers. Their owned extension phase is
+    /// separated from the owner-side tree/backend phase.
     active_task_workers: i32,
     /// px0 `SearchWorker::latest_time_manager_hints_`
     /// (`src/search/classic/search.h:368-369`). Each search worker owns this
@@ -838,8 +977,12 @@ impl<'a> SearchWorker<'a> {
             1,
             (params.max_out_of_order_evals_factor * target_minibatch_size as f32) as usize,
         );
+        let active_task_workers = usize::try_from(task_workers.max(0)).expect("non-negative task worker count");
         let mut task_phase = TaskPhaseState::default();
         task_phase.main_runner.workspace.reset_history_to_root(&history);
+        if active_task_workers > 0 {
+            task_phase.processing_pool = Some(ProcessingTaskPool::new(active_task_workers));
+        }
         Self {
             history,
             played_history_len,
@@ -853,11 +996,11 @@ impl<'a> SearchWorker<'a> {
             target_minibatch_size,
             max_out_of_order,
             task_workers,
-            // px0 `SearchWorker` starts persistent task threads in its
-            // constructor (`search.h:205-244`). Rust has no equivalent yet;
-            // preserve the parsed value above, but never activate it in
-            // production.
-            active_task_workers: 0,
+            // px0 starts `task_threads_` in the constructor
+            // (`src/search/classic/search.h:205-244`). Rust workers own only
+            // extension inputs/results; the owner retains the mutable tree
+            // and backend computation.
+            active_task_workers: i32::try_from(active_task_workers).expect("task worker count fits i32"),
             latest_time_manager_hints: StoppersHints::default(),
             task_phase,
             twofold_correction_lock: Mutex::new(()),
@@ -893,7 +1036,7 @@ impl<'a> SearchWorker<'a> {
     fn selection_context(&self) -> SelectionContext<'_> {
         debug_assert!(
             self.active_task_workers <= self.task_workers,
-            "the temporary activation gate must never exceed the px0-resolved configuration"
+            "active task workers must not exceed the px0-resolved configuration"
         );
         SelectionContext {
             params: self.params,
@@ -991,6 +1134,112 @@ impl<'a> SearchWorker<'a> {
         (main_start, queued > 0)
     }
 
+    /// Publishes px0's already-split processing ranges to persistent Rust
+    /// task workers. The task gets copies of paths/history only; this owner
+    /// retains the mutable minibatch slots and `NodeTree`.
+    fn dispatch_processing_tasks_in_tree(&mut self, tree: &NodeTree) -> Result<usize, EnginError> {
+        let Some(pool) = self.task_phase.processing_pool.as_ref() else {
+            return Ok(0);
+        };
+        let root_idx = tree.current_head();
+        let mut submitted = 0;
+        while let Some(claimed) = self.task_phase.queue.take() {
+            debug_assert_eq!(claimed.task.kind, PickTaskKind::Processing);
+            let mut items = Vec::new();
+            for minibatch_index in claimed.task.start_idx..claimed.task.end_idx {
+                let item = &self.iteration.minibatch[minibatch_index];
+                if item.is_collision || tree.node(item.node_idx).is_terminal() {
+                    continue;
+                }
+                items.push(ExtensionTaskItem {
+                    minibatch_index,
+                    node_idx: item.node_idx,
+                    depth: item.depth,
+                    moves_to_visit: item.moves_to_visit.clone(),
+                });
+            }
+            if items.is_empty() {
+                self.task_phase.queue.complete(claimed);
+                continue;
+            }
+            pool.submit(ExtensionTask {
+                claimed,
+                root_history: self.history.clone(),
+                extend: ExtendContext {
+                    played_history_len: self.played_history_len,
+                    two_fold_draws: self.params.two_fold_draws,
+                },
+                root_idx,
+                items,
+            })?;
+            submitted += 1;
+        }
+        Ok(submitted)
+    }
+
+    /// Applies owned task-worker results at the owner-side half of px0
+    /// `ProcessPickedTask` (`src/search/classic/search.cc:1423-1462`). This
+    /// is intentionally the only point at which a persistent task result can
+    /// mutate a node or enqueue backend input.
+    fn apply_processing_task_results_in_tree(
+        &mut self,
+        tree: &mut NodeTree,
+        completed: Vec<CompletedExtensionTask>,
+    ) -> Result<(), EnginError> {
+        let context = ProcessingContext {
+            params: self.params,
+            computation: self.iteration.computation.as_deref(),
+            extend: ExtendContext {
+                played_history_len: self.played_history_len,
+                two_fold_draws: self.params.two_fold_draws,
+            },
+        };
+        for task in completed {
+            for output in task.outputs {
+                let item = self
+                    .iteration
+                    .minibatch
+                    .get_mut(output.minibatch_index)
+                    .expect("task result refers to this iteration minibatch");
+                debug_assert_eq!(item.node_idx, output.node_idx);
+                debug_assert!(!item.is_collision);
+                match output.result {
+                    ExtensionResult::Edges(moves) => tree.node_mut(output.node_idx).create_edges(&moves),
+                    ExtensionResult::Terminal(result, plies, terminal) => {
+                        tree.make_terminal(output.node_idx, result, plies, terminal)
+                    }
+                }
+                if !tree.node(output.node_idx).is_terminal() {
+                    let position = EvalPosition {
+                        positions: output.history.positions().to_vec(),
+                        legal_moves: tree
+                            .node(output.node_idx)
+                            .edges()
+                            .iter()
+                            .map(|edge| edge.mv)
+                            .collect::<MoveList>(),
+                    };
+                    let (result, ticket) = context
+                        .computation
+                        .ok_or(EnginError::PortIncomplete("P4 ProcessPickedTask without computation"))?
+                        .add_input(position)?;
+                    item.nn_queried = true;
+                    item.is_cache_hit = result == AddInputResult::FetchedImmediately;
+                    item.eval_ticket = Some(ticket);
+                }
+                if context.params.out_of_order_eval
+                    && item.can_eval_out_of_order(tree.node(output.node_idx).is_terminal())
+                {
+                    Self::fetch_single_node_result_in_tree(&context, tree, item)?;
+                    item.ooo_completed = true;
+                }
+            }
+            self.task_phase.queue.complete(task.claimed);
+        }
+        self.task_phase.queue.wait();
+        Ok(())
+    }
+
     /// px0 `SearchWorker::ExecuteOneIteration` (`search.cc:1142-1231`)。
     pub fn execute_one_iteration(&mut self) -> Result<(), EnginError> {
         self.initialize_iteration()?;
@@ -998,8 +1247,9 @@ impl<'a> SearchWorker<'a> {
             return Ok(());
         }
         let gather_result = self.gather_minibatch();
-        // Preserve px0's task-count phase boundary before backend work
-        // (`search.cc:1182-1185`). There are no independent task threads yet.
+        // Preserve px0's task-count idle boundary before backend work
+        // (`search.cc:1182-1185`). Persistent processing workers sleep until
+        // the next split range is published.
         self.task_phase.queue.idle();
         if let Err(error) = gather_result {
             self.release_searcher_permit();
@@ -1257,6 +1507,16 @@ impl<'a> SearchWorker<'a> {
                 picked_visits,
             );
 
+            // px0 publishes all but the final processing range before the
+            // main worker processes its suffix (`search.cc:1322-1362`). The
+            // Rust tasks own only extension inputs, so their tree/backend
+            // half is applied after the owner waits for their results.
+            let submitted_processing_tasks = if needs_wait && self.task_phase.processing_pool.is_some() {
+                self.dispatch_processing_tasks_in_tree(tree)?
+            } else {
+                0
+            };
+
             let mut runner = std::mem::take(&mut self.task_phase.main_runner);
             let process_result = self.process_picked_task_in_tree(
                 tree,
@@ -1264,10 +1524,23 @@ impl<'a> SearchWorker<'a> {
                 self.iteration.minibatch.len(),
                 &mut runner.workspace,
             );
-            if needs_wait {
-                self.wait_for_queued_tasks_in_tree(tree)?;
-            }
+            let task_result = (|| -> Result<(), EnginError> {
+                if submitted_processing_tasks > 0 {
+                    let completed = self
+                        .task_phase
+                        .processing_pool
+                        .as_ref()
+                        .expect("active task worker pool")
+                        .wait_for(submitted_processing_tasks)?;
+                    self.apply_processing_task_results_in_tree(tree, completed)
+                } else if needs_wait {
+                    self.wait_for_queued_tasks_in_tree(tree)
+                } else {
+                    Ok(())
+                }
+            })();
             self.task_phase.main_runner = runner;
+            task_result?;
             process_result?;
 
             let mut some_ooo = false;
@@ -2640,11 +2913,11 @@ mod tests {
         }
     }
 
-    /// Keep px0's configured count visible while the production activation
-    /// gate remains closed. Real ONNX `go movetime` covered the deleted scoped
-    /// bridge's missing aliasing proof; see `NextStep.md`.
+    /// px0 starts task threads for a non-CPU backend in the constructor
+    /// (`src/search/classic/search.h:205-244`). The Rust pool must be live
+    /// before the first iteration and leave no virtual visits after stop.
     #[test]
-    fn gpu_backend_keeps_requested_task_worker_count_diagnostic_only() {
+    fn gpu_backend_starts_owned_processing_task_workers() {
         ensure_init();
         let mut tree = NodeTree::default();
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -2667,7 +2940,8 @@ mod tests {
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
 
         assert_eq!(worker.task_workers, 1);
-        assert_eq!(worker.active_task_workers, 0);
+        assert_eq!(worker.active_task_workers, 1);
+        assert!(worker.task_phase.processing_pool.is_some());
 
         std::thread::scope(|scope| {
             let state = Arc::clone(&search_state);
@@ -2685,8 +2959,52 @@ mod tests {
 
         assert!(search_state.total_playouts.load(Ordering::Acquire) >= 16);
         assert_eq!(worker.task_workers, 1);
-        assert_eq!(worker.active_task_workers, 0);
+        assert_eq!(worker.active_task_workers, 1);
         assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
+    }
+
+    /// The persistent worker receives no `NodeTree`: it can produce the same
+    /// extension payload as px0 `ProcessPickedTask`, while the owner remains
+    /// responsible for applying it (`search.cc:1423-1462`).
+    #[test]
+    fn processing_task_returns_owned_extension_without_tree_access() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let root_history = tree.history().clone();
+        let pool = ProcessingTaskPool::new(1);
+
+        pool.submit(ExtensionTask {
+            claimed: ClaimedTask {
+                id: 0,
+                task: PickTask::processing(0, 1),
+            },
+            root_history,
+            extend: ExtendContext {
+                played_history_len: tree.history().len(),
+                two_fold_draws: true,
+            },
+            root_idx: root,
+            items: vec![ExtensionTaskItem {
+                minibatch_index: 0,
+                node_idx: root,
+                depth: 1,
+                moves_to_visit: Vec::new(),
+            }],
+        })
+        .expect("submit extension task");
+
+        let mut completed = pool.wait_for(1).expect("extension result");
+        let task = completed.pop().expect("one task");
+        assert_eq!(task.claimed.id, 0);
+        assert_eq!(task.outputs.len(), 1);
+        assert_eq!(task.outputs[0].node_idx, root);
+        assert!(matches!(&task.outputs[0].result, ExtensionResult::Edges(moves) if !moves.is_empty()));
+        // The background task has no mutable tree handle, so it cannot create
+        // edges before the owner-side apply phase.
+        assert!(tree.node(root).edges().is_empty());
     }
 
     #[test]

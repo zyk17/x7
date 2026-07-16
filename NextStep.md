@@ -23,8 +23,8 @@ virtual visit 不会带入下一次 `go`。参考 `src/search/classic/search.cc:
 
 ## P4 当前边界
 
-`TaskWorkers` 仍按 px0 `src/search/classic/search.h:205-224` 解析，但正式运行固定
-`active_task_workers=0`。这不是暂时的性能参数，而是安全门控。
+`TaskWorkers` 按 px0 `src/search/classic/search.h:205-224` 解析，并在 `SearchWorker` 构造/析构时创建、
+停止和回收常驻 processing task worker。`active_task_workers` 不再是 `0` 门控。
 
 px0 的 `RunTasks` 让后台 task 在主 worker 持有 `nodes_mutex_` 的同一 tree phase 中直接访问普通
 `Node`/`NodeTree`，见：
@@ -34,7 +34,9 @@ px0 的 `RunTasks` 让后台 task 在主 worker 持有 `nodes_mutex_` 的同一 
 - `src/search/classic/node.cc:245-373`
 
 Rust 当前的 `NodeTree` 需要独占 `&mut` 借用，且 `Node` 的 WDL、terminal、bounds、children 和 edge
-不是可并发字段。此前的 raw-pointer scoped bridge 在真实 ONNX 的长时间搜索中重复扩展节点并停顿，已删除。
+不是可并发字段。processing task 因此只消费 owned leaf path/root history，以私有 `TaskWorkspace` 计算
+`ExtendNode` 的 rule/move result；owner 在 `WaitForTasks` 后独占写 node、提交 backend input、OOO 和 backup。
+此前 raw-pointer scoped bridge 在真实 ONNX 的长时间搜索中重复扩展节点并停顿，已删除。
 
 禁止：
 
@@ -42,20 +44,16 @@ Rust 当前的 `NodeTree` 需要独占 `&mut` 借用，且 `Node` 的 WDL、term
 - 用整树锁把后台 task 串行化后宣称已经并行
 - 仅凭 `n/n_in_flight` 原子化或 child slot 唯一创建解除门控
 
-## 下一翻译点：常驻 Task Worker
+## P4 剩余翻译点：gathering task
 
-只有先确定一个不违背 Rust 所有权、同时能保持 px0 task phase 语义的 tree 并发边界，才允许实现：
-
-1. `SearchWorker` 构造/析构时创建、停止和回收常驻 task worker。
-2. task 只拥有 task、workspace 和 result；主 worker 独占 minibatch、backend computation、计数器与 UCI 生命周期。
-   task 不能直接借用或锁住 `NodeTree`：它以 owned 的 `NodeToProcess + moves/history` 输入计算规则终局与合法着法，
-   返回 extension result；主 worker 在 `WaitForTasks` 后独占写回 node、提交 backend input。这是 Rust 对 px0
-   `ProcessPickedTask` (`search.cc:1423-1462`) tree phase 的无别名边界。
-3. gathering 仅处理不重叠 subtree，processing 仅处理不重叠 minibatch range。
-4. `WaitForTasks` 返回后才允许 collision、NN、fetch、backup 进入下一阶段。
-5. 以真实 x7 ONNX/DirectML 验证固定 nodes、长 `movetime`、`stop -> wait`、`position ... moves ...`，并验证所有节点的 `NInFlight == 0`。
-
-如果无法为第 1-4 项给出对应的安全所有权模型，应保持 `active_task_workers=0`，不实现近似替代。
+1. processing task 已完成安全所有权边界：其连续参考为 px0 `search.h:205-244,348-445` 与
+   `search.cc:1069-1140,1322-1362,1423-1462`。后台 task 只能拥有 `NodeToProcess + moves/history`、workspace
+   和 extension result；owner 在 `WaitForTasks` 后写 tree/backend。
+2. gathering 仍由 owner tree phase 同步运行。若继续翻译 px0 `PickNodesToExtendTask`
+   (`search.cc:1551-1897`)，必须先给出不共享 `NodeTree` 的 owned selection delta 方案；不能用 raw pointer、
+   `unsafe impl Send`、整树锁或共享 `&mut SearchWorker`。
+3. `WaitForTasks` 返回后才允许 collision、NN、fetch、backup 进入下一阶段。
+4. 以真实 x7 ONNX/DirectML 验证固定 nodes、长 `movetime`、`stop -> wait`、`position ... moves ...`，并验证所有节点的 `NInFlight == 0`。
 
 ## 验收命令
 

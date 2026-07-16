@@ -1193,12 +1193,12 @@ mod tests {
         );
     }
 
-    /// A configured px0 `TaskWorkers` value must not activate Rust background
-    /// tasks before the task-owned tree phase is translated. This verifies the
-    /// safe fallback still completes a multi-SearchWorker search
+    /// A configured px0 `TaskWorkers` value starts owned processing tasks
+    /// without breaking the shared-tree search lifecycle. This verifies the
+    /// safe task/result boundary across multiple SearchWorkers
     /// (`search.h:205-244`, `search.cc:1088-1140,1268-1508`).
     #[test]
-    fn shared_search_workers_keep_task_workers_gated() {
+    fn shared_search_workers_complete_with_owned_task_workers() {
         ensure_init();
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));

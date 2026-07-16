@@ -101,8 +101,8 @@ pub struct Node {
     edges: Vec<Edge>,
     // px0 mutates its sibling child list only while `nodes_mutex_` owns the
     // tree phase (`src/search/classic/search.cc:1142-1211,1494-1508`). Rust
-    // mirrors that boundary with `&mut NodeTree`; task workers stay gated
-    // until a separate, proven concurrent representation exists.
+    // keeps this owner-only: persistent task workers return owned extension
+    // results and never borrow `NodeTree`.
     children: Vec<Option<usize>>,
     terminal: Terminal,
     lower_bound: GameResult,
@@ -482,7 +482,8 @@ pub struct NodeArena {
 impl NodeArena {
     /// px0 creates child ownership while its caller owns the tree phase
     /// (`src/search/classic/node.cc:196-210,465-520`). The safe Rust path
-    /// requires an exclusive arena borrow; scoped task workers remain gated.
+    /// requires an exclusive arena borrow; persistent task workers never
+    /// access the arena directly.
     pub fn alloc(&mut self, node: Node) -> usize {
         let idx = self.nodes.len();
         self.nodes.push(Box::new(node));

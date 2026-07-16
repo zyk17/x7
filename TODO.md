@@ -18,16 +18,17 @@
 
 ## P4：常驻 Task Worker
 
-- [ ] 按 `src/search/classic/search.h:205-244,348-445` 与
-  `search.cc:1069-1140,1322-1362,1423-1508,1551-1897` 先定义安全的 tree-phase 所有权边界。
-  不得使用 raw pointer、`unsafe impl Send`、共享 `&mut SearchWorker` 或整树锁串行化。task 仅消费 owned
-  selection input/history 并产出 extension result；主 worker 在 `WaitForTasks` 后独占写回 tree、提交 backend input。
-- [ ] 在上述边界成立后，翻译 px0 的常驻 `task_threads_`、`task_workspaces_`、`RunTasks`、`WaitForTasks`。
+- [x] 按 `src/search/classic/search.h:205-244,348-445` 与
+  `search.cc:1069-1140,1322-1362,1423-1462` 定义 processing 的安全所有权边界：task 仅消费 owned
+  extension input/history 并产出 result；owner 在 `WaitForTasks` 后独占写 tree、提交 backend input。
+- [x] 翻译 processing 的常驻 `task_threads_`、`task_workspaces_`、`RunTasks`、`WaitForTasks`；不使用 raw
+  pointer、`unsafe impl Send`、共享 `&mut SearchWorker`、`NodeTree` 或整树锁串行化。
+- [ ] 只有给出 owned selection delta 后，翻译 px0 gathering task 的并发版本
+  (`search.cc:1551-1897`)；当前 owner 同步 gathering 是有意的安全边界。
 - [ ] 补真实 x7 ONNX/DirectML 回归：固定 nodes、长 `movetime`、`stop -> wait`、
   `position ... moves ...` 与所有节点 `NInFlight == 0`。
 
 ## 约束
 
-- `active_task_workers=0` 是当前唯一正式行为；`TaskWorkers` 只保留 px0 配置解析与同步 split 诊断。
 - `UniformBackend` 只用于单元测试与对拍，正式 UCI 不得使用。
-- P4 task worker 未完成前，不吸收 lc0/KataGo 的搜索结构或性能优化。
+- P4 gathering task 未完成前，不吸收 lc0/KataGo 的搜索结构或性能优化。

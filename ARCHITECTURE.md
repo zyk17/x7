@@ -10,9 +10,9 @@
 2. `engin` 外围：`GameState`、UCI controller/loop、`SearchBase` 与 px0
    `NetworkAsBackendComputation`。P4 的真实 history、124-plane 编码、policy 映射、ONNX batch 和
    `WeightsFile -> OnnxBackend` 子集已接入。
-3. `engin/mcts`：px0 `src/search` 的 classic worker 主线；单 worker 的 minibatch、collision、
-   prefetch、tree reuse 与 watchdog 已接线。旧 scoped raw-pointer task-worker 在真实 ONNX 长
-   `go movetime` 中会停止推进，已删除；当前强制 `active_task_workers=0`。
+3. `engin/mcts`：px0 `src/search` 的 classic worker 主线；minibatch、collision、prefetch、tree reuse、
+   watchdog 与常驻 processing task worker 已接线。task 只处理拥有的 leaf path/history 与规则扩展，
+   owner 在 `WaitForTasks` 后独占写 tree 和提交 backend；旧 scoped raw-pointer bridge 已删除。
 4. prefetch、tree reuse、并发与真实 ONNX 的 px0 `MemCache` wrapper 已接线。缓存通用容器采用
    `quick_cache` 分片 S3-FIFO，value 以 `Arc<EvalResult>` 共享；px0 的 key/collision guard/completed-only
    回填时序不变，但淘汰策略不是严格 FIFO。后续改动只能在明确引用的 px0 语义上继续。
@@ -24,7 +24,7 @@
 
 `crates/xiangqi_core`：px0 `src/chess` 的 Rust 翻译，是唯一规则真相。
 
-`crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。P2 UCI、P3 tree 与 P4 的 ONNX、MemCache、collision、prefetch、单 worker tree phase、watchdog 和 WDL display 已接入。GPU task-worker 仍是 P4 未完成项：旧 scoped raw-pointer 移植已在真实 ONNX 长 `go movetime` 中复现停顿且已删除，当前保持 `active_task_workers=0`。`WeightsFile` 保持 px0 的 UCI 名称，但只接受本项目 ONNX 模型，不实现 px0 的 backend registry、protobuf weight 或 autodiscover。P4 的 `SendUciInfo` 已生成深度、NPS/EPS、WDL、PV、MultiPV、ScoreType 与完整 WDL calibration display 语义。`ClassicEngine` 保持 px0 的会话边界：每个新 `go`、`position`、`ucinewgame` 都先回收旧搜索；`setoption` 只更新下一次 `go` 的参数快照，不中断当前搜索（`src/engine.cc:148-224`、`src/search/classic/wrapper.cc:100-140`）。
+`crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。P2 UCI、P3 tree 与 P4 的 ONNX、MemCache、collision、prefetch、owner tree phase、watchdog、WDL display 和常驻 processing task worker 已接入。task 仅持有输入/workspace/result，主 worker 在 `WaitForTasks` 后写 tree 和提交 backend；这替代了已删除、会在真实 ONNX 长 `go movetime` 停顿的 scoped raw-pointer bridge。gathering 仍在 owner 的 tree phase 执行。`WeightsFile` 保持 px0 的 UCI 名称，但只接受本项目 ONNX 模型，不实现 px0 的 backend registry、protobuf weight 或 autodiscover。P4 的 `SendUciInfo` 已生成深度、NPS/EPS、WDL、PV、MultiPV、ScoreType 与完整 WDL calibration display 语义。`ClassicEngine` 保持 px0 的会话边界：每个新 `go`、`position`、`ucinewgame` 都先回收旧搜索；`setoption` 只更新下一次 `go` 的参数快照，不中断当前搜索（`src/engine.cc:148-224`、`src/search/classic/wrapper.cc:100-140`）。
 
 未完成对应 px0 stopper 或生命周期的 UCI 命令不得伪装支持：`nodes`、`movetime`、`infinite` 与
 px0 factory 默认 legacy 时钟字段可启动搜索。`depth/mate` 仍等待完整 stopper 翻译，

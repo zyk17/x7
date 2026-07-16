@@ -17,9 +17,11 @@ px0 `MemCache` 风格的 `CachingBackend` 包裹：按局面 hash 查找、以�
 `ucinewgame` 清空；默认 `NNCacheSize=2000000`。缓存容器使用 `quick_cache` 分片 S3-FIFO，缓存命中以
 `Arc<EvalResult>` 共享 policy 向量；这替代了 px0 的严格 FIFO 容器，但不改变 NN cache 的 key、collision
 guard 或 completed-only 回填语义。
-px0 的 GPU task-worker 尚未完成：旧 scoped raw-pointer 翻译在真实 ONNX 的长 `go movetime` 中会停止推进，
-已删除而非保留为诊断实现。正式运行强制 `active_task_workers=0`，只保留安全的单 worker 搜索；px0 的
-`TaskWorkers` 解析仅保留作诊断，后续必须按 px0 重建常驻 worker 与节点所有权边界。
+px0 的常驻 processing task-worker 已按 `src/search/classic/search.h:205-244,348-445` 与
+`search.cc:1069-1140,1322-1362,1423-1462` 接入：task 只拥有 leaf path、root history、workspace 与
+extension result；主 worker 在 `WaitForTasks` 后独占写 tree、提交 ONNX 和 backup。旧 scoped raw-pointer
+bridge 已删除，后台 task 不会借用 `NodeTree`、minibatch 或 backend computation。gathering task 仍由 owner
+tree phase 同步执行，避免把 px0 的 `nodes_mutex_` 别名模型错误搬到 Rust。
 
 主 UCI 使用 px0 名称 `WeightsFile` 配置 ONNX 权重，并会在下一条 `position` 前加载它。正式
 `ClassicEngine` 在权重成功加载前没有 `ClassicSearch`，不会以 `UniformBackend` 代替模型搜索。
