@@ -65,6 +65,8 @@ task split 不可用：此前 Rust raw-pointer 版本会让两个 task 重复扩
 `src/search/classic/search.cc:1510-1550,1551-1897`；processing 的 minibatch range/tree 所有权仍待拆分。
 已完成 `ExtendNode` 输入拆分：仅使用 `ExtendContext + tree + history`，参考
 `src/search/classic/search.cc:1899-1974`；下一步仅允许继续收窄 processing 的明确 range。
+已完成 processing range 拆分：`ProcessingContext + &mut [NodeToProcess]`，参考
+`src/search/classic/search.cc:1423-1462,2109-2156`；尚未证明 tree 写入不重叠，`task_workers` 必须保持 0。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占

@@ -133,6 +133,10 @@ twofold 回退改为纯 tree helper，对应 `search.cc:1510-1550`。
 `SearchWorker`。该 context 仅含 px0 `ExtendNode` 使用的 root-history 长度和 twofold 开关，参考
 `src/search/classic/search.cc:1899-1974`；这为 processing range 的独占传递消除了一个 worker 别名来源。
 
+第六步已完成：`ProcessPickedTask`/`FetchSingleNodeResult` 已收为 `ProcessingContext + &mut [NodeToProcess]`
+的 range 操作；computation 以共享 `BackendComputation` 引用进入，task 只能回写自身 item。参考 px0
+`src/search/classic/search.cc:1423-1462,2109-2156`。tree 写入范围仍须在启用后台 task 前证明不重叠。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

@@ -495,6 +495,15 @@ struct ExtendContext {
     two_fold_draws: bool,
 }
 
+/// Inputs used by px0 `ProcessPickedTask` and `FetchSingleNodeResult`
+/// (`src/search/classic/search.cc:1423-1462,2117-2154`). The minibatch range
+/// itself remains separately and exclusively borrowed by the caller.
+struct ProcessingContext<'a> {
+    params: &'a SearchParams,
+    computation: Option<&'a dyn BackendComputation>,
+    extend: ExtendContext,
+}
+
 /// px0 `SearchWorker` (`src/search/classic/search.h:203-448`)。
 pub struct SearchWorker<'a> {
     tree: WorkerTree<'a>,
@@ -1539,23 +1548,41 @@ impl<'a> SearchWorker<'a> {
         end_idx: usize,
         workspace: &mut TaskWorkspace,
     ) -> Result<(), EnginError> {
+        let context = ProcessingContext {
+            params: self.params,
+            computation: self.iteration.computation.as_deref(),
+            extend: ExtendContext {
+                played_history_len: self.played_history_len,
+                two_fold_draws: self.params.two_fold_draws,
+            },
+        };
+        let range = &mut self.iteration.minibatch[start_idx..end_idx];
+        Self::process_picked_range(&context, tree, range, workspace)
+    }
+
+    fn process_picked_range(
+        context: &ProcessingContext<'_>,
+        tree: &mut NodeTree,
+        range: &mut [NodeToProcess],
+        workspace: &mut TaskWorkspace,
+    ) -> Result<(), EnginError> {
         let extend_context = ExtendContext {
-            played_history_len: self.played_history_len,
-            two_fold_draws: self.params.two_fold_draws,
+            played_history_len: context.extend.played_history_len,
+            two_fold_draws: context.extend.two_fold_draws,
         };
         workspace.history = tree.history().clone();
-        for i in start_idx..end_idx {
+        for item in range {
             // px0 immediately skips collisions here. They only carry an
             // in-flight reservation and must not enter terminal/cache OOO
             // evaluation (`search.cc:1429-1432`).
-            if self.iteration.minibatch[i].is_collision {
+            if item.is_collision {
                 continue;
             }
-            let node_idx = self.iteration.minibatch[i].node_idx;
-            let depth = self.iteration.minibatch[i].depth;
-            let moves_to_visit = std::mem::take(&mut self.iteration.minibatch[i].moves_to_visit);
+            let node_idx = item.node_idx;
+            let depth = item.depth;
+            let moves_to_visit = std::mem::take(&mut item.moves_to_visit);
             let is_terminal = tree.node(node_idx).is_terminal();
-            if self.iteration.minibatch[i].is_extendable(is_terminal) {
+            if item.is_extendable(is_terminal) {
                 Self::extend_node_in_tree(
                     extend_context,
                     tree,
@@ -1574,22 +1601,18 @@ impl<'a> SearchWorker<'a> {
                             .map(|edge| edge.mv)
                             .collect::<MoveList>(),
                     };
-                    let (result, ticket) = self
-                        .iteration
+                    let (result, ticket) = context
                         .computation
-                        .as_ref()
                         .ok_or(EnginError::PortIncomplete("P4 ProcessPickedTask without computation"))?
                         .add_input(position)?;
-                    self.iteration.minibatch[i].nn_queried = true;
-                    self.iteration.minibatch[i].is_cache_hit = result == AddInputResult::FetchedImmediately;
-                    self.iteration.minibatch[i].eval_ticket = Some(ticket);
+                    item.nn_queried = true;
+                    item.is_cache_hit = result == AddInputResult::FetchedImmediately;
+                    item.eval_ticket = Some(ticket);
                 }
             }
-            if self.params.out_of_order_eval
-                && self.iteration.minibatch[i].can_eval_out_of_order(tree.node(node_idx).is_terminal())
-            {
-                self.fetch_single_node_result_in_tree(tree, i)?;
-                self.iteration.minibatch[i].ooo_completed = true;
+            if context.params.out_of_order_eval && item.can_eval_out_of_order(tree.node(node_idx).is_terminal()) {
+                Self::fetch_single_node_result_in_tree(context, tree, item)?;
+                item.ooo_completed = true;
             }
         }
         Ok(())
@@ -1878,20 +1901,32 @@ impl<'a> SearchWorker<'a> {
     }
 
     fn fetch_minibatch_results_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        for i in 0..self.iteration.minibatch.len() {
-            self.fetch_single_node_result_in_tree(tree, i)?;
+        let context = ProcessingContext {
+            params: self.params,
+            computation: self.iteration.computation.as_deref(),
+            extend: ExtendContext {
+                played_history_len: self.played_history_len,
+                two_fold_draws: self.params.two_fold_draws,
+            },
+        };
+        for item in &mut self.iteration.minibatch {
+            Self::fetch_single_node_result_in_tree(&context, tree, item)?;
         }
         Ok(())
     }
 
     /// px0 `SearchWorker::FetchSingleNodeResult` (`search.cc:2117-2154`)。
-    fn fetch_single_node_result_in_tree(&mut self, tree: &mut NodeTree, index: usize) -> Result<(), EnginError> {
-        if self.iteration.minibatch[index].is_collision {
+    fn fetch_single_node_result_in_tree(
+        context: &ProcessingContext<'_>,
+        tree: &mut NodeTree,
+        item: &mut NodeToProcess,
+    ) -> Result<(), EnginError> {
+        if item.is_collision {
             return Ok(());
         }
-        let node_idx = self.iteration.minibatch[index].node_idx;
-        if !self.iteration.minibatch[index].nn_queried {
-            self.iteration.minibatch[index].eval = EvalResult {
+        let node_idx = item.node_idx;
+        if !item.nn_queried {
+            item.eval = EvalResult {
                 wl: tree.node(node_idx).wl(),
                 d: tree.node(node_idx).d(),
                 m: tree.node(node_idx).m(),
@@ -1899,13 +1934,11 @@ impl<'a> SearchWorker<'a> {
             };
             return Ok(());
         }
-        let ticket = self.iteration.minibatch[index]
+        let ticket = item
             .eval_ticket
             .ok_or(EnginError::PortIncomplete("P4 FetchSingleNodeResult missing ticket"))?;
-        let mut eval = self
-            .iteration
+        let mut eval = context
             .computation
-            .as_mut()
             .ok_or(EnginError::PortIncomplete(
                 "P4 FetchSingleNodeResult without computation",
             ))?
@@ -1915,27 +1948,23 @@ impl<'a> SearchWorker<'a> {
         // UCI formatting (`src/search/classic/search.cc:2128-2143`). The
         // neutral defaults are identity in ratio/diff terms; contempt mode is
         // translated separately before non-zero diff becomes configurable.
-        if self.params.wdl_rescale_ratio != 1.0
-            || (self.params.wdl_rescale_diff != 0.0 && self.params.contempt_mode != ContemptMode::None)
+        if context.params.wdl_rescale_ratio != 1.0
+            || (context.params.wdl_rescale_diff != 0.0 && context.params.contempt_mode != ContemptMode::None)
         {
-            let root_stm = (self.params.contempt_mode == ContemptMode::Black) == tree.history().is_black_to_move();
-            let sign = if root_stm ^ (self.iteration.minibatch[index].depth % 2 == 1) {
-                1.0
-            } else {
-                -1.0
-            };
+            let root_stm = (context.params.contempt_mode == ContemptMode::Black) == tree.history().is_black_to_move();
+            let sign = if root_stm ^ (item.depth % 2 == 1) { 1.0 } else { -1.0 };
             wdl_rescale(
                 &mut eval.wl,
                 &mut eval.d,
-                self.params.wdl_rescale_ratio,
-                if self.params.contempt_mode == ContemptMode::None {
+                context.params.wdl_rescale_ratio,
+                if context.params.contempt_mode == ContemptMode::None {
                     0.0
                 } else {
-                    self.params.wdl_rescale_diff
+                    context.params.wdl_rescale_diff
                 },
                 sign,
                 false,
-                self.params.wdl_max_s,
+                context.params.wdl_max_s,
             );
         }
         if tree.node(node_idx).n() == 0 {
@@ -1946,7 +1975,7 @@ impl<'a> SearchWorker<'a> {
             // be spawned (`node.cc:291-298`, `search.cc:2145-2153`).
             tree.node_mut(node_idx).sort_edges();
         }
-        self.iteration.minibatch[index].eval = eval;
+        item.eval = eval;
         Ok(())
     }
 
