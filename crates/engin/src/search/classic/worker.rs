@@ -243,7 +243,12 @@ impl PickTask {
 /// `search.cc:1069-1140,1464-1483`). Task execution is wired separately.
 #[derive(Default)]
 pub struct PickTaskQueue {
-    tasks: Mutex<Vec<PickTask>>,
+    // px0 keeps stable `PickTask` storage because task threads hold pointers
+    // into `picking_tasks_` (`search.cc:1088-1090,1469-1473`). Rust instead
+    // moves a claimed task out of its slot, then returns that same task on
+    // completion. This preserves the task/result lifecycle without cloning a
+    // task or aliasing its mutable result vector across threads.
+    tasks: Mutex<Vec<Option<PickTask>>>,
     task_count: AtomicIsize,
     /// px0 `task_taking_started_`: a tiny claim lock around the task index.
     /// Rust keeps task storage behind a mutex, but retains this separate state
@@ -283,7 +288,7 @@ impl PickTaskQueue {
         if tasks.len() >= Self::MAX_TASKS {
             return false;
         }
-        tasks.push(task);
+        tasks.push(Some(task));
         drop(tasks);
         self.task_count.fetch_add(1, Ordering::AcqRel);
         self.task_added.notify_all();
@@ -315,29 +320,19 @@ impl PickTaskQueue {
             }
             std::hint::spin_loop();
         };
-        self.tasks.lock().expect("pick task queue lock").get(index).map(|task| {
-            (
-                index,
-                PickTask {
-                    kind: task.kind,
-                    start: task.start,
-                    base_depth: task.base_depth,
-                    collision_limit: task.collision_limit,
-                    moves_to_base: task.moves_to_base.clone(),
-                    results: Vec::new(),
-                    start_idx: task.start_idx,
-                    end_idx: task.end_idx,
-                    complete: false,
-                },
-            )
-        })
+        self.tasks
+            .lock()
+            .expect("pick task queue lock")
+            .get_mut(index)
+            .and_then(Option::take)
+            .map(|task| (index, task))
     }
 
     /// px0 completion accounting (`src/search/classic/search.cc:1136-1137`).
-    pub fn complete(&self, index: usize, results: Vec<NodeToProcess>) {
-        if let Some(task) = self.tasks.lock().expect("pick task queue lock").get_mut(index) {
-            task.results = results;
+    pub fn complete(&self, index: usize, mut task: PickTask) {
+        if let Some(slot) = self.tasks.lock().expect("pick task queue lock").get_mut(index) {
             task.complete = true;
+            *slot = Some(task);
             self.completed_tasks.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -407,7 +402,7 @@ impl PickTaskQueue {
     pub fn drain_results_into(&self, receiver: &mut Vec<NodeToProcess>) {
         self.wait();
         let mut tasks = self.tasks.lock().expect("pick task queue lock");
-        for task in tasks.iter_mut() {
+        for task in tasks.iter_mut().flatten() {
             receiver.append(&mut task.results);
         }
     }
@@ -1042,28 +1037,25 @@ impl<'a> SearchWorker<'a> {
         tree: &mut NodeTree,
         workspace: &mut TaskWorkspace,
     ) -> Result<(), EnginError> {
-        while let Some((task_id, task)) = self.task_phase.queue.take() {
-            let results = match task.kind {
+        while let Some((task_id, mut task)) = self.task_phase.queue.take() {
+            match task.kind {
                 PickTaskKind::Gathering => {
-                    let mut results = Vec::new();
                     self.pick_nodes_to_extend_task_with_workspace(
                         tree,
                         task.start.expect("gathering task start"),
                         task.base_depth,
                         task.collision_limit,
                         &task.moves_to_base,
-                        &mut results,
+                        &mut task.results,
                         workspace,
                         false,
                     )?;
-                    results
                 }
                 PickTaskKind::Processing => {
                     self.process_picked_task_in_tree(tree, task.start_idx, task.end_idx, workspace)?;
-                    Vec::new()
                 }
-            };
-            self.task_phase.queue.complete(task_id, results);
+            }
+            self.task_phase.queue.complete(task_id, task);
         }
         Ok(())
     }
@@ -2731,6 +2723,26 @@ mod tests {
         let mut claimed = claimed.lock().expect("claimed task lock").clone();
         claimed.sort_unstable();
         assert_eq!(claimed, (0..32).collect::<Vec<_>>());
+    }
+
+    /// A claimed gathering task keeps ownership of its result vector until it
+    /// is explicitly completed, matching px0's `PickTask::results` handoff
+    /// (`src/search/classic/search.cc:1124-1137,1501-1507`).
+    #[test]
+    fn pick_task_queue_returns_owned_gather_results_once() {
+        let queue = PickTaskQueue::default();
+        queue.reset();
+        assert!(queue.push(PickTask::gathering(7, 2, Vec::new(), 1)));
+
+        let (task_id, mut task) = queue.take().expect("claimed gathering task");
+        task.results.push(NodeToProcess::visit(11, 3));
+        queue.complete(task_id, task);
+
+        let mut results = Vec::new();
+        queue.drain_results_into(&mut results);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].node_idx, 11);
+        assert_eq!(results[0].depth, 3);
     }
 
     /// px0 sets `task_count_ = -1` after one gather without destroying its

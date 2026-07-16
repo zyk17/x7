@@ -115,6 +115,11 @@ P4 的单 worker/minibatch/OOO/cache/stopper 主线可用，但 GPU task-worker 
 `InitializeIteration -> UpdateCounters`，仍只由主 worker 写入。下一步不是启用线程，而是把
 `PickTask` 的输入、workspace 与结果变成可移动的独占值，再证明 px0 processing range 不重叠。
 
+第二步已完成：`PickTaskQueue` 领取 task 时移动其唯一所有权，完成后把同一个 task（含 gathering
+结果）回填 slot；不再克隆 `moves_to_base` 或临时 results。该 Rust 所有权映射对应 px0
+`RunTasks` 的领取/完成区间（`src/search/classic/search.cc:1069-1140`）和 `PickTask::results` 的合并区间
+（`1494-1508`）。workspace 和 tree 仍未可安全移动到后台线程。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体
