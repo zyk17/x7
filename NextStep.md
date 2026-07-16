@@ -204,6 +204,14 @@ P4 的 gather/processing task 时序、queue lifecycle、独立 workspace、task
 生产并发搜索。下一步先对照 `src/search/classic/search.cc:1551-1897` 和
 `src/search/classic/node.cc:245-373` 建立该回归的最小复现与唯一扩展证明。
 
+第二十步（并发语义核对）已完成：px0 `PickNodesToExtend` 在主线程持有 `nodes_mutex_` 时启动 task，task
+直接执行 `PickNodesToExtendTask`/`ProcessPickedTask`，见 `src/search/classic/search.cc:1069-1140,1485-1508`；
+该 mutex 的实现是 `std::shared_timed_mutex` 包装，见 `src/utils/mutex.h:93-119`，并不把这把锁交给 task。
+px0 依赖 `Node::TryStartScoreUpdate` 的 `n_ == 0 && n_in_flight_ > 0` 排他规则，见
+`src/search/classic/node.cc:348-365`。现有 Rust raw pointer 直接并发访问普通 arena，会令这组非原子读写发生
+数据竞争，真实 ONNX 的重复 `ExtendNode` 正是其表现。后续不得以“节点已有 edges 则跳过”掩盖；必须先给出能
+保持该 in-flight 原子性的 Rust 节点存储/同步边界，才能重启 task worker。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

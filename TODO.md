@@ -111,6 +111,9 @@ seal/join 后合并 results。
 - [ ] 在固定 visits、`go movetime`、真实 ONNX/DirectML 下补重复 ExtendNode、`NInFlight==0`、stop/wait
   回归；当前真实 ONNX `go infinite -> stop` 已复现重复 ExtendNode，运行时 `active_task_workers=0`。只有该
   回归稳定后才能解除该门控并恢复 px0 GPU `task_workers_` 的实际执行。
+- [ ] 先为 px0 `Node::TryStartScoreUpdate` 的唯一扩展语义建立 Rust 并发边界，对照
+  `src/search/classic/node.cc:348-365`、`search.cc:1485-1508,1551-1897` 与 `src/utils/mutex.h:93-119`：
+  不能把普通 `NodeTree` arena 直接暴露给多个 `&mut`，也不能用“已有 edges 则跳过”吞掉重复扩展。
 
 ## 约束
 

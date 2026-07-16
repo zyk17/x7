@@ -45,6 +45,9 @@ P4 task-worker 允许最小、可审计的 `unsafe`，但只能逐段翻译 px0 
 此前实现会在真实 ONNX 下重复 `ExtendNode`；重启前必须在 `NextStep.md`/`TODO.md` 标明 px0
 `src/search/classic/search.h:205-244,348-445`、`search.cc:1069-1508` 的对应区间，并补齐固定 visits、
 `go movetime`、stop/wait、`NInFlight==0` 与真实 ONNX 回归。不得以整树锁串行化 task worker。
+px0 `nodes_mutex_` 的主线程持锁/task 线程直接读写模型不能按字面作为 Rust alias 模型搬运；必须先保住
+`Node::TryStartScoreUpdate` 的 `n_in_flight_` 唯一扩展语义（`node.cc:348-365`），不得用“已有 edges 则跳过”
+掩盖竞争。
 
 ## 依赖与关键路径
 
