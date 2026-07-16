@@ -669,6 +669,10 @@ struct SelectionContext<'a> {
     latest_time_manager_hints: StoppersHints,
     task_workers: i32,
     task_queue: &'a PickTaskQueue,
+    /// px0 `picking_tasks_mutex_` serializes ancestor rollback for a reused
+    /// two-fold terminal (`search.cc:1517-1541`). This is intentionally a
+    /// per-SearchWorker lock, not a tree-wide lock.
+    twofold_correction_lock: &'a Mutex<()>,
 }
 
 /// Inputs used by px0 `ExtendNode` (`src/search/classic/search.cc:1899-1974`).
@@ -706,10 +710,10 @@ pub struct SearchWorker<'a> {
     /// px0-resolved configuration, retained for diagnostics and future
     /// task-thread activation.
     task_workers: i32,
-    /// Production activation gate. A real ONNX stop/wait regression found
-    /// duplicate `ExtendNode` calls in the scoped raw-pointer path, so task
-    /// publication remains synchronous until that px0 tree-phase defect is
-    /// resolved.
+    /// Production activation gate. The configured px0 count is retained for
+    /// diagnostics, but real ONNX `go movetime` currently deadlocks in the
+    /// scoped raw-pointer path. Keep this at zero until the Rust node-aliasing
+    /// proof matches px0's `nodes_mutex_` tree phase.
     active_task_workers: i32,
     /// px0 `SearchWorker::latest_time_manager_hints_`
     /// (`src/search/classic/search.h:368-369`). Each search worker owns this
@@ -717,6 +721,9 @@ pub struct SearchWorker<'a> {
     latest_time_manager_hints: StoppersHints,
     played_history_len: usize,
     task_phase: TaskPhaseState,
+    /// px0 `picking_tasks_mutex_` (`search.h:435`, `search.cc:1517-1541`).
+    /// It only serializes the exceptional two-fold ancestor rewrite.
+    twofold_correction_lock: Mutex<()>,
 }
 
 impl<'a> SearchWorker<'a> {
@@ -850,9 +857,15 @@ impl<'a> SearchWorker<'a> {
             target_minibatch_size,
             max_out_of_order,
             task_workers,
-            active_task_workers: task_workers,
+            // px0 `SearchWorker` starts persistent task threads in its
+            // constructor (`search.h:205-244`). The scoped Rust substitute is
+            // not equivalent: a real ONNX long-time search stalls while a task
+            // phase is active. Preserve the parsed value above, but never
+            // activate this incomplete translation in production.
+            active_task_workers: 0,
             latest_time_manager_hints: StoppersHints::default(),
             task_phase: TaskPhaseState::default(),
+            twofold_correction_lock: Mutex::new(()),
         }
     }
 
@@ -894,6 +907,7 @@ impl<'a> SearchWorker<'a> {
             latest_time_manager_hints: self.latest_time_manager_hints.clone(),
             task_workers: self.active_task_workers,
             task_queue: &self.task_phase.queue,
+            twofold_correction_lock: &self.twofold_correction_lock,
         }
     }
 
@@ -1399,6 +1413,7 @@ impl<'a> SearchWorker<'a> {
             latest_time_manager_hints: self.latest_time_manager_hints.clone(),
             task_workers: self.active_task_workers,
             task_queue: &self.task_phase.queue,
+            twofold_correction_lock: &self.twofold_correction_lock,
         };
         let queue = &self.task_phase.queue;
         let tree = ScopedTaskTree::from_tree(tree);
@@ -1507,6 +1522,7 @@ impl<'a> SearchWorker<'a> {
             latest_time_manager_hints: self.latest_time_manager_hints.clone(),
             task_workers: self.active_task_workers,
             task_queue: &self.task_phase.queue,
+            twofold_correction_lock: &self.twofold_correction_lock,
         };
         let processing = ProcessingContext {
             params: self.params,
@@ -1900,6 +1916,7 @@ impl<'a> SearchWorker<'a> {
                         tree,
                         child_idx,
                         workspace.current_path.len() as u16 + base_depth,
+                        context.twofold_correction_lock,
                     );
                     if tree.node(child_idx).try_start_score_update() {
                         workspace.current_n_started[best_idx] += 1;
@@ -2012,12 +2029,25 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::EnsureNodeTwoFoldCorrectForDepth`
     /// (`src/search/classic/search.cc:1510-1550`)。
-    fn ensure_node_twofold_correct_for_depth_in_tree(tree: &mut NodeTree, child_idx: usize, depth: u16) {
+    fn ensure_node_twofold_correct_for_depth_in_tree(
+        tree: &mut NodeTree,
+        child_idx: usize,
+        depth: u16,
+        correction_lock: &Mutex<()>,
+    ) {
         let child = tree.node(child_idx);
         if !child.is_twofold_terminal() || depth as f32 >= child.m() {
             return;
         }
 
+        let _guard = correction_lock.lock().expect("px0 twofold correction lock");
+        // A competing task may have completed the correction while this task
+        // waited. px0's lock makes the rewrite exclusive; recheck under the
+        // Rust equivalent before touching the ancestor chain.
+        let child = tree.node(child_idx);
+        if !child.is_twofold_terminal() || depth as f32 >= child.m() {
+            return;
+        }
         let wl = child.wl();
         let d = child.d();
         let m = child.m();
@@ -2039,7 +2069,9 @@ impl<'a> SearchWorker<'a> {
 
     #[cfg(test)]
     fn ensure_node_twofold_correct_for_depth(&mut self, child_idx: usize, depth: u16) {
-        self.with_tree(|_, tree| Self::ensure_node_twofold_correct_for_depth_in_tree(tree, child_idx, depth));
+        self.with_tree(|worker, tree| {
+            Self::ensure_node_twofold_correct_for_depth_in_tree(tree, child_idx, depth, &worker.twofold_correction_lock)
+        });
     }
 
     /// px0 `SearchWorker::ProcessPickedTask` (`src/search/classic/search.cc:1423-1462`)。
@@ -2848,11 +2880,11 @@ mod tests {
         }
     }
 
-    /// px0 activates an explicit GPU task-worker request for both gathering
-    /// and processing phases (`search.h:205-244`,
-    /// `search.cc:1322-1362,1494-1508`).
+    /// Keep px0's configured count visible while the production activation
+    /// gate remains closed. Real ONNX `go movetime` covers the scoped tree
+    /// implementation's missing aliasing proof; see `NextStep.md`.
     #[test]
-    fn gpu_backend_keeps_requested_task_worker_count() {
+    fn gpu_backend_keeps_requested_task_worker_count_diagnostic_only() {
         ensure_init();
         let mut tree = NodeTree::default();
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -2875,7 +2907,7 @@ mod tests {
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
 
         assert_eq!(worker.task_workers, 1);
-        assert_eq!(worker.active_task_workers, 1);
+        assert_eq!(worker.active_task_workers, 0);
 
         std::thread::scope(|scope| {
             let state = Arc::clone(&search_state);
@@ -2887,13 +2919,13 @@ mod tests {
                 }
                 stop.store(true, Ordering::Release);
             });
-            worker.run_blocking().expect("GPU task split search");
+            worker.run_blocking().expect("GPU-configured single-worker search");
             stopper.join().expect("stopper thread");
         });
 
         assert!(search_state.total_playouts.load(Ordering::Acquire) >= 16);
         assert_eq!(worker.task_workers, 1);
-        assert_eq!(worker.active_task_workers, 1);
+        assert_eq!(worker.active_task_workers, 0);
         assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
     }
 

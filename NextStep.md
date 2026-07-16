@@ -10,6 +10,31 @@
 P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正式 ONNX 路径使用
 `124x10x9 -> 2062 + WDL`，Windows 实测后端为 DirectML。
 
+## P4 task-worker 安全门控（2026-07-16）
+
+真实 `x7.onnx` / DirectML 下，默认 GPU task-worker 的 `go movetime 12000` 在约
+`442ms / 6308 nodes` 后停止推进，30 秒内既不产生新 `info` 也不返回 `bestmove`。因此当前
+`active_task_workers` 已重新固定为 `0`；`task_workers` 仍只保留 px0 `search.h:205-224` 的配置解析，
+不得把它当成已启用的并发搜索。
+
+本轮 1:1 审查确认的阻塞项，按修复顺序如下：
+
+1. 先翻译 px0 `search.cc:1510-1550` 的 twofold 回滚互斥。Rust 当前会由 task 同时回写同一祖先链，缺少
+   px0 `picking_tasks_mutex_` 的等价边界。
+2. 收窄或移除 `NodeArena::get_mut_unchecked(&self) -> &mut Node` 的别名接口；所有 task 可写字段必须拥有
+   明确的独占证明，不能只依赖 child slot / first-extend gate。
+3. 只有前两项通过真实 ONNX 长时间、stop/wait 与 `NInFlight==0` 回归后，才翻译 px0
+   `search.h:205-244,348-445` 的常驻 `task_threads_ / task_workspaces_`。禁止每个 phase 临时 spawn。
+4. 随后对照 `search.cc:1899-1906`，复用 worker/task 的 `PositionHistory`（`Trim + Append`），删除每轮、
+   每 range 和 ONNX 编码前的完整 history clone。
+5. 最后处理 `NodeArena` 的单全局 allocation lock、容量预留与 `RESERVED_CHILD` 的 release-mode 无限自旋。
+
+本节优先级高于下方所有“task-worker 已启用/已收口”的历史记录；历史记录仅保留故障演进，不是当前状态。
+
+第一项已完成：`SearchWorker` 现持有 px0 `picking_tasks_mutex_` 对应的 per-worker twofold correction lock，
+并在取得锁后重新检查 terminal 状态。该锁只保护 `search.cc:1517-1541` 的 ancestor rewrite，不解除
+`active_task_workers=0` 门控。
+
 ## P1-P3 进入 P4 前复核（2026-07-15）
 
 - P1：Rust `xiangqi_core` 的 release 全量对拍已通过：px0 移植的 `board_test.cc` depth-5 perft、

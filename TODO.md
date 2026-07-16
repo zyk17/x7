@@ -25,11 +25,21 @@
   `cargo test --release -p engin --lib`（88 项 P2/P3/controller/tree/UCT/P4 回归）与真实 ONNX UCI
   生命周期/legacy clock 冒烟已通过。
 
-## P4：px0 classic task-worker 已启用
+## P4：px0 classic task-worker 重新门控
 
-单 worker/minibatch/OOO/cache/stop 与 GPU task split 均已在真实 ONNX/DirectML 回归。`TaskWorkers`
-按 px0 解析并实际启用；`NodeArena` allocation lock、first-extend CAS、child-slot reservation 共同保证
-task phase 的最小并发边界。历史上的 duplicate `ExtendNode` 门控已解除。
+单 worker/minibatch/OOO/cache/stop 已在真实 ONNX/DirectML 回归。`TaskWorkers` 按 px0 解析，但不再
+实际启用：真实 ONNX 的长 `go movetime` 可复现 scoped task phase 停顿。`NodeArena` allocation lock、
+first-extend CAS 和 child-slot reservation 不能证明 task 对 ancestors/terminal/bounds 的并发写安全。
+
+- [x] 对照 `src/search/classic/search.cc:1510-1550`，为 twofold ancestor rollback 建立 px0 等价的 per-worker
+  task 互斥；锁后重新检查 terminal 状态，避免等待期间重复回滚。
+- [ ] 移除或收窄 `NodeArena::get_mut_unchecked(&self) -> &mut Node`；为每个并发可写 node 字段建立 Rust
+  无别名证明。参考 `src/search/classic/node.cc:245-373`、`search.cc:1551-1897`。
+- [ ] 对照 `src/search/classic/search.h:205-244,348-445`，将 scoped phase 临时线程改为常驻 task worker 与
+  workspace；仅在上述两项和真实 ONNX 回归均通过后开放。
+- [ ] 对照 `src/search/classic/search.cc:1899-1906`，消除 history/`EvalPosition`/ONNX 编码的重复复制。
+- [ ] 对照 `src/search/classic/node.h:468-525`，处理 child reservation 的 release-mode 无限等待，并为 NodeArena
+  设定明确容量策略。
 
 - [x] 翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为正式 ONNX 的
   `CachingBackend` wrapper：当前局面 hash 为 key、合法着数量防碰撞、cache miss 仅在
