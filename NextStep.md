@@ -40,6 +40,28 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
 
 ## P4：单 worker 搜索主线
 
+### P4 task-worker 重译前置约束（2026-07-16）
+
+px0 的 task-worker 不是独立的普通队列：主 worker 在持有 `nodes_mutex_` 的同一 tree phase 内，
+让 task thread 直接执行 `PickNodesToExtendTask` 或 `ProcessPickedTask`。参考
+`src/search/classic/search.cc:1069-1140,1423-1462,1485-1508,1551-1897` 与
+`search.h:348-445`。`Node` 的 visits、children 与 edge 存储均不是原子；px0 的正确性依赖 task split
+后的子树/`minibatch_` range 不重叠，不能用“每个任务各拿一把整树锁”替代。
+
+重新翻译必须按以下顺序完成：
+
+1. 将 Rust `SearchWorker` 的 task 所需状态按 px0 字段划分：task 独占 `TaskWorkspace`、`PickTask`
+   副本与 gathering results；主 worker 独占 `minibatch`、`BackendComputation`、iteration counters 与
+   UCI/stop 生命周期。不得跨线程共享 `&mut SearchWorker`。
+2. 只在 `PickNodesToExtend` 的 px0 tree phase 内向 task 公开任务；`WaitForTasks` 返回前，主 worker
+   不得进入 `CollectCollisions`、NN、fetch 或 backup。task range 的不重叠条件必须由入队处
+   `search.cc:1329-1362,1828-1897` 直接证明，而不是由调用者约定。
+3. 在任何并行实现前补回归：同一未扩展叶只能成功一次 `TryStartScoreUpdate`/`ExtendNode`；每轮
+   `WaitForTasks` 后 `NInFlight == 0`；固定 nodes、`go movetime`、`stop -> wait` 和
+   `position ... moves ...` 都要在真实 ONNX/DirectML 下通过。
+4. 当前保留 `task_workers=0`。只有上述结构与回归完成后，才可评估是否存在最小的、局限于 tree phase
+   的 Rust `unsafe`；不得恢复 `*mut SearchWorker`、`unsafe impl Send` 或 raw-pointer bridge。
+
 collision-only `sleep(10ms)` 保持与 px0 一致：它位于 `SearchWorker::UpdateCounters`
 (`src/search/classic/search.cc:2337-2351`)，只在一次 iteration 完全没有非 collision 工作时退避。
 

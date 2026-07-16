@@ -55,6 +55,9 @@ task split 不可用：此前 Rust raw-pointer 版本会让两个 task 重复扩
 
 ## 后续：P4 task-worker 的安全所有权翻译
 
+- [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
+  `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占
+  minibatch/computation/counters；禁止共享 `&mut SearchWorker`。
 - [ ] 重新设计 Rust task 的所有权边界，对照 px0 `src/search/classic/search.h:205-244,348-445`、
   `search.cc:1069-1508`：task 只能拥有独立 workspace 与明确不重叠的 node/minibatch range，不能共享
   `&mut SearchWorker` 或通过 raw pointer 直接修改整棵树。

@@ -434,6 +434,18 @@ impl Default for TaskWorkspace {
     }
 }
 
+/// px0 `SearchWorker` task-phase fields (`src/search/classic/search.h:433-445`).
+///
+/// This state is deliberately separate from the worker's minibatch, backend
+/// computation, and counters. A future task-worker translation may only move
+/// task-owned workspaces and task/result records across threads; it may not
+/// move the owning `SearchWorker`.
+#[derive(Default)]
+struct TaskPhaseState {
+    queue: PickTaskQueue,
+    main_workspace: TaskWorkspace,
+}
+
 /// px0 `SearchWorker` (`src/search/classic/search.h:203-448`)。
 pub struct SearchWorker<'a> {
     tree: WorkerTree<'a>,
@@ -456,8 +468,7 @@ pub struct SearchWorker<'a> {
     /// value; it must not be shared with other gather loops.
     latest_time_manager_hints: StoppersHints,
     played_history_len: usize,
-    task_queue: PickTaskQueue,
-    picking_workspace: TaskWorkspace,
+    task_phase: TaskPhaseState,
 }
 
 impl<'a> SearchWorker<'a> {
@@ -601,8 +612,7 @@ impl<'a> SearchWorker<'a> {
             task_workers,
             number_out_of_order: 0,
             latest_time_manager_hints: StoppersHints::default(),
-            task_queue: PickTaskQueue::default(),
-            picking_workspace: TaskWorkspace::default(),
+            task_phase: TaskPhaseState::default(),
         }
     }
 
@@ -615,7 +625,7 @@ impl<'a> SearchWorker<'a> {
         let gather_result = self.gather_minibatch();
         // Preserve px0's task-count phase boundary before backend work
         // (`search.cc:1182-1185`). There are no independent task threads yet.
-        self.task_queue.idle();
+        self.task_phase.queue.idle();
         if let Err(error) = gather_result {
             self.release_searcher_permit();
             return Err(error);
@@ -873,7 +883,7 @@ impl<'a> SearchWorker<'a> {
                 let task_workers = usize::try_from(self.task_workers).expect("positive task worker count");
                 let num_tasks = (picked_visits / min_per_task).clamp(2, task_workers + 1);
                 let per_worker = picked_visits / num_tasks;
-                self.task_queue.reset();
+                self.task_phase.queue.reset();
                 let mut found = 0usize;
                 let mut queued = 0usize;
                 for index in new_start..self.minibatch.len() {
@@ -882,7 +892,7 @@ impl<'a> SearchWorker<'a> {
                     }
                     found += 1;
                     if found == per_worker {
-                        if !self.task_queue.push(PickTask::processing(main_start, index + 1)) {
+                        if !self.task_phase.queue.push(PickTask::processing(main_start, index + 1)) {
                             break;
                         }
                         main_start = index + 1;
@@ -896,10 +906,10 @@ impl<'a> SearchWorker<'a> {
                 needs_wait = queued > 0;
             }
 
-            let mut workspace = std::mem::take(&mut self.picking_workspace);
+            let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
             let process_result =
                 self.process_picked_task_in_tree(tree, main_start, self.minibatch.len(), &mut workspace);
-            self.picking_workspace = workspace;
+            self.task_phase.main_workspace = workspace;
             process_result?;
             if needs_wait {
                 self.wait_for_queued_tasks_in_tree(tree)?;
@@ -990,9 +1000,9 @@ impl<'a> SearchWorker<'a> {
         }
         // px0 `SearchWorker::PickNodesToExtend` begins every gather with
         // `ResetTasks` (`src/search/classic/search.cc:1485-1492`).
-        self.task_queue.reset();
+        self.task_phase.queue.reset();
         let mut receiver = std::mem::take(&mut self.minibatch);
-        let mut workspace = std::mem::take(&mut self.picking_workspace);
+        let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
         let result = self.pick_nodes_to_extend_task_with_workspace(
             tree,
             tree.current_head(),
@@ -1003,10 +1013,10 @@ impl<'a> SearchWorker<'a> {
             &mut workspace,
             true,
         );
-        self.picking_workspace = workspace;
+        self.task_phase.main_workspace = workspace;
         self.minibatch = receiver;
         self.wait_for_queued_tasks_in_tree(tree)?;
-        self.task_queue.drain_results_into(&mut self.minibatch);
+        self.task_phase.queue.drain_results_into(&mut self.minibatch);
         result
     }
 
@@ -1020,7 +1030,7 @@ impl<'a> SearchWorker<'a> {
         tree: &mut NodeTree,
         workspace: &mut TaskWorkspace,
     ) -> Result<(), EnginError> {
-        while let Some((task_id, task)) = self.task_queue.take() {
+        while let Some((task_id, task)) = self.task_phase.queue.take() {
             let results = match task.kind {
                 PickTaskKind::Gathering => {
                     let mut results = Vec::new();
@@ -1041,7 +1051,7 @@ impl<'a> SearchWorker<'a> {
                     Vec::new()
                 }
             };
-            self.task_queue.complete(task_id, results);
+            self.task_phase.queue.complete(task_id, results);
         }
         Ok(())
     }
@@ -1052,16 +1062,16 @@ impl<'a> SearchWorker<'a> {
         if self.task_workers == 0 {
             self.run_tasks_synchronously_in_tree(tree)?;
         }
-        self.task_queue.wait();
+        self.task_phase.queue.wait();
         Ok(())
     }
 
     /// CPU fallback for px0 `TaskWorkers=0`: run queued work on the owning
     /// workspace without creating task threads.
     fn run_tasks_synchronously_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        let mut workspace = std::mem::take(&mut self.picking_workspace);
+        let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
         let result = self.run_queued_tasks_in_tree(tree, &mut workspace);
-        self.picking_workspace = workspace;
+        self.task_phase.main_workspace = workspace;
         result
     }
 
@@ -1368,7 +1378,7 @@ impl<'a> SearchWorker<'a> {
                                 moves_to_base,
                                 child_limit,
                             );
-                            if self.task_queue.push(task) {
+                            if self.task_phase.queue.push(task) {
                                 workspace.visits_to_perform.last_mut().expect("visits")[edge_idx] = 0;
                                 passed_off += child_limit;
                             }
@@ -2618,12 +2628,15 @@ mod tests {
         let params = SearchParams::default();
         let state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, &state);
-        worker.task_queue.reset();
-        assert!(worker.task_queue.push(PickTask::gathering(root, 0, Vec::new(), 1)));
+        worker.task_phase.queue.reset();
+        assert!(worker
+            .task_phase
+            .queue
+            .push(PickTask::gathering(root, 0, Vec::new(), 1)));
         let mut workspace = TaskWorkspace::default();
 
         worker.run_queued_tasks(&mut workspace).expect("run gathering task");
-        worker.task_queue.drain_results_into(&mut worker.minibatch);
+        worker.task_phase.queue.drain_results_into(&mut worker.minibatch);
 
         assert_eq!(worker.minibatch.len(), 1);
         assert!(!worker.minibatch[0].is_collision);
