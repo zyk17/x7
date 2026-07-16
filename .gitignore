@@ -9,6 +9,7 @@
 
 # --- Rust ---
 /target/
+/bundle/
 **/*.rs.bk
 
 # --- Python 打包与构建产物 ---

@@ -24,7 +24,7 @@ px0 的 GPU task-worker 尚未完成：旧 scoped raw-pointer 翻译在真实 ON
 主 UCI 使用 px0 名称 `WeightsFile` 配置 ONNX 权重，并会在下一条 `position` 前加载它。正式
 `ClassicEngine` 在权重成功加载前没有 `ClassicSearch`，不会以 `UniformBackend` 代替模型搜索。
 启动时依次查找 `engin.exe` 同目录的 `x7.onnx`、当前工作目录的 `x7.onnx`、开发目录
-`data/x7.onnx`。Windows 上当前优先使用 DirectML；CUDA 仅保留 fallback，不是当前验收后端。
+`data/x7.onnx`。Windows 发行构建只启用 DirectML；DirectML 初始化失败时明确回退 CPU，不依赖本机 CUDA 或 cuDNN。
 
 `info` 输出 px0 语义的平均/选择深度、NPS/EPS、WDL、PV、MultiPV、`ScoreType/WDL_mu` 与
 可配置的 `ContemptMode`/WDL calibration。`go nodes N` 是 px0 的 completed-iteration 下限，
@@ -62,6 +62,15 @@ go nodes 1000
 - 引擎 value：`q = win - loss`
 
 px0 翻译顺序与参考位置见 [NextStep.md](/C:/projects/77xiangqi_engine/NextStep.md) 与 [TODO.md](/C:/projects/77xiangqi_engine/TODO.md)。
+
+## Windows DirectML 打包
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1
+```
+
+脚本清理并重新编译 `engin`，然后生成 `bundle\`。当前 `ort` 静态链接 ONNX Runtime，因此 bundle 包含
+`engin.exe`、`x7.onnx` 和 `DirectML.dll`，不应混入其他版本的 `onnxruntime.dll`。
 
 Python 训练独立位于 `nn/`：固定纯 CNN、`124x10x9 -> 2062 + WDL`，从单一 YAML 配置启动；见
 [nn README](C:/projects/77xiangqi_engine/nn/README.md)。

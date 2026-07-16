@@ -157,6 +157,23 @@ quit
 
 ## 9. 质量检查
 
+## 10. Windows DirectML 打包
+
+清理 Rust 构建产物、以 DirectML-only `ort` 重编译并生成可分发目录。脚本会复制实际需要的
+DirectML provider DLL，并确认 bundle 内的 UCI 搜索没有回退 CPU：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1
+```
+
+默认读取 `data\x7.onnx`，输出到 `bundle\`。可指定其他模型或输出目录：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1 `
+  -ModelPath C:\models\x7.onnx `
+  -BundleDir C:\dist\x7-directml
+```
+
 ```powershell
 cargo check
 ```

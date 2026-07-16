@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ndarray::Array4;
-use ort::ep::{directml::PerformancePreference, DirectML, CUDA};
+use ort::ep::{directml::PerformancePreference, DirectML};
 use ort::session::Session;
 use ort::value::TensorRef;
 
@@ -35,7 +35,6 @@ pub struct OnnxBackend {
 /// network_onnx.cc:140-176`, `src/neural/wrapper.cc:49-68`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnnxProvider {
-    Cuda,
     DirectMl,
     Cpu,
 }
@@ -43,7 +42,6 @@ pub enum OnnxProvider {
 impl OnnxProvider {
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Cuda => "CUDAExecutionProvider",
             Self::DirectMl => "DmlExecutionProvider",
             Self::Cpu => "CPUExecutionProvider",
         }
@@ -142,53 +140,26 @@ impl OnnxBackend {
     }
 }
 
-/// Creates the DirectML session first on Windows, then CUDA, then explicitly
-/// falls back to CPU.
+/// Creates DirectML sessions and explicitly falls back to CPU when DirectML
+/// cannot be initialized.
 ///
 /// px0's ONNX backend receives a provider at construction and derives
 /// `IsCpu`/batch attributes from it (`src/neural/backends/onnx/
-/// network_onnx.cc:140-176`). The Rust port has one formal CUDA provider, so
-/// px0 receives one configured backend rather than a per-inference provider
-/// choice. For this Windows port DirectML is the first GPU backend: the cu12
-/// ONNX Runtime 1.24 artifact cannot execute on Blackwell GPUs, even when its
-/// CUDA/cuDNN DLLs are present. CUDA remains the fallback for systems where
-/// DirectML is unavailable; only failure of both GPU providers permits CPU.
+/// network_onnx.cc:140-176`). This Windows build intentionally supports one
+/// GPU execution provider only: DirectML. That keeps the bundled ORT runtime
+/// independent of locally installed CUDA and cuDNN versions.
 fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginError> {
-    let direct_ml = create_direct_ml_sessions(path);
-    match direct_ml {
+    match create_direct_ml_sessions(path) {
         Ok(sessions) => Ok((OnnxSessions::direct_ml(sessions), OnnxProvider::DirectMl)),
         Err(direct_ml_error) => {
-            let cuda = create_cuda_session(path);
-            match cuda {
-                Ok(session) => {
-                    eprintln!("ONNX DirectML unavailable; using CUDAExecutionProvider: {direct_ml_error}");
-                    Ok((OnnxSessions::single(OnnxProvider::Cuda, session), OnnxProvider::Cuda))
-                }
-                Err(cuda_error) => {
-                    let session = Session::builder()
-                        .map_err(onnx_error)?
-                        .commit_from_file(path)
-                        .map_err(onnx_error)?;
-                    eprintln!(
-                        "ONNX CUDA and DirectML unavailable; using CPUExecutionProvider: \
-                         DirectML={direct_ml_error}; CUDA={cuda_error}"
-                    );
-                    Ok((OnnxSessions::single(OnnxProvider::Cpu, session), OnnxProvider::Cpu))
-                }
-            }
+            let session = Session::builder()
+                .map_err(onnx_error)?
+                .commit_from_file(path)
+                .map_err(onnx_error)?;
+            eprintln!("ONNX DirectML unavailable; using CPUExecutionProvider: {direct_ml_error}");
+            Ok((OnnxSessions::single(OnnxProvider::Cpu, session), OnnxProvider::Cpu))
         }
     }
-}
-
-/// px0 configures CUDA as an ONNX execution provider while constructing the
-/// session (`src/neural/backends/onnx/network_onnx.cc:629-677`).
-fn create_cuda_session(path: &Path) -> Result<Session, EnginError> {
-    Session::builder()
-        .map_err(onnx_error)?
-        .with_execution_providers([CUDA::default().with_device_id(0).build().error_on_failure()])
-        .map_err(onnx_error)?
-        .commit_from_file(path)
-        .map_err(onnx_error)
 }
 
 /// px0 `network_onnx.cc:629-677,810-838,878-901`: create fixed DirectML
@@ -438,36 +409,5 @@ mod tests {
         assert_eq!(eval.policies.len(), legal.len());
         assert!((eval.policies.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         assert!(eval.wl.is_finite() && eval.d.is_finite());
-    }
-
-    /// Opt-in hardware diagnostic. CI and ordinary development do not require
-    /// CUDA; set `ENGIN_CUDA_SMOKE=1` to execute a real CUDA EP kernel.
-    #[test]
-    fn local_cuda_x7_smoke_if_enabled() {
-        if std::env::var_os("ENGIN_CUDA_SMOKE").is_none() {
-            return;
-        }
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx");
-        if !path.is_file() {
-            eprintln!("skip: {} is absent", path.display());
-            return;
-        }
-        let mut session = create_cuda_session(&path).expect("create CUDA ONNX session");
-        validate_model_io(&session).expect("validate CUDA ONNX session");
-        let history = xiangqi_core::PositionHistory::from_positions(vec![xiangqi_core::Position::from_fen(
-            xiangqi_core::STARTPOS_FEN,
-        )
-        .unwrap()]);
-        let input = encode_position_for_nn(&history, FillEmptyHistory::FenOnly);
-        let board = Array4::from_shape_vec((1, INPUT_PLANES, BOARD_ROWS, BOARD_COLS), input).unwrap();
-        let tensor = TensorRef::from_array_view(&board).unwrap();
-        let outputs = session
-            .run(ort::inputs!["board" => tensor])
-            .expect("run CUDA ONNX inference");
-        assert_eq!(
-            tensor_output(&outputs, "logits", 1, POLICY_SIZE).unwrap().len(),
-            POLICY_SIZE
-        );
-        assert_eq!(tensor_output(&outputs, "value", 1, 3).unwrap().len(), 3);
     }
 }

@@ -8,7 +8,7 @@ default-run = "engin"
 
 [dependencies]
 ndarray = "0.17"
-ort = { version = "2.0.0-rc.12", features = ["cuda", "directml", "download-binaries"] }
+ort = { version = "2.0.0-rc.12", features = ["directml", "download-binaries"] }
 parking_lot = "0.12"
 quick_cache = "0.7"
 xiangqi_core = { path = "../xiangqi_core" }

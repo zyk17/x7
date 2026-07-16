@@ -541,6 +541,14 @@ impl NodeTree {
         self.arena.get_mut(idx).expect("valid node index")
     }
 
+    /// px0 clears shared collision reservations before a search can be
+    /// destroyed (`src/search/classic/search.cc:1044-1064`). This test-only
+    /// whole-tree probe catches a leaked virtual visit below the root.
+    #[cfg(test)]
+    pub(crate) fn has_in_flight_visits(&self) -> bool {
+        self.arena.nodes.iter().any(|node| node.n_in_flight() != 0)
+    }
+
     /// px0 `EdgeAndNode(Edge*, Node*)` (`node.h:358-410`) 的 arena 适配。
     pub fn edge_and_node(&self, node_idx: usize, edge_idx: usize) -> EdgeAndNode<'_> {
         let node = self.node(node_idx);

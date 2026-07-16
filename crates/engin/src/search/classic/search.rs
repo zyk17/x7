@@ -21,7 +21,7 @@ use super::params::{
 };
 use super::stoppers::timemgr::{IterationStats, StoppersHints};
 use super::stoppers::{build_search_stoppers, ChainedSearchStopper, LegacyTimeManager, SearchStopper};
-use super::worker::{SearchWorker, WorkerSearchState};
+use super::worker::{cancel_shared_collisions, SearchWorker, WorkerSearchState};
 use crate::utils::fastmath::{fast_log, fast_logistic};
 
 pub fn best_move(tree: &NodeTree, params: &SearchParams, root_move_filter: &[Move]) -> (Move, Move) {
@@ -356,7 +356,7 @@ fn best_child_edge_is_better(
 }
 
 #[derive(Clone, Debug)]
-pub struct SearchOutput {
+struct SearchOutput {
     pub bestmove: BestMoveInfo,
     pub infos: Vec<ThinkingInfo>,
 }
@@ -369,7 +369,6 @@ struct SearchMeta {
     /// than at worker or backend creation time.
     nps_start_time: Option<Instant>,
     initial_visits: u32,
-    search_active: bool,
     /// px0 `Search::root_move_filter_` (`src/search/classic/search.h:168-171`).
     /// It is reconstructed from legal UCI `searchmoves` for every search.
     root_move_filter: Vec<Move>,
@@ -517,7 +516,6 @@ pub struct ClassicSearch {
     move_overhead_ms: i64,
     /// Same pending lifecycle for px0 `Slowmover` (`stoppers/factory.cc:73-114`).
     slowmover: f32,
-    pub outputs: Vec<SearchOutput>,
 }
 
 impl ClassicSearch {
@@ -528,7 +526,6 @@ impl ClassicSearch {
             move_start: Instant::now(),
             nps_start_time: None,
             initial_visits: 0,
-            search_active: false,
             root_move_filter: Vec::new(),
             contempt_mode: ContemptMode::None,
         }));
@@ -556,7 +553,6 @@ impl ClassicSearch {
             time_manager: LegacyTimeManager::new(200, 1.0),
             move_overhead_ms: 200,
             slowmover: 1.0,
-            outputs: Vec::new(),
         }
     }
 
@@ -764,7 +760,6 @@ impl ClassicSearch {
             how_many
         };
         self.worker_state.thread_count.store(thread_count, Ordering::Release);
-        self.meta.lock().expect("meta lock").search_active = true;
 
         let tree = Arc::clone(&self.tree);
         let worker_state = Arc::clone(&self.worker_state);
@@ -792,29 +787,39 @@ impl ClassicSearch {
             let mut watchdog_hints = StoppersHints::default();
             loop {
                 watchdog_stop_controller.maybe_trigger_stop(&watchdog_worker_state, &mut watchdog_hints);
-                if !watchdog_stop.load(Ordering::Acquire) {
-                    if let Some(responder) = &responder {
-                        // Keep px0's tree-before-current-best lock order. Backup
-                        // updates current_best_edge while holding the tree phase.
-                        let tree = watchdog_tree.read();
-                        let meta = watchdog_meta.lock().expect("meta lock");
-                        let edge = *watchdog_worker_state.current_best_edge.lock().expect("best edge lock");
-                        if edge.is_some() {
-                            if let Some(output) =
-                                ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
+                if let Some(responder) = &responder {
+                    // px0 calls `MaybeOutputInfo` after every stopper pass,
+                    // including the pass that first sets `stop_`
+                    // (`src/search/classic/search.cc:981-1017`). Keep its
+                    // tree-before-counters order while outputting the final
+                    // info and the infinite/ponder limit warning.
+                    let tree = watchdog_tree.read();
+                    let meta = watchdog_meta.lock().expect("meta lock");
+                    let edge = *watchdog_worker_state.current_best_edge.lock().expect("best edge lock");
+                    if !bestmove_is_sent.load(Ordering::Acquire) && edge.is_some() {
+                        if let Some(output) =
+                            ClassicSearch::snapshot_output(&tree, &meta, &watchdog_worker_state, has_wdl)
+                        {
+                            let info = output.infos.first().expect("root best edge has info");
+                            let mut last = live_info.lock().expect("live info lock");
+                            if edge != last.edge
+                                || info.depth != last.depth
+                                || info.seldepth != last.seldepth
+                                || last.time + 5_000 < info.time
                             {
-                                let info = output.infos.first().expect("root best edge has info");
-                                let mut last = live_info.lock().expect("live info lock");
-                                if edge != last.edge
-                                    || info.depth != last.depth
-                                    || info.seldepth != last.seldepth
-                                    || last.time + 5_000 < info.time
+                                responder.output_thinking_info(&output.infos);
+                                last.edge = edge;
+                                last.depth = info.depth;
+                                last.seldepth = info.seldepth;
+                                last.time = info.time;
+                                if watchdog_stop.load(Ordering::Acquire)
+                                    && !ok_to_respond_bestmove.load(Ordering::Acquire)
                                 {
-                                    responder.output_thinking_info(&output.infos);
-                                    last.edge = edge;
-                                    last.depth = info.depth;
-                                    last.seldepth = info.seldepth;
-                                    last.time = info.time;
+                                    responder.output_thinking_info(&[ThinkingInfo {
+                                        comment: "WARNING: Search has reached limit and does not make any progress."
+                                            .into(),
+                                        ..ThinkingInfo::default()
+                                    }]);
                                 }
                             }
                         }
@@ -909,7 +914,6 @@ impl SearchBase for ClassicSearch {
         *self.tree.write() = NodeTree::default();
         self.time_manager = LegacyTimeManager::new(self.move_overhead_ms, self.slowmover);
         self.worker_state = Arc::new(WorkerSearchState::new(Arc::clone(&self.stop)));
-        self.outputs.clear();
         Ok(())
     }
 
@@ -930,10 +934,13 @@ impl SearchBase for ClassicSearch {
         if params.depth.is_some() || params.mate.is_some() {
             return Err(EnginError::PortIncomplete("go depth/go mate stopper"));
         }
-        self.outputs.clear();
         self.stop.store(false, Ordering::Release);
         self.infinite.store(params.infinite, Ordering::Release);
-        self.ok_to_respond_bestmove.store(!params.infinite, Ordering::Release);
+        // px0 initializes this as `!infinite && !ponder` in `Search::Search`
+        // (`src/search/classic/search.cc:138-141`). UCI ponder remains
+        // unsupported, but the internal search contract must not diverge.
+        self.ok_to_respond_bestmove
+            .store(!params.infinite && !params.ponder, Ordering::Release);
         self.bestmove_is_sent.store(false, Ordering::Release);
         *self.live_info.lock().expect("live info lock") = LiveInfoState::default();
 
@@ -960,7 +967,7 @@ impl SearchBase for ClassicSearch {
             return Err(EnginError::PortIncomplete("time-based search stopper"));
         }
 
-        {
+        let infinite_play_contempt_warning = {
             let tree = self.tree.read();
             // px0 `StringsToMovelist` (`src/search/classic/wrapper.cc:78-100`)
             // parses at the root, retains legal requests only, and rejects a
@@ -988,6 +995,12 @@ impl SearchBase for ClassicSearch {
                 tree.history().is_black_to_move(),
                 params.ponder,
             );
+            // px0 `Search::Search` warns while constructing the search when
+            // `play` contempt is disabled for an infinite search
+            // (`src/search/classic/search.cc:156-170`).
+            let warn = params.infinite
+                && meta.params.contempt_mode == ContemptMode::Play
+                && meta.params.wdl_rescale_diff != 0.0;
             meta.nps_start_time = None;
             self.worker_state.total_playouts.store(0, Ordering::Release);
             self.worker_state.total_batches.store(0, Ordering::Release);
@@ -1013,6 +1026,17 @@ impl SearchBase for ClassicSearch {
                 time_manager_stopper,
             );
             *self.stopper.lock().expect("stopper lock") = Some(chain);
+            warn
+        };
+
+        if infinite_play_contempt_warning {
+            if let Some(responder) = &self.responder {
+                responder.output_thinking_info(&[ThinkingInfo {
+                    comment: "WARNING: Contempt mode set to 'disable' as 'play' not supported for infinite search."
+                        .into(),
+                    ..ThinkingInfo::default()
+                }]);
+            }
         }
 
         self.start_threads(0)?;
@@ -1025,13 +1049,18 @@ impl SearchBase for ClassicSearch {
     }
 
     fn wait_search(&mut self) -> Result<(), EnginError> {
-        // px0 `Search::Wait` only joins threads (`search.cc:1035-1041`). The
-        // watchdog, not this caller, owns stopping and response timing.
+        // px0 `Search::Wait` joins all threads (`search.cc:1035-1041`), and
+        // its per-go `Search` destructor then clears shared collision virtual
+        // visits (`search.cc:1044-1064`). This long-lived wrapper performs
+        // both operations at the equivalent post-join boundary.
         let handles: Vec<_> = self.threads.lock().expect("threads lock").drain(..).collect();
         for handle in handles {
             let _ = handle.join();
         }
-        self.meta.lock().expect("meta lock").search_active = false;
+        {
+            let mut tree = self.tree.write();
+            cancel_shared_collisions(&self.worker_state, &mut tree);
+        }
         Ok(())
     }
 
@@ -1056,7 +1085,7 @@ impl SearchBase for ClassicSearch {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Once};
+    use std::sync::{Arc, Mutex, Once};
 
     use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
@@ -1064,6 +1093,7 @@ mod tests {
         best_child_edge, best_move, orient_move, resolve_contempt_mode, score_from_wdl, wdl_from_wl_d, wdl_rescale,
         ContemptMode, ScoreType, SearchParams, WdlDisplayContext,
     };
+    use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo};
     use crate::neural::backend::{
         Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, UniformBackend,
     };
@@ -1075,6 +1105,19 @@ mod tests {
 
     fn ensure_init() {
         INIT.call_once(initialize_magic_bitboards);
+    }
+
+    #[derive(Default)]
+    struct RecordingSearchResponder {
+        infos: Mutex<Vec<ThinkingInfo>>,
+    }
+
+    impl SearchResponder for RecordingSearchResponder {
+        fn output_best_move(&self, _: &BestMoveInfo) {}
+
+        fn output_thinking_info(&self, infos: &[ThinkingInfo]) {
+            self.infos.lock().expect("infos lock").extend_from_slice(infos);
+        }
     }
 
     /// Deterministic backend used to exercise px0's multi-SearchWorker
@@ -1150,12 +1193,12 @@ mod tests {
         );
     }
 
-    /// px0 allows every GPU SearchWorker to keep its own helper threads while
-    /// `nodes_mutex_` serializes the outer tree phase (`search.h:205-244`,
-    /// `search.cc:1088-1140,1268-1508`). This exercises that composition with
-    /// a deterministic backend rather than relying on a local ONNX runtime.
+    /// A configured px0 `TaskWorkers` value must not activate Rust background
+    /// tasks before the task-owned tree phase is translated. This verifies the
+    /// safe fallback still completes a multi-SearchWorker search
+    /// (`search.h:205-244`, `search.cc:1088-1140,1268-1508`).
     #[test]
-    fn shared_search_workers_complete_scoped_task_phases() {
+    fn shared_search_workers_keep_task_workers_gated() {
         ensure_init();
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
@@ -1176,8 +1219,15 @@ mod tests {
 
         assert!(!best.is_null());
         assert!(visits >= 96);
+        assert_eq!(
+            search
+                .worker_state
+                .thread_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            3
+        );
         let tree = search.tree.read();
-        assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
+        assert!(!tree.has_in_flight_visits());
         assert!(search
             .worker_state
             .shared_collisions
@@ -1235,7 +1285,7 @@ mod tests {
                 >= u64::from(visits)
         );
         let tree = search.tree.read();
-        assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
+        assert!(!tree.has_in_flight_visits());
         assert!(search
             .worker_state
             .shared_collisions
@@ -1267,7 +1317,35 @@ mod tests {
         let tree = search.tree.read();
         let root = tree.current_head();
         assert!(tree.node(root).has_solid_children());
-        assert_eq!(tree.node(root).n_in_flight(), 0);
+        assert!(!tree.has_in_flight_visits());
+    }
+
+    /// px0 `Abort -> Wait` joins every search worker and cancels collision
+    /// reservations before the next UCI position/search boundary
+    /// (`src/search/classic/search.cc:1027-1064`).
+    #[test]
+    fn abort_wait_leaves_no_in_flight_visits_anywhere_in_tree() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(ParallelUniformBackend::default()));
+        search.set_position(&state).expect("position");
+        search
+            .start_search(&crate::uci_loop::GoParams {
+                infinite: true,
+                ..Default::default()
+            })
+            .expect("start infinite search");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        search.abort_search().expect("abort and wait");
+
+        let tree = search.tree.read();
+        assert!(!tree.has_in_flight_visits());
+        assert!(search
+            .worker_state
+            .shared_collisions
+            .lock()
+            .expect("collisions lock")
+            .is_empty());
     }
 
     #[test]
@@ -1317,7 +1395,6 @@ mod tests {
             move_start: std::time::Instant::now(),
             nps_start_time: None,
             initial_visits: 17,
-            search_active: true,
             root_move_filter: Vec::new(),
             contempt_mode: ContemptMode::Play,
         };
@@ -1372,6 +1449,49 @@ mod tests {
             resolve_contempt_mode(ContemptMode::Play, false, false, true),
             ContemptMode::Black
         );
+    }
+
+    #[test]
+    fn infinite_play_contempt_emits_px0_warning_before_workers_start() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(UniformBackend::default()));
+        search.set_position(&state).expect("position");
+        search.meta.lock().expect("meta lock").params.wdl_rescale_diff = 0.1;
+
+        let responder = Arc::new(RecordingSearchResponder::default());
+        search.set_uci_responder(Arc::clone(&responder) as Arc<dyn SearchResponder>);
+        search
+            .start_search(&crate::uci_loop::GoParams {
+                infinite: true,
+                ..Default::default()
+            })
+            .expect("infinite search");
+
+        let infos = responder.infos.lock().expect("infos lock");
+        assert!(infos.iter().any(|info| {
+            info.comment == "WARNING: Contempt mode set to 'disable' as 'play' not supported for infinite search."
+        }));
+        drop(infos);
+        search.abort_search().expect("abort");
+    }
+
+    #[test]
+    fn ponder_suppresses_bestmove_like_px0_search_constructor() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(UniformBackend::default()));
+        search.set_position(&state).expect("position");
+        search
+            .start_search(&crate::uci_loop::GoParams {
+                nodes: Some(1),
+                ponder: true,
+                ..Default::default()
+            })
+            .expect("internal ponder search");
+
+        assert!(!search.ok_to_respond_bestmove.load(std::sync::atomic::Ordering::Acquire));
+        search.abort_search().expect("abort");
     }
 
     #[test]

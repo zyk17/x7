@@ -73,6 +73,23 @@ impl WorkerSearchState {
     }
 }
 
+/// px0 `Search::CancelSharedCollisions` (`src/search/classic/search.cc:1044-1053`).
+///
+/// px0 invokes this after every worker has stopped, when destroying the
+/// per-`go` `Search`. Rust retains `ClassicSearch` across UCI searches, so the
+/// same cleanup must be callable from both the worker backup path and the
+/// post-join lifecycle boundary.
+pub(crate) fn cancel_shared_collisions(search_state: &WorkerSearchState, tree: &mut NodeTree) {
+    let collisions = std::mem::take(&mut *search_state.shared_collisions.lock().expect("collisions lock"));
+    for (node_idx, multivisit) in collisions {
+        let mut current = tree.node(node_idx).parent();
+        while let Some(parent_idx) = current {
+            tree.node(parent_idx).cancel_score_update(multivisit);
+            current = tree.node(parent_idx).parent();
+        }
+    }
+}
+
 /// px0 `SearchWorker::NodeToProcess` (`search.h:288-347`)。
 #[derive(Clone, Debug)]
 pub struct NodeToProcess {
@@ -2291,14 +2308,7 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `Search::CancelSharedCollisions` (`search.cc:1044-1053`).
     fn cancel_shared_collisions_in_tree(&mut self, tree: &mut NodeTree) {
-        let collisions = std::mem::take(&mut *self.search_state.shared_collisions.lock().expect("collisions lock"));
-        for (node_idx, multivisit) in collisions {
-            let mut current = tree.node(node_idx).parent();
-            while let Some(node_idx) = current {
-                tree.node(node_idx).cancel_score_update(multivisit);
-                current = tree.node(node_idx).parent();
-            }
-        }
+        cancel_shared_collisions(self.search_state, tree);
     }
 
     /// px0 `SearchWorker::MaybeSetBounds` (`search.cc:2229-2289`).
@@ -2849,6 +2859,37 @@ mod tests {
 
         assert_eq!(tree.node(root).n_in_flight(), 0);
         assert_eq!(state.shared_collisions.lock().expect("collisions lock").len(), 0);
+    }
+
+    /// px0 destroys each per-go `Search` after joining its workers, then
+    /// cancels any collision reservation that did not reach backup
+    /// (`src/search/classic/search.cc:1044-1064`).
+    #[test]
+    fn post_join_collision_cleanup_releases_ancestor_virtual_visits() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let only_move = tree.history().last().board().generate_legal_moves()[0];
+        tree.node_mut(root).create_edges(&vec![only_move]);
+        let child = tree.arena_mut().spawn_child(root, 0);
+        tree.node(root).increment_n_in_flight(3);
+
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
+        search_state
+            .shared_collisions
+            .lock()
+            .expect("collisions lock")
+            .push((child, 3));
+        cancel_shared_collisions(&search_state, &mut tree);
+
+        assert_eq!(tree.node(root).n_in_flight(), 0);
+        assert!(search_state
+            .shared_collisions
+            .lock()
+            .expect("collisions lock")
+            .is_empty());
     }
 
     /// px0 `SearchWorker::UpdateCounters` treats collision-only iterations as
