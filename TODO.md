@@ -104,6 +104,11 @@ seal/join 后合并 results。
 消费不重叠 range，同时 main runner 处理最终 suffix，seal/join 后继续 OOO/backup。P4 pipeline 的结构翻译
 至此收口；下一步只补真实 ONNX/DirectML 固定 visits、movetime、stop/wait、`NInFlight==0` 回归，不再扩结构。
 
+已将 px0 gathering subtree 的隐含互斥收为 Rust queue 不变量，参考
+`src/search/classic/search.cc:1828-1864`、`src/search/classic/node.h:234-239`：同级 sibling task root
+可以共存，但 duplicate/ancestor/descendant root 必须拒绝，且 handoff 不得清零父 DFS budget。该回归只证明
+task split，不让 `Vec<Box<Node>>` 或 `Node` 的非原子统计变成可并发访问。
+
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占
   minibatch/computation/counters；禁止共享 `&mut SearchWorker`。

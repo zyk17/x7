@@ -214,6 +214,12 @@ px0 依赖 `Node::TryStartScoreUpdate` 的 `n_ == 0 && n_in_flight_ > 0` 排他�
 数据竞争，真实 ONNX 的重复 `ExtendNode` 正是其表现。后续不得以“节点已有 edges 则跳过”掩盖；必须先给出能
 保持该 in-flight 原子性的 Rust 节点存储/同步边界，才能重启 task worker。
 
+第二十一步（gathering subtree 不变量）已完成：Rust `PickTaskQueue` 在发布 gathering task 时保留整个
+phase 的 task-root claim，并按 px0 parent 链拒绝同 root 或祖先/后代重叠；同级 sibling root 仍可并行。
+参考 px0 `src/search/classic/search.cc:1828-1864` 和 `src/search/classic/node.h:234-239`。这把 px0 task
+split 的隐含前提变成回归，且失败时不清零父 DFS 的 visit budget；它不能解决普通 `NodeArena` 的 `Vec` 分配
+和非原子 node 字段并发写入，因此不能据此解除 `active_task_workers=0`。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

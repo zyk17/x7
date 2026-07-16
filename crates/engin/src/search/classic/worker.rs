@@ -258,6 +258,12 @@ struct PickTaskQueue {
     // completion. This preserves the task/result lifecycle without cloning a
     // task or aliasing its mutable result vector across threads.
     tasks: Mutex<Vec<Option<PickTask>>>,
+    /// Rust-visible proof of px0's gathering-task split invariant. A task
+    /// keeps its claimed root until the whole phase ends, so another task
+    /// cannot be published for the same subtree or one of its ancestors.
+    /// px0 relies on this implicitly in `PickNodesToExtendTask`
+    /// (`src/search/classic/search.cc:1828-1864`).
+    gathering_roots: Mutex<Vec<usize>>,
     task_count: AtomicIsize,
     /// px0 `task_taking_started_`: a tiny claim lock around the task index.
     /// Rust keeps task storage behind a mutex and retains the same claim
@@ -292,6 +298,8 @@ impl PickTaskQueue {
         // px0 reserves `MAX_TASKS` every reset because task workers retain
         // pointers into this vector while they execute.
         tasks.reserve(Self::MAX_TASKS);
+        drop(tasks);
+        self.gathering_roots.lock().expect("gathering root lock").clear();
     }
 
     /// px0 task enqueue (`src/search/classic/search.cc:1843-1856`).
@@ -308,6 +316,60 @@ impl PickTaskQueue {
         self.task_count.fetch_add(1, Ordering::AcqRel);
         self.task_added.notify_all();
         true
+    }
+
+    /// Publishes a gathering task only when its tree root is disjoint from
+    /// every subtree already handed to this phase. This is not a search
+    /// heuristic: it exposes the ownership precondition that px0's task split
+    /// assumes before task workers mutate the tree concurrently
+    /// (`src/search/classic/search.cc:1828-1864`).
+    fn push_gathering(&self, tree: &NodeTree, task: PickTask) -> bool {
+        debug_assert_eq!(task.kind, PickTaskKind::Gathering);
+        let start = task.start.expect("gathering task has a start node");
+        if self.task_count.load(Ordering::Acquire) < 0 {
+            return false;
+        }
+
+        // Keep the lock order identical to `reset`: task slots first, then
+        // root claims. Future gathering workers may publish nested tasks.
+        let mut tasks = self.tasks.lock().expect("pick task queue lock");
+        if tasks.len() >= Self::MAX_TASKS {
+            return false;
+        }
+        let mut roots = self.gathering_roots.lock().expect("gathering root lock");
+        if roots
+            .iter()
+            .copied()
+            .any(|existing| Self::subtrees_overlap(tree, existing, start))
+        {
+            return false;
+        }
+
+        tasks.push(Some(task));
+        roots.push(start);
+        drop(roots);
+        drop(tasks);
+        self.task_count.fetch_add(1, Ordering::AcqRel);
+        self.task_added.notify_all();
+        true
+    }
+
+    /// Two task roots overlap exactly when either root is an ancestor of the
+    /// other in px0's parent chain (`src/search/classic/node.h:234-239`).
+    fn subtrees_overlap(tree: &NodeTree, left: usize, right: usize) -> bool {
+        Self::is_ancestor_of(tree, left, right) || Self::is_ancestor_of(tree, right, left)
+    }
+
+    fn is_ancestor_of(tree: &NodeTree, ancestor: usize, mut node: usize) -> bool {
+        loop {
+            if node == ancestor {
+                return true;
+            }
+            let Some(parent) = tree.node(node).parent() else {
+                return false;
+            };
+            node = parent;
+        }
     }
 
     /// px0 task claim (`src/search/classic/search.cc:1076-1093`).
@@ -860,12 +922,10 @@ impl<'a> SearchWorker<'a> {
 
         let mut moves_to_base = workspace.moves_to_path.clone();
         moves_to_base.push(mv);
-        if !queue.push(PickTask::gathering(
-            child_idx,
-            task_base_depth,
-            moves_to_base,
-            child_limit,
-        )) {
+        if !queue.push_gathering(
+            tree,
+            PickTask::gathering(child_idx, task_base_depth, moves_to_base, child_limit),
+        ) {
             return false;
         }
         workspace.visits_to_perform.last_mut().expect("visits")[edge_idx] = 0;
@@ -3255,6 +3315,32 @@ mod tests {
         assert_eq!(claimed.task.moves_to_base, vec![mv]);
         assert_eq!(claimed.task.collision_limit, 3);
         queue.complete(claimed);
+    }
+
+    /// px0 only hands independent descendants to concurrent gathering tasks
+    /// (`search.cc:1828-1864`). Sibling roots may run together; a duplicate
+    /// root or an ancestor/descendant pair must remain with the parent DFS.
+    #[test]
+    fn gathering_task_roots_are_disjoint_for_the_whole_phase() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let moves = tree.history().last().board().generate_legal_moves();
+        tree.node_mut(root).create_edges(&moves[..2].to_vec());
+        let first_child = tree.arena_mut().spawn_child(root, 0);
+        let second_child = tree.arena_mut().spawn_child(root, 1);
+        tree.node_mut(first_child).create_single_child_node(moves[2]);
+        let grandchild = tree.arena_mut().spawn_child(first_child, 0);
+
+        let queue = PickTaskQueue::default();
+        queue.reset();
+        assert!(queue.push_gathering(&tree, PickTask::gathering(first_child, 1, vec![moves[0]], 8),));
+        assert!(queue.push_gathering(&tree, PickTask::gathering(second_child, 1, vec![moves[1]], 8),));
+        assert!(!queue.push_gathering(&tree, PickTask::gathering(first_child, 1, vec![moves[0]], 8),));
+        assert!(!queue.push_gathering(&tree, PickTask::gathering(grandchild, 2, vec![moves[0], moves[2]], 4),));
+        assert_eq!(queue.task_count.load(Ordering::Acquire), 2);
     }
 
     #[test]
