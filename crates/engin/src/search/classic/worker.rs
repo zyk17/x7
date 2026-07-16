@@ -2928,6 +2928,37 @@ mod tests {
         assert_eq!(worker.iteration.minibatch[0].moves_to_visit, vec![mv]);
     }
 
+    /// px0 executes a processing task against the task worker's own
+    /// workspace, never the main worker's scratch (`search.cc:1125-1129`).
+    #[test]
+    fn task_runner_processing_owns_its_workspace() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        tree.make_terminal(root, GameResult::Draw, 0.0, Terminal::EndOfGame);
+
+        let params = SearchParams::default();
+        let context = ProcessingContext {
+            params: &params,
+            computation: None,
+            extend: ExtendContext {
+                played_history_len: tree.history().len(),
+                two_fold_draws: params.two_fold_draws,
+            },
+        };
+        let mut runner = TaskRunner::default();
+        let mut range = vec![NodeToProcess::visit(root, 1)];
+
+        runner
+            .run_processing_range(&context, &mut tree, &mut range)
+            .expect("terminal processing task");
+
+        assert_eq!(runner.workspace.history.len(), tree.history().len());
+        assert!(!range[0].nn_queried);
+    }
+
     #[test]
     fn pick_task_queue_wakes_and_closes_like_px0_run_tasks() {
         let queue = Arc::new(PickTaskQueue::default());

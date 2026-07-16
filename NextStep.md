@@ -159,6 +159,11 @@ runner 只拥有自己的 DFS/history scratch，gathering task 保留自己的�
 minibatch slice。参考 `src/search/classic/search.cc:1116-1129,1322-1362`。当前仍由 main runner 同步调用，
 不能据此开启 `task_workers`。
 
+第十二步已完成：核实 px0 在 `PickNodesToExtend` 内由主 worker 持有 `nodes_mutex_`，同时 task threads 直接
+读写 tree；其 C++ 接口以 `NO_THREAD_SAFETY_ANALYSIS` 明确绕过静态别名检查。参考
+`src/search/classic/search.cc:1485-1508,1551-1897`。Rust `NodeTree` 当前是普通可变 arena，不能安全地按该
+别名模型启动线程；本轮只补齐 `TaskRunner` processing 独占 workspace 回归，不以全树锁伪造并发。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

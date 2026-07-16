@@ -78,6 +78,10 @@ gathering task 的 subtree/tree 写入所有权证明，不能以全树锁替代
 已完成 px0 `task_workspaces_[tid]` 的执行边界：`TaskRunner` 独占 workspace，gathering task 自有结果，
 processing 只接收已拆分 minibatch slice，参考 `src/search/classic/search.cc:1116-1129,1322-1362`；当前仍是
 main runner 的同步调用。
+已核实 px0 task threads 在主 worker 持有 `nodes_mutex_` 的 gather phase 内直接修改 tree，且
+`PickNodesToExtendTask` 标记为 `NO_THREAD_SAFETY_ANALYSIS`，参考
+`src/search/classic/search.cc:1485-1508,1551-1897`。Rust 不能对普通 `NodeTree` 复制该可变别名；不得用
+全树锁或 raw pointer 启用 task worker。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占
