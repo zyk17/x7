@@ -454,7 +454,16 @@ impl Default for TaskWorkspace {
 #[derive(Default)]
 struct TaskPhaseState {
     queue: PickTaskQueue,
-    main_workspace: TaskWorkspace,
+    main_runner: TaskRunner,
+}
+
+/// px0 keeps one `TaskWorkspace` per `RunTasks` thread plus a separate
+/// `main_workspace_` (`src/search/classic/search.h:348-365,441-445`). A Rust
+/// runner owns exactly one workspace; it must never borrow another runner's
+/// path/history buffers.
+#[derive(Default)]
+struct TaskRunner {
+    workspace: TaskWorkspace,
 }
 
 /// px0 `SearchWorker` 每轮迭代状态（`src/search/classic/search.h:419-427`）。
@@ -999,10 +1008,10 @@ impl<'a> SearchWorker<'a> {
                 picked_visits,
             );
 
-            let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
+            let mut workspace = std::mem::take(&mut self.task_phase.main_runner.workspace);
             let process_result =
                 self.process_picked_task_in_tree(tree, main_start, self.iteration.minibatch.len(), &mut workspace);
-            self.task_phase.main_workspace = workspace;
+            self.task_phase.main_runner.workspace = workspace;
             process_result?;
             if needs_wait {
                 self.wait_for_queued_tasks_in_tree(tree)?;
@@ -1095,7 +1104,7 @@ impl<'a> SearchWorker<'a> {
         // `ResetTasks` (`src/search/classic/search.cc:1485-1492`).
         self.task_phase.queue.reset();
         let mut receiver = std::mem::take(&mut self.iteration.minibatch);
-        let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
+        let mut workspace = std::mem::take(&mut self.task_phase.main_runner.workspace);
         let context = self.selection_context();
         let result = Self::pick_nodes_to_extend_task_with_workspace(
             &context,
@@ -1108,7 +1117,7 @@ impl<'a> SearchWorker<'a> {
             &mut workspace,
             true,
         );
-        self.task_phase.main_workspace = workspace;
+        self.task_phase.main_runner.workspace = workspace;
         self.iteration.minibatch = receiver;
         self.wait_for_queued_tasks_in_tree(tree)?;
         self.task_phase.queue.drain_results_into(&mut self.iteration.minibatch);
@@ -1164,9 +1173,9 @@ impl<'a> SearchWorker<'a> {
     /// CPU fallback for px0 `TaskWorkers=0`: run queued work on the owning
     /// workspace without creating task threads.
     fn run_tasks_synchronously_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
+        let mut workspace = std::mem::take(&mut self.task_phase.main_runner.workspace);
         let result = self.run_queued_tasks_in_tree(tree, &mut workspace);
-        self.task_phase.main_workspace = workspace;
+        self.task_phase.main_runner.workspace = workspace;
         result
     }
 

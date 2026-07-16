@@ -141,6 +141,10 @@ twofold 回退改为纯 tree helper，对应 `search.cc:1510-1550`。
 `src/search/classic/search.cc:1322-1362`。回归验证混合 collision batch 的 queued ranges 互不重叠，且均在
 main suffix 之前；这只证明 minibatch 所有权，未证明 gathering task 的 tree 子树写入范围。
 
+第八步已完成：px0 的 `task_workspaces_ / main_workspace_` 已映射为 Rust `TaskRunner` 的独占 workspace，
+参考 `src/search/classic/search.h:348-365,441-445`。当前仅有 main runner；未来每个后台 task runner 必须自带
+workspace，不能共享主 runner 的 history/path scratch。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

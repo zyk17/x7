@@ -69,6 +69,8 @@ task split 不可用：此前 Rust raw-pointer 版本会让两个 task 重复扩
 `src/search/classic/search.cc:1423-1462,2109-2156`；尚未证明 tree 写入不重叠，`task_workers` 必须保持 0。
 已完成 processing range 规划与不重叠回归，参考 `src/search/classic/search.cc:1322-1362`；下一步仅处理
 gathering task 的 subtree/tree 写入所有权证明，不能以全树锁替代。
+已完成 workspace 所有权映射：`TaskRunner` 独占其 `TaskWorkspace`，参考
+`src/search/classic/search.h:348-365,441-445`；仍未创建后台 runner。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占
