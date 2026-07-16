@@ -96,6 +96,14 @@ pub struct ClassicEngine {
     loaded_weights_file: Option<String>,
 }
 
+impl Default for ClassicEngine {
+    /// Rust adapter for the formal px0 `Engine::Engine` constructor
+    /// (`src/engine.cc:137-167`); it adds no separate initialization path.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClassicEngine {
     /// px0 `Engine::Engine` + `Engine::UpdateBackendConfig`
     /// (`src/engine.cc:137-167`), with the ONNX factory deferred until

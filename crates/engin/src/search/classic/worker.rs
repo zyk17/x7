@@ -1888,6 +1888,10 @@ impl<'a> SearchWorker<'a> {
     }
 
     /// px0 `SearchWorker::MaybeSetBounds` (`search.cc:2229-2289`).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keeps the px0 MaybeSetBounds output-parameter contract explicit."
+    )]
     fn maybe_set_bounds_in_tree(
         &mut self,
         tree: &mut NodeTree,
