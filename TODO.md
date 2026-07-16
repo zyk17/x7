@@ -82,6 +82,10 @@ main runner 的同步调用。
 `PickNodesToExtendTask` 标记为 `NO_THREAD_SAFETY_ANALYSIS`，参考
 `src/search/classic/search.cc:1485-1508,1551-1897`。Rust 不能对普通 `NodeTree` 复制该可变别名；不得用
 全树锁或 raw pointer 启用 task worker。
+已核实 px0 `Node` 的统计、child sibling 链与 edge 排序均非 atomic，`Edge_Iterator` 允许 sibling 在调用
+间隙插入但要求外部同步，参考 `src/search/classic/node.h:132-260,423-525`、`node.cc:245-373`。这使后台
+task-worker 的 Rust 所有权/并发表示成为明确阻塞项：未形成按上述代码逐段证明的无别名方案前，固定
+`task_workers=0`，不得以全树锁或 raw pointer 启用。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占

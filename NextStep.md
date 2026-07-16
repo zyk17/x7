@@ -164,6 +164,13 @@ minibatch slice。参考 `src/search/classic/search.cc:1116-1129,1322-1362`。�
 `src/search/classic/search.cc:1485-1508,1551-1897`。Rust `NodeTree` 当前是普通可变 arena，不能安全地按该
 别名模型启动线程；本轮只补齐 `TaskRunner` processing 独占 workspace 回归，不以全树锁伪造并发。
 
+第十三步已完成：进一步核实 px0 `Node` 的 `wl_/d_/m_/n_/n_in_flight_`、child sibling 链和 edge 排序都不是
+atomic；`Edge_Iterator` 明确要求外部同步却允许 sibling 在 iterator 调用间插入。参考
+`src/search/classic/node.h:132-260,423-525`、`node.cc:245-373`。因此 Rust 不能把当前普通 arena 的 `&mut
+NodeTree` 借给多个 runner 后仍声称是安全的逐行翻译。P4 后台 task-worker 的下一步是明确阻塞项：必须先给出
+不依赖 raw-pointer alias、且不以整树锁串行化的 Rust 所有权/并发表示，并逐段对照上述 px0 行；在此之前维持
+`task_workers=0`。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体
