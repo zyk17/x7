@@ -226,6 +226,11 @@ node 只能产生一个成功者。参考 `src/search/classic/node.cc:346-365`�
 `WaitForTasks` 后由主 worker 写入，符合 px0 phase 时序；下一步只处理 child slot/arena allocation 的
 唯一创建，不能因为 n/in-flight 已原子化而提前开启 task worker。
 
+第二十三步（child slot 单胜者）已完成：每条 edge 的 child slot 已改为 atomic
+`empty -> reserved -> published-index` 状态；并发 caller 只能有一个 reservation winner，其余 caller 等待并
+读取同一个稳定 child index。参考 px0 `src/search/classic/node.h:468-525`。现有 `NodeArena` 仍是普通
+`Vec<Box<Node>>`，所以该 slot 只能消除 parent-edge 重复创建，尚未让 arena allocation 可并发执行。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

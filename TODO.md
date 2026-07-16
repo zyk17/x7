@@ -113,6 +113,10 @@ task split，不让 `Vec<Box<Node>>` 或 `Node` 的非原子统计变成可并�
 `src/search/classic/node.cc:346-365`；并发回归保证一个未扩展 node 只有一个 in-flight winner。WL/D/M
 仍保持 px0 的 `WaitForTasks` 后主 worker backup 时序；`NodeArena` child allocation 尚未并发安全。
 
+已将 edge child slot 改为 atomic `empty -> reserved -> published-index`，参考
+`src/search/classic/node.h:468-525`；并发回归保证同一 edge 只会有一个 reservation winner。此项只解决
+parent slot 重复创建，`NodeArena(Vec<Box<Node>>)` 的并发 allocation 仍是下一阻塞点。
+
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占
   minibatch/computation/counters；禁止共享 `&mut SearchWorker`。

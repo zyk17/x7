@@ -1,8 +1,11 @@
 //! px0 `src/search/classic/node.h:84-260`、`node.cc:161-373,465-543`。
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use xiangqi_core::{GameResult, Move, MoveList, Position, PositionHistory};
+
+const EMPTY_CHILD: usize = usize::MAX;
+const RESERVED_CHILD: usize = usize::MAX - 1;
 
 /// px0 `Node::Terminal` (`node.h:132`)。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -99,7 +102,7 @@ pub struct Node {
     parent: Option<usize>,
     edge_index: u16,
     edges: Vec<Edge>,
-    children: Vec<Option<usize>>,
+    children: Vec<AtomicUsize>,
     terminal: Terminal,
     lower_bound: GameResult,
     upper_bound: GameResult,
@@ -149,7 +152,11 @@ impl Clone for Node {
             parent: self.parent,
             edge_index: self.edge_index,
             edges: self.edges.clone(),
-            children: self.children.clone(),
+            children: self
+                .children
+                .iter()
+                .map(|child| AtomicUsize::new(child.load(Ordering::Acquire)))
+                .collect(),
             terminal: self.terminal,
             lower_bound: self.lower_bound,
             upper_bound: self.upper_bound,
@@ -263,12 +270,39 @@ impl Node {
     /// nodes exist, so the parallel child slots are all empty and need no
     /// reordering.
     pub fn sort_edges(&mut self) {
-        assert!(self.children.iter().all(Option::is_none));
+        assert!(self
+            .children
+            .iter()
+            .all(|child| child.load(Ordering::Acquire) == EMPTY_CHILD));
         self.edges.sort_unstable_by_key(|edge| std::cmp::Reverse(edge.p));
     }
 
     pub fn child(&self, index: usize) -> Option<usize> {
-        self.children.get(index).copied().flatten()
+        let child = self.children.get(index)?;
+        loop {
+            let index = child.load(Ordering::Acquire);
+            if index == RESERVED_CHILD {
+                std::hint::spin_loop();
+                continue;
+            }
+            return (index != EMPTY_CHILD).then_some(index);
+        }
+    }
+
+    /// Reserves one px0 `GetOrSpawnNode` child slot. The winner must publish
+    /// a stable arena index with `publish_child`; every other caller waits in
+    /// `child()` and observes that same index. Reference:
+    /// `src/search/classic/node.h:468-525`.
+    fn try_reserve_child(&self, index: usize) -> bool {
+        self.children[index]
+            .compare_exchange(EMPTY_CHILD, RESERVED_CHILD, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn publish_child(&self, edge_idx: usize, child_idx: usize) {
+        debug_assert_ne!(child_idx, EMPTY_CHILD);
+        debug_assert_ne!(child_idx, RESERVED_CHILD);
+        self.children[edge_idx].store(child_idx, Ordering::Release);
     }
 
     /// px0 `Node::MakeSolid` state predicate (`node.cc:245-288`).
@@ -279,17 +313,20 @@ impl Node {
     /// px0 `Node::CreateEdges` (`node.cc:205-210`)。
     pub fn create_edges(&mut self, moves: &MoveList) {
         assert!(self.edges.is_empty());
-        assert!(self.children.iter().all(|child| child.is_none()));
+        assert!(self
+            .children
+            .iter()
+            .all(|child| child.load(Ordering::Acquire) == EMPTY_CHILD));
         assert!(moves.len() <= u8::MAX as usize, "px0 Node::num_edges_ is uint8_t");
         self.edges = moves.iter().copied().map(Edge::new).collect();
-        self.children = vec![None; moves.len()];
+        self.children = (0..moves.len()).map(|_| AtomicUsize::new(EMPTY_CHILD)).collect();
     }
 
     /// px0 `Node::CreateSingleChildNode` (`node.cc:196-203`)。
     pub fn create_single_child_node(&mut self, mv: Move) -> usize {
         assert!(self.edges.is_empty());
         self.edges = vec![Edge::new(mv)];
-        self.children = vec![None];
+        self.children = vec![AtomicUsize::new(EMPTY_CHILD)];
         0
     }
 
@@ -427,7 +464,8 @@ impl Node {
     pub fn visited_policy(&self, arena: &NodeArena) -> f32 {
         let mut sum = 0.0;
         for (idx, child) in self.children.iter().enumerate() {
-            if child
+            if (child.load(Ordering::Acquire) != EMPTY_CHILD)
+                .then(|| child.load(Ordering::Acquire))
                 .and_then(|child_idx| arena.get(child_idx))
                 .is_some_and(|node| node.n() > 0)
             {
@@ -438,9 +476,9 @@ impl Node {
     }
 
     fn release_children_except_one(&mut self, keep_edge: Option<usize>) {
-        for (idx, child) in self.children.iter_mut().enumerate() {
+        for (idx, child) in self.children.iter().enumerate() {
             if Some(idx) != keep_edge {
-                *child = None;
+                child.store(EMPTY_CHILD, Ordering::Release);
             }
         }
         // px0 `ReleaseChildrenExceptOne(nullptr)` resets both `num_edges_`
@@ -486,8 +524,13 @@ impl NodeArena {
     }
 
     pub fn spawn_child(&mut self, parent_idx: usize, edge_idx: usize) -> usize {
+        if !self.nodes[parent_idx].try_reserve_child(edge_idx) {
+            return self.nodes[parent_idx]
+                .child(edge_idx)
+                .expect("reserved child slot must be published");
+        }
         let child_idx = self.alloc(Node::new(Some(parent_idx), edge_idx as u16));
-        self.nodes[parent_idx].children[edge_idx] = Some(child_idx);
+        self.nodes[parent_idx].publish_child(edge_idx, child_idx);
         child_idx
     }
 }
@@ -550,7 +593,15 @@ impl NodeTree {
 
     /// px0 `Node::MakeNotTerminal` (`node.cc:319-341`) 的 arena 适配。
     pub fn make_not_terminal(&mut self, node_idx: usize) {
-        let child_indices: Vec<usize> = self.node(node_idx).children.iter().copied().flatten().collect();
+        let child_indices: Vec<usize> = self
+            .node(node_idx)
+            .children
+            .iter()
+            .filter_map(|child| {
+                let index = child.load(Ordering::Acquire);
+                (index != EMPTY_CHILD).then_some(index)
+            })
+            .collect();
         let child_stats = child_indices
             .into_iter()
             .map(|child| {
@@ -574,7 +625,10 @@ impl NodeTree {
         }
 
         let mut total_in_flight = 0u32;
-        for child_idx in node.children.iter().copied().flatten() {
+        for child_idx in node.children.iter().filter_map(|child| {
+            let index = child.load(Ordering::Acquire);
+            (index != EMPTY_CHILD).then_some(index)
+        }) {
             let child = self.node(child_idx);
             if (child.n() <= 1 || child.is_terminal()) && child.n_in_flight() > 0 {
                 return false;
@@ -590,7 +644,7 @@ impl NodeTree {
             .children
             .iter()
             .enumerate()
-            .filter_map(|(edge_idx, child)| child.is_none().then_some(edge_idx))
+            .filter_map(|(edge_idx, child)| (child.load(Ordering::Acquire) == EMPTY_CHILD).then_some(edge_idx))
             .collect::<Vec<_>>();
         for edge_idx in missing_edges {
             self.arena.spawn_child(node_idx, edge_idx);
@@ -755,6 +809,38 @@ mod tests {
             1
         );
         assert_eq!(node.n_in_flight(), 1);
+    }
+
+    /// px0 `GetOrSpawnNode` has one child-slot winner even when several
+    /// gathering tasks reach the same edge (`src/search/classic/node.h:468-525`).
+    #[test]
+    fn child_slot_has_one_concurrent_reservation_winner() {
+        let mut node = Node::default();
+        node.create_single_child_node(Move::new(
+            xiangqi_core::Square::parse("a0").expect("a0"),
+            xiangqi_core::Square::parse("a1").expect("a1"),
+        ));
+        let node = std::sync::Arc::new(node);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let node = std::sync::Arc::clone(&node);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                node.try_reserve_child(0)
+            }));
+        }
+        assert_eq!(
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().ok())
+                .filter(|reserved| *reserved)
+                .count(),
+            1
+        );
+        node.publish_child(0, 42);
+        assert_eq!(node.child(0), Some(42));
     }
 
     #[test]
