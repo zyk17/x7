@@ -61,6 +61,8 @@ task split 不可用：此前 Rust raw-pointer 版本会让两个 task 重复扩
 `src/search/classic/search.cc:1069-1140,1494-1508`；task workspace/tree 的所有权拆分仍未完成。
 生产队列只保留同步 phase；`RunTasks` 的 sleep/exit 仅保留为测试状态机，参考
 `src/search/classic/search.cc:1069-1124`，不能误作为后台 worker 已启用。
+已完成 gathering 输入拆分：`PickNodesToExtendTask` 只读取 `SelectionContext`，参考
+`src/search/classic/search.cc:1510-1550,1551-1897`；processing 的 minibatch range/tree 所有权仍待拆分。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占

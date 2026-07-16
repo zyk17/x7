@@ -124,6 +124,11 @@ P4 的单 worker/minibatch/OOO/cache/stopper 主线可用，但 GPU task-worker 
 `RunTasks` 的 sleep/exit 条件仅作为测试状态机保留（`src/search/classic/search.cc:1069-1124`）。在没有真实
 task owner 前，不把该测试机制伪装成后台 task worker，也不让它影响 `task_workers_=0` 搜索路径。
 
+第四步已完成：`PickNodesToExtendTask` 的 Rust 入口只接收 `SelectionContext`、tree、task-owned workspace
+和结果 receiver。`SelectionContext` 精确收纳 px0 selection 所读的 params、root filter、best-edge、stopper
+hints 与 task queue（`src/search/classic/search.cc:1551-1897`）；它不含 minibatch/backend/其他 workspace。
+twofold 回退改为纯 tree helper，对应 `search.cc:1510-1550`。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

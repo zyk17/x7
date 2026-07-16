@@ -470,6 +470,22 @@ struct IterationState {
     number_out_of_order: usize,
 }
 
+/// Immutable inputs consumed by px0 `PickNodesToExtendTask`
+/// (`src/search/classic/search.cc:1551-1897`).
+///
+/// Keeping this separate from `SearchWorker` is a prerequisite for a later
+/// task-owned gathering translation: selection may read these values, but it
+/// must not gain access to the iteration minibatch, backend computation, or
+/// another task's workspace.
+struct SelectionContext<'a> {
+    params: &'a SearchParams,
+    search_state: &'a WorkerSearchState,
+    root_move_filter: &'a [Move],
+    latest_time_manager_hints: StoppersHints,
+    task_workers: i32,
+    task_queue: &'a PickTaskQueue,
+}
+
 /// px0 `SearchWorker` (`src/search/classic/search.h:203-448`)。
 pub struct SearchWorker<'a> {
     tree: WorkerTree<'a>,
@@ -633,6 +649,19 @@ impl<'a> SearchWorker<'a> {
             task_workers,
             latest_time_manager_hints: StoppersHints::default(),
             task_phase: TaskPhaseState::default(),
+        }
+    }
+
+    /// Builds the immutable input view used by px0
+    /// `PickNodesToExtendTask` (`src/search/classic/search.cc:1551-1897`).
+    fn selection_context(&self) -> SelectionContext<'_> {
+        SelectionContext {
+            params: self.params,
+            search_state: self.search_state,
+            root_move_filter: self.root_move_filter,
+            latest_time_manager_hints: self.latest_time_manager_hints.clone(),
+            task_workers: self.task_workers,
+            task_queue: &self.task_phase.queue,
         }
     }
 
@@ -1026,7 +1055,9 @@ impl<'a> SearchWorker<'a> {
         self.task_phase.queue.reset();
         let mut receiver = std::mem::take(&mut self.iteration.minibatch);
         let mut workspace = std::mem::take(&mut self.task_phase.main_workspace);
-        let result = self.pick_nodes_to_extend_task_with_workspace(
+        let context = self.selection_context();
+        let result = Self::pick_nodes_to_extend_task_with_workspace(
+            &context,
             tree,
             tree.current_head(),
             0,
@@ -1056,7 +1087,9 @@ impl<'a> SearchWorker<'a> {
         while let Some(mut claimed) = self.task_phase.queue.take() {
             match claimed.task.kind {
                 PickTaskKind::Gathering => {
-                    self.pick_nodes_to_extend_task_with_workspace(
+                    let context = self.selection_context();
+                    let result = Self::pick_nodes_to_extend_task_with_workspace(
+                        &context,
                         tree,
                         claimed.task.start.expect("gathering task start"),
                         claimed.task.base_depth,
@@ -1065,7 +1098,8 @@ impl<'a> SearchWorker<'a> {
                         &mut claimed.task.results,
                         workspace,
                         false,
-                    )?;
+                    );
+                    result?;
                 }
                 PickTaskKind::Processing => {
                     self.process_picked_task_in_tree(tree, claimed.task.start_idx, claimed.task.end_idx, workspace)?;
@@ -1117,7 +1151,7 @@ impl<'a> SearchWorker<'a> {
         reason = "Keeps the px0 PickNodesToExtendTask input contract explicit."
     )]
     fn pick_nodes_to_extend_task_with_workspace(
-        &mut self,
+        context: &SelectionContext<'_>,
         tree: &mut NodeTree,
         root_idx: usize,
         base_depth: u16,
@@ -1147,7 +1181,7 @@ impl<'a> SearchWorker<'a> {
         // (`src/search/classic/search.cc:1584-1588`). It is only used for
         // root smart pruning below; nested gathering tasks have no root edge.
         let (current_best_edge, best_node_n) = if is_root {
-            let best_edge = *self.search_state.current_best_edge.lock().expect("best edge lock");
+            let best_edge = *context.search_state.current_best_edge.lock().expect("best edge lock");
             let best_n = best_edge
                 .and_then(|edge_idx| tree.node(root_idx).child(edge_idx))
                 .map_or(0, |child_idx| tree.node(child_idx).n());
@@ -1206,7 +1240,7 @@ impl<'a> SearchWorker<'a> {
                 // px0 `search.cc:1657-1671`: normally a bounded policy prefix
                 // is sufficient. With `searchmoves`, px0 must copy every root
                 // edge because an allowed move can be outside that prefix.
-                let max_needed = if is_root_node && !self.root_move_filter.is_empty() {
+                let max_needed = if is_root_node && !context.root_move_filter.is_empty() {
                     tree.node(current_idx).num_edges()
                 } else {
                     tree.node(current_idx)
@@ -1223,13 +1257,13 @@ impl<'a> SearchWorker<'a> {
                 // and in-flight visit counters for this tree level.
                 let draw_score = Self::draw_score_for_tree(
                     tree,
-                    self.params,
+                    context.params,
                     (workspace.current_path.len() + base_depth as usize).is_multiple_of(2),
                 );
-                let cpuct = super::uct::compute_cpuct(self.params, tree.node(current_idx).n(), is_root_node);
+                let cpuct = super::uct::compute_cpuct(context.params, tree.node(current_idx).n(), is_root_node);
                 let puct_mult = cpuct * (tree.node(current_idx).children_visits().max(1) as f32).sqrt();
                 let fpu = super::uct::get_fpu(
-                    self.params,
+                    context.params,
                     tree.node(current_idx),
                     tree.arena(),
                     is_root_node,
@@ -1271,7 +1305,7 @@ impl<'a> SearchWorker<'a> {
                                 .node(current_idx)
                                 .child(edge_idx)
                                 .map_or(0, |child_idx| tree.node(child_idx).n());
-                            if self.latest_time_manager_hints.estimated_remaining_playouts()
+                            if context.latest_time_manager_hints.estimated_remaining_playouts()
                                 < i64::from(best_node_n) - i64::from(edge_n)
                             {
                                 continue;
@@ -1280,8 +1314,8 @@ impl<'a> SearchWorker<'a> {
                         // px0 `search.cc:1737-1740`: root filtering is part of
                         // selection, not only bestmove/PV presentation.
                         if is_root_node
-                            && !self.root_move_filter.is_empty()
-                            && !self
+                            && !context.root_move_filter.is_empty()
+                            && !context
                                 .root_move_filter
                                 .contains(&tree.node(current_idx).edge(edge_idx).mv)
                         {
@@ -1324,7 +1358,7 @@ impl<'a> SearchWorker<'a> {
                         .unwrap_or_else(|| tree.arena_mut().spawn_child(current_idx, best_idx));
                     // px0 `search.cc:1791-1794`: a tree-reused two-fold
                     // terminal may have been reached before the new root.
-                    self.ensure_node_twofold_correct_for_depth_in_tree(
+                    Self::ensure_node_twofold_correct_for_depth_in_tree(
                         tree,
                         child_idx,
                         workspace.current_path.len() as u16 + base_depth,
@@ -1361,10 +1395,10 @@ impl<'a> SearchWorker<'a> {
                 // subtrees to gathering workers, while retaining enough work
                 // for the current DFS task. The queue's MAX_TASKS cap is the
                 // same classic-search reservation (100).
-                if self.task_workers > 0 {
-                    let min_work = u32::try_from(self.params.minimum_work_size_for_picking)
+                if context.task_workers > 0 {
+                    let min_work = u32::try_from(context.params.minimum_work_size_for_picking)
                         .expect("px0 MinimumPickingWork is non-negative");
-                    let min_remaining = u32::try_from(self.params.minimum_remaining_work_size_for_picking)
+                    let min_remaining = u32::try_from(context.params.minimum_remaining_work_size_for_picking)
                         .expect("px0 MinimumRemainingPickingWork is non-negative");
                     let last_filled = *workspace.vtp_last_filled.last().expect("last filled");
                     if last_filled >= 0 {
@@ -1398,7 +1432,7 @@ impl<'a> SearchWorker<'a> {
                                 moves_to_base,
                                 child_limit,
                             );
-                            if self.task_phase.queue.push(task) {
+                            if context.task_queue.push(task) {
                                 workspace.visits_to_perform.last_mut().expect("visits")[edge_idx] = 0;
                                 passed_off += child_limit;
                             }
@@ -1448,7 +1482,7 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::EnsureNodeTwoFoldCorrectForDepth`
     /// (`src/search/classic/search.cc:1510-1550`)。
-    fn ensure_node_twofold_correct_for_depth_in_tree(&mut self, tree: &mut NodeTree, child_idx: usize, depth: u16) {
+    fn ensure_node_twofold_correct_for_depth_in_tree(tree: &mut NodeTree, child_idx: usize, depth: u16) {
         let child = tree.node(child_idx);
         if !child.is_twofold_terminal() || depth as f32 >= child.m() {
             return;
@@ -1475,7 +1509,7 @@ impl<'a> SearchWorker<'a> {
 
     #[cfg(test)]
     fn ensure_node_twofold_correct_for_depth(&mut self, child_idx: usize, depth: u16) {
-        self.with_tree(|worker, tree| worker.ensure_node_twofold_correct_for_depth_in_tree(tree, child_idx, depth));
+        self.with_tree(|_, tree| Self::ensure_node_twofold_correct_for_depth_in_tree(tree, child_idx, depth));
     }
 
     /// px0 `SearchWorker::ProcessPickedTask` (`src/search/classic/search.cc:1423-1462`)。
