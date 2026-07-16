@@ -5,7 +5,9 @@
 //! 尚未完成；当前严格使用 px0 `task_workers_ == 0` 同步分支。
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex};
 
 use parking_lot::RwLock;
 
@@ -188,23 +190,31 @@ impl<'a> WorkerTree<'a> {
 /// A gathering task owns a disjoint subtree root; a processing task owns a
 /// non-overlapping minibatch range.
 #[derive(Debug)]
-pub struct PickTask {
-    pub kind: PickTaskKind,
-    pub start: Option<usize>,
-    pub base_depth: u16,
-    pub collision_limit: u32,
-    pub moves_to_base: MoveList,
-    pub results: Vec<NodeToProcess>,
-    pub start_idx: usize,
-    pub end_idx: usize,
-    pub complete: bool,
+struct PickTask {
+    kind: PickTaskKind,
+    start: Option<usize>,
+    base_depth: u16,
+    collision_limit: u32,
+    moves_to_base: MoveList,
+    results: Vec<NodeToProcess>,
+    start_idx: usize,
+    end_idx: usize,
+    complete: bool,
 }
 
 /// px0 `PickTask::PickTaskType` (`src/search/classic/search.h:368-370`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PickTaskKind {
+enum PickTaskKind {
     Gathering,
     Processing,
+}
+
+/// px0 `RunTasks` claims both a stable task index and its task storage
+/// (`src/search/classic/search.cc:1076-1093`). Rust keeps that pair together
+/// until completion so an owned task cannot be returned into a different slot.
+struct ClaimedTask {
+    id: usize,
+    task: PickTask,
 }
 
 impl PickTask {
@@ -242,7 +252,7 @@ impl PickTask {
 /// px0 task queue state (`src/search/classic/search.h:435-445`,
 /// `search.cc:1069-1140,1464-1483`). Task execution is wired separately.
 #[derive(Default)]
-pub struct PickTaskQueue {
+struct PickTaskQueue {
     // px0 keeps stable `PickTask` storage because task threads hold pointers
     // into `picking_tasks_` (`search.cc:1088-1090,1469-1473`). Rust instead
     // moves a claimed task out of its slot, then returns that same task on
@@ -251,15 +261,17 @@ pub struct PickTaskQueue {
     tasks: Mutex<Vec<Option<PickTask>>>,
     task_count: AtomicIsize,
     /// px0 `task_taking_started_`: a tiny claim lock around the task index.
-    /// Rust keeps task storage behind a mutex, but retains this separate state
-    /// so `take_blocking()` follows px0's acquire/spin/sleep lifecycle.
+    /// Rust keeps task storage behind a mutex and retains the same claim
+    /// serialization for the synchronous task phase.
     task_taking_started: AtomicBool,
     tasks_taken: AtomicUsize,
     completed_tasks: AtomicUsize,
     // This is px0's `task_count_ == -1` sentinel (`search.cc:1097-1119`,
-    // `search.h:435-445`). Persistent scoped task threads sleep on it between
-    // iterations and only exit after `close()` sets `exiting`.
+    // `search.h:435-445`). The active Rust path consumes it synchronously;
+    // blocking sleep/exit remains test-only until task ownership is complete.
+    #[cfg(test)]
     exiting: AtomicBool,
+    #[cfg(test)]
     task_added: Condvar,
 }
 
@@ -267,7 +279,7 @@ impl PickTaskQueue {
     const MAX_TASKS: usize = 100;
 
     /// px0 `SearchWorker::ResetTasks` (`src/search/classic/search.cc:1466-1473`).
-    pub fn reset(&self) {
+    fn reset(&self) {
         self.task_count.store(0, Ordering::Release);
         self.task_taking_started.store(false, Ordering::Release);
         self.tasks_taken.store(0, Ordering::Release);
@@ -280,7 +292,7 @@ impl PickTaskQueue {
     }
 
     /// px0 task enqueue (`src/search/classic/search.cc:1843-1856`).
-    pub fn push(&self, task: PickTask) -> bool {
+    fn push(&self, task: PickTask) -> bool {
         if self.task_count.load(Ordering::Acquire) < 0 {
             return false;
         }
@@ -291,12 +303,13 @@ impl PickTaskQueue {
         tasks.push(Some(task));
         drop(tasks);
         self.task_count.fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
         self.task_added.notify_all();
         true
     }
 
     /// px0 task claim (`src/search/classic/search.cc:1076-1093`).
-    pub fn take(&self) -> Option<(usize, PickTask)> {
+    fn take(&self) -> Option<ClaimedTask> {
         let index = loop {
             let taken = self.tasks_taken.load(Ordering::Acquire);
             let task_count = self.task_count.load(Ordering::Acquire);
@@ -325,20 +338,20 @@ impl PickTaskQueue {
             .expect("pick task queue lock")
             .get_mut(index)
             .and_then(Option::take)
-            .map(|task| (index, task))
+            .map(|task| ClaimedTask { id: index, task })
     }
 
     /// px0 completion accounting (`src/search/classic/search.cc:1136-1137`).
-    pub fn complete(&self, index: usize, mut task: PickTask) {
-        if let Some(slot) = self.tasks.lock().expect("pick task queue lock").get_mut(index) {
-            task.complete = true;
-            *slot = Some(task);
+    fn complete(&self, mut claimed: ClaimedTask) {
+        if let Some(slot) = self.tasks.lock().expect("pick task queue lock").get_mut(claimed.id) {
+            claimed.task.complete = true;
+            *slot = Some(claimed.task);
             self.completed_tasks.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     /// px0 `SearchWorker::WaitForTasks` (`src/search/classic/search.cc:1475-1483`).
-    pub fn wait(&self) {
+    fn wait(&self) {
         while self.completed_tasks.load(Ordering::Acquire) < self.task_count.load(Ordering::Acquire).max(0) as usize {
             std::hint::spin_loop();
         }
@@ -347,8 +360,9 @@ impl PickTaskQueue {
     /// px0 `task_count_.store(-1)` after `GatherMinibatch`
     /// (`src/search/classic/search.cc:1182-1185`). Persistent task threads
     /// sleep after this publication until the next `reset/push` cycle.
-    pub fn idle(&self) {
+    fn idle(&self) {
         self.task_count.store(-1, Ordering::Release);
+        #[cfg(test)]
         self.task_added.notify_all();
     }
 
@@ -358,7 +372,8 @@ impl PickTaskQueue {
     /// A `-1` task count means either idle or exiting. Workers only return
     /// after `close()` sets `exiting`; otherwise they sleep until `reset/push`
     /// publishes the next iteration's work.
-    pub fn take_blocking(&self) -> Option<(usize, PickTask)> {
+    #[cfg(test)]
+    fn take_blocking(&self) -> Option<ClaimedTask> {
         let mut spins = 0usize;
         loop {
             if let Some(task) = self.take() {
@@ -392,14 +407,15 @@ impl PickTaskQueue {
     }
 
     /// px0 `SearchWorker::~SearchWorker` (`src/search/classic/search.h:225-233`).
-    pub fn close(&self) {
+    #[cfg(test)]
+    fn close(&self) {
         self.exiting.store(true, Ordering::Release);
         self.task_count.store(-1, Ordering::Release);
         self.task_added.notify_all();
     }
 
     /// px0 result merge (`src/search/classic/search.cc:1501-1507`).
-    pub fn drain_results_into(&self, receiver: &mut Vec<NodeToProcess>) {
+    fn drain_results_into(&self, receiver: &mut Vec<NodeToProcess>) {
         self.wait();
         let mut tasks = self.tasks.lock().expect("pick task queue lock");
         for task in tasks.iter_mut().flatten() {
@@ -1037,25 +1053,25 @@ impl<'a> SearchWorker<'a> {
         tree: &mut NodeTree,
         workspace: &mut TaskWorkspace,
     ) -> Result<(), EnginError> {
-        while let Some((task_id, mut task)) = self.task_phase.queue.take() {
-            match task.kind {
+        while let Some(mut claimed) = self.task_phase.queue.take() {
+            match claimed.task.kind {
                 PickTaskKind::Gathering => {
                     self.pick_nodes_to_extend_task_with_workspace(
                         tree,
-                        task.start.expect("gathering task start"),
-                        task.base_depth,
-                        task.collision_limit,
-                        &task.moves_to_base,
-                        &mut task.results,
+                        claimed.task.start.expect("gathering task start"),
+                        claimed.task.base_depth,
+                        claimed.task.collision_limit,
+                        &claimed.task.moves_to_base,
+                        &mut claimed.task.results,
                         workspace,
                         false,
                     )?;
                 }
                 PickTaskKind::Processing => {
-                    self.process_picked_task_in_tree(tree, task.start_idx, task.end_idx, workspace)?;
+                    self.process_picked_task_in_tree(tree, claimed.task.start_idx, claimed.task.end_idx, workspace)?;
                 }
             }
-            self.task_phase.queue.complete(task_id, task);
+            self.task_phase.queue.complete(claimed);
         }
         Ok(())
     }
@@ -2684,10 +2700,10 @@ mod tests {
         });
         ready_rx.recv().expect("worker ready");
         assert!(queue.push(PickTask::processing(3, 5)));
-        let (id, task) = worker.join().expect("task worker").expect("queued task");
-        assert_eq!(id, 0);
-        assert_eq!(task.kind, PickTaskKind::Processing);
-        assert_eq!((task.start_idx, task.end_idx), (3, 5));
+        let claimed = worker.join().expect("task worker").expect("queued task");
+        assert_eq!(claimed.id, 0);
+        assert_eq!(claimed.task.kind, PickTaskKind::Processing);
+        assert_eq!((claimed.task.start_idx, claimed.task.end_idx), (3, 5));
 
         let closing_queue = Arc::new(PickTaskQueue::default());
         let waiter_queue = Arc::clone(&closing_queue);
@@ -2713,8 +2729,8 @@ mod tests {
                 let queue = Arc::clone(&queue);
                 let claimed = Arc::clone(&claimed);
                 scope.spawn(move || {
-                    while let Some((index, _)) = queue.take() {
-                        claimed.lock().expect("claimed task lock").push(index);
+                    while let Some(task) = queue.take() {
+                        claimed.lock().expect("claimed task lock").push(task.id);
                     }
                 });
             }
@@ -2734,9 +2750,9 @@ mod tests {
         queue.reset();
         assert!(queue.push(PickTask::gathering(7, 2, Vec::new(), 1)));
 
-        let (task_id, mut task) = queue.take().expect("claimed gathering task");
-        task.results.push(NodeToProcess::visit(11, 3));
-        queue.complete(task_id, task);
+        let mut claimed = queue.take().expect("claimed gathering task");
+        claimed.task.results.push(NodeToProcess::visit(11, 3));
+        queue.complete(claimed);
 
         let mut results = Vec::new();
         queue.drain_results_into(&mut results);
@@ -2754,9 +2770,9 @@ mod tests {
         let worker_queue = Arc::clone(&queue);
         let (first_tx, first_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let first = worker_queue.take_blocking()?.0;
+            let first = worker_queue.take_blocking()?.id;
             first_tx.send(()).expect("first task claimed");
-            let second = worker_queue.take_blocking()?.0;
+            let second = worker_queue.take_blocking()?.id;
             Some((first, second))
         });
 

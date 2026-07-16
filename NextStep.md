@@ -120,6 +120,10 @@ P4 的单 worker/minibatch/OOO/cache/stopper 主线可用，但 GPU task-worker 
 `RunTasks` 的领取/完成区间（`src/search/classic/search.cc:1069-1140`）和 `PickTask::results` 的合并区间
 （`1494-1508`）。workspace 和 tree 仍未可安全移动到后台线程。
 
+第三步已完成：生产 `PickTaskQueue` 只保留 `task_count / claim / complete / wait` 的同步 phase；px0
+`RunTasks` 的 sleep/exit 条件仅作为测试状态机保留（`src/search/classic/search.cc:1069-1124`）。在没有真实
+task owner 前，不把该测试机制伪装成后台 task worker，也不让它影响 `task_workers_=0` 搜索路径。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体
