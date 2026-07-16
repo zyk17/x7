@@ -2,8 +2,6 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use parking_lot::RwLock;
-
 use xiangqi_core::{GameResult, Move, MoveList, Position, PositionHistory};
 
 /// px0 `Node::Terminal` (`node.h:132`)。
@@ -470,14 +468,15 @@ impl Node {
 ///
 /// px0 用 `unique_ptr<Node>` 保存 child；Rust 保留 arena 索引作为 parent/child
 /// 链接，但每个 Node 使用 Box 单独分配，避免 arena 扩容时改变节点地址。
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 #[allow(clippy::vec_box)] // px0 child nodes retain stable heap addresses across arena growth.
 pub struct NodeArena {
     /// `Box<Node>` keeps each node address stable while the vector grows.
-    /// The lock protects vector metadata and allocation only; node-level
-    /// ownership remains the px0 task-split/in-flight responsibility.
-    /// Reference: `src/search/classic/node.h:282-300,468-525`.
-    nodes: RwLock<Vec<Box<Node>>>,
+    /// `NodeTree` owns the px0 `nodes_mutex_` tree-phase boundary, so this
+    /// container deliberately has no second lock or escaped references.
+    /// Reference: `src/search/classic/node.h:282-300`,
+    /// `search.cc:1142-1211,1494-1508`.
+    nodes: Vec<Box<Node>>,
 }
 
 impl NodeArena {
@@ -485,26 +484,17 @@ impl NodeArena {
     /// (`src/search/classic/node.cc:196-210,465-520`). The safe Rust path
     /// requires an exclusive arena borrow; scoped task workers remain gated.
     pub fn alloc(&mut self, node: Node) -> usize {
-        let nodes = self.nodes.get_mut();
-        let idx = nodes.len();
-        nodes.push(Box::new(node));
+        let idx = self.nodes.len();
+        self.nodes.push(Box::new(node));
         idx
     }
 
     pub fn get(&self, idx: usize) -> Option<&Node> {
-        let node = self
-            .nodes
-            .read()
-            .get(idx)
-            .map(|node| Box::as_ref(node) as *const Node)?;
-        // SAFETY: every entry is a Box and NodeArena never removes or moves a
-        // Node allocation until the complete tree is dropped after workers
-        // have joined. The RwLock only protects the Vec metadata.
-        Some(unsafe { &*node })
+        self.nodes.get(idx).map(Box::as_ref)
     }
 
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Node> {
-        self.nodes.get_mut().get_mut(idx).map(Box::as_mut)
+        self.nodes.get_mut(idx).map(Box::as_mut)
     }
 
     pub fn spawn_child(&mut self, parent_idx: usize, edge_idx: usize) -> usize {
@@ -514,20 +504,6 @@ impl NodeArena {
         let child_idx = self.alloc(Node::new(Some(parent_idx), edge_idx as u16));
         self.get_mut(parent_idx).expect("valid parent node").children[edge_idx] = Some(child_idx);
         child_idx
-    }
-}
-
-impl Clone for NodeArena {
-    fn clone(&self) -> Self {
-        let nodes = self
-            .nodes
-            .read()
-            .iter()
-            .map(|node| Box::new((**node).clone()))
-            .collect();
-        Self {
-            nodes: RwLock::new(nodes),
-        }
     }
 }
 

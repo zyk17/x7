@@ -36,10 +36,10 @@
 - [x] 移除 `NodeArena::get_mut_unchecked(&self) -> &mut Node`；正常单 worker 路径仅通过 `&mut NodeTree`
   访问可变节点，allocation 不再取得 arena `RwLock` 写锁。参考
   `src/search/classic/node.cc:245-373`、`search.cc:1551-1897`。
-- [ ] 为 task-worker 的 `NodeArena::get(&self)` 裸引用读取与所有并发写建立 Rust 无别名证明；未完成前不得
-  重新打开 scoped task worker。参考 `src/search/classic/node.cc:245-373`、`search.cc:1551-1897`。
 - [ ] 对照 `src/search/classic/search.h:205-244,348-445`，将 scoped phase 临时线程改为常驻 task worker 与
-  workspace；仅在上述两项和真实 ONNX 回归均通过后开放。
+  workspace。任务只传 owned task/result/workspace；所有 `NodeTree` 访问继续经 tree-phase lock，禁止 raw
+  pointer、`unsafe impl Send` 或共享 `&mut SearchWorker`。完成后才可开启，并补真实 ONNX 长 `movetime`、stop/wait
+  与 `NInFlight==0` 回归。参考 `src/search/classic/search.h:205-244,348-445`、`search.cc:1069-1508`。
 - [x] 对照 `src/search/classic/search.cc:1233-1241,1899-1906`，复用 SearchWorker/main workspace 的 history：
   初始化一次根 history，后续 range 只 `Trim + Append`；根变化时才保留容量地覆盖。`EvalPosition`/ONNX batch
   的跨接口拥有权复制仍待 backend I/O 收口后单独审查。
