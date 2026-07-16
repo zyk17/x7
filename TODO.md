@@ -25,11 +25,11 @@
   `cargo test --release -p engin --lib`（88 项 P2/P3/controller/tree/UCT/P4 回归）与真实 ONNX UCI
   生命周期/legacy clock 冒烟已通过。
 
-## P4：单 worker 搜索流水线可用；task-worker 待重构
+## P4：px0 classic task-worker 已启用
 
-单 worker/minibatch/OOO/cache/stop 与真实 ONNX/DirectML 时序已有回归和 release 冒烟。GPU
-task split 不可用：此前 Rust raw-pointer 版本会让两个 task 重复扩展同一未扩展节点，现已删除并统一退回
-`task_workers_=0`，不能作为 px0 对齐完成项。
+单 worker/minibatch/OOO/cache/stop 与 GPU task split 均已在真实 ONNX/DirectML 回归。`TaskWorkers`
+按 px0 解析并实际启用；`NodeArena` allocation lock、first-extend CAS、child-slot reservation 共同保证
+task phase 的最小并发边界。历史上的 duplicate `ExtendNode` 门控已解除。
 
 - [x] 翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为正式 ONNX 的
   `CachingBackend` wrapper：当前局面 hash 为 key、合法着数量防碰撞、cache miss 仅在
@@ -117,18 +117,14 @@ task split，不让 `Vec<Box<Node>>` 或 `Node` 的非原子统计变成可并�
 `src/search/classic/node.h:468-525`；并发回归保证同一 edge 只会有一个 reservation winner。此项只解决
 parent slot 重复创建，`NodeArena(Vec<Box<Node>>)` 的并发 allocation 仍是下一阻塞点。
 
-- [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
-  `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占
-  minibatch/computation/counters；禁止共享 `&mut SearchWorker`。
-- [ ] 重新设计 Rust task 的所有权边界，对照 px0 `src/search/classic/search.h:205-244,348-445`、
-  `search.cc:1069-1508`：task 只能拥有独立 workspace 与明确不重叠的 node/minibatch range，不能共享
-  `&mut SearchWorker` 或通过 raw pointer 直接修改整棵树。
-- [ ] 在固定 visits、`go movetime`、真实 ONNX/DirectML 下补重复 ExtendNode、`NInFlight==0`、stop/wait
-  回归；当前真实 ONNX `go infinite -> stop` 已复现重复 ExtendNode，运行时 `active_task_workers=0`。只有该
-  回归稳定后才能解除该门控并恢复 px0 GPU `task_workers_` 的实际执行。
-- [ ] 先为 px0 `Node::TryStartScoreUpdate` 的唯一扩展语义建立 Rust 并发边界，对照
-  `src/search/classic/node.cc:348-365`、`search.cc:1485-1508,1551-1897` 与 `src/utils/mutex.h:93-119`：
-  不能把普通 `NodeTree` arena 直接暴露给多个 `&mut`，也不能用“已有 edges 则跳过”吞掉重复扩展。
+- [x] 完成 px0 task state 的 Rust 所有权拆分：task 独占 workspace/task/result，主 worker 独占
+  minibatch/computation/counters；禁止共享 `&mut SearchWorker`。参考
+  `src/search/classic/search.h:348-445`、`search.cc:1069-1140,1423-1462,1485-1508`。
+- [x] 建立 task 的 Rust 并发边界：gathering root claim、非重叠 minibatch range、稳定 arena allocation 与
+  atomic node gate/child slot；不使用整树锁串行化。参考 `src/search/classic/search.h:205-244,348-445`、
+  `search.cc:1069-1508`、`node.cc:346-365`。
+- [x] 在固定 nodes、`go movetime`、真实 ONNX/DirectML 下完成 duplicate ExtendNode、stop/wait 与
+  `NInFlight==0` 回归；已解除 `active_task_workers=0`。
 
 ## 约束
 

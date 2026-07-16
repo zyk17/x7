@@ -231,6 +231,14 @@ node 只能产生一个成功者。参考 `src/search/classic/node.cc:346-365`�
 读取同一个稳定 child index。参考 px0 `src/search/classic/node.h:468-525`。现有 `NodeArena` 仍是普通
 `Vec<Box<Node>>`，所以该 slot 只能消除 parent-edge 重复创建，尚未让 arena allocation 可并发执行。
 
+第二十四步（task-worker 解锁）已完成：`NodeArena` 的 `Vec<Box<Node>>` metadata 已经由短范围 allocation
+lock 保护，而 `Box<Node>` 地址在扩容期间稳定；task worker 可通过既有 scoped tree phase 运行。
+`active_task_workers` 现等于 px0 解析的 `task_workers`。真实 `x7.onnx` 已通过 `go nodes 10000`（开局与
+中局）、`go infinite -> stop`、`position ... moves ... -> go movetime 500` 与 `go movetime 3000`（约
+54.7k nodes / 19.5k nps）回归，无重复 `ExtendNode` 或 in-flight 泄漏。参考
+`src/search/classic/search.h:205-244,348-445`、`search.cc:1069-1140,1322-1362,1485-1508`、
+`node.cc:346-365`。此前 active=0 的描述仅保留作故障历史，不能再视为当前状态。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

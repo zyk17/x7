@@ -850,7 +850,7 @@ impl<'a> SearchWorker<'a> {
             target_minibatch_size,
             max_out_of_order,
             task_workers,
-            active_task_workers: 0,
+            active_task_workers: task_workers,
             latest_time_manager_hints: StoppersHints::default(),
             task_phase: TaskPhaseState::default(),
         }
@@ -1281,7 +1281,7 @@ impl<'a> SearchWorker<'a> {
                         let multivisit = self.iteration.minibatch[i].multivisit;
                         let mut node = node_idx;
                         while let Some(parent) = tree.node(node).parent() {
-                            tree.node_mut(parent).cancel_score_update(multivisit);
+                            tree.node(parent).cancel_score_update(multivisit);
                             node = parent;
                             if node == tree.current_head() {
                                 break;
@@ -1319,7 +1319,7 @@ impl<'a> SearchWorker<'a> {
                 if extra > 0 {
                     let mut node = node_idx;
                     while let Some(parent) = tree.node(node).parent() {
-                        tree.node_mut(parent).increment_n_in_flight(extra);
+                        tree.node(parent).increment_n_in_flight(extra);
                         node = parent;
                         if node == tree.current_head() {
                             break;
@@ -1740,7 +1740,7 @@ impl<'a> SearchWorker<'a> {
                 };
 
                 if tree.node(current_idx).n() == 0 || tree.node(current_idx).is_terminal() {
-                    if is_root_node && tree.node_mut(current_idx).try_start_score_update() {
+                    if is_root_node && tree.node(current_idx).try_start_score_update() {
                         cur_limit -= 1;
                         receiver.push(NodeToProcess::visit(
                             current_idx,
@@ -1768,7 +1768,7 @@ impl<'a> SearchWorker<'a> {
                 }
 
                 if is_root_node {
-                    tree.node_mut(current_idx).increment_n_in_flight(cur_limit);
+                    tree.node(current_idx).increment_n_in_flight(cur_limit);
                 }
 
                 // px0 `search.cc:1657-1671`: normally a bounded policy prefix
@@ -1901,11 +1901,11 @@ impl<'a> SearchWorker<'a> {
                         child_idx,
                         workspace.current_path.len() as u16 + base_depth,
                     );
-                    if tree.node_mut(child_idx).try_start_score_update() {
+                    if tree.node(child_idx).try_start_score_update() {
                         workspace.current_n_started[best_idx] += 1;
                         let remaining_visits = new_visits - 1;
                         if tree.node(child_idx).n() > 0 && !tree.node(child_idx).is_terminal() {
-                            tree.node_mut(child_idx).increment_n_in_flight(remaining_visits);
+                            tree.node(child_idx).increment_n_in_flight(remaining_visits);
                             workspace.current_n_started[best_idx] += remaining_visits;
                         }
                         workspace.current_score[best_idx] = workspace.current_utility[best_idx]
@@ -2531,7 +2531,7 @@ impl<'a> SearchWorker<'a> {
         for (node_idx, multivisit) in collisions {
             let mut current = tree.node(node_idx).parent();
             while let Some(node_idx) = current {
-                tree.node_mut(node_idx).cancel_score_update(multivisit);
+                tree.node(node_idx).cancel_score_update(multivisit);
                 current = tree.node(node_idx).parent();
             }
         }
@@ -2848,11 +2848,9 @@ mod tests {
         }
     }
 
-    /// px0 retains an explicit GPU task-worker request even while the real
-    /// ONNX duplicate-`ExtendNode` regression keeps Rust task activation at
-    /// zero (`search.h:205-244`, `search.cc:1322-1362,1494-1508`). This
-    /// prevents a configuration-only change from re-enabling unsafe tree
-    /// mutation before the scoped path is proven.
+    /// px0 activates an explicit GPU task-worker request for both gathering
+    /// and processing phases (`search.h:205-244`,
+    /// `search.cc:1322-1362,1494-1508`).
     #[test]
     fn gpu_backend_keeps_requested_task_worker_count() {
         ensure_init();
@@ -2877,7 +2875,7 @@ mod tests {
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
 
         assert_eq!(worker.task_workers, 1);
-        assert_eq!(worker.active_task_workers, 0);
+        assert_eq!(worker.active_task_workers, 1);
 
         std::thread::scope(|scope| {
             let state = Arc::clone(&search_state);
@@ -2895,7 +2893,7 @@ mod tests {
 
         assert!(search_state.total_playouts.load(Ordering::Acquire) >= 16);
         assert_eq!(worker.task_workers, 1);
-        assert_eq!(worker.active_task_workers, 0);
+        assert_eq!(worker.active_task_workers, 1);
         assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
     }
 

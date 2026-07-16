@@ -2,6 +2,8 @@
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+use parking_lot::RwLock;
+
 use xiangqi_core::{GameResult, Move, MoveList, Position, PositionHistory};
 
 const EMPTY_CHILD: usize = usize::MAX;
@@ -279,9 +281,16 @@ impl Node {
 
     pub fn child(&self, index: usize) -> Option<usize> {
         let child = self.children.get(index)?;
+        #[cfg(debug_assertions)]
+        let mut spins = 0usize;
         loop {
             let index = child.load(Ordering::Acquire);
             if index == RESERVED_CHILD {
+                #[cfg(debug_assertions)]
+                {
+                    spins += 1;
+                    assert!(spins < 10_000_000, "child reservation was never published");
+                }
                 std::hint::spin_loop();
                 continue;
             }
@@ -349,7 +358,7 @@ impl Node {
     }
 
     /// px0 `Node::CancelScoreUpdate` (`node.cc:354`)。
-    pub fn cancel_score_update(&mut self, multivisit: u32) {
+    pub fn cancel_score_update(&self, multivisit: u32) {
         self.n_in_flight.fetch_sub(multivisit, Ordering::AcqRel);
     }
 
@@ -502,36 +511,89 @@ impl Node {
 ///
 /// px0 用 `unique_ptr<Node>` 保存 child；Rust 保留 arena 索引作为 parent/child
 /// 链接，但每个 Node 使用 Box 单独分配，避免 arena 扩容时改变节点地址。
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 #[allow(clippy::vec_box)] // px0 child nodes retain stable heap addresses across arena growth.
 pub struct NodeArena {
-    nodes: Vec<Box<Node>>,
+    /// `Box<Node>` keeps each node address stable while the vector grows.
+    /// The lock protects vector metadata and allocation only; node-level
+    /// ownership remains the px0 task-split/in-flight responsibility.
+    /// Reference: `src/search/classic/node.h:282-300,468-525`.
+    nodes: RwLock<Vec<Box<Node>>>,
 }
 
 impl NodeArena {
-    pub fn alloc(&mut self, node: Node) -> usize {
-        let idx = self.nodes.len();
-        self.nodes.push(Box::new(node));
+    pub fn alloc(&self, node: Node) -> usize {
+        let mut nodes = self.nodes.write();
+        let idx = nodes.len();
+        nodes.push(Box::new(node));
         idx
     }
 
     pub fn get(&self, idx: usize) -> Option<&Node> {
-        self.nodes.get(idx).map(Box::as_ref)
+        let node = self
+            .nodes
+            .read()
+            .get(idx)
+            .map(|node| Box::as_ref(node) as *const Node)?;
+        // SAFETY: every entry is a Box and NodeArena never removes or moves a
+        // Node allocation until the complete tree is dropped after workers
+        // have joined. The RwLock only protects the Vec metadata.
+        Some(unsafe { &*node })
+    }
+
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "The arena owns stable Box allocations; callers document the px0 node-level exclusivity proof."
+    )]
+    unsafe fn get_mut_unchecked(&self, idx: usize) -> Option<&mut Node> {
+        let node = self
+            .nodes
+            .read()
+            .get(idx)
+            .map(|node| Box::as_ref(node) as *const Node as *mut Node)?;
+        // SAFETY: callers must hold the px0 node-level exclusive right: an
+        // unexpanded node's in-flight winner or the post-WaitForTasks main
+        // phase. This is narrower than a whole-tree lock and is documented by
+        // `TryStartScoreUpdate` / child-slot reservation.
+        Some(unsafe { &mut *node })
     }
 
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Node> {
-        self.nodes.get_mut(idx).map(Box::as_mut)
+        // SAFETY: a mutable NodeArena borrow excludes all other arena users.
+        unsafe { self.get_mut_unchecked(idx) }
     }
 
-    pub fn spawn_child(&mut self, parent_idx: usize, edge_idx: usize) -> usize {
-        if !self.nodes[parent_idx].try_reserve_child(edge_idx) {
-            return self.nodes[parent_idx]
+    pub fn spawn_child(&self, parent_idx: usize, edge_idx: usize) -> usize {
+        if !self
+            .get(parent_idx)
+            .expect("valid parent node")
+            .try_reserve_child(edge_idx)
+        {
+            return self
+                .get(parent_idx)
+                .expect("valid parent node")
                 .child(edge_idx)
                 .expect("reserved child slot must be published");
         }
         let child_idx = self.alloc(Node::new(Some(parent_idx), edge_idx as u16));
-        self.nodes[parent_idx].publish_child(edge_idx, child_idx);
+        self.get(parent_idx)
+            .expect("valid parent node")
+            .publish_child(edge_idx, child_idx);
         child_idx
+    }
+}
+
+impl Clone for NodeArena {
+    fn clone(&self) -> Self {
+        let nodes = self
+            .nodes
+            .read()
+            .iter()
+            .map(|node| Box::new((**node).clone()))
+            .collect();
+        Self {
+            nodes: RwLock::new(nodes),
+        }
     }
 }
 
@@ -557,7 +619,7 @@ impl NodeTree {
         &self.arena
     }
 
-    pub fn arena_mut(&mut self) -> &mut NodeArena {
+    pub fn arena_mut(&mut self) -> &NodeArena {
         &mut self.arena
     }
 
@@ -566,7 +628,10 @@ impl NodeTree {
     }
 
     pub fn node_mut(&mut self, idx: usize) -> &mut Node {
-        self.arena.get_mut(idx).expect("valid node index")
+        // SAFETY: a normal NodeTree borrow is exclusive. Scoped task workers
+        // may only call this after winning px0's node in-flight/child-slot
+        // ownership gate; see NodeArena::get_mut_unchecked.
+        unsafe { self.arena.get_mut_unchecked(idx) }.expect("valid node index")
     }
 
     /// px0 `EdgeAndNode(Edge*, Node*)` (`node.h:358-410`) 的 arena 适配。
