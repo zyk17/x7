@@ -35,6 +35,12 @@ P0-P3 的规则、历史、UCI、classic tree/worker 基础已建立。P4 的正
 并在取得锁后重新检查 terminal 状态。该锁只保护 `search.cc:1517-1541` 的 ancestor rewrite，不解除
 `active_task_workers=0` 门控。
 
+第二、四项的单 worker 子集已完成：`NodeArena::get_mut_unchecked(&self)` 已删除，普通搜索只能由真实
+`&mut NodeTree` 取得可变节点；allocation 也不再进入 `RwLock` 写锁。`SearchWorker` 与主 task workspace
+在构造期复制根 history，之后按照 px0 `search.cc:1899-1906` 仅 `Trim + Append`；workspace 只在根 history
+发生变化时保留容量地覆盖。未来 task-worker 仍须证明 `NodeArena::get(&self)` 的裸引用读取与所有并发写之间
+无别名，不能把这两个子集误认为 task-worker 已安全。
+
 ## P1-P3 进入 P4 前复核（2026-07-15）
 
 - P1：Rust `xiangqi_core` 的 release 全量对拍已通过：px0 移植的 `board_test.cc` depth-5 perft、

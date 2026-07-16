@@ -522,8 +522,11 @@ pub struct NodeArena {
 }
 
 impl NodeArena {
-    pub fn alloc(&self, node: Node) -> usize {
-        let mut nodes = self.nodes.write();
+    /// px0 creates child ownership while its caller owns the tree phase
+    /// (`src/search/classic/node.cc:196-210,465-520`). The safe Rust path
+    /// requires an exclusive arena borrow; scoped task workers remain gated.
+    pub fn alloc(&mut self, node: Node) -> usize {
+        let nodes = self.nodes.get_mut();
         let idx = nodes.len();
         nodes.push(Box::new(node));
         idx
@@ -541,29 +544,11 @@ impl NodeArena {
         Some(unsafe { &*node })
     }
 
-    #[allow(
-        clippy::mut_from_ref,
-        reason = "The arena owns stable Box allocations; callers document the px0 node-level exclusivity proof."
-    )]
-    unsafe fn get_mut_unchecked(&self, idx: usize) -> Option<&mut Node> {
-        let node = self
-            .nodes
-            .read()
-            .get(idx)
-            .map(|node| Box::as_ref(node) as *const Node as *mut Node)?;
-        // SAFETY: callers must hold the px0 node-level exclusive right: an
-        // unexpanded node's in-flight winner or the post-WaitForTasks main
-        // phase. This is narrower than a whole-tree lock and is documented by
-        // `TryStartScoreUpdate` / child-slot reservation.
-        Some(unsafe { &mut *node })
-    }
-
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Node> {
-        // SAFETY: a mutable NodeArena borrow excludes all other arena users.
-        unsafe { self.get_mut_unchecked(idx) }
+        self.nodes.get_mut().get_mut(idx).map(Box::as_mut)
     }
 
-    pub fn spawn_child(&self, parent_idx: usize, edge_idx: usize) -> usize {
+    pub fn spawn_child(&mut self, parent_idx: usize, edge_idx: usize) -> usize {
         if !self
             .get(parent_idx)
             .expect("valid parent node")
@@ -619,7 +604,7 @@ impl NodeTree {
         &self.arena
     }
 
-    pub fn arena_mut(&mut self) -> &NodeArena {
+    pub fn arena_mut(&mut self) -> &mut NodeArena {
         &mut self.arena
     }
 
@@ -628,10 +613,7 @@ impl NodeTree {
     }
 
     pub fn node_mut(&mut self, idx: usize) -> &mut Node {
-        // SAFETY: a normal NodeTree borrow is exclusive. Scoped task workers
-        // may only call this after winning px0's node in-flight/child-slot
-        // ownership gate; see NodeArena::get_mut_unchecked.
-        unsafe { self.arena.get_mut_unchecked(idx) }.expect("valid node index")
+        self.arena.get_mut(idx).expect("valid node index")
     }
 
     /// px0 `EdgeAndNode(Edge*, Node*)` (`node.h:358-410`) 的 arena 适配。

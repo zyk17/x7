@@ -186,6 +186,15 @@ impl PositionHistory {
         &self.positions
     }
 
+    /// Copies a root history without discarding this instance's reserved DFS
+    /// capacity. px0 gives every search workspace a persistent
+    /// `PositionHistory` and reuses it through `Trim`/`Append`
+    /// (`src/search/classic/search.h:348-365`, `search.cc:1899-1906`).
+    pub fn copy_from_history(&mut self, source: &Self) {
+        self.positions.clear();
+        self.positions.extend_from_slice(source.positions());
+    }
+
     /// px0 `PositionHistory::Reserve` (`position.h:126-128`).
     pub fn reserve(&mut self, size: usize) {
         self.positions.reserve(size.saturating_sub(self.positions.len()));

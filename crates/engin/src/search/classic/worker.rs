@@ -155,6 +155,23 @@ struct TaskWorkspace {
     history: PositionHistory,
 }
 
+impl TaskWorkspace {
+    /// px0 keeps one `PositionHistory` per task workspace and `ExtendNode`
+    /// returns it to `played_history_` with `Trim` before each leaf
+    /// (`src/search/classic/search.h:348-365`, `search.cc:1899-1906`).
+    ///
+    /// Recopy the root only when this workspace belongs to another search
+    /// root. Normal ranges retain their allocation and only discard the
+    /// previous leaf suffix.
+    fn reset_history_to_root(&mut self, root_history: &PositionHistory) {
+        if self.history.positions().get(..root_history.len()) != Some(root_history.positions()) {
+            self.history.copy_from_history(root_history);
+        } else {
+            self.history.trim(root_history.len());
+        }
+    }
+}
+
 /// px0 keeps `nodes_mutex_` across each tree phase
 /// (`search.cc:1142-1211,1494-1508`). Rust represents that boundary by
 /// borrowing the tree explicitly for every phase instead of storing an active
@@ -844,6 +861,8 @@ impl<'a> SearchWorker<'a> {
             1,
             (params.max_out_of_order_evals_factor * target_minibatch_size as f32) as usize,
         );
+        let mut task_phase = TaskPhaseState::default();
+        task_phase.main_runner.workspace.reset_history_to_root(&history);
         Self {
             history,
             played_history_len,
@@ -864,7 +883,7 @@ impl<'a> SearchWorker<'a> {
             // activate this incomplete translation in production.
             active_task_workers: 0,
             latest_time_manager_hints: StoppersHints::default(),
-            task_phase: TaskPhaseState::default(),
+            task_phase,
             twofold_correction_lock: Mutex::new(()),
         }
     }
@@ -1189,8 +1208,8 @@ impl<'a> SearchWorker<'a> {
         self.iteration.computation = Some(self.backend.create_computation()?);
         self.iteration.minibatch.clear();
         self.iteration.minibatch.reserve(2 * self.target_minibatch_size);
-        self.history = tree.history().clone();
-        self.played_history_len = self.history.len();
+        debug_assert_eq!(self.played_history_len, tree.history().len());
+        self.history.trim(self.played_history_len);
         Ok(())
     }
 
@@ -2114,7 +2133,7 @@ impl<'a> SearchWorker<'a> {
             played_history_len: context.extend.played_history_len,
             two_fold_draws: context.extend.two_fold_draws,
         };
-        workspace.history = tree.history().clone();
+        workspace.reset_history_to_root(tree.history());
         for item in range {
             // px0 immediately skips collisions here. They only carry an
             // in-flight reservation and must not enter terminal/cache OOO
@@ -3213,6 +3232,28 @@ mod tests {
             .expect("prefetch");
 
         assert_eq!(worker.history.len(), worker.played_history_len);
+    }
+
+    /// px0 reuses the task workspace history across `ProcessPickedTask`
+    /// calls and relies on `PositionHistory::Trim` to discard the last DFS
+    /// suffix (`src/search/classic/search.cc:1899-1906`).
+    #[test]
+    fn task_workspace_resets_leaf_suffix_without_recopied_root() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root_history = tree.history().clone();
+        let mut workspace = TaskWorkspace::default();
+
+        workspace.reset_history_to_root(&root_history);
+        let root_storage = workspace.history.positions().as_ptr();
+        let root_move = workspace.history.last().board().generate_legal_moves()[0];
+        workspace.history.append(root_move);
+        workspace.reset_history_to_root(&root_history);
+
+        assert_eq!(workspace.history, root_history);
+        assert_eq!(workspace.history.positions().as_ptr(), root_storage);
     }
 
     #[test]

@@ -33,11 +33,16 @@ first-extend CAS 和 child-slot reservation 不能证明 task 对 ancestors/term
 
 - [x] 对照 `src/search/classic/search.cc:1510-1550`，为 twofold ancestor rollback 建立 px0 等价的 per-worker
   task 互斥；锁后重新检查 terminal 状态，避免等待期间重复回滚。
-- [ ] 移除或收窄 `NodeArena::get_mut_unchecked(&self) -> &mut Node`；为每个并发可写 node 字段建立 Rust
-  无别名证明。参考 `src/search/classic/node.cc:245-373`、`search.cc:1551-1897`。
+- [x] 移除 `NodeArena::get_mut_unchecked(&self) -> &mut Node`；正常单 worker 路径仅通过 `&mut NodeTree`
+  访问可变节点，allocation 不再取得 arena `RwLock` 写锁。参考
+  `src/search/classic/node.cc:245-373`、`search.cc:1551-1897`。
+- [ ] 为 task-worker 的 `NodeArena::get(&self)` 裸引用读取与所有并发写建立 Rust 无别名证明；未完成前不得
+  重新打开 scoped task worker。参考 `src/search/classic/node.cc:245-373`、`search.cc:1551-1897`。
 - [ ] 对照 `src/search/classic/search.h:205-244,348-445`，将 scoped phase 临时线程改为常驻 task worker 与
   workspace；仅在上述两项和真实 ONNX 回归均通过后开放。
-- [ ] 对照 `src/search/classic/search.cc:1899-1906`，消除 history/`EvalPosition`/ONNX 编码的重复复制。
+- [x] 对照 `src/search/classic/search.cc:1233-1241,1899-1906`，复用 SearchWorker/main workspace 的 history：
+  初始化一次根 history，后续 range 只 `Trim + Append`；根变化时才保留容量地覆盖。`EvalPosition`/ONNX batch
+  的跨接口拥有权复制仍待 backend I/O 收口后单独审查。
 - [ ] 对照 `src/search/classic/node.h:468-525`，处理 child reservation 的 release-mode 无限等待，并为 NodeArena
   设定明确容量策略。
 
