@@ -154,6 +154,11 @@ visit budget；队列满、未扩展或 terminal child 必须继续由父任务�
 `src/search/classic/search.cc:1828-1864`。回归覆盖 task 的 root/path/depth/budget 与父边去重；这仍不表示
 后台 task-worker 已安全可用。
 
+第十一步已完成：px0 `task_workspaces_[tid]` 的 gathering/processing 分支已映射为 `TaskRunner` 方法；
+runner 只拥有自己的 DFS/history scratch，gathering task 保留自己的结果 vector，processing 只接收已拆分的
+minibatch slice。参考 `src/search/classic/search.cc:1116-1129,1322-1362`。当前仍由 main runner 同步调用，
+不能据此开启 `task_workers`。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

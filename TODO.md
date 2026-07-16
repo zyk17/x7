@@ -75,6 +75,9 @@ gathering task 的 subtree/tree 写入所有权证明，不能以全树锁替代
 `src/search/classic/search.h:348-365,441-445`；仍未创建后台 runner。
 已完成 gathering handoff 的父边去重：仅 `PickTask` 发布成功后才从主 DFS 清零该 child 的 visit budget，
 参考 `src/search/classic/search.cc:1828-1864`；尚未证明后台 task 的 subtree/tree 写入不重叠。
+已完成 px0 `task_workspaces_[tid]` 的执行边界：`TaskRunner` 独占 workspace，gathering task 自有结果，
+processing 只接收已拆分 minibatch slice，参考 `src/search/classic/search.cc:1116-1129,1322-1362`；当前仍是
+main runner 的同步调用。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占

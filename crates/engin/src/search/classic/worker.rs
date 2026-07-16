@@ -466,6 +466,43 @@ struct TaskRunner {
     workspace: TaskWorkspace,
 }
 
+impl TaskRunner {
+    /// px0 `RunTasks` gathering branch (`src/search/classic/search.cc:1116-1124`).
+    /// A runner owns its DFS/history scratch; the queued task owns its result
+    /// vector. Neither object needs a mutable `SearchWorker` alias.
+    fn run_gathering_task(
+        &mut self,
+        context: &SelectionContext<'_>,
+        tree: &mut NodeTree,
+        task: &mut PickTask,
+    ) -> Result<(), EnginError> {
+        debug_assert_eq!(task.kind, PickTaskKind::Gathering);
+        SearchWorker::pick_nodes_to_extend_task_with_workspace(
+            context,
+            tree,
+            task.start.expect("gathering task start"),
+            task.base_depth,
+            task.collision_limit,
+            &task.moves_to_base,
+            &mut task.results,
+            &mut self.workspace,
+            false,
+        )
+    }
+
+    /// px0 `RunTasks` processing branch (`src/search/classic/search.cc:1125-1129`).
+    /// The caller provides an already-disjoint minibatch range, matching px0's
+    /// task split before a runner mutates its private history scratch.
+    fn run_processing_range(
+        &mut self,
+        context: &ProcessingContext<'_>,
+        tree: &mut NodeTree,
+        range: &mut [NodeToProcess],
+    ) -> Result<(), EnginError> {
+        SearchWorker::process_picked_range(context, tree, range, &mut self.workspace)
+    }
+}
+
 /// px0 `SearchWorker` 每轮迭代状态（`src/search/classic/search.h:419-427`）。
 ///
 /// `minibatch_`、`computation_` 和 `number_out_of_order_` 的生命周期只跨越
@@ -1166,30 +1203,27 @@ impl<'a> SearchWorker<'a> {
     /// The queue is consumed by its owning worker until px0's independent
     /// task-worker SearchWorker ownership is translated. This is not a
     /// persistent task-thread implementation.
-    fn run_queued_tasks_in_tree(
-        &mut self,
-        tree: &mut NodeTree,
-        workspace: &mut TaskWorkspace,
-    ) -> Result<(), EnginError> {
+    fn run_queued_tasks_in_tree(&mut self, tree: &mut NodeTree, runner: &mut TaskRunner) -> Result<(), EnginError> {
         while let Some(mut claimed) = self.task_phase.queue.take() {
             match claimed.task.kind {
                 PickTaskKind::Gathering => {
                     let context = self.selection_context();
-                    let result = Self::pick_nodes_to_extend_task_with_workspace(
-                        &context,
-                        tree,
-                        claimed.task.start.expect("gathering task start"),
-                        claimed.task.base_depth,
-                        claimed.task.collision_limit,
-                        &claimed.task.moves_to_base,
-                        &mut claimed.task.results,
-                        workspace,
-                        false,
-                    );
-                    result?;
+                    runner.run_gathering_task(&context, tree, &mut claimed.task)?;
                 }
                 PickTaskKind::Processing => {
-                    self.process_picked_task_in_tree(tree, claimed.task.start_idx, claimed.task.end_idx, workspace)?;
+                    let context = ProcessingContext {
+                        params: self.params,
+                        computation: self.iteration.computation.as_deref(),
+                        extend: ExtendContext {
+                            played_history_len: self.played_history_len,
+                            two_fold_draws: self.params.two_fold_draws,
+                        },
+                    };
+                    runner.run_processing_range(
+                        &context,
+                        tree,
+                        &mut self.iteration.minibatch[claimed.task.start_idx..claimed.task.end_idx],
+                    )?;
                 }
             }
             self.task_phase.queue.complete(claimed);
@@ -1210,15 +1244,20 @@ impl<'a> SearchWorker<'a> {
     /// CPU fallback for px0 `TaskWorkers=0`: run queued work on the owning
     /// workspace without creating task threads.
     fn run_tasks_synchronously_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        let mut workspace = std::mem::take(&mut self.task_phase.main_runner.workspace);
-        let result = self.run_queued_tasks_in_tree(tree, &mut workspace);
-        self.task_phase.main_runner.workspace = workspace;
+        let mut runner = std::mem::take(&mut self.task_phase.main_runner);
+        let result = self.run_queued_tasks_in_tree(tree, &mut runner);
+        self.task_phase.main_runner = runner;
         result
     }
 
     #[cfg(test)]
     fn run_queued_tasks(&mut self, workspace: &mut TaskWorkspace) -> Result<(), EnginError> {
-        self.with_tree(|worker, tree| worker.run_queued_tasks_in_tree(tree, workspace))
+        let mut runner = TaskRunner {
+            workspace: std::mem::take(workspace),
+        };
+        let result = self.with_tree(|worker, tree| worker.run_queued_tasks_in_tree(tree, &mut runner));
+        *workspace = runner.workspace;
+        result
     }
 
     /// px0 `PickNodesToExtendTask` (`src/search/classic/search.cc:1551-1897`)
