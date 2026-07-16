@@ -82,8 +82,8 @@ stopper 现在也遵守 px0 的 root-first-visit gate：root 尚无访问时只�
 机制，不承载任何搜索策略或节点语义。参考 px0 的 `nodes_mutex_` 使用边界
 `src/search/classic/search.cc:1142-1211,1494-1508`。
 
-P4 的单 worker/minibatch/OOO/cache/stopper 主线可用，但 GPU task-worker 的 raw-pointer 翻译已被
-撤回到 px0 的 `task_workers_=0` 安全分支：真实 ONNX 的正时间搜索会触发重复 `ExtendNode`，不能继续
+P4 的单 worker/minibatch/OOO/cache/stopper 主线可用，但 GPU task-worker 的 raw-pointer 翻译已从代码
+删除并退回到 px0 的 `task_workers_=0` 安全分支：真实 ONNX 的正时间搜索会触发重复 `ExtendNode`，不能继续
 把该实现称为对齐。完整 task-worker 必须先将 `SearchWorker` 的 task 所需状态拆成可独占借用的数据，
 再翻译 px0 `search.h:205-244,435-445` 和 `search.cc:1069-1508`；不得重新启用当前 `&mut SearchWorker`
 跨线程别名版本。
@@ -93,10 +93,10 @@ UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体
 (`simple/smooth/alphazero`) 仍不暴露，避免把未翻译配置伪装成可用功能。
 
-完整 task-worker 是明确缺口，不得把 `TaskTreeBridge` / `TaskWorkerRunner` 当作可启用实现；后续只能
+完整 task-worker 是明确缺口，不得把已删除的 `TaskTreeBridge` / `TaskWorkerRunner` 当作可启用实现；后续只能
 从 px0 `search.h:205-244,348-445`、`search.cc:1069-1508` 重新建立无别名的数据所有权边界。此前的
 `*mut SearchWorker` / `unsafe impl Send` bridge 在真实 ONNX 正时间搜索会触发重复 `ExtendNode`，已
-完全停用；不得恢复或以全树锁掩盖该错误。
+从代码删除；不得恢复或以全树锁掩盖该错误。
 
 这不是仅把 `Vec<Box<Node>>` 改成线程安全容器就能解决的问题。px0 自己声明 `Edge_Iterator` 和
 `VisitedNode_Iterator` 非线程安全（`src/search/classic/node.h:423-436,547-551`），而

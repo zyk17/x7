@@ -26,7 +26,7 @@
 ## P4：单 worker 搜索流水线可用；task-worker 待重构
 
 单 worker/minibatch/OOO/cache/stop 与真实 ONNX/DirectML 时序已有回归和 release 冒烟。GPU
-task split 不可用：当前 Rust raw-pointer 版本会让两个 task 重复扩展同一未扩展节点，已统一退回
+task split 不可用：此前 Rust raw-pointer 版本会让两个 task 重复扩展同一未扩展节点，现已删除并统一退回
 `task_workers_=0`，不能作为 px0 对齐完成项。
 
 - [x] 翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为正式 ONNX 的

@@ -16,7 +16,7 @@ shared-tree、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。正式 
 px0 `MemCache` 风格的 `CachingBackend` 包裹：按局面 hash 查找、以合法着数量防碰撞、batch 完成后写入、
 `ucinewgame` 清空；默认 `NNCacheSize=2000000`。
 px0 的 GPU task-worker 尚未完成：此前 Rust 端把一个 `SearchWorker` 的可变状态错误地交给多个 task
-thread，真实 ONNX 搜索会重复 `ExtendNode`。该 raw-pointer 路径已停用，当前强制
+thread，真实 ONNX 搜索会重复 `ExtendNode`。该 raw-pointer 路径已从代码删除，当前强制
 `task_workers=0`，只保留安全的单 worker 搜索；后续必须按 px0 重新建立无别名的 task 所有权边界。
 
 主 UCI 使用 px0 名称 `WeightsFile` 配置 ONNX 权重，并会在下一条 `position` 前加载它。正式

@@ -8,7 +8,7 @@
   legacy clock manager 与 UCI 生命周期已接通。
 - px0 默认 legacy 时钟预算已实现：`MoveOverheadMs`、`Slowmover`、
   `go wtime/btime/winc/binc/movestogo`。`depth/mate/ponder/ponderhit` 仍明确拒绝。
-- 已知 P4 缺口：GPU task-worker 的 raw-pointer 翻译会在真实 ONNX 搜索中重复 `ExtendNode`；当前强制
+- 已知 P4 缺口：GPU task-worker 的 raw-pointer 翻译会在真实 ONNX 搜索中重复 `ExtendNode`，现已删除；当前强制
   `task_workers=0`。后续必须依照 px0 `src/search/classic/search.h:205-244,348-445` 与
   `search.cc:1069-1508` 重新建立无别名的 task 所有权，再恢复该路径。
 
