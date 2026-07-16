@@ -187,6 +187,11 @@ processing range 通过仅在 scope 内有效的 raw pointer 传入，主 worker
 验证 task 执行/回填生命周期，但尚未达到 px0 “主 DFS 发布时 task 已并行消费”的持续流水线；下一步只能在
 固定 ONNX 回归后把 spawn 前移到 gathering/processing producer phase。
 
+第十七步已完成：gathering scope 已前移到主 `PickNodesToExtendTask` 的 producer phase。task runners 先等待
+queue，主 DFS 可持续发布 gathering 子树，随后 seal/join 并按 px0 顺序合并 results。参考
+`src/search/classic/search.cc:1069-1140,1485-1508,1828-1864`。processing split 仍在主 suffix 结束后才
+启动 task scope，是下一步唯一未对齐的 pipeline 时序。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

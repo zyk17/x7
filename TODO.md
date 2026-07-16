@@ -95,6 +95,9 @@ CPU/GPU 与硬件线程公式推导。当前仅据此做 split，`WaitForTasks` 
 只在 scope 内以审计过的 raw pointer 访问，参考
 `src/search/classic/search.cc:1069-1140,1322-1362,1485-1508`。当前在 producer seal 后才启动 scope，尚未
 实现 px0 主 DFS 与 task 的持续并行消费；下一步需固定 ONNX 回归后将 spawn 前移。
+已将 gathering scope 前移到主 `PickNodesToExtendTask` producer phase，参考
+`src/search/classic/search.cc:1069-1140,1485-1508,1828-1864`：task runners 等待 queue，主 DFS 发布子树，
+seal/join 后合并 results。processing 的 main suffix 与 task range 仍未同时运行。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占

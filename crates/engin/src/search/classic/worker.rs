@@ -1271,24 +1271,109 @@ impl<'a> SearchWorker<'a> {
         // `ResetTasks` (`src/search/classic/search.cc:1485-1492`).
         self.task_phase.queue.reset();
         let mut receiver = std::mem::take(&mut self.iteration.minibatch);
-        let mut workspace = std::mem::take(&mut self.task_phase.main_runner.workspace);
-        let context = self.selection_context();
-        let result = Self::pick_nodes_to_extend_task_with_workspace(
-            &context,
-            tree,
-            tree.current_head(),
-            0,
-            collision_limit,
-            &MoveList::new(),
-            &mut receiver,
-            &mut workspace,
-            true,
-        );
-        self.task_phase.main_runner.workspace = workspace;
+        let mut runner = std::mem::take(&mut self.task_phase.main_runner);
+        let result = if self.task_workers == 0 {
+            let context = self.selection_context();
+            Self::pick_nodes_to_extend_task_with_workspace(
+                &context,
+                tree,
+                tree.current_head(),
+                0,
+                collision_limit,
+                &MoveList::new(),
+                &mut receiver,
+                &mut runner.workspace,
+                true,
+            )
+        } else {
+            self.run_gathering_phase_scoped_in_tree(tree, collision_limit, &mut receiver, &mut runner)
+        };
+        self.task_phase.main_runner = runner;
         self.iteration.minibatch = receiver;
-        self.wait_for_queued_tasks_in_tree(tree)?;
+        if self.task_workers == 0 {
+            self.wait_for_queued_tasks_in_tree(tree)?;
+        } else {
+            self.task_phase.queue.wait();
+        }
         self.task_phase.queue.drain_results_into(&mut self.iteration.minibatch);
         result
+    }
+
+    /// px0 starts `RunTasks` before the main `PickNodesToExtendTask` walks the
+    /// tree, then waits before merging task results (`src/search/classic/
+    /// search.cc:1069-1140,1485-1508`). The scoped translation preserves that
+    /// ordering without sharing `SearchWorker` or task workspaces.
+    fn run_gathering_phase_scoped_in_tree(
+        &mut self,
+        tree: &mut NodeTree,
+        collision_limit: u32,
+        receiver: &mut Vec<NodeToProcess>,
+        main_runner: &mut TaskRunner,
+    ) -> Result<(), EnginError> {
+        let task_workers = usize::try_from(self.task_workers).expect("positive px0 task worker count");
+        let context = SelectionContext {
+            params: self.params,
+            search_state: self.search_state,
+            root_move_filter: self.root_move_filter,
+            latest_time_manager_hints: self.latest_time_manager_hints.clone(),
+            task_workers: self.task_workers,
+            task_queue: &self.task_phase.queue,
+        };
+        let queue = &self.task_phase.queue;
+        let tree = ScopedTaskTree::from_tree(tree);
+        let first_error = Mutex::new(None);
+        let context = &context;
+        let first_error = &first_error;
+
+        let main_result = std::thread::scope(|scope| {
+            for _ in 0..task_workers {
+                scope.spawn(move || {
+                    let mut runner = TaskRunner::default();
+                    while let Some(mut claimed) = queue.take_until_phase_sealed() {
+                        debug_assert_eq!(claimed.task.kind, PickTaskKind::Gathering);
+                        // SAFETY: the main DFS and these task runners execute
+                        // only inside this px0 tree phase; join completes
+                        // before the owner reuses `NodeTree`.
+                        let result = unsafe {
+                            tree.with_mut(|tree| runner.run_gathering_task(context, tree, &mut claimed.task))
+                        };
+                        if let Err(error) = result {
+                            let mut first = first_error.lock().expect("task error lock");
+                            if first.is_none() {
+                                *first = Some(error);
+                            }
+                        }
+                        queue.complete(claimed);
+                    }
+                });
+            }
+
+            // SAFETY: exactly the same scoped px0 tree phase as the runners.
+            // The queue is sealed immediately after this producer returns.
+            let result = unsafe {
+                tree.with_mut(|tree| {
+                    Self::pick_nodes_to_extend_task_with_workspace(
+                        context,
+                        tree,
+                        tree.current_head(),
+                        0,
+                        collision_limit,
+                        &MoveList::new(),
+                        receiver,
+                        &mut main_runner.workspace,
+                        true,
+                    )
+                })
+            };
+            queue.seal_phase();
+            result
+        });
+
+        main_result?;
+        if let Some(error) = first_error.lock().expect("task error lock").take() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// px0 `SearchWorker::RunTasks` (`src/search/classic/search.cc:1069-1140`).
