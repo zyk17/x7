@@ -77,7 +77,7 @@ impl WorkerSearchState {
 #[derive(Clone, Debug)]
 pub struct NodeToProcess {
     pub node_idx: usize,
-    pub eval: EvalResult,
+    pub eval: Arc<EvalResult>,
     pub multivisit: u32,
     pub maxvisit: u32,
     pub depth: u16,
@@ -94,7 +94,7 @@ impl NodeToProcess {
     pub fn visit(node_idx: usize, depth: u16) -> Self {
         Self {
             node_idx,
-            eval: EvalResult::default(),
+            eval: Arc::new(EvalResult::default()),
             multivisit: 1,
             maxvisit: 0,
             depth,
@@ -111,7 +111,7 @@ impl NodeToProcess {
     pub fn collision(node_idx: usize, depth: u16, multivisit: u32, maxvisit: u32) -> Self {
         Self {
             node_idx,
-            eval: EvalResult::default(),
+            eval: Arc::new(EvalResult::default()),
             multivisit,
             maxvisit,
             depth,
@@ -2378,24 +2378,25 @@ impl<'a> SearchWorker<'a> {
         }
         let node_idx = item.node_idx;
         if !item.nn_queried {
-            item.eval = EvalResult {
+            item.eval = Arc::new(EvalResult {
                 wl: tree.node(node_idx).wl(),
                 d: tree.node(node_idx).d(),
                 m: tree.node(node_idx).m(),
                 policies: Vec::new(),
-            };
+            });
             return Ok(());
         }
         let ticket = item
             .eval_ticket
             .ok_or(EnginError::PortIncomplete("P4 FetchSingleNodeResult missing ticket"))?;
-        let mut eval = context
+        let eval = context
             .computation
             .ok_or(EnginError::PortIncomplete(
                 "P4 FetchSingleNodeResult without computation",
             ))?
             .take_result(ticket)?;
-        eval.wl = -eval.wl;
+        let mut wl = -eval.wl;
+        let mut d = eval.d;
         // px0 rescales NN WDL before it reaches backup, never afterwards in
         // UCI formatting (`src/search/classic/search.cc:2128-2143`). The
         // neutral defaults are identity in ratio/diff terms; contempt mode is
@@ -2406,8 +2407,8 @@ impl<'a> SearchWorker<'a> {
             let root_stm = (context.params.contempt_mode == ContemptMode::Black) == tree.history().is_black_to_move();
             let sign = if root_stm ^ (item.depth % 2 == 1) { 1.0 } else { -1.0 };
             wdl_rescale(
-                &mut eval.wl,
-                &mut eval.d,
+                &mut wl,
+                &mut d,
                 context.params.wdl_rescale_ratio,
                 if context.params.contempt_mode == ContemptMode::None {
                     0.0
@@ -2427,7 +2428,15 @@ impl<'a> SearchWorker<'a> {
             // be spawned (`node.cc:291-298`, `search.cc:2145-2153`).
             tree.node_mut(node_idx).sort_edges();
         }
-        item.eval = eval;
+        // Policy is consumed by the leaf edges above. Keep only the adjusted
+        // scalar fields in the tree item so a cache hit never clones its policy
+        // vector.
+        item.eval = Arc::new(EvalResult {
+            wl,
+            d,
+            m: eval.m,
+            policies: Vec::new(),
+        });
         Ok(())
     }
 
@@ -2757,7 +2766,7 @@ mod tests {
     struct GpuUniformBackend(UniformBackend);
 
     impl Backend for GpuUniformBackend {
-        fn evaluate(&self, history: &PositionHistory, legal_moves: &[Move]) -> EvalResult {
+        fn evaluate(&self, history: &PositionHistory, legal_moves: &[Move]) -> Arc<EvalResult> {
             self.0.evaluate(history, legal_moves)
         }
 
@@ -2774,7 +2783,7 @@ mod tests {
             self.0.create_computation()
         }
 
-        fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
+        fn cached_evaluation(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
             self.0.cached_evaluation(position)
         }
     }
@@ -2931,7 +2940,11 @@ mod tests {
                 .used_batch_size(),
             0
         );
-        assert_eq!(worker.iteration.minibatch[0].eval.policies.len(), legal_moves.len());
+        assert!(worker.iteration.minibatch[0].eval.policies.is_empty());
+        worker.with_tree_for_test(|tree| {
+            assert_eq!(tree.node(root).num_edges(), legal_moves.len());
+            assert!(tree.node(root).edges().iter().all(|edge| edge.get_p() > 0.0));
+        });
     }
 
     /// px0 removes an OOO cache result from the minibatch only after its

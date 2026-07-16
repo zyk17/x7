@@ -13,8 +13,9 @@
 3. `engin/mcts`：px0 `src/search` 的 classic worker 主线；单 worker 的 minibatch、collision、
    prefetch、tree reuse 与 watchdog 已接线。GPU task-worker 的 Rust 所有权翻译尚未完成，当前强制
    `task_workers=0`，不得把已删除的 raw-pointer bridge 视为已接线实现。
-4. prefetch、tree reuse、并发与真实 ONNX 的 px0 `MemCache` wrapper 已接线。后续改动只能在明确
-   引用的 px0 语义上继续。
+4. prefetch、tree reuse、并发与真实 ONNX 的 px0 `MemCache` wrapper 已接线。缓存通用容器采用
+   `quick_cache` 分片 S3-FIFO，value 以 `Arc<EvalResult>` 共享；px0 的 key/collision guard/completed-only
+   回填时序不变，但淘汰策略不是严格 FIFO。后续改动只能在明确引用的 px0 语义上继续。
 5. `pxzero-training`：数据、训练与 ONNX 导出契约。
 
 只有 px0 主线翻译完成并有对拍测试后，才允许比较 lc0 或 KataGo，并将明确记录的差异作为独立优化事项。

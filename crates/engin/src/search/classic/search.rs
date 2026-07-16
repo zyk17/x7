@@ -1056,7 +1056,7 @@ impl SearchBase for ClassicSearch {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
+    use std::sync::{Arc, Once};
 
     use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
 
@@ -1083,7 +1083,11 @@ mod tests {
     struct ParallelUniformBackend(UniformBackend);
 
     impl Backend for ParallelUniformBackend {
-        fn evaluate(&self, history: &xiangqi_core::PositionHistory, legal_moves: &[xiangqi_core::Move]) -> EvalResult {
+        fn evaluate(
+            &self,
+            history: &xiangqi_core::PositionHistory,
+            legal_moves: &[xiangqi_core::Move],
+        ) -> Arc<EvalResult> {
             self.0.evaluate(history, legal_moves)
         }
 
@@ -1101,7 +1105,7 @@ mod tests {
             self.0.create_computation()
         }
 
-        fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
+        fn cached_evaluation(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
             self.0.cached_evaluation(position)
         }
     }

@@ -95,9 +95,11 @@ stopper 现在也遵守 px0 的 root-first-visit gate：root 尚无访问时只�
 
 真实 ONNX 已由 `CachingBackend` 包裹，对照 px0 `src/neural/memcache.h:34-45` 与
 `memcache.cc:38-190`：缓存 key 是当前局面 hash，合法着数量保护碰撞，cache miss 仅在
-`ComputeBlocking` 后回填，`Engine::NewGame` 清 cache。FIFO 容器保留 px0 `HashKeyedCache` 的
-“不替换已有 key、按插入顺序淘汰”语义（`src/utils/cache.h:35-57,69-105,214-230`）；默认和 UCI
-`NNCacheSize` 均为 px0 的 `2000000`（`src/neural/shared_params.cc:63-82`）。
+`ComputeBlocking` 后回填，`Engine::NewGame` 清 cache。通用缓存容器已改为 `quick_cache` 分片 S3-FIFO，
+value 是 `Arc<EvalResult>`，避免 cache hit 复制 policy 向量；这刻意不保留 px0 `HashKeyedCache` 的严格
+FIFO 淘汰（`src/utils/cache.h:35-57,69-105,214-230`），但仍原子地保留首个 completed value、hash 与
+合法着数量 guard。默认和 UCI `NNCacheSize` 均为 px0 的 `2000000`
+（`src/neural/shared_params.cc:63-82`）。
 这对应 px0 `nodes_mutex_` 的单 worker phase 边界（`src/search/classic/search.cc:1142-1211,1494-1508`）。
 
 共享 `NodeTree` 的通用 `RwLock` 已采用 `parking_lot`，替代标准库会 poison 的锁接口；这只承担锁

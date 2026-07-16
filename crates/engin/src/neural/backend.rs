@@ -75,12 +75,12 @@ pub trait BackendComputation: Send + Sync {
     fn used_batch_size(&self) -> usize;
     fn add_input(&self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError>;
     fn compute_blocking(&self) -> Result<(), EnginError>;
-    fn take_result(&self, ticket: EvalTicket) -> Result<EvalResult, EnginError>;
+    fn take_result(&self, ticket: EvalTicket) -> Result<Arc<EvalResult>, EnginError>;
 }
 
 /// px0 `Backend` 评估边界（P3 单线程 + P4 batch）。
 pub trait Backend: Send + Sync {
-    fn evaluate(&self, history: &PositionHistory, legal_moves: &[Move]) -> EvalResult;
+    fn evaluate(&self, history: &PositionHistory, legal_moves: &[Move]) -> Arc<EvalResult>;
 
     /// px0 `Backend::GetAttributes` (`src/neural/backend.h:85`)。
     fn attributes(&self) -> BackendAttributes;
@@ -89,7 +89,7 @@ pub trait Backend: Send + Sync {
     fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError>;
 
     /// px0 `Backend::GetCachedEvaluation` (`src/neural/backend.h:95-97`)。
-    fn cached_evaluation(&self, _position: &EvalPosition) -> Option<EvalResult> {
+    fn cached_evaluation(&self, _position: &EvalPosition) -> Option<Arc<EvalResult>> {
         None
     }
 
@@ -106,14 +106,14 @@ pub trait Backend: Send + Sync {
 /// owns cache lookup, batch miss forwarding and post-compute insertion.
 pub struct CachingBackend {
     wrapped: Arc<dyn Backend>,
-    cache: Arc<Mutex<EvalCache>>,
+    cache: Arc<EvalCache>,
 }
 
 impl CachingBackend {
     pub fn new(wrapped: Box<dyn Backend>) -> Self {
         Self {
             wrapped: Arc::from(wrapped),
-            cache: Arc::new(Mutex::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE))),
+            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
         }
     }
 
@@ -123,20 +123,17 @@ impl CachingBackend {
         position.positions.last().map_or(0, Position::hash)
     }
 
-    fn cached(&self, position: &EvalPosition) -> Option<EvalResult> {
-        self.cache
-            .lock()
-            .expect("NN cache lock")
-            .get(Self::cache_key(position), position.legal_moves.len())
+    fn cached(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
+        self.cache.get(Self::cache_key(position), position.legal_moves.len())
     }
 
     fn resize_cache(&self, size: usize) {
-        self.cache.lock().expect("NN cache lock").set_capacity(size);
+        self.cache.set_capacity(size);
     }
 }
 
 impl Backend for CachingBackend {
-    fn evaluate(&self, history: &PositionHistory, legal_moves: &[Move]) -> EvalResult {
+    fn evaluate(&self, history: &PositionHistory, legal_moves: &[Move]) -> Arc<EvalResult> {
         let computation = self.create_computation().expect("create caching computation");
         let (_, ticket) = computation
             .add_input(EvalPosition {
@@ -160,12 +157,12 @@ impl Backend for CachingBackend {
         }))
     }
 
-    fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
+    fn cached_evaluation(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
         self.cached(position)
     }
 
     fn clear_cache(&self) {
-        self.cache.lock().expect("NN cache lock").clear();
+        self.cache.clear();
         self.wrapped.clear_cache();
     }
 
@@ -186,13 +183,13 @@ struct CacheEntry {
 #[derive(Default)]
 struct CachingComputationState {
     entries: Vec<CacheEntry>,
-    results: HashMap<usize, EvalResult>,
+    results: HashMap<usize, Arc<EvalResult>>,
     next_ticket: usize,
 }
 
 struct CachingBackendComputation {
     wrapped: Box<dyn BackendComputation>,
-    cache: Arc<Mutex<EvalCache>>,
+    cache: Arc<EvalCache>,
     state: Mutex<CachingComputationState>,
 }
 
@@ -209,12 +206,7 @@ impl BackendComputation for CachingBackendComputation {
             ticket
         };
         let key = CachingBackend::cache_key(&position);
-        if let Some(result) = self
-            .cache
-            .lock()
-            .expect("NN cache lock")
-            .get(key, position.legal_moves.len())
-        {
+        if let Some(result) = self.cache.get(key, position.legal_moves.len()) {
             self.state
                 .lock()
                 .expect("caching computation lock")
@@ -244,10 +236,10 @@ impl BackendComputation for CachingBackendComputation {
         let mut results = Vec::with_capacity(entries.len());
         for entry in entries {
             let result = self.wrapped.take_result(entry.inner_ticket)?;
-            self.cache.lock().expect("NN cache lock").insert_if_absent(
+            self.cache.insert_if_absent(
                 entry.key,
                 CachedEval {
-                    result: result.clone(),
+                    result: Arc::clone(&result),
                     num_moves: entry.num_moves,
                 },
             );
@@ -261,7 +253,7 @@ impl BackendComputation for CachingBackendComputation {
         Ok(())
     }
 
-    fn take_result(&self, ticket: EvalTicket) -> Result<EvalResult, EnginError> {
+    fn take_result(&self, ticket: EvalTicket) -> Result<Arc<EvalResult>, EnginError> {
         self.state
             .lock()
             .expect("caching computation lock")
@@ -279,7 +271,7 @@ struct UniformBackendComputation {
 
 struct UniformComputationState {
     pending: Vec<(EvalTicket, EvalPosition)>,
-    results: HashMap<usize, EvalResult>,
+    results: HashMap<usize, Arc<EvalResult>>,
     next_ticket: usize,
 }
 
@@ -330,7 +322,7 @@ impl BackendComputation for UniformBackendComputation {
         Ok(())
     }
 
-    fn take_result(&self, ticket: EvalTicket) -> Result<EvalResult, EnginError> {
+    fn take_result(&self, ticket: EvalTicket) -> Result<Arc<EvalResult>, EnginError> {
         self.state
             .lock()
             .expect("uniform computation lock")
@@ -346,7 +338,7 @@ pub struct UniformBackend {
     pub wl: f32,
     pub d: f32,
     pub m: f32,
-    cache: Arc<Mutex<EvalCache>>,
+    cache: Arc<EvalCache>,
 }
 
 impl Default for UniformBackend {
@@ -355,7 +347,7 @@ impl Default for UniformBackend {
             wl: 0.0,
             d: 0.0,
             m: 0.0,
-            cache: Arc::new(Mutex::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE))),
+            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
         }
     }
 }
@@ -370,27 +362,27 @@ impl UniformBackend {
             wl,
             d,
             m,
-            cache: Arc::new(Mutex::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE))),
+            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
         }
     }
 }
 
 impl Backend for UniformBackend {
-    fn evaluate(&self, _history: &PositionHistory, legal_moves: &[Move]) -> EvalResult {
+    fn evaluate(&self, _history: &PositionHistory, legal_moves: &[Move]) -> Arc<EvalResult> {
         let count = legal_moves.len().max(1);
         let p = 1.0 / count as f32;
-        EvalResult {
+        Arc::new(EvalResult {
             wl: self.wl,
             d: self.d,
             m: self.m,
             policies: vec![p; legal_moves.len()],
-        }
+        })
     }
 
-    fn cached_evaluation(&self, position: &EvalPosition) -> Option<EvalResult> {
+    fn cached_evaluation(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
         let key = Self::cache_key(position);
         let requested_moves = position.legal_moves.len();
-        self.cache.lock().expect("cache lock").get(key, requested_moves)
+        self.cache.get(key, requested_moves)
     }
 
     fn attributes(&self) -> BackendAttributes {
@@ -402,18 +394,18 @@ impl Backend for UniformBackend {
     }
 
     fn clear_cache(&self) {
-        self.cache.lock().expect("cache lock").clear();
+        self.cache.clear();
     }
 
     fn set_cache_size(&self, size: usize) {
-        self.cache.lock().expect("cache lock").set_capacity(size);
+        self.cache.set_capacity(size);
     }
 }
 
 impl UniformBackend {
-    pub fn store_cache(&self, position: &EvalPosition, result: EvalResult) {
+    pub fn store_cache(&self, position: &EvalPosition, result: Arc<EvalResult>) {
         let key = Self::cache_key(position);
-        self.cache.lock().expect("cache lock").insert_if_absent(
+        self.cache.insert_if_absent(
             key,
             CachedEval {
                 result,

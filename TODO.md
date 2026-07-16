@@ -34,7 +34,9 @@ task split 不可用：此前 Rust raw-pointer 版本会让两个 task 重复扩
 - [x] 翻译 px0 `src/neural/memcache.cc:38-190`、`memcache.h:34-45` 为正式 ONNX 的
   `CachingBackend` wrapper：当前局面 hash 为 key、合法着数量防碰撞、cache miss 仅在
   `ComputeBlocking` 后写入、`ucinewgame` 清 cache；`NNCacheSize` 默认/范围为
-  `src/neural/shared_params.cc:63-82` 的 `2000000` / `0..999999999`。
+  `src/neural/shared_params.cc:63-82` 的 `2000000` / `0..999999999`。通用存储已替换为
+  `quick_cache` 分片 S3-FIFO，缓存 value 为 `Arc<EvalResult>`；这不是 px0 严格 FIFO 的逐项翻译，
+  但不改变 key/collision guard/completed-only 回填语义。
 
 - [x] 按 `src/search/classic/search.cc:981-1034` 翻译 watchdog 的 counters-mutex/condition-variable
   等待与 `FireStopInternal` 唤醒；不再固定 1ms polling。

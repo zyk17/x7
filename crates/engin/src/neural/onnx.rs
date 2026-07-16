@@ -215,7 +215,7 @@ fn create_direct_ml_sessions(path: &Path) -> Result<Vec<(usize, Session)>, Engin
 }
 
 impl Backend for OnnxBackend {
-    fn evaluate(&self, history: &xiangqi_core::PositionHistory, legal_moves: &[xiangqi_core::Move]) -> EvalResult {
+    fn evaluate(&self, history: &xiangqi_core::PositionHistory, legal_moves: &[xiangqi_core::Move]) -> Arc<EvalResult> {
         let computation = self.create_computation().expect("create ONNX computation");
         let (_, ticket) = computation
             .add_input(EvalPosition {
@@ -244,7 +244,7 @@ struct OnnxBackendComputation {
 
 struct OnnxComputationState {
     entries: Vec<(EvalTicket, EvalPosition)>,
-    results: HashMap<usize, EvalResult>,
+    results: HashMap<usize, Arc<EvalResult>>,
     next_ticket: usize,
 }
 
@@ -310,12 +310,12 @@ impl BackendComputation for OnnxBackendComputation {
                 let value = &wdl[index * 3..(index + 1) * 3];
                 results.insert(
                     ticket.0,
-                    EvalResult {
+                    Arc::new(EvalResult {
                         wl: value[0] - value[2],
                         d: value[1],
                         m: 0.0,
                         policies,
-                    },
+                    }),
                 );
             }
         }
@@ -327,7 +327,7 @@ impl BackendComputation for OnnxBackendComputation {
         Ok(())
     }
 
-    fn take_result(&self, ticket: EvalTicket) -> Result<EvalResult, EnginError> {
+    fn take_result(&self, ticket: EvalTicket) -> Result<Arc<EvalResult>, EnginError> {
         self.state
             .lock()
             .expect("ONNX computation lock")

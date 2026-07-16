@@ -14,7 +14,9 @@
 P4 的单 worker 主线已接通真实 `124x10x9` ONNX backend、minibatch、prefetch、collision、
 shared-tree、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。正式 ONNX 已由
 px0 `MemCache` 风格的 `CachingBackend` 包裹：按局面 hash 查找、以合法着数量防碰撞、batch 完成后写入、
-`ucinewgame` 清空；默认 `NNCacheSize=2000000`。
+`ucinewgame` 清空；默认 `NNCacheSize=2000000`。缓存容器使用 `quick_cache` 分片 S3-FIFO，缓存命中以
+`Arc<EvalResult>` 共享 policy 向量；这替代了 px0 的严格 FIFO 容器，但不改变 NN cache 的 key、collision
+guard 或 completed-only 回填语义。
 px0 的 GPU task-worker 尚未完成：此前 Rust 端把一个 `SearchWorker` 的可变状态错误地交给多个 task
 thread，真实 ONNX 搜索会重复 `ExtendNode`。该 raw-pointer 路径已从代码删除，当前强制
 `task_workers=0`，只保留安全的单 worker 搜索；后续必须按 px0 重新建立无别名的 task 所有权边界。
