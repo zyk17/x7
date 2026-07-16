@@ -2779,10 +2779,11 @@ mod tests {
         }
     }
 
-    /// px0 retains an explicit GPU task-worker request even while this Rust
-    /// port drains the split tasks synchronously (`search.h:205-244`,
-    /// `search.cc:1322-1362,1494-1508`). This keeps split semantics testable
-    /// before scoped task threads are enabled.
+    /// px0 retains an explicit GPU task-worker request even while the real
+    /// ONNX duplicate-`ExtendNode` regression keeps Rust task activation at
+    /// zero (`search.h:205-244`, `search.cc:1322-1362,1494-1508`). This
+    /// prevents a configuration-only change from re-enabling unsafe tree
+    /// mutation before the scoped path is proven.
     #[test]
     fn gpu_backend_keeps_requested_task_worker_count() {
         ensure_init();
@@ -2807,6 +2808,7 @@ mod tests {
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
 
         assert_eq!(worker.task_workers, 1);
+        assert_eq!(worker.active_task_workers, 0);
 
         std::thread::scope(|scope| {
             let state = Arc::clone(&search_state);
@@ -2824,6 +2826,7 @@ mod tests {
 
         assert!(search_state.total_playouts.load(Ordering::Acquire) >= 16);
         assert_eq!(worker.task_workers, 1);
+        assert_eq!(worker.active_task_workers, 0);
         assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
     }
 
