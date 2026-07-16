@@ -73,6 +73,8 @@ task split 不可用：此前 Rust raw-pointer 版本会让两个 task 重复扩
 gathering task 的 subtree/tree 写入所有权证明，不能以全树锁替代。
 已完成 workspace 所有权映射：`TaskRunner` 独占其 `TaskWorkspace`，参考
 `src/search/classic/search.h:348-365,441-445`；仍未创建后台 runner。
+已完成 gathering handoff 的父边去重：仅 `PickTask` 发布成功后才从主 DFS 清零该 child 的 visit budget，
+参考 `src/search/classic/search.cc:1828-1864`；尚未证明后台 task 的 subtree/tree 写入不重叠。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占

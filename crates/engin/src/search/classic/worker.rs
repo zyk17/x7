@@ -692,6 +692,43 @@ impl<'a> SearchWorker<'a> {
         }
     }
 
+    /// px0 gathering-task handoff (`src/search/classic/search.cc:1828-1864`).
+    ///
+    /// The parent DFS relinquishes this edge only after the task has been
+    /// published successfully. A full queue, an unexpanded child, or a
+    /// terminal child leaves the parent's visit budget intact.
+    fn hand_off_gathering_task(
+        queue: &PickTaskQueue,
+        tree: &mut NodeTree,
+        workspace: &mut TaskWorkspace,
+        current_idx: usize,
+        edge_idx: usize,
+        task_base_depth: u16,
+        child_limit: u32,
+    ) -> bool {
+        let mv = tree.node(current_idx).edge(edge_idx).mv;
+        let child_idx = tree
+            .node(current_idx)
+            .child(edge_idx)
+            .unwrap_or_else(|| tree.arena_mut().spawn_child(current_idx, edge_idx));
+        if tree.node(child_idx).n() == 0 || tree.node(child_idx).is_terminal() {
+            return false;
+        }
+
+        let mut moves_to_base = workspace.moves_to_path.clone();
+        moves_to_base.push(mv);
+        if !queue.push(PickTask::gathering(
+            child_idx,
+            task_base_depth,
+            moves_to_base,
+            child_limit,
+        )) {
+            return false;
+        }
+        workspace.visits_to_perform.last_mut().expect("visits")[edge_idx] = 0;
+        true
+    }
+
     /// px0 `GatherMinibatch` processing task split
     /// (`src/search/classic/search.cc:1322-1362`). Every queued range ends
     /// before the returned main range, so the caller can prove mutable
@@ -1471,23 +1508,15 @@ impl<'a> SearchWorker<'a> {
                             {
                                 continue;
                             }
-                            let child_idx = tree
-                                .node(current_idx)
-                                .child(edge_idx)
-                                .unwrap_or_else(|| tree.arena_mut().spawn_child(current_idx, edge_idx));
-                            if tree.node(child_idx).n() == 0 || tree.node(child_idx).is_terminal() {
-                                continue;
-                            }
-                            let mut moves_to_base = workspace.moves_to_path.clone();
-                            moves_to_base.push(tree.node(current_idx).edge(edge_idx).mv);
-                            let task = PickTask::gathering(
-                                child_idx,
+                            if Self::hand_off_gathering_task(
+                                context.task_queue,
+                                tree,
+                                workspace,
+                                current_idx,
+                                edge_idx,
                                 (workspace.current_path.len() + base_depth as usize) as u16,
-                                moves_to_base,
                                 child_limit,
-                            );
-                            if context.task_queue.push(task) {
-                                workspace.visits_to_perform.last_mut().expect("visits")[edge_idx] = 0;
+                            ) {
                                 passed_off += child_limit;
                             }
                         }
@@ -2783,6 +2812,46 @@ mod tests {
             .expect("leaf visit");
         assert_eq!(visit.moves_to_visit, vec![first, second]);
         assert_eq!(visit.depth, 3);
+    }
+
+    /// px0 `PickNodesToExtendTask` only zeros the parent work after the
+    /// gathering task is published (`search.cc:1828-1864`).
+    #[test]
+    fn gathering_handoff_relinquishes_parent_edge_only_after_enqueue() {
+        ensure_init();
+        let mut tree = NodeTree::default();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let mv = tree.history().last().board().generate_legal_moves()[0];
+        tree.node_mut(root).create_single_child_node(mv);
+        let child = tree.arena_mut().spawn_child(root, 0);
+        assert!(tree.node_mut(child).try_start_score_update());
+        tree.node_mut(child).finalize_score_update(0.0, 0.0, 0.0, 1);
+
+        let queue = PickTaskQueue::default();
+        queue.reset();
+        let mut workspace = TaskWorkspace::default();
+        workspace.visits_to_perform.push(vec![3]);
+
+        assert!(SearchWorker::hand_off_gathering_task(
+            &queue,
+            &mut tree,
+            &mut workspace,
+            root,
+            0,
+            1,
+            3,
+        ));
+        assert_eq!(workspace.visits_to_perform.last().expect("visits")[0], 0);
+
+        let claimed = queue.take().expect("published gathering task");
+        assert_eq!(claimed.task.kind, PickTaskKind::Gathering);
+        assert_eq!(claimed.task.start, Some(child));
+        assert_eq!(claimed.task.base_depth, 1);
+        assert_eq!(claimed.task.moves_to_base, vec![mv]);
+        assert_eq!(claimed.task.collision_limit, 3);
+        queue.complete(claimed);
     }
 
     #[test]

@@ -149,6 +149,11 @@ workspace，不能共享主 runner 的 history/path scratch。
 `backend_attributes_.has_mlh == false` 时构造禁用的 `MEvaluator()`；访问过与未访问 child 的 M utility
 均为零，不能留下隐式的 moves-left 启发式。参考 `src/search/classic/search.cc:60-114,1596,1680-1692`。
 
+第十步已完成：gathering 子树 handoff 已收为独立 helper。它只在 task 成功发布后清零父 DFS 的该 edge
+visit budget；队列满、未扩展或 terminal child 必须继续由父任务处理。参考
+`src/search/classic/search.cc:1828-1864`。回归覆盖 task 的 root/path/depth/budget 与父边去重；这仍不表示
+后台 task-worker 已安全可用。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体
