@@ -84,8 +84,11 @@ main runner 的同步调用。
 全树锁或 raw pointer 启用 task worker。
 已核实 px0 `Node` 的统计、child sibling 链与 edge 排序均非 atomic，`Edge_Iterator` 允许 sibling 在调用
 间隙插入但要求外部同步，参考 `src/search/classic/node.h:132-260,423-525`、`node.cc:245-373`。这使后台
-task-worker 的 Rust 所有权/并发表示成为明确阻塞项：未形成按上述代码逐段证明的无别名方案前，固定
-`task_workers=0`，不得以全树锁或 raw pointer 启用。
+task-worker 的 Rust 所有权/并发表示成为明确阻塞项：未形成按上述代码逐段证明的 scoped tree-phase
+方案前，配置值只能影响 split，不能启动后台线程；不得以全树锁或未经审计的 raw pointer 启用。
+已恢复 px0 `TaskWorkers` 构造期解析，参考 `src/search/classic/search.h:205-224`：显式值保留，`-1` 按
+CPU/GPU 与硬件线程公式推导。当前仅据此做 split，`WaitForTasks` 仍同步 drain；后续 scoped task threads
+必须满足 `AGENTS.md` 的 raw-pointer tree phase 与真实 ONNX 回归约束。
 
 - [ ] 先完成 px0 task state 的 Rust 所有权拆分，对照 `src/search/classic/search.h:348-445`、
   `search.cc:1069-1140,1423-1462,1485-1508`：task 独占 workspace/task/result，主 worker 独占

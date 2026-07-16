@@ -171,6 +171,11 @@ NodeTree` 借给多个 runner 后仍声称是安全的逐行翻译。P4 后台 t
 不依赖 raw-pointer alias、且不以整树锁串行化的 Rust 所有权/并发表示，并逐段对照上述 px0 行；在此之前维持
 `task_workers=0`。
 
+第十四步已完成：`TaskWorkers` 已恢复 px0 构造期解析：显式非负值原样保留，`-1` 时 CPU 为 0，GPU 按
+`min(hardware_concurrency / max(search_threads - 1, 1) - 1, 4)` 推导。参考
+`src/search/classic/search.h:205-224`。当前已按该数值规划 gather/processing split，但 `WaitForTasks` 仍由
+owner 同步 drain；下一步才将该 drain 替换为 scoped task threads。
+
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持
 `MoveOverheadMs`、`Slowmover` 与 `go wtime/btime/winc/binc/movestogo`；`TimeManager` 的其他 px0 变体

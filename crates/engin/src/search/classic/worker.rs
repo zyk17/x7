@@ -1,8 +1,8 @@
 //! px0 `src/search/classic/search.h:201-448` 的 P4 worker。
 //!
 //! P4 worker 七阶段流水线、碰撞和 task queue 数据结构已按 px0 源码翻译。
-//! px0 task thread 共享一个 `SearchWorker`，但 Rust 的无别名 task 所有权
-//! 尚未完成；当前严格使用 px0 `task_workers_ == 0` 同步分支。
+//! px0 task thread 共享一个 `SearchWorker`。Rust 先将 task/workspace/result
+//! 所有权拆开；后台 tree phase 仍在逐段重译。
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
@@ -686,14 +686,7 @@ impl<'a> SearchWorker<'a> {
         if target_minibatch_size == 0 {
             target_minibatch_size = 1;
         }
-        // Gap from px0 `SearchWorker` construction (`search.h:210-224`): its
-        // task threads mutate disjoint C++ subobjects under the long-lived
-        // `nodes_mutex_` phase. The prior raw-pointer Rust translation aliased
-        // one `&mut SearchWorker` across task threads and could duplicate
-        // `ExtendNode`, so it is not a valid port. Keep the exact px0 CPU
-        // `task_workers_=0` execution branch for every backend until task
-        // ownership is split into independently borrowable state.
-        let task_workers = 0;
+        let task_workers = Self::resolve_task_workers(params, backend.attributes(), search_state);
         let max_out_of_order = std::cmp::max(
             1,
             (params.max_out_of_order_evals_factor * target_minibatch_size as f32) as usize,
@@ -714,6 +707,30 @@ impl<'a> SearchWorker<'a> {
             latest_time_manager_hints: StoppersHints::default(),
             task_phase: TaskPhaseState::default(),
         }
+    }
+
+    /// px0 `SearchWorker::SearchWorker` task-worker resolution
+    /// (`src/search/classic/search.h:205-224`). Negative configuration uses
+    /// the backend/CPU heuristic; explicit values are retained verbatim.
+    fn resolve_task_workers(
+        params: &SearchParams,
+        attributes: crate::neural::backend::BackendAttributes,
+        search_state: &WorkerSearchState,
+    ) -> i32 {
+        if params.task_workers_per_search_worker >= 0 {
+            return params.task_workers_per_search_worker;
+        }
+        if attributes.runs_on_cpu {
+            return 0;
+        }
+        let working_threads = search_state
+            .thread_count
+            .load(Ordering::Acquire)
+            .saturating_sub(1)
+            .max(1);
+        let hardware_threads = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+        i32::try_from((hardware_threads / working_threads).wrapping_sub(1).min(4))
+            .expect("px0 task worker count fits i32")
     }
 
     /// Builds the immutable input view used by px0
@@ -981,11 +998,10 @@ impl<'a> SearchWorker<'a> {
 
     /// px0 `SearchWorker::RunBlocking` (`src/search/classic/search.h:235-249`).
     ///
-    /// The current Rust port uses only px0's `task_workers_ == 0` path. The
-    /// persistent task-thread branch is not enabled until its state ownership
-    /// can be translated without aliases.
+    /// px0 `SearchWorker::RunBlocking` (`search.h:235-249`). Task splitting
+    /// follows the configured px0 count; until scoped task threads are enabled
+    /// the owner consumes those tasks synchronously at `WaitForTasks`.
     pub fn run_blocking(&mut self) -> Result<(), EnginError> {
-        debug_assert_eq!(self.task_workers, 0);
         self.run_blocking_without_task_threads()
     }
 
@@ -1232,11 +1248,11 @@ impl<'a> SearchWorker<'a> {
     }
 
     /// px0 waits for independent task workers here (`search.cc:1494-1508`).
-    /// CPU workers have none and retain the direct synchronous path.
+    /// The current ownership translation retains px0's split decision but
+    /// drains the queue on its owner until the scoped tree-phase workers are
+    /// enabled.
     fn wait_for_queued_tasks_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        if self.task_workers == 0 {
-            self.run_tasks_synchronously_in_tree(tree)?;
-        }
+        self.run_tasks_synchronously_in_tree(tree)?;
         self.task_phase.queue.wait();
         Ok(())
     }
@@ -2431,12 +2447,12 @@ mod tests {
         }
     }
 
-    /// The raw-pointer task-worker attempt was removed until its
-    /// ownership model can reproduce px0 `search.h:205-244` without aliasing
-    /// mutable Rust state. GPU backends must retain the correct synchronous
-    /// worker path rather than crashing while extending a duplicate leaf.
+    /// px0 retains an explicit GPU task-worker request even while this Rust
+    /// port drains the split tasks synchronously (`search.h:205-244`,
+    /// `search.cc:1322-1362,1494-1508`). This keeps split semantics testable
+    /// before scoped task threads are enabled.
     #[test]
-    fn gpu_backend_falls_back_to_safe_synchronous_worker() {
+    fn gpu_backend_keeps_requested_task_worker_count() {
         ensure_init();
         let mut tree = NodeTree::default();
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -2458,7 +2474,7 @@ mod tests {
         let search_state = Arc::new(WorkerSearchState::new(Arc::clone(&stop)));
         let mut worker = SearchWorker::new(&mut tree, &backend, &params, search_state.as_ref());
 
-        assert_eq!(worker.task_workers, 0);
+        assert_eq!(worker.task_workers, 1);
 
         std::thread::scope(|scope| {
             let state = Arc::clone(&search_state);
@@ -2470,12 +2486,12 @@ mod tests {
                 }
                 stop.store(true, Ordering::Release);
             });
-            worker.run_blocking().expect("synchronous GPU search");
+            worker.run_blocking().expect("GPU task split search");
             stopper.join().expect("stopper thread");
         });
 
         assert!(search_state.total_playouts.load(Ordering::Acquire) >= 16);
-        assert_eq!(worker.task_workers, 0);
+        assert_eq!(worker.task_workers, 1);
         assert_eq!(tree.node(tree.current_head()).n_in_flight(), 0);
     }
 
