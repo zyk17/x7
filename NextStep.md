@@ -104,11 +104,11 @@ stopper 现在也遵守 px0 的 root-first-visit gate：root 尚无访问时只�
 机制，不承载任何搜索策略或节点语义。参考 px0 的 `nodes_mutex_` 使用边界
 `src/search/classic/search.cc:1142-1211,1494-1508`。
 
-P4 的单 worker/minibatch/OOO/cache/stopper 主线可用，但 GPU task-worker 的 raw-pointer 翻译已从代码
-删除并退回到 px0 的 `task_workers_=0` 安全分支：真实 ONNX 的正时间搜索会触发重复 `ExtendNode`，不能继续
-把该实现称为对齐。完整 task-worker 必须先将 `SearchWorker` 的 task 所需状态拆成可独占借用的数据，
-再翻译 px0 `search.h:205-244,435-445` 和 `search.cc:1069-1508`；不得重新启用当前 `&mut SearchWorker`
-跨线程别名版本。
+P4 的单 worker/minibatch/OOO/cache/stopper 主线可用。GPU task-worker 的 scoped raw-pointer 结构仍保留为
+翻译对象，但真实 ONNX 的 `go infinite -> stop` 回归已复现重复 `ExtendNode`；因此运行时激活门固定为
+`active_task_workers=0`，而 UCI/px0 的 `TaskWorkers` 解析仍保留作诊断。不能把当前后台路径称为完成对齐。
+下一步必须逐行核实 `PickNodesToExtendTask` 的 in-flight/collision 互斥，参考 px0
+`search.cc:1551-1897`，并用真实 ONNX 覆盖固定 visits、movetime 与 stop/wait，回归稳定前不得解除门控。
 
 第一步已完成：Rust 的 `IterationState` 已独占封装 px0 `minibatch_`、`computation_` 与
 `number_out_of_order_`（`src/search/classic/search.h:419-427`），其生命周期限定为
@@ -197,6 +197,12 @@ main runner 处理最终 suffix，随后 seal/join。参考 `src/search/classic/
 P4 的 gather/processing task 时序、queue lifecycle、独立 workspace、task result merge 与 raw tree-phase
 边界均已翻译；下一步只做真实 ONNX/DirectML 固定 visits、movetime、stop/wait 与 `NInFlight==0` 回归，
 不再继续扩结构。
+
+第十九步（回归门控）已完成：真实 ONNX 的 `go infinite -> stop` 触发 `Node::create_edges` 的重复扩展断言，
+说明当前 scoped gathering 对普通 Rust `NodeTree` 的并发写入尚未满足 px0 的 in-flight/collision 时序。运行时
+`active_task_workers` 因此固定为 0；保留 `TaskWorkers` 的 px0 解析和 scoped 实现，仅供逐行诊断，不能作为
+生产并发搜索。下一步先对照 `src/search/classic/search.cc:1551-1897` 和
+`src/search/classic/node.cc:245-373` 建立该回归的最小复现与唯一扩展证明。
 
 UCI 时间管理已翻译 px0 工厂默认 `legacy` 的连续区间：`stoppers/factory.cc:44-115`、
 `legacy.cc:43-174`、`stoppers.cc:39-129`、`common.cc:118-165`。正式支持

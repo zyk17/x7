@@ -26,7 +26,8 @@
 - `crates/xiangqi_core`：翻译 px0 `src/chess`。
 - `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2/P3 已完成，P4 的 ONNX、
   单 worker、minibatch、MemCache、prefetch、collision、shared-tree 与 watchdog 主线已接入。GPU
-  task-worker 正在重译；px0 `TaskWorkers` 解析已恢复，但后台 task thread 默认不启用，直到真实 ONNX 回归通过。
+  task-worker 正在重译；px0 `TaskWorkers` 解析已恢复，但真实 ONNX 的 stop/wait 已复现重复 `ExtendNode`，因此
+  运行时 `active_task_workers=0`，直到对应回归通过。
   正式 ONNX 必须经 `CachingBackend`，其 key/collision guard/回填时序只能对照
   `px0/src/neural/memcache.cc:38-190` 修改。
   已删除的 `TaskTreeBridge` / `TaskWorkerRunner` 不是可用实现；后续只能以无别名的数据所有权重译

@@ -109,7 +109,8 @@ seal/join 后合并 results。
   `search.cc:1069-1508`：task 只能拥有独立 workspace 与明确不重叠的 node/minibatch range，不能共享
   `&mut SearchWorker` 或通过 raw pointer 直接修改整棵树。
 - [ ] 在固定 visits、`go movetime`、真实 ONNX/DirectML 下补重复 ExtendNode、`NInFlight==0`、stop/wait
-  回归；只有该回归稳定后才能恢复 px0 GPU `task_workers_` 默认解析。
+  回归；当前真实 ONNX `go infinite -> stop` 已复现重复 ExtendNode，运行时 `active_task_workers=0`。只有该
+  回归稳定后才能解除该门控并恢复 px0 GPU `task_workers_` 的实际执行。
 
 ## 约束
 

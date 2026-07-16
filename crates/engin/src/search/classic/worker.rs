@@ -641,7 +641,14 @@ pub struct SearchWorker<'a> {
     history: PositionHistory,
     target_minibatch_size: usize,
     max_out_of_order: usize,
+    /// px0-resolved configuration, retained for diagnostics and future
+    /// task-thread activation.
     task_workers: i32,
+    /// Production activation gate. A real ONNX stop/wait regression found
+    /// duplicate `ExtendNode` calls in the scoped raw-pointer path, so task
+    /// publication remains synchronous until that px0 tree-phase defect is
+    /// resolved.
+    active_task_workers: i32,
     /// px0 `SearchWorker::latest_time_manager_hints_`
     /// (`src/search/classic/search.h:368-369`). Each search worker owns this
     /// value; it must not be shared with other gather loops.
@@ -781,6 +788,7 @@ impl<'a> SearchWorker<'a> {
             target_minibatch_size,
             max_out_of_order,
             task_workers,
+            active_task_workers: 0,
             latest_time_manager_hints: StoppersHints::default(),
             task_phase: TaskPhaseState::default(),
         }
@@ -813,12 +821,16 @@ impl<'a> SearchWorker<'a> {
     /// Builds the immutable input view used by px0
     /// `PickNodesToExtendTask` (`src/search/classic/search.cc:1551-1897`).
     fn selection_context(&self) -> SelectionContext<'_> {
+        debug_assert!(
+            self.active_task_workers <= self.task_workers,
+            "the temporary activation gate must never exceed the px0-resolved configuration"
+        );
         SelectionContext {
             params: self.params,
             search_state: self.search_state,
             root_move_filter: self.root_move_filter,
             latest_time_manager_hints: self.latest_time_manager_hints.clone(),
-            task_workers: self.task_workers,
+            task_workers: self.active_task_workers,
             task_queue: &self.task_phase.queue,
         }
     }
@@ -1169,14 +1181,14 @@ impl<'a> SearchWorker<'a> {
             let (main_start, needs_wait) = Self::split_processing_tasks(
                 &self.task_phase.queue,
                 self.params,
-                self.task_workers,
+                self.active_task_workers,
                 &self.iteration.minibatch,
                 new_start,
                 picked_visits,
             );
 
             let mut runner = std::mem::take(&mut self.task_phase.main_runner);
-            let process_result = if needs_wait && self.task_workers > 0 {
+            let process_result = if needs_wait && self.active_task_workers > 0 {
                 self.run_processing_phase_scoped_in_tree(tree, main_start, &mut runner)
             } else {
                 let result = self.process_picked_task_in_tree(
@@ -1281,7 +1293,7 @@ impl<'a> SearchWorker<'a> {
         self.task_phase.queue.reset();
         let mut receiver = std::mem::take(&mut self.iteration.minibatch);
         let mut runner = std::mem::take(&mut self.task_phase.main_runner);
-        let result = if self.task_workers == 0 {
+        let result = if self.active_task_workers == 0 {
             let context = self.selection_context();
             Self::pick_nodes_to_extend_task_with_workspace(
                 &context,
@@ -1299,7 +1311,7 @@ impl<'a> SearchWorker<'a> {
         };
         self.task_phase.main_runner = runner;
         self.iteration.minibatch = receiver;
-        if self.task_workers == 0 {
+        if self.active_task_workers == 0 {
             self.wait_for_queued_tasks_in_tree(tree)?;
         } else {
             self.task_phase.queue.wait();
@@ -1319,13 +1331,13 @@ impl<'a> SearchWorker<'a> {
         receiver: &mut Vec<NodeToProcess>,
         main_runner: &mut TaskRunner,
     ) -> Result<(), EnginError> {
-        let task_workers = usize::try_from(self.task_workers).expect("positive px0 task worker count");
+        let task_workers = usize::try_from(self.active_task_workers).expect("positive px0 task worker count");
         let context = SelectionContext {
             params: self.params,
             search_state: self.search_state,
             root_move_filter: self.root_move_filter,
             latest_time_manager_hints: self.latest_time_manager_hints.clone(),
-            task_workers: self.task_workers,
+            task_workers: self.active_task_workers,
             task_queue: &self.task_phase.queue,
         };
         let queue = &self.task_phase.queue;
@@ -1426,14 +1438,14 @@ impl<'a> SearchWorker<'a> {
     /// access. The raw pointers are confined to this phase; see
     /// `ScopedTaskTree` and `ScopedMinibatch`.
     fn run_tasks_scoped_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
-        debug_assert!(self.task_workers > 0);
-        let task_workers = usize::try_from(self.task_workers).expect("positive px0 task worker count");
+        debug_assert!(self.active_task_workers > 0);
+        let task_workers = usize::try_from(self.active_task_workers).expect("positive px0 task worker count");
         let selection = SelectionContext {
             params: self.params,
             search_state: self.search_state,
             root_move_filter: self.root_move_filter,
             latest_time_manager_hints: self.latest_time_manager_hints.clone(),
-            task_workers: self.task_workers,
+            task_workers: self.active_task_workers,
             task_queue: &self.task_phase.queue,
         };
         let processing = ProcessingContext {
@@ -1503,7 +1515,7 @@ impl<'a> SearchWorker<'a> {
         main_start: usize,
         main_runner: &mut TaskRunner,
     ) -> Result<(), EnginError> {
-        let task_workers = usize::try_from(self.task_workers).expect("positive px0 task worker count");
+        let task_workers = usize::try_from(self.active_task_workers).expect("positive px0 task worker count");
         let processing = ProcessingContext {
             params: self.params,
             computation: self.iteration.computation.as_deref(),
@@ -1567,7 +1579,7 @@ impl<'a> SearchWorker<'a> {
     /// enabled.
     fn wait_for_queued_tasks_in_tree(&mut self, tree: &mut NodeTree) -> Result<(), EnginError> {
         self.task_phase.queue.seal_phase();
-        if self.task_workers == 0 {
+        if self.active_task_workers == 0 {
             self.run_tasks_synchronously_in_tree(tree)?;
         } else {
             self.run_tasks_scoped_in_tree(tree)?;
