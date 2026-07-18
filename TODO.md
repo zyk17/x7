@@ -43,7 +43,10 @@
   不要求不同 event 调度得到逐边相同 `N/Q`，但完成时所有 `started == completed`。
 - [x] S2b error propagation：`create_computation` / `add_input` 失败必须 cancel/finish 全部已 claim、未处理的
   Eval event；owner 获得原始错误，`wait_for_idle` 不可死等。
-- [ ] S2b 回归：补真实 ONNX 长 `movetime`。
+- [x] S2b 长 ONNX：`stream_compare --movetime-ms 30000` 在 `data/x7.onnx` / DirectML 下完成 292,409
+  playout、11,935 NN batch，deadline 后 root settled；该二进制不接 UCI。
+- [ ] S2c policy output：LC3 Policy 文档将 final move 标为 TBD；先定义/批准 X7 的 final-move 与 PV 规则，
+  再实现 read-only root snapshot 到 UCI output 的映射，不能伪称为 LC3 既有实现。
 - [ ] S3 UCI：仅在 S1/S2 回归通过后让 stream 替代 classic；验证 bare `go`、nodes、movetime、infinite/stop、
   position replacement、ucinewgame、exactly-one bestmove。
 

@@ -59,10 +59,14 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
    `P` 相同，调度可改变逐 edge `N/Q`，但所有 edge 在完成时必须无 in-flight。
 6. `BackendComputation::create_computation` 与 `add_input` 失败时，Eval 已 claim 但未提交的 event 会逐个
    cancel/finish；错误保留给 owner，`wait_for_idle()` 不会因 outstanding 泄漏永久等待。
-7. 下一项是真实 ONNX 长 `movetime`、PV/final move policy 与 Watchdog/UCI；这些通过前不切换至 stream。
+7. `stream_compare --movetime-ms 30000` 已在 `data/x7.onnx` / DirectML 下运行：30.012 秒内完成
+   292,409 playout、11,935 个 NN batch，deadline 后根无 in-flight。该工具不走 UCI，只证明常驻 pipeline
+   的长期推进与收敛。
+8. 下一项是 PV/final move policy 与 Watchdog/UCI。LC3 Policy 文档把“search finished 后走哪步”明确列为
+   TBD，不能未经决策直接复用 classic 的 best-child 规则后宣称这是 LC3；这些明确后才切换 UCI。
 
-门槛：真实 ONNX `go movetime 30s` 持续推进；`position -> go -> stop -> position -> go` 无旧 generation
-更新、无 reservation 泄漏、恰好一次 bestmove。
+门槛：真实 ONNX stream 30 秒 deadline 持续推进；完成 final-move/watchdog 设计后再验证
+`position -> go -> stop -> position -> go` 无旧 generation 更新、无 reservation 泄漏、恰好一次 bestmove。
 
 ## NN：x7 v2 固定 trunk
 

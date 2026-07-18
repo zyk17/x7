@@ -167,9 +167,31 @@ quit
 '@ | C:\projects\77xiangqi_engine\target\release\engin.exe
 ```
 
-## 10. 质量检查
+## 10. Stream ONNX 生命周期诊断
 
-## 11. Windows DirectML 打包
+`stream` 仍未接入正式 UCI。下面的诊断二进制会以同一 ONNX/FEN 运行 classic、串行 stream 与常驻 worker；
+默认固定 playout 对比，额外 `--movetime-ms` 则只验证 stream worker 持续推进、deadline 收敛及 root 无 in-flight。
+
+```powershell
+cargo run --release -p engin --bin stream_compare -- `
+  --onnx data\x7.onnx `
+  --playouts 128
+```
+
+```powershell
+target\release\stream_compare.exe `
+  --onnx data\x7.onnx `
+  --playouts 64 `
+  --movetime-ms 30000
+```
+
+固定 playout 下 classic 允许在已提交 minibatch 的边界超过请求节点数；工具会按 classic 的实际 root completed N
+运行 stream。并发 stream 不要求和 serial/classic 得到逐边相同 `N/Q`，但必须完成既定预算或 deadline，且每条 edge
+都满足 `started == completed`。
+
+## 11. 质量检查
+
+## 12. Windows DirectML 打包
 
 清理 Rust 构建产物、以 DirectML-only `ort` 重编译并生成可分发目录。脚本会复制实际需要的
 DirectML provider DLL，并确认 bundle 内的 UCI 搜索没有回退 CPU：

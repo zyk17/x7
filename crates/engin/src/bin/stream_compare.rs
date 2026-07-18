@@ -4,18 +4,22 @@
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>.
 //! This binary compares the deterministic serial baseline with the owned-event
 //! worker pipeline. It deliberately does not compare exact edge visit counts:
-//! queue scheduling changes selection order. The required invariants are the
-//! same completed playout count, legal root expansion, and no root reservation
-//! left in flight.
+//! queue scheduling changes selection order. Fixed-playout mode requires the
+//! same completed count; timed mode requires continued progress until its
+//! deadline. Both require legal root expansion and no root reservation left
+//! in flight.
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use engin::neural::backend::{Backend, CachingBackend};
 use engin::neural::onnx::OnnxBackend;
 use engin::search::classic::ClassicSearch;
-use engin::search::stream::{SearchGeneration, StreamSearch, StreamStats, StreamWorkerConfig, StreamWorkerPipeline};
+use engin::search::stream::{
+    SearchGeneration, StreamSearch, StreamSearchLimits, StreamStats, StreamWorkerConfig, StreamWorkerPipeline,
+};
 use engin::SearchBase;
 use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
@@ -24,10 +28,18 @@ const ROOT_TOP: usize = 8;
 
 /// CLI parsing is intentionally local to this diagnostic binary. The search
 /// contract is defined by `search::stream`, not by an additional UCI option.
-fn parse_args() -> Result<(PathBuf, String, u64), String> {
+struct Args {
+    onnx: PathBuf,
+    fen: String,
+    playouts: u64,
+    stream_movetime: Option<Duration>,
+}
+
+fn parse_args() -> Result<Args, String> {
     let mut onnx = PathBuf::from("data/x7.onnx");
     let mut fen = STARTPOS_FEN.to_owned();
     let mut playouts = DEFAULT_PLAYOUTS;
+    let mut stream_movetime = None;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -40,8 +52,19 @@ fn parse_args() -> Result<(PathBuf, String, u64), String> {
                     .parse()
                     .map_err(|_| "--playouts must be an unsigned integer")?;
             }
+            "--movetime-ms" => {
+                let millis = args
+                    .next()
+                    .ok_or("--movetime-ms requires an integer")?
+                    .parse::<u64>()
+                    .map_err(|_| "--movetime-ms must be an unsigned integer")?;
+                stream_movetime = Some(Duration::from_millis(millis));
+            }
             "--help" | "-h" => {
-                return Err("usage: stream_compare [--onnx data/x7.onnx] [--playouts 128] [--fen \"...\"]".to_owned());
+                return Err(
+                    "usage: stream_compare [--onnx data/x7.onnx] [--playouts 128] [--movetime-ms 30000] [--fen \"...\"]"
+                        .to_owned(),
+                );
             }
             _ => return Err(format!("unknown argument: {argument}")),
         }
@@ -49,7 +72,12 @@ fn parse_args() -> Result<(PathBuf, String, u64), String> {
     if playouts == 0 {
         return Err("--playouts must be greater than zero".to_owned());
     }
-    Ok((onnx, fen, playouts))
+    Ok(Args {
+        onnx,
+        fen,
+        playouts,
+        stream_movetime,
+    })
 }
 
 /// LC3 stream roots retain completed node statistics while in-flight visits
@@ -129,18 +157,20 @@ fn print_classic_root(stats: &engin::search::classic::ClassicRootStats) -> bool 
 /// Reference execution: serial `Gather -> Eval -> Backprop` versus persistent
 /// LC3-style workers. This is not a classic-vs-stream strength comparison.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let (onnx, fen, playouts) = parse_args().map_err(std::io::Error::other)?;
-    let state = GameState::from_fen_moves(&fen, &[] as &[&str])?;
+    let args = parse_args().map_err(std::io::Error::other)?;
+    let state = GameState::from_fen_moves(&args.fen, &[] as &[&str])?;
     let history = Arc::new(PositionHistory::from_positions(state.positions()));
     let legal_moves = history.last().board().generate_legal_moves();
 
-    println!("onnx={}", onnx.display());
-    println!("fen={fen}");
-    println!("requested_playouts={playouts} legal_moves={}", legal_moves.len());
+    println!("onnx={}", args.onnx.display());
+    println!("fen={}", args.fen);
+    println!("requested_playouts={} legal_moves={}", args.playouts, legal_moves.len());
 
-    let mut classic = ClassicSearch::new(Box::new(CachingBackend::new(Box::new(OnnxBackend::from_file(&onnx)?))));
+    let mut classic = ClassicSearch::new(Box::new(CachingBackend::new(Box::new(OnnxBackend::from_file(
+        &args.onnx,
+    )?))));
     classic.set_position(&state)?;
-    let (classic_best, classic_visits) = classic.run_blocking_nodes(playouts as u32);
+    let (classic_best, classic_visits) = classic.run_blocking_nodes(args.playouts as u32);
     let classic_root = classic.root_stats_snapshot();
     println!(
         "classic_bestmove={} returned_visits={classic_visits}",
@@ -155,7 +185,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let comparison_playouts = u64::from(classic_root.completed_visits);
     println!("stream_comparison_playouts={comparison_playouts}");
 
-    let serial_backend = load_backend(&onnx)?;
+    let serial_backend = load_backend(&args.onnx)?;
     let root_eval = serial_backend.evaluate(&history, &legal_moves);
     println!(
         "root_network: W={:.5} D={:.5} L={:.5} Q={:.5}",
@@ -169,14 +199,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let serial_root = serial.repository().get(serial.root_key()).expect("serial root exists");
     let serial_settled = print_root("serial", serial_stats, &serial_root);
 
-    let worker_backend = load_backend(&onnx)?;
+    let worker_backend = load_backend(&args.onnx)?;
     let mut workers = StreamWorkerPipeline::new(
         worker_backend,
         SearchGeneration(1),
         history,
         StreamWorkerConfig::default(),
     );
-    let worker_stats = workers.run_playouts(comparison_playouts)?;
+    let (worker_stats, worker_budget_satisfied) = match args.stream_movetime {
+        Some(movetime) => {
+            let start = Instant::now();
+            let stats = workers.run_with_limits(StreamSearchLimits {
+                max_playouts: None,
+                deadline: Some(start + movetime),
+            })?;
+            println!(
+                "stream_movetime_ms={} elapsed_ms={} completed_playouts={}",
+                movetime.as_millis(),
+                start.elapsed().as_millis(),
+                stats.completed_playouts,
+            );
+            (stats, stats.completed_playouts > 0)
+        }
+        None => {
+            let stats = workers.run_playouts(comparison_playouts)?;
+            (stats, stats.completed_playouts == comparison_playouts)
+        }
+    };
     let worker_root = workers
         .repository()
         .get(workers.root_key())
@@ -185,13 +234,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     workers.stop_and_join();
 
     let stream_passed = serial_stats.completed_playouts == comparison_playouts
-        && worker_stats.completed_playouts == comparison_playouts
+        && worker_budget_satisfied
         && classic_settled
         && serial_settled
         && worker_settled;
     println!(
         "classic_budget_delta={}",
-        i64::from(classic_root.completed_visits) - playouts as i64
+        i64::from(classic_root.completed_visits) - args.playouts as i64
     );
     println!("stream_pipeline={}", if stream_passed { "PASS" } else { "FAIL" });
     if stream_passed {
