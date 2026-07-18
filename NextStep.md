@@ -52,7 +52,10 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
    generation gate 和 stop/join，不引入 classic shared mutable tree。`request_stop()` 与 `stop_and_join()` 已拆开：
    前者是未来 UCI `stop` 的正常搜索边界，后者只负责 owner 析构/join。固定 playout、根扩展后立即 stop/join，
    以及大量 playout 中外部 stop 返回部分统计且回收所有 reservation 均已回归。
-4. 下一项是固定-visits 结构对拍、真实 ONNX 长 `movetime` 和 worker error propagation 回归；Watchdog/UCI
+4. `StreamSearchLimits` 已统一相对 playout 预算、绝对 deadline 与显式 stop；返回前必定等待已提交 event
+   完成或取消。它是后续 single Watchdog 将 `go nodes` / `go movetime` 映射到 stream 的内部边界，不直接复用
+   classic stopper 或提前切换 UCI。
+5. 下一项是固定-visits 结构对拍、真实 ONNX 长 `movetime` 和 worker error propagation 回归；Watchdog/UCI
    只在三者通过后切换至 stream。
 
 门槛：真实 ONNX `go movetime 30s` 持续推进；`position -> go -> stop -> position -> go` 无旧 generation

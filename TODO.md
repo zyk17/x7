@@ -37,6 +37,8 @@
 - [x] S2a NN：接入 `BackendComputation`、ONNX minibatch 和 cache-hit backprop；不得共享 classic backend computation workspace。
 - [x] S2b workers：S2a queue stage 已搬到常驻 Gather/Eval/Backprop worker；worker 只收发 owned event，覆盖
   fixed playout、析构 `stop_and_join`，以及正常 `request_stop` 返回部分统计后的 reservation drain。
+- [x] S2b lifecycle：以 `StreamSearchLimits` 统一相对 playout budget、绝对 deadline 与显式 stop；返回前
+  必须完成或取消所有已提交 event，不允许 root snapshot 留下 in-flight reservation。
 - [ ] S2b 回归：补真实 ONNX 长 `movetime`、worker error propagation 和 fixed-visits root `N/Q/P` 对拍。
 - [ ] S3 UCI：仅在 S1/S2 回归通过后让 stream 替代 classic；验证 bare `go`、nodes、movetime、infinite/stop、
   position replacement、ucinewgame、exactly-one bestmove。

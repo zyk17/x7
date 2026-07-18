@@ -28,7 +28,7 @@ pub use policy::{select_edge, ValueDelta};
 pub use repository::{EdgeReservation, ExpansionState, NodeKey, NodeRepository, StreamEdge, StreamNode};
 pub use search::{StreamOutcome, StreamSearch, StreamStats};
 pub use stats::{root_stats, StreamRootEdgeStats, StreamRootStats};
-pub use workers::{StreamWorkerConfig, StreamWorkerPipeline};
+pub use workers::{StreamSearchLimits, StreamWorkerConfig, StreamWorkerPipeline};
 
 /// Converts an absolute Xiangqi terminal result to the current leaf side's
 /// compact WDL value. Both serial and queued stream paths must use it.

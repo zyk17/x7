@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, SendTimeoutError, Sender, TryRecvError};
 use parking_lot::{Condvar, Mutex};
@@ -24,6 +24,24 @@ use super::{
 };
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
+
+/// Search budget consumed relative to the pipeline's current completed
+/// playout count. A later UCI watchdog maps `go nodes` / `go movetime` onto
+/// this boundary; workers themselves only observe the immutable limit and
+/// the explicit `request_stop()` signal.
+///
+/// Reference: LC3 overview, "Stats Collection" and "WatchdogWorker".
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamSearchLimits {
+    pub max_playouts: Option<u64>,
+    pub deadline: Option<Instant>,
+}
+
+impl StreamSearchLimits {
+    fn is_exhausted(self, completed: u64, target: u64) -> bool {
+        completed >= target || self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamWorkerConfig {
@@ -265,21 +283,34 @@ impl StreamWorkerPipeline {
     }
 
     pub fn run_playouts(&self, count: u64) -> Result<StreamStats, EnginError> {
-        let target = self.stats().completed_playouts + count;
-        while self.stats().completed_playouts < target && !self.is_stopping() {
+        self.run_with_limits(StreamSearchLimits {
+            max_playouts: Some(count),
+            deadline: None,
+        })
+    }
+
+    /// Runs owned stream events until a relative playout budget, deadline, or
+    /// explicit stop is reached. It always waits for submitted events to
+    /// complete or cancel before returning, so root snapshots never observe
+    /// a leaked edge reservation.
+    pub fn run_with_limits(&self, limits: StreamSearchLimits) -> Result<StreamStats, EnginError> {
+        let initial_completed = self.stats().completed_playouts;
+        let target = initial_completed.saturating_add(limits.max_playouts.unwrap_or(u64::MAX));
+        while !self.is_stopping() && !limits.is_exhausted(self.stats().completed_playouts, target) {
             let root_is_expanded = self
                 .shared
                 .repository
                 .get(self.root_key)
                 .is_some_and(|root| root.expansion_state() == ExpansionState::Expanded);
             let submit_count = if root_is_expanded {
-                self.queue_capacity
-                    .min((target - self.stats().completed_playouts) as usize)
+                usize::try_from(target.saturating_sub(self.stats().completed_playouts))
+                    .unwrap_or(usize::MAX)
+                    .min(self.queue_capacity)
             } else {
                 1
             };
             for _ in 0..submit_count {
-                if self.is_stopping() {
+                if self.is_stopping() || limits.is_exhausted(self.stats().completed_playouts, target) {
                     break;
                 }
                 if let Err(error) = self.submit_playout() {
@@ -529,11 +560,11 @@ fn backprop_worker(shared: Arc<SharedPipeline>, receiver: Receiver<BackpropEvent
 mod tests {
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
-    use super::{StreamWorkerConfig, StreamWorkerPipeline};
+    use super::{StreamSearchLimits, StreamWorkerConfig, StreamWorkerPipeline};
     use crate::neural::backend::UniformBackend;
     use crate::search::stream::SearchGeneration;
 
@@ -651,6 +682,25 @@ mod tests {
         for edge in root.edges().iter() {
             assert_eq!(edge.visits(), edge.completed_visits());
         }
+        pipeline.stop_and_join();
+    }
+
+    #[test]
+    fn expired_deadline_submits_no_new_playout() {
+        let mut pipeline = StreamWorkerPipeline::new(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(25),
+            startpos_history(),
+            StreamWorkerConfig::default(),
+        );
+        let stats = pipeline
+            .run_with_limits(StreamSearchLimits {
+                max_playouts: Some(64),
+                deadline: Some(Instant::now()),
+            })
+            .expect("expired deadline is a normal result");
+        assert_eq!(stats.completed_playouts, 0);
+        assert!(pipeline.repository().get(pipeline.root_key()).is_none());
         pipeline.stop_and_join();
     }
 }
