@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{bounded, Receiver, SendTimeoutError, Sender, TryRecvError};
 use parking_lot::{Condvar, Mutex};
 use xiangqi_core::{GameResult, PositionHistory};
 
@@ -227,15 +227,23 @@ impl StreamWorkerPipeline {
             return Err(EnginError::PortIncomplete("stale stream search generation"));
         }
         self.shared.outstanding.fetch_add(1, Ordering::AcqRel);
-        match self.shared.gather_tx.try_send(event) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(event)) => {
+        let mut event = event;
+        loop {
+            if self.shared.stopping.load(Ordering::Acquire) {
                 self.shared.cancel_and_finish(event, false);
-                Err(EnginError::PortIncomplete("stream gather queue full"))
+                return Err(EnginError::PortIncomplete("stream worker pipeline is stopped"));
             }
-            Err(TrySendError::Disconnected(event)) => {
-                self.shared.cancel_and_finish(event, false);
-                Err(EnginError::PortIncomplete("stream gather queue disconnected"))
+            // LC3 workers communicate through bounded event queues. Queue
+            // capacity is normal backpressure, not a failed search request;
+            // use a short timeout so a concurrent Stop can still interrupt a
+            // producer that is waiting for Gather capacity.
+            match self.shared.gather_tx.send_timeout(event, RECEIVE_POLL) {
+                Ok(()) => return Ok(()),
+                Err(SendTimeoutError::Timeout(returned)) => event = returned,
+                Err(SendTimeoutError::Disconnected(returned)) => {
+                    self.shared.cancel_and_finish(returned, false);
+                    return Err(EnginError::PortIncomplete("stream gather queue disconnected"));
+                }
             }
         }
     }
@@ -556,5 +564,29 @@ mod tests {
         for edge in root.edges().iter() {
             assert_eq!(edge.visits(), edge.completed_visits());
         }
+    }
+
+    #[test]
+    fn bounded_gather_queue_backpressures_without_failing_submission() {
+        let mut pipeline = StreamWorkerPipeline::new(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(23),
+            startpos_history(),
+            StreamWorkerConfig {
+                pipeline: super::StreamPipelineConfig {
+                    queue_capacity: 1,
+                    eval_batch_size: 1,
+                    ..super::StreamPipelineConfig::default()
+                },
+                gather_workers: 1,
+                backprop_workers: 1,
+            },
+        );
+        pipeline.run_playouts(1).expect("expand root");
+        for _ in 0..32 {
+            pipeline.submit_playout().expect("bounded queue waits for gather");
+        }
+        pipeline.wait_for_idle().expect("all submitted work drains");
+        pipeline.stop_and_join();
     }
 }
