@@ -1,6 +1,7 @@
 //! px0 `src/search/search.h:45-99` 的 P3 搜索接口。
 
 pub mod classic;
+pub mod stream;
 
 use xiangqi_core::GameState;
 
