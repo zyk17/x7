@@ -14,10 +14,15 @@
 ## 当前共识
 
 - 这是全新 Rust 实现；旧 `xiangqi_core` 与旧 MCTS 不是兼容目标。
-- 当前唯一工程参考是：
+- `xiangqi_core`、classic 和 NN 的工程参考是：
   - `C:\Users\Administrator\projects\px0`
   - `C:\Users\Administrator\projects\pxzero-training`
-- 当前工作是逐函数 1:1 翻译 px0；翻译完成前不吸收 lc0/KataGo 的结构或性能细节。
+- `search::stream` 的架构参考仅为 LC3 官方文档：
+  - <https://lczero.org/dev/lc0/search/lc3/overview/>
+  - <https://lczero.org/dev/lc0/search/lc3/policy/>
+  - <https://lczero.org/dev/lc0/search/lc3/glossary/>
+- 本地 lc0 checkout 不含 LC3 源码。因此 stream 只能按文档实现等价架构，不得伪称 1:1 源码翻译；也不得把
+  px0 classic 的共享 mutable tree/task-worker 模型补丁式移植到 stream。
 - 搜索主路线只有 MCTS；重建完成前 `go` 必须明确返回不可搜索状态，不能返回 heuristic 或旧结果。
 - 正式模型契约保持 `124x10x9 -> 2062 + WDL`。
 
@@ -33,6 +38,9 @@
   `px0/src/neural/memcache.cc:38-190` 修改。
   已删除的 `TaskTreeBridge` / `TaskWorkerRunner` 不是可用实现；task 生命周期以现有
   `PickTaskQueue` / `TaskRunner` 与同步 tree phase 为准。唯一准确状态以 `NextStep.md`、`TODO.md` 为准。
+- `crates/engin/src/search/stream`：独立的 LC3-style streaming MCTS。不得复用 `classic::NodeTree`、
+  `classic::Node`、classic worker 或 snapshot/replay delta。事件必须 owned，且携带完整 root history + variation；
+  repository 的首版是树 key，不引入 DAG/TT。
 - `nn/`：对齐 pxzero-training 的数据、训练和导出。
 
 不要引入：
@@ -60,6 +68,7 @@ px0 `nodes_mutex_` 的主线程持锁/task 线程直接读写模型不能按字�
 ## 参考纪律
 
 - 每个新 Rust 函数必须在注释、变更说明、`NextStep.md`、`TODO.md` 或 review 记录中标出 px0 文件路径和连续行区间。
+- stream 新函数改为标出上述 LC3 URL 和对应标题；找不到 LC3 文档语义时，先记录缺口，不自行补充搜索策略。
 - 对规则层优先参考：
   - `px0/src/chess/types.h`
   - `px0/src/chess/bitboard.h`

@@ -10,10 +10,9 @@ Set-Location C:\projects\77xiangqi_engine
 
 - Kaggle 数据集：`pikacat/px0data`
 - 本地目录：`C:\work\px0data\{version}\`
+- 数据准备入口：`nn\scripts\data\prepare_px0.py --config nn\configs\<name>.yaml`
 - 训练入口：`nn\scripts\train\train_px0.py --config nn\configs\<name>.yaml`
-- 如果本地已有 `training.*.gz`，直接复用
-- 如果只有 `archive.zip` / `data.bin`，自动解压整理
-- 如果目录为空，自动从 Kaggle 下载
+- 准备脚本负责下载、解压、train/val 切分和固定 validation manifest；训练不会再做这些工作
 
 ## 1. 首次准备环境
 
@@ -24,44 +23,57 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install -e "nn[t
 这会安装 PyTorch、ONNX、Kaggle、PyYAML、pytest 和 ruff。配置要求 `training.device: cuda` 时，
 训练不会静默降级到 CPU；只有写为 `auto` 才允许回退。
 
-## 2. 用 YAML 训练
+## 2. 准备数据
+
+每个 `px0_version + val_ratio + seed + validation_*` 组合只需要准备一次。此步骤可能较慢：首次下载、解压和
+validation manifest 的局面扫描都在这里完成。
 
 ```powershell
-Copy-Item nn\configs\example.yaml nn\configs\x7_qmix_075_01.yaml
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\prepare_px0.py `
+  --config nn\configs\x7_v2_01.yaml
+```
+
+## 3. 用 YAML 训练
+
+```powershell
+Copy-Item nn\configs\example.yaml nn\configs\x7_v2_01.yaml
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --config nn\configs\x7_qmix_075_01.yaml
+  --config nn\configs\x7_v2_01.yaml
 ```
 
 配置分为 `dataset`、`model`、`training` 三段，格式参考
 `C:\Users\Administrator\projects\pxzero-training\tf\configs\example.yaml`，但只保留当前 PyTorch/PX0
 主线需要的字段。`124x10x9 -> 2062 + WDL`、纯 CNN trunk 与 loss 语义固定，不能通过配置切换。
+优化器固定为 pxzero-training 的 `SGD(momentum=0.9, nesterov=true)`。
 所有可配置字段、默认值与注释见 [nn/configs/example.yaml](C:/projects/77xiangqi_engine/nn/configs/example.yaml)。
 `example.yaml` 是唯一提交到 Git 的配置文件；复制出的实验 YAML 被忽略。
 
-## 3. 继续训练
+训练只加载已准备 manifest；若准备结果缺失或 YAML 的 dataset 参数变了，会立即失败而不是自动等待。
+
+## 4. 继续训练
 
 再次运行同一条 YAML 命令即可。`training.out` 已存在时自动恢复；只需把 YAML 中的
 `training.steps` 调大。
 
-## 4. 开启新阶段训练（从旧权重起步）
+## 5. 开启新阶段训练（从旧权重起步）
 
 复制 YAML，修改 `name`、`training.out`、`training.init_from`、`training.q_ratio` 和 `training.steps`。
 例如先用 `q_ratio=0.0` 训出第一阶段，再切到新的 `q_ratio`：
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --config nn\configs\x7_qmix_025_01.yaml
+  --config nn\configs\x7_v2_01.yaml
 ```
 
-## 5. 强制重下并重建某个版本
+## 6. 强制重下并重建某个版本
 
-把 YAML 的 `dataset.force_download` 改为 `true` 后，运行第 2 节命令；完成后改回 `false`。
+把 YAML 的 `dataset.force_download` 改为 `true` 后，运行第 2 节准备命令；完成后改回 `false`。
 
-## 6. 导出 best checkpoint 为 ONNX
+## 7. 导出 best checkpoint 为 ONNX
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
-  --checkpoint data\checkpoints\x7_qmix_075_01.best.pt `
+  --checkpoint data\checkpoints\x7_v2_01.best.pt `
   --out data\x7.onnx
 ```
 
@@ -75,13 +87,13 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\expor
 - `q_ratio=0.0` 表示纯最终结果监督
 - `q_ratio=1.0` 表示纯搜索监督
 
-## 7. 检查 ONNX 合约
+## 8. 检查 ONNX 合约
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test_policy_onnx_contract.py
 ```
 
-## 8. 当前引擎 UCI 冒烟
+## 9. 当前引擎 UCI 冒烟
 
 当前引擎只提供正式 UCI stdin/stdout 入口；没有独立 ONNX evaluator、bench CLI 或 px0 trace
 对拍脚本。权重由 `WeightsFile` 在下一条 `position` 前加载。
@@ -155,9 +167,9 @@ quit
 '@ | C:\projects\77xiangqi_engine\target\release\engin.exe
 ```
 
-## 9. 质量检查
+## 10. 质量检查
 
-## 10. Windows DirectML 打包
+## 11. Windows DirectML 打包
 
 清理 Rust 构建产物、以 DirectML-only `ort` 重编译并生成可分发目录。脚本会复制实际需要的
 DirectML provider DLL，并确认 bundle 内的 UCI 搜索没有回退 CPU：
