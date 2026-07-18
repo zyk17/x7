@@ -19,6 +19,7 @@ mod pipeline;
 mod policy;
 mod repository;
 mod search;
+mod stats;
 mod workers;
 
 pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
@@ -26,6 +27,7 @@ pub use pipeline::{StreamPipeline, StreamPipelineConfig};
 pub use policy::{select_edge, ValueDelta};
 pub use repository::{EdgeReservation, ExpansionState, NodeKey, NodeRepository, StreamEdge, StreamNode};
 pub use search::{StreamOutcome, StreamSearch, StreamStats};
+pub use stats::{root_stats, StreamRootEdgeStats, StreamRootStats};
 pub use workers::{StreamWorkerConfig, StreamWorkerPipeline};
 
 /// Converts an absolute Xiangqi terminal result to the current leaf side's
