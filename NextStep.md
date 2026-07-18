@@ -62,8 +62,11 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
 7. `stream_compare --movetime-ms 30000` 已在 `data/x7.onnx` / DirectML 下运行：30.012 秒内完成
    292,409 playout、11,935 个 NN batch，deadline 后根无 in-flight。该工具不走 UCI，只证明常驻 pipeline
    的长期推进与收敛。
-8. 下一项是 PV/final move policy 与 Watchdog/UCI。LC3 Policy 文档把“search finished 后走哪步”明确列为
-   TBD，不能未经决策直接复用 classic 的 best-child 规则后宣称这是 LC3；这些明确后才切换 UCI。
+8. stream 已保留网络/terminal `M`：叶子写入 `EvalResult.m`（终局为 0），每层 backup 加一 ply；这是 px0
+   `SearchWorker::DoBackupUpdate` (`src/search/classic/search.cc:2189-2234`) 的数据流。
+9. LC3 Policy 文档把 final move 标为 TBD；X7 明确采用 px0 `Search::GetBestChildrenNoTemperature`
+   (`src/search/classic/search.cc:705-808`) 作为 stream 首版输出策略：终局结果、完成 N、Q、P，且按该规则提取
+   只读 PV。当前无 tablebase/searchmoves，因此两项不伪实现；Watchdog/UCI 只能在该明确差异下接入。
 
 门槛：真实 ONNX stream 30 秒 deadline 持续推进；完成 final-move/watchdog 设计后再验证
 `position -> go -> stop -> position -> go` 无旧 generation 更新、无 reservation 泄漏、恰好一次 bestmove。

@@ -77,6 +77,7 @@ struct NodeStats {
     visits: u32,
     value_sum: f32,
     draw_sum: f32,
+    moves_left_sum: f32,
 }
 
 impl StreamEdge {
@@ -182,7 +183,7 @@ pub struct StreamNode {
     /// LC3 nodes retain their completed aggregate. In-flight visits remain
     /// edge-local and are deliberately excluded from this value.
     stats: Mutex<NodeStats>,
-    terminal: Mutex<Option<(f32, f32)>>,
+    terminal: Mutex<Option<(f32, f32, f32)>>,
 }
 
 impl StreamNode {
@@ -208,11 +209,21 @@ impl StreamNode {
         }
     }
 
+    pub fn moves_left(&self) -> f32 {
+        let stats = self.stats.lock();
+        if stats.visits == 0 {
+            0.0
+        } else {
+            stats.moves_left_sum / stats.visits as f32
+        }
+    }
+
     pub(crate) fn add_value(&self, delta: ValueDelta) {
         let mut stats = self.stats.lock();
         stats.visits += delta.visits;
         stats.value_sum += delta.value_sum;
         stats.draw_sum += delta.draw_sum;
+        stats.moves_left_sum += delta.moves_left_sum;
     }
 
     pub fn expansion_state(&self) -> ExpansionState {
@@ -261,16 +272,16 @@ impl StreamNode {
             .expect("only evaluating stream nodes can abort evaluation");
     }
 
-    pub fn mark_terminal(&self, value: f32, draw: f32) {
+    pub fn mark_terminal(&self, value: f32, draw: f32, moves_left: f32) {
         assert!(
             self.expansion_state() == ExpansionState::Evaluating,
             "node must be evaluating"
         );
-        *self.terminal.lock() = Some((value, draw));
+        *self.terminal.lock() = Some((value, draw, moves_left));
         self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
     }
 
-    pub fn terminal_value(&self) -> Option<(f32, f32)> {
+    pub fn terminal_value(&self) -> Option<(f32, f32, f32)> {
         *self.terminal.lock()
     }
 

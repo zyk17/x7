@@ -45,8 +45,11 @@
   Eval event；owner 获得原始错误，`wait_for_idle` 不可死等。
 - [x] S2b 长 ONNX：`stream_compare --movetime-ms 30000` 在 `data/x7.onnx` / DirectML 下完成 292,409
   playout、11,935 NN batch，deadline 后 root settled；该二进制不接 UCI。
-- [ ] S2c policy output：LC3 Policy 文档将 final move 标为 TBD；先定义/批准 X7 的 final-move 与 PV 规则，
-  再实现 read-only root snapshot 到 UCI output 的映射，不能伪称为 LC3 既有实现。
+- [x] S2c policy output：LC3 Policy 文档将 final move 标为 TBD；X7 明确采用 px0
+  `Search::GetBestChildrenNoTemperature` (`src/search/classic/search.cc:705-808`) 的终局、完成 N、Q、P
+  排序及只读 PV。已补齐 M backup；tablebase/searchmoves 未实现且不伪装支持。
+- [ ] S2d output regression：固定 FEN 覆盖 terminal win/loss、N/Q/P tie-break、PV 与 stream root snapshot；
+  再由 Watchdog 映射到 UCI `info` / exactly-one `bestmove`。
 - [ ] S3 UCI：仅在 S1/S2 回归通过后让 stream 替代 classic；验证 bare `go`、nodes、movetime、infinite/stop、
   position replacement、ucinewgame、exactly-one bestmove。
 

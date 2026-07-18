@@ -119,15 +119,21 @@ pub struct BackpropEvent {
     pub node: NodeEvent,
     pub value: f32,
     pub draw: f32,
+    pub moves_left: f32,
 }
 
 impl BackpropEvent {
     /// Completes the path bottom-up. The leaf value is from the leaf side to
     /// move; each parent edge therefore receives the sign-flipped update.
     pub fn complete(self, repository: &super::NodeRepository) {
-        let Self { node, value, draw } = self;
+        let Self {
+            node,
+            value,
+            draw,
+            moves_left,
+        } = self;
         debug_assert_eq!(node.node_path.len(), node.reservations.len() + 1);
-        let mut delta = ValueDelta::one(value, draw);
+        let mut delta = ValueDelta::one(value, draw, moves_left);
         let mut reservations = node.reservations.into_iter().rev();
         for (node_index, node_key) in node.node_path.into_iter().enumerate().rev() {
             repository.get_or_insert(node_key).add_value(delta);
@@ -197,6 +203,7 @@ mod tests {
             node: child,
             value: 0.4,
             draw: 0.2,
+            moves_left: 3.0,
         }
         .complete(&repository);
 
@@ -209,5 +216,7 @@ mod tests {
         let child_node = repository.get(NodeKey::root(42)).expect("child node");
         assert_eq!(child_node.completed_visits(), 1);
         assert!((child_node.q() - 0.4).abs() < f32::EPSILON);
+        assert!((child_node.moves_left() - 3.0).abs() < f32::EPSILON);
+        assert!((root_node.moves_left() - 4.0).abs() < f32::EPSILON);
     }
 }

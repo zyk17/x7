@@ -218,11 +218,12 @@ impl StreamPipeline {
                 self.stats.collisions += 1;
             }
             ExpansionState::Terminal => {
-                let (value, draw) = node.terminal_value().expect("terminal stream value");
+                let (value, draw, moves_left) = node.terminal_value().expect("terminal stream value");
                 self.forward_backprop(BackpropEvent {
                     node: event,
                     value,
                     draw,
+                    moves_left,
                 })?;
             }
             ExpansionState::Expanded => {
@@ -273,11 +274,12 @@ impl StreamPipeline {
                 }
                 result => {
                     let (value, draw) = terminal_value_for_side_to_move(result, history.last().is_black_to_move());
-                    node.mark_terminal(value, draw);
+                    node.mark_terminal(value, draw, 0.0);
                     self.forward_backprop(BackpropEvent {
                         node: event,
                         value,
                         draw,
+                        moves_left: 0.0,
                     })?;
                 }
             }
@@ -325,6 +327,7 @@ impl StreamPipeline {
                 node: event,
                 value: eval.wl,
                 draw: eval.d,
+                moves_left: eval.m,
             })?;
         }
         Ok(true)
