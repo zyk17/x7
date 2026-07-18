@@ -175,4 +175,27 @@ mod tests {
 
         assert_eq!(principal_variation(&repository, root_key).moves, vec![first, second]);
     }
+
+    #[test]
+    fn non_terminal_order_is_visits_then_q_then_prior() {
+        let repository = NodeRepository::default();
+        let root_key = NodeKey::root(3);
+        let root = repository.get_or_insert(root_key);
+        let high_n = mv("b2", "b3");
+        let high_q = mv("c3", "c4");
+        let high_p = mv("h2", "h3");
+        assert!(root.try_begin_evaluation());
+        root.publish_edges(vec![(high_n, 0.1), (high_q, 0.2), (high_p, 0.9)]);
+        root.add_value(ValueDelta::one(0.0, 0.0, 0.0));
+
+        for _ in 0..2 {
+            root.reserve_edge(0).expect("high N").complete(0.0);
+        }
+        root.reserve_edge(1).expect("high Q").complete(0.8);
+        root.reserve_edge(2).expect("high P").complete(0.8);
+        assert_eq!(
+            best_children_no_temperature(&repository, root_key, 3),
+            vec![high_n, high_p, high_q]
+        );
+    }
 }
