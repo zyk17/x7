@@ -3,7 +3,7 @@
 # 路径相对于启动命令所在目录解析；仓库根目录启动时，data/... 即为仓库 data/。
 
 # 仅写入 checkpoint 元数据和日志，建议与 training.out 的文件名一致。
-name: x7_qmix_075_01
+name: example
 
 dataset:
   # Kaggle pikacat/px0data 的版本号；本地目录为 C:/work/px0data/{version}/。
@@ -11,40 +11,57 @@ dataset:
   # 本地版本缓存根目录。目录已有完整 manifest/chunk 时不访问 Kaggle。
   px0_root: "C:/work/px0data"
   # 固定文件级 train/validation 切分中 validation 的比例，必须在 (0, 1)。
-  val_ratio: 0.10
+  val_ratio: 0.05
+  # 每次 validation 使用的固定局面数。首次训练会生成并持久化 record-level manifest；
+  # 此后所有 validation 读取同一批局面，曲线可以横向比较。
+  validation_samples: 16384
+  # 首次构建 manifest 时允许扫描的 validation chunk 上限。0 表示按固定随机顺序扫描，
+  # 达到三档配额即停止；正数用于限制初始化成本。
+  validation_source_files: 0
   # 文件切分随机种子。改变它会生成另一份 train/validation manifest。
   seed: 42
-  # true 会删除此版本已准备的 chunk/archive/manifest 后重新下载；通常保持 false。
+  # 仅 prepare_px0.py 使用：true 会删除此版本已准备的 chunk/archive/manifest 后重新下载；通常保持 false。
   force_download: false
 
 model:
-  # trunk 通道数。当前 baseline 是 160；必须为正且能被 4 整除。
-  width: 160
-  # pre-activation/global-pooling residual block 数。当前 baseline 是 10。
-  blocks: 10
+  # x7 v2 基准为 width=256、blocks=12、bottleneck_channels=112：3x3 stem 124->256，12 个 256->112->112->256
+  # PreAct bottleneck。可为实验调整；两次 mean/max Global Broadcast 始终均匀插入三个 trunk stage 之间。
+  # bottleneck_channels 控制每个 block 的中间表示；两个 3x3 层使其参数量近似二次增长。
+  # 同一个 checkpoint 续训或 init_from 时，这三个数必须精确一致。
+  width: 256
+  blocks: 12
+  bottleneck_channels: 128
 
 training:
-  # 训练 checkpoint。文件存在时自动从其中的 optimizer/model/step 续训。
-  out: "data/checkpoints/x7_qmix_075_01.pt"
-  # 新阶段可选：只加载模型权重，不加载 optimizer/step。使用时必须换新的 out。
+  # 一个 YAML 对应一个模型 checkpoint。文件存在时自动续训。
+  out: "data/checkpoints/example.pt"
+  # 从另一模型初始化时才使用；正常 qMix 分阶段训练不需要它。
   # init_from: "data/checkpoints/x7_qmix_000_01.best.pt"
-  # 总训练 step，不是本次增加的 step。续训时必须大于 checkpoint 的 completed_steps。
-  steps: 200000
+  # 全局总 step，不是本次增加的 step。续训时必须大于 checkpoint 的 completed_steps。
+  steps: 2000
   # 每个 optimizer step 的样本数。
   batch_size: 256
   # 每隔多少 step 跑一次 validation 并写 checkpoint。
-  eval_every: 1000
-  # 每次 validation 最多读取多少 batch；控制验证耗时，不改变训练集。
-  val_batches: 32
-  # AdamW 初始学习率；调度为固定 warmup 后 cosine decay 到 1e-5。
-  lr: 0.001
-  # AdamW weight decay。
-  weight_decay: 0.0001
+  eval_every: 100
+  # pxzero-style record shuffle buffer 的总大小；会按 DataLoader worker 均分，避免顺序读取
+  # 同一对局相邻局面。4096 个解码样本约占 200 MB 主存。
+  shuffle_size: 4096
+  # phase-local warmup。q_ratio 变化会开启新 phase，因此这个步数也会重新计算。
+  warmup_steps: 250
+  # pxzero-training 风格的分段学习率；列表长度必须是 lr_boundaries 长度加一。
+  # step <= 140000 用 1e-3，之后依次切换到 3e-4、1e-4。
+  lr_values: [0.001, 0.0003, 0.0001]
+  lr_boundaries: [1000, 1300]
+  # 优化器固定为 pxzero-training 的 SGD(momentum=0.9, nesterov=true)，不配置 AdamW weight decay。
   # WDL cross-entropy 在总 loss 中的系数；policy 系数固定为 1.0。
   value_loss_weight: 1.0
+  # pxzero-training 语义：raw plies-left Huber loss 的系数。
+  moves_left_loss_weight: 1.0
   # 固定 qMix：0.0 = winner WDL，1.0 = search WDL，中间值线性混合。
-  # 一个 checkpoint 内保持固定；切阶段时复制 YAML、设置 init_from 和新的 out。
-  q_ratio: 0.75
+  # Value 主 loss 仅为该 target 的 WDL CE；日志中的 Q-MSE 只作观测，不反传。
+  # 改变 q_ratio 且使用同一个 out 时，训练器自动开启新 phase：保留模型权重，
+  # 但重置 optimizer、LR schedule 和 best validation，并在 checkpoint 记录 q_ratio_history。
+  q_ratio: 0.5
   # cuda: 必须有 CUDA，缺失即失败；cpu: 强制 CPU；auto: CUDA 不可用时允许回退 CPU。
   device: cuda
   # DataLoader worker 数。null 使用平台默认值；Windows 本机常用 4。

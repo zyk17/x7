@@ -1,8 +1,7 @@
-"""纯 CNN 的 KataGo 风格 trunk + px0 卷积 policy + WDL value。"""
+"""X7 v2 bottleneck trunk + px0 spatial policy + WDL/moves-left heads。"""
 
 from __future__ import annotations
 
-import math
 from importlib.resources import files
 
 import torch
@@ -105,43 +104,56 @@ def _build_conv_policy_index() -> torch.Tensor:
     return torch.tensor(policy_to_conv, dtype=torch.long)
 
 
-class PreActBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
+def _mean_max_pool(features: torch.Tensor) -> torch.Tensor:
+    mean = F.adaptive_avg_pool2d(features, output_size=1).flatten(1)
+    maxv = F.adaptive_max_pool2d(features, output_size=1).flatten(1)
+    return torch.cat([mean, maxv], dim=1)
+
+
+class PreActBottleneck(nn.Module):
+    """Pre-activation `1x1 -> 3x3 -> 3x3 -> 1x1` residual bottleneck."""
+
+    def __init__(self, channels: int, *, bottleneck_channels: int) -> None:
         super().__init__()
         self.bn1 = nn.BatchNorm2d(channels)
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(channels, bottleneck_channels, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(bottleneck_channels)
+        self.conv2 = nn.Conv2d(bottleneck_channels, bottleneck_channels, kernel_size=3, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(bottleneck_channels)
+        self.conv3 = nn.Conv2d(bottleneck_channels, bottleneck_channels, kernel_size=3, padding=1, bias=False)
+        self.bn4 = nn.BatchNorm2d(bottleneck_channels)
+        self.conv4 = nn.Conv2d(bottleneck_channels, channels, kernel_size=1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.conv1(F.relu(self.bn1(x), inplace=True))
-        y = self.conv2(F.relu(self.bn2(y), inplace=True))
+        y = self.conv1(F.silu(self.bn1(x), inplace=True))
+        y = self.conv2(F.silu(self.bn2(y), inplace=True))
+        y = self.conv3(F.silu(self.bn3(y), inplace=True))
+        y = self.conv4(F.silu(self.bn4(y), inplace=True))
         return x + y
 
 
-class GlobalPoolingResidualBlock(nn.Module):
+class GlobalBroadcast(nn.Module):
+    """Inject a mean/max global summary into every spatial square.
+
+    The 10x9 Xiangqi board has a fixed size, so a board-size-scaled mean would
+    only duplicate the ordinary mean. This is deliberately a standalone
+    residual injection after the first and second trunk stages, not an
+    additional trunk block.
+    """
+
     def __init__(self, channels: int, *, gpool_channels: int) -> None:
         super().__init__()
         self.pre_bn = nn.BatchNorm2d(channels)
-        self.regular_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.gpool_conv = nn.Conv2d(channels, gpool_channels, kernel_size=1, bias=False)
+        self.gpool_conv = nn.Conv2d(channels, gpool_channels, kernel_size=3, padding=1, bias=False)
         self.gpool_bn = nn.BatchNorm2d(gpool_channels)
-        self.gpool_to_bias = nn.Linear(gpool_channels, channels)
-        self.mid_bn = nn.BatchNorm2d(channels)
-        self.final_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.gpool_to_bias = nn.Linear(gpool_channels * 2, channels, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        trunk = F.relu(self.pre_bn(x), inplace=True)
-        spatial = self.regular_conv(trunk)
-
+        trunk = F.silu(self.pre_bn(x), inplace=True)
         pooled = self.gpool_conv(trunk)
-        pooled = F.relu(self.gpool_bn(pooled), inplace=True)
-        pooled = F.adaptive_avg_pool2d(pooled, output_size=1).flatten(1)
-        bias = self.gpool_to_bias(pooled).unsqueeze(-1).unsqueeze(-1)
-
-        fused = spatial + bias
-        fused = self.final_conv(F.relu(self.mid_bn(fused), inplace=True))
-        return x + fused
+        pooled = F.silu(self.gpool_bn(pooled), inplace=True)
+        global_bias = self.gpool_to_bias(_mean_max_pool(pooled))
+        return x + global_bias.unsqueeze(-1).unsqueeze(-1)
 
 
 class PolicyHead(nn.Module):
@@ -149,63 +161,49 @@ class PolicyHead(nn.Module):
         super().__init__()
         self.pre_bn = nn.BatchNorm2d(channels)
         self.spatial_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.gpool_conv = nn.Conv2d(channels, channels // 2, kernel_size=1, bias=False)
+        self.gpool_conv = nn.Conv2d(channels, channels // 2, kernel_size=3, padding=1, bias=False)
         self.gpool_bn = nn.BatchNorm2d(channels // 2)
-        self.gpool_to_bias = nn.Linear(channels // 2, channels)
+        self.gpool_to_bias = nn.Linear(channels, channels, bias=False)
         self.mid_bn = nn.BatchNorm2d(channels)
         self.out_conv = nn.Conv2d(channels, policy_planes, kernel_size=3, padding=1, bias=True)
         self.register_buffer("policy_index", _build_conv_policy_index(), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        trunk = F.relu(self.pre_bn(x), inplace=True)
+        trunk = F.silu(self.pre_bn(x), inplace=True)
         spatial = self.spatial_conv(trunk)
 
         pooled = self.gpool_conv(trunk)
-        pooled = F.relu(self.gpool_bn(pooled), inplace=True)
-        pooled = F.adaptive_avg_pool2d(pooled, output_size=1).flatten(1)
-        bias = self.gpool_to_bias(pooled).unsqueeze(-1).unsqueeze(-1)
+        pooled = F.silu(self.gpool_bn(pooled), inplace=True)
+        bias = self.gpool_to_bias(_mean_max_pool(pooled)).unsqueeze(-1).unsqueeze(-1)
 
-        logits_2d = self.out_conv(F.relu(self.mid_bn(spatial + bias), inplace=True))
+        logits_2d = self.out_conv(F.silu(self.mid_bn(spatial + bias), inplace=True))
         flat = logits_2d.flatten(1)
         return flat.index_select(1, self.policy_index)
 
 
-class ValueHead(nn.Module):
+class ValueAuxHead(nn.Module):
+    """Shared global readout for WDL and moves-left.
+
+    The trunk already receives global context through GPool blocks. Like
+    KataGo's value head, this readout pools a compact 1x1 feature map instead
+    of assigning a large fully connected layer to every board square.
+    Reference: KataGo `python/katago/train/model_pytorch.py:2544-2673`.
+    """
+
     def __init__(self, channels: int, *, hidden_dim: int) -> None:
         super().__init__()
         self.pre_bn = nn.BatchNorm2d(channels)
         self.conv = nn.Conv2d(channels, hidden_dim, kernel_size=1, bias=False)
         self.conv_bn = nn.BatchNorm2d(hidden_dim)
-        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 3)
+        self.fc = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.value_out = nn.Linear(hidden_dim, 3)
+        self.moves_left_out = nn.Linear(hidden_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        trunk = F.relu(self.pre_bn(x), inplace=True)
-        features = F.relu(self.conv_bn(self.conv(trunk)), inplace=True)
-        avg = F.adaptive_avg_pool2d(features, output_size=1).flatten(1)
-        maxv = F.adaptive_max_pool2d(features, output_size=1).flatten(1)
-        fused = torch.cat([avg, maxv], dim=1)
-        fused = F.relu(self.fc1(fused), inplace=True)
-        return self.fc2(fused)
-
-
-class MovesLeftHead(nn.Module):
-    def __init__(self, channels: int, *, hidden_dim: int) -> None:
-        super().__init__()
-        self.pre_bn = nn.BatchNorm2d(channels)
-        self.conv = nn.Conv2d(channels, hidden_dim // 2, kernel_size=1, bias=False)
-        self.conv_bn = nn.BatchNorm2d(hidden_dim // 2)
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        trunk = F.relu(self.pre_bn(x), inplace=True)
-        features = F.relu(self.conv_bn(self.conv(trunk)), inplace=True)
-        avg = F.adaptive_avg_pool2d(features, output_size=1).flatten(1)
-        maxv = F.adaptive_max_pool2d(features, output_size=1).flatten(1)
-        fused = torch.cat([avg, maxv], dim=1)
-        fused = F.relu(self.fc1(fused), inplace=True)
-        return self.fc2(fused)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        trunk = F.silu(self.pre_bn(x), inplace=True)
+        features = F.silu(self.conv_bn(self.conv(trunk)), inplace=True)
+        global_features = F.silu(self.fc(_mean_max_pool(features)), inplace=True)
+        return self.value_out(global_features), F.relu(self.moves_left_out(global_features), inplace=True)
 
 
 class PolicyResNet(nn.Module):
@@ -214,17 +212,18 @@ class PolicyResNet(nn.Module):
     def __init__(
         self,
         in_planes: int = 124,
-        width: int = 160,
-        num_blocks: int = 10,
+        width: int = 256,
+        num_blocks: int = 12,
         num_moves: int = 2062,
         *,
+        bottleneck_channels: int | None = None,
         value_head: bool = False,
         moves_left_head: bool = False,
-        trunk_kind: str = "katago_cnn_v1",
+        trunk_kind: str = "x7_v2_bottleneck_gbroadcast",
     ) -> None:
         super().__init__()
-        if int(width) <= 0 or int(width) % 2 != 0:
-            raise ValueError(f"width={width} 须为正偶数")
+        if int(width) < 4 or int(width) % 2 != 0:
+            raise ValueError(f"width={width} 须为不小于 4 的偶数")
         if int(num_moves) != 2062:
             raise ValueError(f"当前只支持 px0 2062 policy，got num_moves={num_moves}")
         self.in_planes = int(in_planes)
@@ -234,35 +233,62 @@ class PolicyResNet(nn.Module):
         self.trunk_kind = str(trunk_kind)
 
         self.stem = nn.Conv2d(in_planes, width, kernel_size=3, padding=1, bias=False)
-        gpool_channels = max(16, width // 2)
-        blocks: list[nn.Module] = []
-        for block_idx in range(int(num_blocks)):
-            if (block_idx + 1) % 3 == 0:
-                blocks.append(GlobalPoolingResidualBlock(width, gpool_channels=gpool_channels))
-            else:
-                blocks.append(PreActBlock(width))
-        self.blocks = nn.Sequential(*blocks)
+        bottleneck_channels = width * 7 // 16 if bottleneck_channels is None else int(bottleneck_channels)
+        if bottleneck_channels < 1:
+            raise ValueError(f"bottleneck_channels={bottleneck_channels} 须为正整数")
+        if int(num_blocks) < 3:
+            raise ValueError(f"num_blocks={num_blocks} 须至少为 3，才能放置两次 Global Broadcast")
+
+        # Keep the v2 baseline at 4/4/4, but let a YAML experiment choose any
+        # practical depth. Two broadcasts remain evenly distributed through
+        # the trunk rather than creating a separate architecture family.
+        stage1_blocks = int(num_blocks) // 3
+        stage2_blocks = int(num_blocks) // 3
+        stage3_blocks = int(num_blocks) - stage1_blocks - stage2_blocks
+        self.num_blocks = int(num_blocks)
+        self.bottleneck_channels = bottleneck_channels
+
+        self.stage1 = nn.Sequential(
+            *(PreActBottleneck(width, bottleneck_channels=bottleneck_channels) for _ in range(stage1_blocks))
+        )
+        # Preserve the baseline state-dict names so existing 256x12 v2
+        # checkpoints remain exportable. For another depth they mean the first
+        # and second stage boundary, not literally block 4 and block 8.
+        self.broadcast4 = GlobalBroadcast(width, gpool_channels=width // 2)
+        self.stage2 = nn.Sequential(
+            *(PreActBottleneck(width, bottleneck_channels=bottleneck_channels) for _ in range(stage2_blocks))
+        )
+        self.broadcast8 = GlobalBroadcast(width, gpool_channels=width // 2)
+        self.stage3 = nn.Sequential(
+            *(PreActBottleneck(width, bottleneck_channels=bottleneck_channels) for _ in range(stage3_blocks))
+        )
         self.trunk_bn = nn.BatchNorm2d(width)
 
         self.policy_head = PolicyHead(width)
-        if self.value_head:
-            self.value_head_module = ValueHead(width, hidden_dim=max(64, width))
-        if self.moves_left_head:
-            self.moves_left_head_module = MovesLeftHead(width, hidden_dim=max(64, width))
+        if self.value_head or self.moves_left_head:
+            self.value_aux_head_module = ValueAuxHead(width, hidden_dim=max(64, width))
 
     def forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        trunk = self.blocks(self.stem(x))
-        trunk = F.relu(self.trunk_bn(trunk), inplace=True)
+        trunk = self.stem(x)
+        trunk = self.broadcast4(self.stage1(trunk))
+        trunk = self.broadcast8(self.stage2(trunk))
+        trunk = self.stage3(trunk)
+        trunk = F.silu(self.trunk_bn(trunk), inplace=True)
         logits = self.policy_head(trunk)
 
         outputs: list[torch.Tensor] = [logits]
+        value = moves_left = None
+        if self.value_head or self.moves_left_head:
+            value, moves_left = self.value_aux_head_module(trunk)
         if self.value_head:
-            outputs.append(self.value_head_module(trunk))
+            assert value is not None
+            outputs.append(value)
         if self.moves_left_head:
-            outputs.append(self.moves_left_head_module(trunk))
+            assert moves_left is not None
+            outputs.append(moves_left)
         if len(outputs) == 1:
             return outputs[0]
         return tuple(outputs)  # type: ignore[return-value]
@@ -280,7 +306,6 @@ def policy_cross_entropy(
     *,
     label_smoothing: float = 0.0,
     reduction: str = "mean",
-    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if reduction not in ("mean", "none"):
         raise ValueError("reduction 须为 mean 或 none")
@@ -304,14 +329,6 @@ def policy_cross_entropy(
         target_dist = torch.where(only_one, one_hot, target_dist)
         nll = -(target_dist * safe_logp).sum(dim=1)
 
-    if sample_weight is not None:
-        if sample_weight.shape != (batch_size,):
-            raise ValueError("sample_weight 形状须为 [B]")
-        nll = nll * sample_weight.to(device=device, dtype=nll.dtype)
-        if reduction == "mean":
-            return nll.sum() / sample_weight.sum().clamp(min=1e-8)
-        return nll
-
     if reduction == "mean":
         return nll.mean()
     return nll
@@ -323,7 +340,6 @@ def soft_policy_cross_entropy(
     legal_mask: torch.Tensor,
     *,
     reduction: str = "mean",
-    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if reduction not in ("mean", "none"):
         raise ValueError("reduction 须为 mean 或 none")
@@ -333,14 +349,6 @@ def soft_policy_cross_entropy(
     safe_target = torch.where(legal_mask, target_probs, torch.zeros_like(target_probs))
     safe_target = safe_target / safe_target.sum(dim=1, keepdim=True).clamp(min=1e-8)
     loss = -(safe_target * safe_logp).sum(dim=1)
-
-    if sample_weight is not None:
-        if sample_weight.shape != loss.shape:
-            raise ValueError("sample_weight 形状须为 [B]")
-        loss = loss * sample_weight
-        if reduction == "mean":
-            return loss.sum() / sample_weight.sum().clamp(min=1e-8)
-        return loss
 
     if reduction == "mean":
         return loss.mean()
@@ -381,7 +389,6 @@ def value_wdl_cross_entropy(
     pred_value: torch.Tensor,
     tgt_wdl: torch.Tensor,
     *,
-    sample_weight: torch.Tensor | None = None,
     reduction: str = "mean",
 ) -> torch.Tensor:
     if reduction not in ("mean", "none"):
@@ -393,14 +400,8 @@ def value_wdl_cross_entropy(
 
     safe_target = tgt_wdl / tgt_wdl.sum(dim=1, keepdim=True).clamp(min=1e-8)
     err = -(safe_target * F.log_softmax(pred_value, dim=1)).sum(dim=1)
-    weight = torch.ones_like(err)
-    if sample_weight is not None:
-        if sample_weight.shape != err.shape:
-            raise ValueError("sample_weight 形状须为 [B]")
-        weight = weight * sample_weight
-    err = err * weight
     if reduction == "mean":
-        return err.sum() / weight.sum().clamp(min=1e-8)
+        return err.mean()
     return err
 
 
@@ -408,7 +409,6 @@ def value_q_mse_from_wdl(
     pred_value: torch.Tensor,
     tgt_q: torch.Tensor,
     *,
-    sample_weight: torch.Tensor | None = None,
     reduction: str = "mean",
 ) -> torch.Tensor:
     if reduction not in ("mean", "none"):
@@ -419,29 +419,15 @@ def value_q_mse_from_wdl(
     if tgt_q.shape != pred_q.shape:
         raise ValueError("tgt_q 形状须为 [B] 或 [B,1]")
     err = (pred_q - tgt_q) ** 2
-    if sample_weight is not None:
-        if sample_weight.ndim == 2 and sample_weight.shape[1] == 1:
-            sample_weight = sample_weight.squeeze(1)
-        if sample_weight.shape != err.shape:
-            raise ValueError("sample_weight 形状须为 [B] 或 [B,1]")
-        err = err * sample_weight
-        if reduction == "mean":
-            return err.sum() / sample_weight.sum().clamp(min=1e-8)
-        return err
     if reduction == "mean":
         return err.mean()
     return err
-
-
-def normalize_plies_left(plies_left: torch.Tensor, *, scale: float = 256.0) -> torch.Tensor:
-    return torch.log1p(plies_left.clamp_min(0.0)) / math.log1p(float(scale))
 
 
 def moves_left_loss(
     pred_moves_left: torch.Tensor,
     tgt_plies_left: torch.Tensor,
     *,
-    sample_weight: torch.Tensor | None = None,
     reduction: str = "mean",
 ) -> torch.Tensor:
     if reduction not in ("mean", "none"):
@@ -452,34 +438,7 @@ def moves_left_loss(
         tgt_plies_left = tgt_plies_left.squeeze(1)
     if pred_moves_left.shape != tgt_plies_left.shape:
         raise ValueError("moves_left 形状须匹配")
-    target = normalize_plies_left(tgt_plies_left)
-    err = F.smooth_l1_loss(pred_moves_left, target, reduction="none")
-    if sample_weight is not None:
-        if sample_weight.ndim == 2 and sample_weight.shape[1] == 1:
-            sample_weight = sample_weight.squeeze(1)
-        if sample_weight.shape != err.shape:
-            raise ValueError("sample_weight 形状须为 [B] 或 [B,1]")
-        err = err * sample_weight
-        if reduction == "mean":
-            return err.sum() / sample_weight.sum().clamp(min=1e-8)
-        return err
+    err = F.huber_loss(pred_moves_left / 20.0, tgt_plies_left / 20.0, delta=0.5, reduction="none")
     if reduction == "mean":
         return err.mean()
     return err
-
-
-def visits_to_sample_weight(visits: torch.Tensor) -> torch.Tensor:
-    if visits.ndim == 2 and visits.shape[1] == 1:
-        visits = visits.squeeze(1)
-    visits = visits.clamp_min(0.0)
-    scale = math.log1p(256.0)
-    weight = torch.log1p(visits) / scale
-    return weight.clamp_(min=0.25, max=2.0)
-
-
-def policy_kld_to_weight(policy_kld: torch.Tensor) -> torch.Tensor:
-    if policy_kld.ndim == 2 and policy_kld.shape[1] == 1:
-        policy_kld = policy_kld.squeeze(1)
-    policy_kld = torch.nan_to_num(policy_kld, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-    weight = 1.0 + 0.35 * torch.log1p(policy_kld)
-    return weight.clamp_(min=1.0, max=2.0)

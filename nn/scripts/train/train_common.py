@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 
 TRAIN_SEED = 42
-WARMUP_EPOCHS = 1
-MIN_LR = 1e-5
 
 
 def default_num_workers() -> int:

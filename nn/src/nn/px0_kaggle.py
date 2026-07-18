@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import tarfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from nn.px0_record import expand_chunk_globs
+from nn.px0_record import Px0Sample, expand_chunk_globs, iter_px0_chunk_file
 
 DEFAULT_PX0_ROOT = Path(r"C:\work\px0data")
 DATASET_HANDLE = "pikacat/px0data"
@@ -22,6 +23,9 @@ class PreparedPx0Version:
     chunk_files: list[Path]
     train_manifest: Path
     val_manifest: Path
+
+
+VALIDATION_STAGES = ("opening", "middlegame", "endgame")
 
 
 def read_px0_manifest(path: Path | str) -> dict:
@@ -120,6 +124,248 @@ def write_px0_manifest(path: Path, *, files: list[Path], version: str, seed: int
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _validation_stage(sample: Px0Sample) -> str:
+    """Bucket a position by current material, not by unavailable game ply."""
+    pieces = int(sample.planes[:14].sum())
+    if pieces >= 28:
+        return "opening"
+    if pieces >= 16:
+        return "middlegame"
+    return "endgame"
+
+
+def _validation_manifest_path(prepared: PreparedPx0Version, *, samples: int, source_files: int) -> Path:
+    return prepared.version_dir / "manifests" / f"validation_{samples}_{source_files}.json"
+
+
+def _training_ready_path(prepared: PreparedPx0Version, *, samples: int, source_files: int) -> Path:
+    return prepared.version_dir / "manifests" / f"training_ready_{samples}_{source_files}.json"
+
+
+def _validation_manifest_matches(
+    payload: dict,
+    *,
+    prepared: PreparedPx0Version,
+    samples: int,
+    source_files: int,
+    seed: int,
+) -> bool:
+    entries = payload.get("samples")
+    return (
+        payload.get("format") == "px0_stratified_validation_v1"
+        and str(payload.get("version")) == prepared.version
+        and int(payload.get("seed", -1)) == seed
+        and int(payload.get("sample_count", -1)) == samples
+        and int(payload.get("source_file_limit", -1)) == source_files
+        and isinstance(entries, list)
+        and len(entries) == samples
+    )
+
+
+def ensure_stratified_validation_manifest(
+    prepared: PreparedPx0Version,
+    *,
+    samples: int,
+    source_files: int,
+    seed: int,
+) -> Path:
+    """Build a fixed, material-stratified validation sample manifest.
+
+    Scanning every file in a 10% px0 split is impractical. We therefore select
+    a deterministic random subset of validation chunks, reservoir-sample each
+    material bucket, and persist the exact record references. Every later
+    validation uses the same positions.
+    """
+    if samples < len(VALIDATION_STAGES):
+        raise ValueError("validation_samples 必须至少为 3")
+    if source_files < 0:
+        raise ValueError("validation_source_files 须为非负整数")
+
+    path = _validation_manifest_path(prepared, samples=samples, source_files=source_files)
+    existing = try_load_stratified_validation_manifest(
+        prepared,
+        samples=samples,
+        source_files=source_files,
+        seed=seed,
+    )
+    if existing is not None:
+        return existing
+
+    val_payload = read_px0_manifest(prepared.val_manifest)
+    val_files = [Path(str(item)).resolve() for item in val_payload["files"]]
+    rng = random.Random(seed)
+    rng.shuffle(val_files)
+    selected_files = val_files if source_files == 0 else val_files[:source_files]
+    quotas = {
+        stage: samples // len(VALIDATION_STAGES) + (index < samples % len(VALIDATION_STAGES))
+        for index, stage in enumerate(VALIDATION_STAGES)
+    }
+    reservoirs: dict[str, list[dict[str, int | str]]] = {stage: [] for stage in VALIDATION_STAGES}
+    seen = {stage: 0 for stage in VALIDATION_STAGES}
+
+    for chunk_path in selected_files:
+        for record_index, sample in enumerate(iter_px0_chunk_file(chunk_path)):
+            stage = _validation_stage(sample)
+            seen[stage] += 1
+            entry: dict[str, int | str] = {"file": str(chunk_path), "record_index": record_index, "stage": stage}
+            reservoir = reservoirs[stage]
+            if len(reservoir) < quotas[stage]:
+                reservoir.append(entry)
+                continue
+            replace_at = rng.randrange(seen[stage])
+            if replace_at < quotas[stage]:
+                reservoir[replace_at] = entry
+        if all(len(reservoirs[stage]) >= quotas[stage] for stage in VALIDATION_STAGES):
+            break
+
+    missing = [stage for stage in VALIDATION_STAGES if len(reservoirs[stage]) < quotas[stage]]
+    if missing:
+        raise ValueError(
+            "固定验证样本无法覆盖分层: "
+            + ", ".join(f"{stage}={len(reservoirs[stage])}/{quotas[stage]}" for stage in missing)
+            + "; 增大 validation_source_files，或设为 0 自动扫描"
+        )
+    entries = [entry for stage in VALIDATION_STAGES for entry in reservoirs[stage]]
+    entries.sort(key=lambda item: (str(item["file"]), int(item["record_index"])))
+    payload = {
+        "format": "px0_stratified_validation_v1",
+        "version": prepared.version,
+        "seed": seed,
+        "sample_count": samples,
+        "source_file_limit": source_files,
+        "source_file_count": len({Path(str(entry["file"])) for entry in entries}),
+        "source_files": sorted({str(entry["file"]) for entry in entries}),
+        "stage_definition": {"opening": ">=28 pieces", "middlegame": "16-27 pieces", "endgame": "<=15 pieces"},
+        "stage_counts": {stage: len(reservoirs[stage]) for stage in VALIDATION_STAGES},
+        "samples": entries,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def try_load_stratified_validation_manifest(
+    prepared: PreparedPx0Version,
+    *,
+    samples: int,
+    source_files: int,
+    seed: int,
+) -> Path | None:
+    """Return an already prepared validation manifest without scanning chunks."""
+    path = _validation_manifest_path(prepared, samples=samples, source_files=source_files)
+    if not path.is_file():
+        return None
+    payload = read_px0_manifest(path)
+    if not _validation_manifest_matches(
+        payload,
+        prepared=prepared,
+        samples=samples,
+        source_files=source_files,
+        seed=seed,
+    ):
+        return None
+    return path
+
+
+def prepare_px0_training_data(
+    version: str,
+    *,
+    root: Path | str,
+    val_ratio: float,
+    seed: int,
+    force_download: bool,
+    validation_samples: int,
+    validation_source_files: int,
+) -> tuple[PreparedPx0Version, Path]:
+    """Perform the slow, one-time download, split, and validation preparation."""
+    prepared = ensure_px0_version(
+        version,
+        root=root,
+        val_ratio=val_ratio,
+        seed=seed,
+        force_download=force_download,
+    )
+    validation_manifest = ensure_stratified_validation_manifest(
+        prepared,
+        samples=validation_samples,
+        source_files=validation_source_files,
+        seed=seed,
+    )
+    ready_path = _training_ready_path(
+        prepared,
+        samples=validation_samples,
+        source_files=validation_source_files,
+    )
+    ready_path.write_text(
+        json.dumps(
+            {
+                "format": "px0_training_ready_v1",
+                "version": prepared.version,
+                "seed": seed,
+                "val_ratio": val_ratio,
+                "validation_samples": validation_samples,
+                "validation_source_files": validation_source_files,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return prepared, validation_manifest
+
+
+def load_prepared_px0_training_data(
+    version: str,
+    *,
+    root: Path | str,
+    val_ratio: float,
+    seed: int,
+    validation_samples: int,
+    validation_source_files: int,
+) -> tuple[PreparedPx0Version, Path]:
+    """Load only prepared manifests; training must never download or rescan data."""
+    version_dir = px0_version_dir(version, root=root)
+    manifest_dir = version_dir / "manifests"
+    train_manifest = manifest_dir / "train.json"
+    val_manifest = manifest_dir / "val.json"
+    prepared = PreparedPx0Version(
+        version=str(version),
+        version_dir=version_dir,
+        chunk_files=[],
+        train_manifest=train_manifest,
+        val_manifest=val_manifest,
+    )
+    validation_manifest = _validation_manifest_path(
+        prepared,
+        samples=validation_samples,
+        source_files=validation_source_files,
+    )
+    ready_path = _training_ready_path(
+        prepared,
+        samples=validation_samples,
+        source_files=validation_source_files,
+    )
+    required_paths = (train_manifest, val_manifest, validation_manifest, ready_path)
+    if any(not path.is_file() for path in required_paths):
+        raise FileNotFoundError(
+            f"PX0 {version} 尚未准备完成；先运行 scripts/data/prepare_px0.py --config <YAML>"
+        )
+    ready = read_px0_manifest(ready_path)
+    if (
+        ready.get("format") != "px0_training_ready_v1"
+        or str(ready.get("version")) != str(version)
+        or int(ready.get("seed", -1)) != int(seed)
+        or abs(float(ready.get("val_ratio", -1.0)) - float(val_ratio)) > 1e-12
+        or int(ready.get("validation_samples", -1)) != int(validation_samples)
+        or int(ready.get("validation_source_files", -1)) != int(validation_source_files)
+    ):
+        raise FileNotFoundError(
+            f"PX0 {version} 的准备参数与 YAML 不一致；先运行 scripts/data/prepare_px0.py --config <YAML>"
+        )
+    return prepared, validation_manifest
+
+
 def split_px0_train_val(
     files: list[Path],
     *,
@@ -128,8 +374,6 @@ def split_px0_train_val(
 ) -> tuple[list[Path], list[Path]]:
     if len(files) < 2:
         raise ValueError("需要至少 2 个 chunk 文件才能切 train/val")
-    import random
-
     ordered = list(sorted(files))
     random.Random(int(seed)).shuffle(ordered)
     val_count = max(1, int(round(len(ordered) * float(val_ratio))))

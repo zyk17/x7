@@ -16,6 +16,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from nn import PolicyResNet
 
 
+TRUNK_KIND = "x7_v2_bottleneck_gbroadcast"
+
+
 class PolicyOnnxExport(nn.Module):
     """导出用包装：value 导出为 WDL 概率，与引擎消费语义一致。"""
 
@@ -43,9 +46,12 @@ def main() -> None:
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
+    if str(ckpt.get("trunk_kind")) != TRUNK_KIND:
+        raise SystemExit(f"checkpoint 不是当前 {TRUNK_KIND} 架构，不能导出")
     in_planes = int(ckpt.get("in_planes", 124))
     width = int(ckpt["width"])
     blocks = int(ckpt["blocks"])
+    bottleneck_channels = int(ckpt.get("bottleneck_channels", width * 7 // 16))
     n_moves = int(ckpt["n_moves"])
     sd = ckpt["model"]
     value_head = bool(ckpt.get("value_head", False))
@@ -57,9 +63,10 @@ def main() -> None:
         width=width,
         num_blocks=blocks,
         num_moves=n_moves,
+        bottleneck_channels=bottleneck_channels,
         value_head=value_head,
         moves_left_head=moves_left_head,
-        trunk_kind=str(ckpt.get("trunk_kind", "katago_cnn_v1")),
+        trunk_kind=TRUNK_KIND,
     )
     model.load_state_dict(sd, strict=True)
     model.eval()
@@ -87,7 +94,7 @@ def main() -> None:
     )
     tail = "（value 已为 WDL 概率）" if value_head else ""
     print(
-        f"exported -> {args.out} moves={n_moves} width={width} blocks={blocks} "
+        f"exported -> {args.out} moves={n_moves} width={width} blocks={blocks} bt={bottleneck_channels} "
         f"in_planes={in_planes} outputs={out_names}{tail}"
     )
 

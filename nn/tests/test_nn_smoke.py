@@ -14,13 +14,11 @@ from nn import (
     mix_wdl_targets,
     moves_left_loss,
     policy_cross_entropy,
-    policy_kld_to_weight,
     value_q_mse_from_wdl,
     value_wdl_cross_entropy,
-    visits_to_sample_weight,
     wdl_logits_to_q,
 )
-from nn.model import _load_move_vocab
+from nn.model import GlobalBroadcast, PreActBottleneck, ValueAuxHead, _load_move_vocab
 
 
 def test_policy_vocab_is_packaged_with_python_module():
@@ -35,7 +33,7 @@ def test_px0_contract_shape():
 
 
 def test_policy_forward_and_masked_loss():
-    m = PolicyResNet(in_planes=124, width=32, num_blocks=2, num_moves=2062)
+    m = PolicyResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
     x = torch.zeros((1, 124, 10, 9), dtype=torch.float32)
     logits = m(x)
     assert logits.shape == (1, 2062)
@@ -45,23 +43,15 @@ def test_policy_forward_and_masked_loss():
     loss = policy_cross_entropy(logits, tgt, mask)
     assert loss.ndim == 0 and torch.isfinite(loss)
 
-    loss_s = policy_cross_entropy(
-        logits, tgt, mask, label_smoothing=0.1, reduction="mean"
-    )
+    loss_s = policy_cross_entropy(logits, tgt, mask, label_smoothing=0.1, reduction="mean")
     assert loss_s.ndim == 0 and torch.isfinite(loss_s)
-
-    w = torch.tensor([2.0])
-    loss_w = policy_cross_entropy(
-        logits, tgt, mask, sample_weight=w, reduction="mean"
-    )
-    assert loss_w.ndim == 0 and torch.isfinite(loss_w)
 
 
 def test_value_wdl_forward_and_loss():
     m = PolicyResNet(
         in_planes=124,
         width=32,
-        num_blocks=2,
+        num_blocks=12,
         num_moves=2062,
         value_head=True,
         moves_left_head=True,
@@ -81,11 +71,71 @@ def test_value_wdl_forward_and_loss():
 
 
 def test_pure_cnn_policy_head_forward_shape():
-    m = PolicyResNet(in_planes=124, width=32, num_blocks=2, num_moves=2062)
+    m = PolicyResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
     x = torch.zeros((2, 124, 10, 9), dtype=torch.float32)
     logits = m(x)
     assert logits.shape == (2, 2062)
     assert torch.isfinite(logits).all()
+
+
+def test_x7_v2_uses_three_stages_and_two_global_broadcasts():
+    model = PolicyResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
+    assert len(model.stage1) == len(model.stage2) == len(model.stage3) == 4
+    assert all(isinstance(block, PreActBottleneck) for block in (*model.stage1, *model.stage2, *model.stage3))
+    assert isinstance(model.broadcast4, GlobalBroadcast)
+    assert isinstance(model.broadcast8, GlobalBroadcast)
+    assert model.stage1[0].conv1.kernel_size == (1, 1)
+    assert model.stage1[0].conv2.kernel_size == (3, 3)
+    assert model.stage1[0].conv3.kernel_size == (3, 3)
+    assert model.stage1[0].conv4.kernel_size == (1, 1)
+    assert model.stage1[0].conv1.out_channels == 14
+    assert model.broadcast4.gpool_conv.kernel_size == (3, 3)
+    assert model.broadcast4.gpool_to_bias.in_features == 32
+
+
+def test_x7_v2_allows_non_baseline_depth_with_evenly_split_stages():
+    model = PolicyResNet(in_planes=124, width=32, num_blocks=10, num_moves=2062)
+    assert (len(model.stage1), len(model.stage2), len(model.stage3)) == (3, 3, 4)
+    logits = model(torch.zeros((1, 124, 10, 9), dtype=torch.float32))
+    assert logits.shape == (1, 2062)
+
+
+def test_x7_v2_allows_explicit_bottleneck_width():
+    model = PolicyResNet(in_planes=124, width=32, num_blocks=10, bottleneck_channels=20, num_moves=2062)
+    assert model.bottleneck_channels == 20
+    assert model.stage1[0].conv1.out_channels == 20
+
+
+def test_policy_and_shared_value_aux_head_features():
+    model = PolicyResNet(
+        in_planes=124,
+        width=32,
+        num_blocks=12,
+        num_moves=2062,
+        value_head=True,
+        moves_left_head=True,
+    )
+    assert model.policy_head.gpool_conv.kernel_size == (3, 3)
+    assert model.policy_head.gpool_to_bias.in_features == 32
+    assert isinstance(model.value_aux_head_module, ValueAuxHead)
+    assert model.value_aux_head_module.fc.in_features == model.value_aux_head_module.conv.out_channels * 2
+    assert model.value_aux_head_module.value_out.out_features == 3
+    assert model.value_aux_head_module.moves_left_out.out_features == 1
+
+    _logits, _value, moves_left = model(torch.randn((1, 124, 10, 9)))
+    assert torch.all(moves_left >= 0)
+
+
+def test_x7_v2_256x12_parameter_count_is_stable():
+    model = PolicyResNet(
+        in_planes=124,
+        width=256,
+        num_blocks=12,
+        num_moves=2062,
+        value_head=True,
+        moves_left_head=True,
+    )
+    assert sum(param.numel() for param in model.parameters()) == 5_690_808
 
 
 def test_soft_policy_cross_entropy_masks_px0_illegal_minus_one_targets():
@@ -103,10 +153,8 @@ def test_mix_wdl_targets_uses_fixed_q_ratio_semantics():
     assert torch.equal(mix_wdl_targets(winner, search, q_ratio=1.0), search)
 
 
-def test_aux_weights_and_wdl_q_loss_are_finite():
+def test_wdl_q_metric_is_finite():
     value_logits = torch.tensor([[0.2, -0.1, 0.0]], dtype=torch.float32)
     tgt_q = torch.tensor([[0.4]], dtype=torch.float32)
-    sample_weight = visits_to_sample_weight(torch.tensor([[128.0]], dtype=torch.float32))
-    sample_weight = sample_weight * policy_kld_to_weight(torch.tensor([[0.7]], dtype=torch.float32))
-    loss = value_q_mse_from_wdl(value_logits, tgt_q, sample_weight=sample_weight)
+    loss = value_q_mse_from_wdl(value_logits, tgt_q)
     assert loss.ndim == 0 and torch.isfinite(loss)

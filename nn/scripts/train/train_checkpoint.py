@@ -6,19 +6,33 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-
-from train_common import MIN_LR, WARMUP_EPOCHS
+from torch.optim import Optimizer
 
 
-def lr_scheduler(opt: AdamW, *, epochs: int):
-    warmup = WARMUP_EPOCHS
-    if warmup >= epochs:
-        return CosineAnnealingLR(opt, T_max=max(1, epochs), eta_min=MIN_LR)
-    warm = LinearLR(opt, start_factor=1e-2, end_factor=1.0, total_iters=warmup)
-    cos = CosineAnnealingLR(opt, T_max=max(1, epochs - warmup), eta_min=MIN_LR)
-    return SequentialLR(opt, [warm, cos], milestones=[warmup])
+def learning_rate_at_step(
+    step: int,
+    *,
+    values: tuple[float, ...],
+    boundaries: tuple[int, ...],
+    warmup_steps: int,
+) -> float:
+    """Return the pxzero-style phase-local piecewise learning rate.
+
+    Reference: pxzero-training `tf/configs/example.yaml:16-27` and
+    `tf/tfprocess.py` training-step learning-rate selection.
+    """
+    if step < 1:
+        raise ValueError("step must be positive")
+    index = sum(step > boundary for boundary in boundaries)
+    lr = values[index]
+    if warmup_steps > 0 and step < warmup_steps:
+        return lr * (step / warmup_steps)
+    return lr
+
+
+def set_optimizer_learning_rate(opt: Optimizer, lr: float) -> None:
+    for group in opt.param_groups:
+        group["lr"] = lr
 
 
 def save_checkpoint(payload: dict[str, Any], path: Path) -> None:
