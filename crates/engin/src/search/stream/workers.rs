@@ -566,7 +566,7 @@ mod tests {
 
     use super::{StreamSearchLimits, StreamWorkerConfig, StreamWorkerPipeline};
     use crate::neural::backend::UniformBackend;
-    use crate::search::stream::SearchGeneration;
+    use crate::search::stream::{root_stats, SearchGeneration, StreamSearch};
 
     fn startpos_history() -> Arc<PositionHistory> {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -702,5 +702,64 @@ mod tests {
         assert_eq!(stats.completed_playouts, 0);
         assert!(pipeline.repository().get(pipeline.root_key()).is_none());
         pipeline.stop_and_join();
+    }
+
+    #[test]
+    fn serial_and_workers_share_fixed_playout_root_contract() {
+        let count = 64;
+        let mut serial = StreamSearch::new(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(26),
+            startpos_history(),
+            1.0,
+        );
+        serial.run_playouts(count).expect("serial playouts");
+        let serial_root = root_stats(serial.repository(), serial.root_key()).expect("serial root");
+
+        let mut workers = StreamWorkerPipeline::new(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(27),
+            startpos_history(),
+            StreamWorkerConfig {
+                pipeline: super::StreamPipelineConfig {
+                    queue_capacity: 8,
+                    eval_batch_size: 4,
+                    ..super::StreamPipelineConfig::default()
+                },
+                gather_workers: 2,
+                backprop_workers: 1,
+            },
+        );
+        let worker_stats = workers.run_playouts(count).expect("worker playouts");
+        let worker_root = root_stats(workers.repository(), workers.root_key()).expect("worker root");
+
+        assert_eq!(serial_root.completed_visits, count as u32);
+        assert_eq!(worker_stats.completed_playouts, count);
+        assert_eq!(worker_root.completed_visits, count as u32);
+        assert_eq!(serial_root.edges.len(), worker_root.edges.len());
+        assert!(serial_root
+            .edges
+            .iter()
+            .all(|edge| edge.started_visits == edge.completed_visits));
+        assert!(worker_root
+            .edges
+            .iter()
+            .all(|edge| edge.started_visits == edge.completed_visits));
+
+        let mut serial_priors = serial_root
+            .edges
+            .iter()
+            .map(|edge| (edge.mv, edge.prior))
+            .collect::<Vec<_>>();
+        let mut worker_priors = worker_root
+            .edges
+            .iter()
+            .map(|edge| (edge.mv, edge.prior))
+            .collect::<Vec<_>>();
+        serial_priors.sort_unstable_by_key(|(mv, _)| mv.raw());
+        worker_priors.sort_unstable_by_key(|(mv, _)| mv.raw());
+        assert_eq!(serial_priors, worker_priors);
+
+        workers.stop_and_join();
     }
 }
