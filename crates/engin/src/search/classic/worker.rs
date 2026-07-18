@@ -4,7 +4,7 @@
 //! px0 task thread 共享一个 `SearchWorker`。Rust 先将 task/workspace/result
 //! 所有权拆开；后台 tree phase 仍在逐段重译。
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,11 @@ pub struct WorkerSearchState {
     /// Rust stores the root edge index; edge ordering stays stable for one
     /// `ClassicSearch::StartSearch` lifetime.
     pub current_best_edge: Mutex<Option<usize>>,
+    /// px0 decrements `Search::initial_visits_` when a tree-reused two-fold
+    /// terminal is reopened (`search.cc:1541-1544`). Rust keeps that search
+    /// baseline in `SearchMeta`, so workers accumulate the exact decrement
+    /// here and stats readers apply it to the baseline.
+    pub reverted_initial_visits: AtomicU32,
     pub total_playouts: AtomicU64,
     pub total_batches: AtomicU64,
     pub network_evaluations: AtomicU64,
@@ -59,6 +64,7 @@ impl WorkerSearchState {
             thread_count: AtomicUsize::new(1),
             shared_collisions: Mutex::new(Vec::new()),
             current_best_edge: Mutex::new(None),
+            reverted_initial_visits: AtomicU32::new(0),
             total_playouts: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
@@ -1949,6 +1955,7 @@ impl<'a> SearchWorker<'a> {
                         child_idx,
                         workspace.current_path.len() as u16 + base_depth,
                         context.twofold_correction_lock,
+                        context.search_state,
                     );
                     if tree.node(child_idx).try_start_score_update() {
                         workspace.current_n_started[best_idx] += 1;
@@ -2066,6 +2073,7 @@ impl<'a> SearchWorker<'a> {
         child_idx: usize,
         depth: u16,
         correction_lock: &Mutex<()>,
+        search_state: &WorkerSearchState,
     ) {
         let child = tree.node(child_idx);
         if !child.is_twofold_terminal() || depth as f32 >= child.m() {
@@ -2097,12 +2105,23 @@ impl<'a> SearchWorker<'a> {
             node_idx = parent;
         }
         tree.make_not_terminal(child_idx);
+        // px0 `search.cc:1541-1544`: the reopened two-fold terminal was part
+        // of the reused root count, so it must no longer inflate UCI `nodes`.
+        search_state
+            .reverted_initial_visits
+            .fetch_add(terminal_visits, Ordering::AcqRel);
     }
 
     #[cfg(test)]
     fn ensure_node_twofold_correct_for_depth(&mut self, child_idx: usize, depth: u16) {
         self.with_tree(|worker, tree| {
-            Self::ensure_node_twofold_correct_for_depth_in_tree(tree, child_idx, depth, &worker.twofold_correction_lock)
+            Self::ensure_node_twofold_correct_for_depth_in_tree(
+                tree,
+                child_idx,
+                depth,
+                &worker.twofold_correction_lock,
+                worker.search_state,
+            )
         });
     }
 
@@ -2249,15 +2268,11 @@ impl<'a> SearchWorker<'a> {
         let board = history.last().board();
         let legal_moves = board.generate_legal_moves();
         if legal_moves.is_empty() {
-            return ExtensionResult::Terminal(
-                if history.is_black_to_move() {
-                    GameResult::WhiteWon
-                } else {
-                    GameResult::BlackWon
-                },
-                0.0,
-                Terminal::EndOfGame,
-            );
+            // `Node` stores the value from the parent edge's perspective, not
+            // an absolute red/black game result. px0 therefore always writes
+            // WHITE_WON here; backup flips it once per edge
+            // (`src/search/classic/search.cc:1913-1919,2175-2257`).
+            return ExtensionResult::Terminal(GameResult::WhiteWon, 0.0, Terminal::EndOfGame);
         }
         if !is_root {
             if history.last().repetitions() >= 2 {
@@ -2552,14 +2567,14 @@ impl<'a> SearchWorker<'a> {
                 context.params.wdl_max_s,
             );
         }
-        if tree.node(node_idx).n() == 0 {
-            for (edge_idx, policy) in eval.policies.iter().enumerate() {
-                tree.node_mut(node_idx).edge_mut(edge_idx).set_p(*policy);
-            }
-            // px0 sorts the just-initialized policy before any child node can
-            // be spawned (`node.cc:291-298`, `search.cc:2145-2153`).
-            tree.node_mut(node_idx).sort_edges();
+        // px0 writes and sorts the policy for every NN result without a local
+        // `N == 0` guard (`search.cc:2145-2153`). Selection ownership prevents
+        // duplicate live extensions; adding a Rust-only guard would otherwise
+        // mask an ordering difference at an out-of-order/reuse boundary.
+        for (edge_idx, policy) in eval.policies.iter().enumerate() {
+            tree.node_mut(node_idx).edge_mut(edge_idx).set_p(*policy);
         }
+        tree.node_mut(node_idx).sort_edges();
         // Policy is consumed by the leaf edges above. Keep only the adjusted
         // scalar fields in the tree item so a cache hit never clones its policy
         // vector.
@@ -3788,6 +3803,7 @@ mod tests {
         assert!(!worker.with_tree_for_test(|tree| tree.node(child).is_terminal()));
         assert_eq!(worker.with_tree_for_test(|tree| tree.node(child).n()), 0);
         assert_eq!(worker.with_tree_for_test(|tree| tree.node(root).n()), 0);
+        assert_eq!(state.reverted_initial_visits.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -3821,5 +3837,33 @@ mod tests {
 
         assert!(worker.with_tree_for_test(|tree| tree.node(child).is_twofold_terminal()));
         assert!((worker.with_tree_for_test(|tree| tree.node(child).m()) - 4.0).abs() < f32::EPSILON);
+    }
+
+    /// px0 `ExtendNode` records a no-legal-move leaf as `WHITE_WON` regardless
+    /// of the FEN side to move (`search.cc:1913-1919`): node WL is local to
+    /// its parent edge and backup supplies the alternating sign. Treating it
+    /// as an absolute red/black result reverses mates on one ply parity.
+    #[test]
+    fn extend_node_encodes_checkmate_in_parent_local_perspective() {
+        ensure_init();
+        let state = GameState::from_fen_moves("4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", &[] as &[&str])
+            .expect("valid checkmate FEN");
+        assert!(state.current_position().board().generate_legal_moves().is_empty());
+
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let backend = UniformBackend::default();
+        let params = SearchParams::default();
+        let search_state = WorkerSearchState::new(Arc::new(AtomicBool::new(false)));
+        let mut worker = SearchWorker::new(&mut tree, &backend, &params, &search_state);
+        let mut history = worker.with_tree_for_test(|tree| tree.history().clone());
+
+        worker
+            .extend_node(root, 1, &[], &mut history)
+            .expect("extend checkmate leaf");
+
+        assert!(worker.with_tree_for_test(|tree| tree.node(root).is_terminal()));
+        assert!((worker.with_tree_for_test(|tree| tree.node(root).wl()) - 1.0).abs() < f32::EPSILON);
     }
 }

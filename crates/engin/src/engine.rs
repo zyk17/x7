@@ -270,6 +270,14 @@ impl EngineController for ClassicEngine {
         if let Some(search) = self.search.as_mut() {
             search.abort_search()?;
         }
+        // px0 starts its UCI clock in `Engine::SetPosition` before backend
+        // configuration (`src/engine.cc:187-197`). Keep the existing clock
+        // when replacing a configured backend; if there was no search yet,
+        // start the equivalent clock after its first successful creation.
+        let had_search = self.search.is_some();
+        if let Some(search) = self.search.as_mut() {
+            search.start_clock()?;
+        }
         // px0 `Engine::SetPosition` updates backend configuration after
         // stopping search and before making the new `GameState`
         // (`src/engine.cc:187-197`). Retrying here also handles a file that
@@ -277,6 +285,9 @@ impl EngineController for ClassicEngine {
         self.update_backend_config()?;
         let state = GameState::from_fen_moves(fen, moves)?;
         if let Some(search) = self.search.as_mut() {
+            if !had_search {
+                search.start_clock()?;
+            }
             search.set_position(&state)?;
         }
         self.position = Some(state);
@@ -290,6 +301,14 @@ impl EngineController for ClassicEngine {
         // and silently running a normal search would be a false UCI feature.
         if params.ponder {
             return Err(EnginError::Uci("Ponder is not enabled.".into()));
+        }
+        // px0 `Engine::Go` restarts the clock only without a UCI clock budget
+        // (`src/engine.cc:205-219`). With `wtime` or `btime`, the budget
+        // intentionally runs from the preceding `position` command.
+        if params.wtime.is_none() && params.btime.is_none() {
+            if let Some(search) = self.search.as_mut() {
+                search.start_clock()?;
+            }
         }
         // px0 `Engine::Go` initializes a missing position through `NewGame`
         // before calling `StartSearch` (`src/engine.cc:206-219`). NewGame in
@@ -339,7 +358,15 @@ impl EngineController for ClassicEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uci_loop::VecUciResponder;
+    use crate::uci_loop::{UciLoop, VecUciResponder};
+
+    fn bestmove_count(responder: &VecUciResponder) -> usize {
+        responder
+            .responses
+            .iter()
+            .filter(|line| line.starts_with("bestmove "))
+            .count()
+    }
 
     #[test]
     fn deferred_engine_never_searches_with_uniform_when_weights_are_missing() {
@@ -409,6 +436,21 @@ mod tests {
 
         assert!(engine.position.is_some());
         assert!(engine.search().expect("search").total_root_visits() >= 1);
+    }
+
+    /// px0 accepts a bare `go`: the common stopper supplies the default
+    /// 4_000_000_000 visit cap instead of requiring an explicit UCI budget
+    /// (`chess/uciloop.cc:207-237`, `stoppers/common.cc:133-145`).
+    #[test]
+    fn bare_go_without_a_budget_starts_until_explicit_stop() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        engine.go(&GoParams::default(), &mut responder).expect("bare go");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        engine.stop(&mut responder).expect("stop");
+        engine.wait().expect("wait");
+
+        assert!(engine.search().expect("search").total_root_visits() > 0);
     }
 
     #[test]
@@ -484,5 +526,75 @@ mod tests {
 
         engine.new_game().expect("new game must abort the active search");
         assert_eq!(engine.search().expect("search").total_root_visits(), 0);
+    }
+
+    /// px0 `Engine::Stop` enables exactly one final response, while
+    /// `Search::Abort` suppresses a replaced search (`engine.cc:148-151`,
+    /// `search.cc:1019-1041`). This is the UCI boundary used by GUI sequences
+    /// such as `go infinite`, `stop`, then `wait`.
+    #[test]
+    fn uci_stop_then_wait_emits_exactly_one_bestmove() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        let mut options = UciOptions::populate_defaults();
+        {
+            let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+            uci.process_line("position startpos", "test").expect("position");
+            uci.process_line("go infinite", "test").expect("infinite go");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            uci.process_line("stop", "test").expect("stop");
+            uci.process_line("wait", "test").expect("wait");
+        }
+
+        assert_eq!(bestmove_count(&responder), 1);
+    }
+
+    /// px0 `Engine::SetPosition` calls `EnsureSearchStopped` before it stores
+    /// the replacement state (`engine.cc:187-197`). The aborted search must
+    /// not publish a stale `bestmove`; the following finite `go` owns the only
+    /// response.
+    #[test]
+    fn uci_position_replacement_suppresses_the_old_search_bestmove() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        let mut options = UciOptions::populate_defaults();
+        {
+            let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+            uci.process_line("position startpos", "test").expect("initial position");
+            uci.process_line("go infinite", "test").expect("infinite go");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            uci.process_line("position startpos moves b2b3", "test")
+                .expect("replacement position");
+            uci.process_line("go nodes 8", "test").expect("replacement go");
+            uci.process_line("wait", "test").expect("wait");
+        }
+
+        assert_eq!(bestmove_count(&responder), 1);
+    }
+
+    /// px0 emits `bestmove a0a0` for a root with no legal move rather than
+    /// silently ending the UCI request (`search.cc:612-621`,
+    /// `uciloop.cc:279-287`).
+    #[test]
+    fn uci_checkmated_root_emits_px0_null_bestmove() {
+        let mut engine = ClassicEngine::uniform();
+        let mut responder = VecUciResponder::default();
+        let mut options = UciOptions::populate_defaults();
+        {
+            let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+            uci.process_line("position fen 4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", "test")
+                .expect("checkmated position");
+            uci.process_line("go nodes 1", "test").expect("go");
+            uci.process_line("wait", "test").expect("wait");
+        }
+
+        assert_eq!(
+            responder
+                .responses
+                .iter()
+                .filter(|line| line.as_str() == "bestmove a0a0")
+                .count(),
+            1
+        );
     }
 }

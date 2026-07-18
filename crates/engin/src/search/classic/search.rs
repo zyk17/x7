@@ -214,11 +214,15 @@ fn score_from_wdl(
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum BestEdgeRank {
-    NonTerminal,
-    TerminalWin,
+    // Keep this declaration order identical to px0's `EdgeRank`
+    // (`src/search/classic/search.cc:736-743`): callers select the larger
+    // rank, so reversing either terminal pair makes a proven loss outrank a
+    // proven win at the root.
     TerminalLoss,
-    TablebaseWin,
     TablebaseLoss,
+    NonTerminal,
+    TablebaseWin,
+    TerminalWin,
 }
 
 fn draw_score(tree: &NodeTree, params: &SearchParams, is_odd_depth: bool) -> f32 {
@@ -341,8 +345,16 @@ fn best_child_edge_is_better(
         if candidate_n != current_n {
             return candidate_n > current_n;
         }
-        let candidate_q = candidate.map_or(0.0, |node| node.q(draw_score));
-        let current_q = current.map_or(0.0, |node| node.q(draw_score));
+        // `EdgeAndNode::GetQ(0, draw_score)` only reads a child after it has
+        // completed a visit. A spawned `N == 0` child carries placeholder
+        // WDL fields, which must not leak into PV/bestmove ordering when
+        // DrawScore is non-zero (`px0 search.cc:775-784`, `node.h:375-377`).
+        let candidate_q = candidate
+            .filter(|node| node.n() > 0)
+            .map_or(0.0, |node| node.q(draw_score));
+        let current_q = current
+            .filter(|node| node.n() > 0)
+            .map_or(0.0, |node| node.q(draw_score));
         if candidate_q != current_q {
             return candidate_q > current_q;
         }
@@ -359,6 +371,31 @@ fn best_child_edge_is_better(
 struct SearchOutput {
     pub bestmove: BestMoveInfo,
     pub infos: Vec<ThinkingInfo>,
+}
+
+/// Read-only root edge view for diagnostics and fixed-playout comparisons.
+///
+/// It follows the same child-Q/default-Q and move-orientation rules as px0
+/// `Search::SendUciInfo` (`src/search/classic/search.cc:249-336`). It does
+/// not expose the mutable `NodeTree` or permit a caller to alter search state.
+#[derive(Clone, Debug)]
+pub struct ClassicRootEdgeStats {
+    pub mv: Move,
+    pub completed_visits: u32,
+    pub started_visits: u32,
+    pub q: f32,
+    pub prior: f32,
+}
+
+/// Stable root statistics collected after `Wait()`. Root Q is reported from
+/// the root side-to-move perspective; child edges use the UCI-info Q rule.
+#[derive(Clone, Debug)]
+pub struct ClassicRootStats {
+    pub completed_visits: u32,
+    pub in_flight_visits: u32,
+    pub q: f32,
+    pub draw: f32,
+    pub edges: Vec<ClassicRootEdgeStats>,
 }
 
 struct SearchMeta {
@@ -419,7 +456,11 @@ impl SearchStopController {
             // px0 keeps the tree-reuse visits in `total_nodes`, while the
             // current-search budget sees only newly completed playouts
             // (`src/search/classic/search.cc:908-922`).
-            total_nodes: total_playouts + i64::from(meta.initial_visits),
+            total_nodes: total_playouts
+                + i64::from(
+                    meta.initial_visits
+                        .saturating_sub(worker_state.reverted_initial_visits.load(Ordering::Acquire)),
+                ),
             nodes_since_movestart: total_playouts,
             batches_since_movestart: worker_state.total_batches.load(Ordering::Acquire) as i64,
             average_depth: {
@@ -561,6 +602,42 @@ impl ClassicSearch {
         tree.node(tree.current_head()).n()
     }
 
+    /// px0 `Search::SendUciInfo` (`search.cc:249-336`) read-only root
+    /// snapshot. The stream/classic diagnostic uses this instead of reading
+    /// the classic tree through a second, divergent interpretation.
+    pub fn root_stats_snapshot(&self) -> ClassicRootStats {
+        let tree = self.tree.read();
+        let meta = self.meta.lock().expect("meta lock");
+        let root = tree.current_head();
+        let root_node = tree.node(root);
+        let root_draw_score = draw_score(&tree, &meta.params, false);
+        let default_q = -root_node.q(-root_draw_score);
+        let edges = root_node
+            .edges()
+            .iter()
+            .enumerate()
+            .map(|(edge_index, edge)| {
+                let child = root_node.child(edge_index).map(|index| tree.node(index));
+                ClassicRootEdgeStats {
+                    mv: orient_move(edge.mv, tree.history().is_black_to_move()),
+                    completed_visits: child.map_or(0, Node::n),
+                    started_visits: child.map_or(0, Node::n_started),
+                    q: child
+                        .filter(|node| node.n() > 0)
+                        .map_or(default_q, |node| node.q(root_draw_score)),
+                    prior: edge.get_p(),
+                }
+            })
+            .collect();
+        ClassicRootStats {
+            completed_visits: root_node.n(),
+            in_flight_visits: root_node.n_in_flight(),
+            q: -root_node.q(-root_draw_score),
+            draw: root_node.d(),
+            edges,
+        }
+    }
+
     /// px0 `SearchBase` receives its responder during search construction
     /// (`src/search/search.h:45-55`). It is immutable while workers run.
     pub fn set_uci_responder(&mut self, responder: Arc<dyn SearchResponder>) {
@@ -663,9 +740,6 @@ impl ClassicSearch {
         has_wdl: bool,
     ) -> Option<SearchOutput> {
         let (best, ponder) = best_move(tree, &meta.params, &meta.root_move_filter);
-        if best.is_null() {
-            return None;
-        }
         let elapsed = meta.move_start.elapsed();
         let total_playouts = worker_state.total_playouts.load(Ordering::Acquire);
         let nps = meta.nps_start_time.and_then(|started| {
@@ -721,7 +795,11 @@ impl ClassicSearch {
                 nodes: if meta.params.per_pv_counters {
                     child.map_or(0, Node::n) as i64
                 } else {
-                    total_playouts as i64 + meta.initial_visits as i64
+                    total_playouts as i64
+                        + meta
+                            .initial_visits
+                            .saturating_sub(worker_state.reverted_initial_visits.load(Ordering::Acquire))
+                            as i64
                 },
                 nps: nps.unwrap_or(-1),
                 eps: nps.map_or(-1, |_| {
@@ -825,9 +903,18 @@ impl ClassicSearch {
                         }
                     }
                 }
+                // px0 gates stopping on `stats.total_nodes`, which includes
+                // reused root visits (`search.cc:595-620`). A zero-movetime
+                // search on an already expanded root must therefore return
+                // that root's existing bestmove without demanding a new
+                // playout from this `go`.
+                let root_has_visits = {
+                    let tree = watchdog_tree.read();
+                    tree.node(tree.current_head()).n() > 0
+                };
                 if watchdog_stop.load(Ordering::Acquire)
                     && ok_to_respond_bestmove.load(Ordering::Acquire)
-                    && watchdog_worker_state.total_playouts.load(Ordering::Acquire) > 0
+                    && root_has_visits
                     && bestmove_is_sent
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
@@ -944,29 +1031,6 @@ impl SearchBase for ClassicSearch {
         self.bestmove_is_sent.store(false, Ordering::Release);
         *self.live_info.lock().expect("live info lock") = LiveInfoState::default();
 
-        let nodes = params.nodes.filter(|&n| n > 0);
-        if params.nodes.is_some() && nodes.is_none() {
-            return Err(EnginError::Uci("go nodes must be positive".into()));
-        }
-        if let Some(movetime) = params.movetime {
-            if movetime < 0 {
-                return Err(EnginError::Uci("go movetime must be non-negative".into()));
-            }
-        }
-
-        let has_clock_budget = {
-            let tree = self.tree.read();
-            if tree.history().is_black_to_move() {
-                params.btime.is_some()
-            } else {
-                params.wtime.is_some()
-            }
-        };
-        let has_budget = nodes.is_some() || params.movetime.is_some() || has_clock_budget || params.infinite;
-        if !has_budget {
-            return Err(EnginError::PortIncomplete("time-based search stopper"));
-        }
-
         let infinite_play_contempt_warning = {
             let tree = self.tree.read();
             // px0 `StringsToMovelist` (`src/search/classic/wrapper.cc:78-100`)
@@ -986,7 +1050,6 @@ impl SearchBase for ClassicSearch {
                 return Err(EnginError::Uci("No legal searchmoves.".into()));
             }
             let mut meta = self.meta.lock().expect("meta lock");
-            meta.move_start = Instant::now();
             meta.initial_visits = tree.node(tree.current_head()).n();
             meta.root_move_filter = root_move_filter;
             meta.contempt_mode = resolve_contempt_mode(
@@ -1003,6 +1066,7 @@ impl SearchBase for ClassicSearch {
                 && meta.params.wdl_rescale_diff != 0.0;
             meta.nps_start_time = None;
             self.worker_state.total_playouts.store(0, Ordering::Release);
+            self.worker_state.reverted_initial_visits.store(0, Ordering::Release);
             self.worker_state.total_batches.store(0, Ordering::Release);
             self.worker_state.network_evaluations.store(0, Ordering::Release);
             self.worker_state.cum_depth.store(0, Ordering::Release);
@@ -1097,7 +1161,7 @@ mod tests {
     use crate::neural::backend::{
         Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, UniformBackend,
     };
-    use crate::search::classic::node::NodeTree;
+    use crate::search::classic::node::{NodeTree, Terminal};
     use crate::search::SearchBase;
     use crate::EnginError;
 
@@ -1369,6 +1433,66 @@ mod tests {
         assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0, &[]), Some(0));
     }
 
+    /// px0 `Search::GetBestChildrenNoTemperature` ranks terminal outcomes as
+    /// loss < tablebase loss < non-terminal < tablebase win < win
+    /// (`search.cc:736-795`). A proven safe terminal win must therefore beat a
+    /// proven terminal loss regardless of their visit counts.
+    #[test]
+    fn best_child_prefers_a_proven_terminal_win_to_a_terminal_loss() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let moves = state.startpos.board().generate_legal_moves();
+        tree.node_mut(root).create_edges(&moves[..2].to_vec());
+        assert!(tree.node_mut(root).try_start_score_update());
+        tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
+
+        let losing = tree.arena_mut().spawn_child(root, 0);
+        tree.make_terminal(losing, xiangqi_core::GameResult::BlackWon, 1.0, Terminal::EndOfGame);
+        assert!(tree.node_mut(losing).try_start_score_update());
+        tree.node_mut(losing).finalize_score_update(-1.0, 0.0, 1.0, 1);
+
+        let winning = tree.arena_mut().spawn_child(root, 1);
+        tree.make_terminal(winning, xiangqi_core::GameResult::WhiteWon, 1.0, Terminal::EndOfGame);
+        assert!(tree.node_mut(winning).try_start_score_update());
+        tree.node_mut(winning).finalize_score_update(1.0, 0.0, 1.0, 1);
+
+        assert_eq!(best_child_edge(&tree, root, &SearchParams::default(), 0, &[]), Some(1));
+    }
+
+    /// px0 `EdgeAndNode::GetQ` returns its supplied default for an allocated
+    /// but unvisited child. In particular, a reverted terminal retains
+    /// placeholder WDL fields at `N == 0`; those fields cannot override the
+    /// prior merely because `DrawScore` is non-zero (`node.h:375-377`,
+    /// `search.cc:775-784`).
+    #[test]
+    fn best_child_ignores_placeholder_wdl_of_unvisited_child() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut tree = NodeTree::default();
+        tree.reset_to_position(&state.startpos, &state.moves);
+        let root = tree.current_head();
+        let moves = state.startpos.board().generate_legal_moves();
+        tree.node_mut(root).create_edges(&moves[..2].to_vec());
+        tree.node_mut(root).edge_mut(0).set_p(0.2);
+        tree.node_mut(root).edge_mut(1).set_p(0.8);
+        assert!(tree.node_mut(root).try_start_score_update());
+        tree.node_mut(root).finalize_score_update(0.0, 0.0, 0.0, 1);
+
+        let child = tree.arena_mut().spawn_child(root, 1);
+        tree.make_terminal(child, xiangqi_core::GameResult::Draw, 0.0, Terminal::EndOfGame);
+        tree.node_mut(child).revert_terminal_visits(0.0, 1.0, 0.0, 1);
+        assert_eq!(tree.node(child).n(), 0);
+
+        let params = SearchParams {
+            draw_score: -0.5,
+            ..SearchParams::default()
+        };
+        assert_eq!(best_child_edge(&tree, root, &params, 0, &[]), Some(1));
+    }
+
     #[test]
     fn root_filter_applies_before_the_root_has_visits() {
         ensure_init();
@@ -1410,6 +1534,34 @@ mod tests {
         assert!(meta.nps_start_time.is_some());
     }
 
+    /// px0 `EnsureNodeTwoFoldCorrectForDepth` removes reopened two-fold
+    /// terminal visits from `initial_visits_` (`search.cc:1541-1544`). The
+    /// Rust worker records that decrement atomically because `SearchMeta` is
+    /// owned by the controller rather than the tree phase.
+    #[test]
+    fn iteration_stats_exclude_reopened_twofold_reused_visits() {
+        let mut meta = super::SearchMeta {
+            params: SearchParams::default(),
+            move_start: std::time::Instant::now(),
+            nps_start_time: None,
+            initial_visits: 17,
+            root_move_filter: Vec::new(),
+            contempt_mode: ContemptMode::Play,
+        };
+        let worker_state = super::WorkerSearchState::default();
+        worker_state
+            .total_playouts
+            .store(5, std::sync::atomic::Ordering::Release);
+        worker_state
+            .reverted_initial_visits
+            .store(3, std::sync::atomic::Ordering::Release);
+
+        let stats = super::SearchStopController::populate_iteration_stats(&mut meta, &worker_state);
+
+        assert_eq!(stats.total_nodes, 19);
+        assert_eq!(stats.nodes_since_movestart, 5);
+    }
+
     #[test]
     fn wdl_integerization_matches_px0_send_uci_info() {
         assert_eq!(
@@ -1449,6 +1601,79 @@ mod tests {
             resolve_contempt_mode(ContemptMode::Play, false, false, true),
             ContemptMode::Black
         );
+    }
+
+    /// px0 starts the clock in `Engine::SetPosition`, then preserves it for a
+    /// `go wtime/btime` search (`engine.cc:187-219`). `StartSearch` must not
+    /// silently replace that UCI timing origin.
+    #[test]
+    fn start_search_preserves_the_existing_uci_clock() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(UniformBackend::default()));
+        search.set_position(&state).expect("position");
+        search.start_clock().expect("start clock");
+        let move_start = search.meta.lock().expect("meta lock").move_start;
+
+        search
+            .start_search(&crate::uci_loop::GoParams {
+                wtime: Some(1_000),
+                btime: Some(1_000),
+                nodes: Some(1),
+                ..Default::default()
+            })
+            .expect("clock-budget search");
+        search.wait_search().expect("wait");
+
+        assert_eq!(search.meta.lock().expect("meta lock").move_start, move_start);
+    }
+
+    /// px0 `MaybeTriggerStop` checks `total_nodes`, not only playouts from
+    /// the current `go` (`search.cc:595-620`). A retained root can therefore
+    /// answer `go movetime 0` immediately from existing visits.
+    #[test]
+    fn reused_root_movetime_zero_returns_a_bestmove() {
+        ensure_init();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let mut search = super::ClassicSearch::new(Box::new(UniformBackend::default()));
+        search.set_position(&state).expect("position");
+        search.run_blocking_nodes(8);
+        let prior_visits = search.total_root_visits();
+
+        search
+            .start_search(&crate::uci_loop::GoParams {
+                movetime: Some(0),
+                ..Default::default()
+            })
+            .expect("reused zero-movetime search");
+        search.wait_search().expect("wait");
+
+        // The watchdog and search workers start concurrently in px0, so a
+        // small racing batch may still complete before the timeout observer.
+        // The invariant is that pre-existing visits make a terminal response
+        // possible; they are never discarded or replaced by a mandatory batch.
+        assert!(search.total_root_visits() >= prior_visits);
+        assert!(search.bestmove_is_sent.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// px0 still sends its null move when the root has no legal children
+    /// (`search.cc:612-621`, `uciloop.cc:279-287`). `snapshot_output` must not
+    /// erase that UCI response merely because its info/PV list is empty.
+    #[test]
+    fn checkmated_root_keeps_the_px0_null_bestmove_output() {
+        ensure_init();
+        let state = GameState::from_fen_moves("4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", &[] as &[&str])
+            .expect("valid checkmate FEN");
+        let mut search = super::ClassicSearch::new(Box::new(UniformBackend::default()));
+        search.set_position(&state).expect("position");
+        search.run_blocking_nodes(1);
+
+        let tree = search.tree.read();
+        let meta = search.meta.lock().expect("meta lock");
+        let output = super::ClassicSearch::snapshot_output(&tree, &meta, &search.worker_state, true)
+            .expect("null bestmove output");
+        assert!(output.bestmove.bestmove.is_null());
+        assert!(output.infos.is_empty());
     }
 
     #[test]

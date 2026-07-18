@@ -116,18 +116,27 @@ fn classic_engine_multipv_emits_ranked_root_lines() {
     );
 }
 
+/// px0 passes a parsed `go nodes 0` unchanged to `VisitsStopper`; it is an
+/// immediate visit cap, not a UCI parse error (`chess/uciloop.cc:230-237`,
+/// `search/classic/stoppers/common.cc:133-145`). The worker still completes
+/// its initial iteration before observing the stopper.
 #[test]
-fn classic_engine_rejects_non_positive_node_budget() {
+fn classic_engine_accepts_zero_node_budget_as_immediate_cap() {
     ensure_init();
     let mut options = UciOptions::populate_defaults();
     let mut engine = ClassicEngine::uniform();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
     uci.process_line("position startpos", "0.0.0").expect("position");
-    let error = uci
-        .process_line("go nodes 0", "0.0.0")
-        .expect_err("zero nodes must fail");
-    assert_eq!(error.to_string(), "go nodes must be positive");
+    uci.process_line("go nodes 0", "0.0.0").expect("px0 accepts zero nodes");
+    uci.process_line("wait", "0.0.0").expect("wait");
+    drop(uci);
+
+    assert!(
+        responder.responses.iter().any(|line| line.starts_with("bestmove ")),
+        "responses: {:?}",
+        responder.responses
+    );
 }
 
 /// px0 `StringsToMovelist` filters root selection itself, not just the final

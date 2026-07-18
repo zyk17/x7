@@ -408,8 +408,10 @@ impl Node {
         let mut n = 0;
         if !self.edges.is_empty() {
             n = 1;
-            self.wl = 0.0;
-            self.d = 0.0;
+            // px0 keeps the node's current WDL as the retained first visit,
+            // then merges completed children (`node.cc:319-341`). In
+            // particular, reopening a two-fold terminal must not silently
+            // discard that base evaluation before tree reuse continues.
             for &(child_n, child_wl, child_d) in child_stats {
                 if child_n > 0 {
                     n += child_n;
@@ -826,6 +828,21 @@ mod tests {
         assert!((node.wl() - 0.2).abs() < 1e-6);
         assert!((node.d() - 0.4).abs() < 1e-6);
         assert!((node.m() - 3.0).abs() < 1e-6);
+    }
+
+    /// px0 `Node::MakeNotTerminal` retains the node's existing WDL as its
+    /// first visit before accumulating children (`node.cc:319-341`).
+    #[test]
+    fn reopen_terminal_keeps_px0_base_wdl_before_merging_children() {
+        let mut node = Node::default();
+        node.create_single_child_node(Move::NULL);
+        node.make_terminal(GameResult::Draw, 0.0, Terminal::TwoFold);
+
+        node.make_not_terminal(&[(1, 1.0, 0.0)]);
+
+        assert_eq!(node.n(), 2);
+        assert!((node.wl() + 0.5).abs() < f32::EPSILON);
+        assert!((node.d() - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]

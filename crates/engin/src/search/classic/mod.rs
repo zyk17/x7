@@ -9,5 +9,5 @@ pub mod worker;
 
 pub use node::{Edge, Node, NodeArena, NodeTree, Terminal};
 pub use params::{ContemptMode, ScoreType, SearchParams};
-pub use search::{best_move, ClassicSearch};
+pub use search::{best_move, ClassicRootEdgeStats, ClassicRootStats, ClassicSearch};
 pub use worker::{NodeToProcess, SearchWorker, WorkerSearchState};
