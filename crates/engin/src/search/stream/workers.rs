@@ -213,6 +213,22 @@ impl StreamWorkerPipeline {
         self.shared.stats()
     }
 
+    /// Requests a normal stream-search stop without tearing down worker
+    /// threads. Gather/Eval/Backprop cancel every unfinished event and its
+    /// edge reservation before becoming idle. This is the boundary a later
+    /// UCI controller will use for `stop`; `stop_and_join()` remains the
+    /// terminal owner cleanup path.
+    ///
+    /// Reference: LC3 overview, "Watchdog" and worker stop coordination.
+    pub fn request_stop(&self) {
+        self.shared.stopping.store(true, Ordering::Release);
+        self.shared.idle.notify_all();
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.shared.stopping.load(Ordering::Acquire)
+    }
+
     pub fn submit_playout(&self) -> Result<(), EnginError> {
         self.submit_event(NodeEvent::root(self.shared.generation, Arc::clone(&self.root_history)))
     }
@@ -250,7 +266,7 @@ impl StreamWorkerPipeline {
 
     pub fn run_playouts(&self, count: u64) -> Result<StreamStats, EnginError> {
         let target = self.stats().completed_playouts + count;
-        while self.stats().completed_playouts < target {
+        while self.stats().completed_playouts < target && !self.is_stopping() {
             let root_is_expanded = self
                 .shared
                 .repository
@@ -263,10 +279,22 @@ impl StreamWorkerPipeline {
                 1
             };
             for _ in 0..submit_count {
-                self.submit_playout()?;
+                if self.is_stopping() {
+                    break;
+                }
+                if let Err(error) = self.submit_playout() {
+                    if self.is_stopping() {
+                        break;
+                    }
+                    return Err(error);
+                }
             }
             self.wait_for_idle()?;
         }
+        // A requested stop is a normal search outcome. `wait_for_idle()` has
+        // already ensured every queued event either completed or cancelled its
+        // reservation, so callers can safely snapshot the partial tree.
+        self.wait_for_idle()?;
         Ok(self.stats())
     }
 
@@ -282,7 +310,7 @@ impl StreamWorkerPipeline {
     }
 
     pub fn stop_and_join(&mut self) {
-        self.shared.stopping.store(true, Ordering::Release);
+        self.request_stop();
         let _ = self.wait_for_idle();
         for worker in self.workers.drain(..) {
             let _ = worker.join();
@@ -500,6 +528,8 @@ fn backprop_worker(shared: Arc<SharedPipeline>, receiver: Receiver<BackpropEvent
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
@@ -587,6 +617,40 @@ mod tests {
             pipeline.submit_playout().expect("bounded queue waits for gather");
         }
         pipeline.wait_for_idle().expect("all submitted work drains");
+        pipeline.stop_and_join();
+    }
+
+    #[test]
+    fn requested_stop_returns_partial_stats_and_releases_reservations() {
+        let mut pipeline = StreamWorkerPipeline::new(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(24),
+            startpos_history(),
+            StreamWorkerConfig {
+                pipeline: super::StreamPipelineConfig {
+                    queue_capacity: 8,
+                    eval_batch_size: 4,
+                    ..super::StreamPipelineConfig::default()
+                },
+                gather_workers: 2,
+                backprop_workers: 1,
+            },
+        );
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(1));
+                pipeline.request_stop();
+            });
+            let stats = pipeline.run_playouts(1_000_000).expect("normal stop");
+            assert!(pipeline.is_stopping());
+            assert!(stats.completed_playouts < 1_000_000);
+        });
+
+        let root = pipeline.repository().get(pipeline.root_key()).expect("root");
+        for edge in root.edges().iter() {
+            assert_eq!(edge.visits(), edge.completed_visits());
+        }
         pipeline.stop_and_join();
     }
 }

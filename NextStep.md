@@ -49,9 +49,11 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
 2. Eval 侧已接现有 `BackendComputation`：cache hit 直接取结果，miss 以 `eval_batch_size` 聚合并单次
    `compute_blocking()`；stream stats 记录实际 NN batch/evaluation 数。
 3. S2b 已将 queue stage 移至常驻 worker：多个 Gather、一个 batch Eval、多个 Backprop；保持 event 所有权、
-   generation gate 和 stop/join，不引入 classic shared mutable tree。已覆盖 worker fixed-playout 与
-   根扩展后立即 stop/join 的 reservation drain。
-4. 下一项是固定-visits 结构对拍和真实 ONNX 长 `movetime` 回归；Watchdog/UCI 只在两者通过后切换至 stream。
+   generation gate 和 stop/join，不引入 classic shared mutable tree。`request_stop()` 与 `stop_and_join()` 已拆开：
+   前者是未来 UCI `stop` 的正常搜索边界，后者只负责 owner 析构/join。固定 playout、根扩展后立即 stop/join，
+   以及大量 playout 中外部 stop 返回部分统计且回收所有 reservation 均已回归。
+4. 下一项是固定-visits 结构对拍、真实 ONNX 长 `movetime` 和 worker error propagation 回归；Watchdog/UCI
+   只在三者通过后切换至 stream。
 
 门槛：真实 ONNX `go movetime 30s` 持续推进；`position -> go -> stop -> position -> go` 无旧 generation
 更新、无 reservation 泄漏、恰好一次 bestmove。
