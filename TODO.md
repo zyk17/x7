@@ -41,7 +41,9 @@
   必须完成或取消所有已提交 event，不允许 root snapshot 留下 in-flight reservation。
 - [x] S2b fixed-visits：串行与常驻 worker 在同一 UniformBackend 下对拍 root `N`、合法 edge 集合与 `P`；
   不要求不同 event 调度得到逐边相同 `N/Q`，但完成时所有 `started == completed`。
-- [ ] S2b 回归：补真实 ONNX 长 `movetime` 与 worker error propagation。
+- [x] S2b error propagation：`create_computation` / `add_input` 失败必须 cancel/finish 全部已 claim、未处理的
+  Eval event；owner 获得原始错误，`wait_for_idle` 不可死等。
+- [ ] S2b 回归：补真实 ONNX 长 `movetime`。
 - [ ] S3 UCI：仅在 S1/S2 回归通过后让 stream 替代 classic；验证 bare `go`、nodes、movetime、infinite/stop、
   position replacement、ucinewgame、exactly-one bestmove。
 

@@ -57,8 +57,9 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
    classic stopper 或提前切换 UCI。
 5. 固定 visits 的串行/常驻 worker root contract 已回归：同一 UniformBackend 下 root `N`、合法 edge 集合和
    `P` 相同，调度可改变逐 edge `N/Q`，但所有 edge 在完成时必须无 in-flight。
-6. 下一项是真实 ONNX 长 `movetime`、worker error propagation、PV/final move policy 与 Watchdog/UCI；
-   这些通过前不切换至 stream。
+6. `BackendComputation::create_computation` 与 `add_input` 失败时，Eval 已 claim 但未提交的 event 会逐个
+   cancel/finish；错误保留给 owner，`wait_for_idle()` 不会因 outstanding 泄漏永久等待。
+7. 下一项是真实 ONNX 长 `movetime`、PV/final move policy 与 Watchdog/UCI；这些通过前不切换至 stream。
 
 门槛：真实 ONNX `go movetime 30s` 持续推进；`position -> go -> stop -> position -> go` 无旧 generation
 更新、无 reservation 泄漏、恰好一次 bestmove。

@@ -446,9 +446,16 @@ fn eval_worker(shared: Arc<SharedPipeline>, receiver: Receiver<NodeEvent>, batch
 }
 
 fn process_eval_events(shared: &SharedPipeline, events: Vec<NodeEvent>) -> Result<(), EnginError> {
-    let computation = shared.backend.create_computation()?;
+    let computation = match shared.backend.create_computation() {
+        Ok(computation) => computation,
+        Err(error) => {
+            cancel_unstarted_eval_events(shared, events.into_iter());
+            return Err(error);
+        }
+    };
     let mut pending = Vec::new();
-    for event in events {
+    let mut events = events.into_iter();
+    while let Some(event) = events.next() {
         let node = shared.repository.get_or_insert(event.node_key);
         let history = event.variation.replay_history();
         match history.compute_game_result() {
@@ -470,6 +477,7 @@ fn process_eval_events(shared: &SharedPipeline, events: Vec<NodeEvent>) -> Resul
                         node.abort_evaluation();
                         shared.finish(false);
                         cancel_pending(shared, pending);
+                        cancel_unstarted_eval_events(shared, events);
                         return Err(error);
                     }
                 }
@@ -537,6 +545,21 @@ fn cancel_pending(shared: &SharedPipeline, pending: Vec<PendingEval>) {
     }
 }
 
+/// Cancels events that Gather already claimed for Eval but whose computation
+/// was never created or accepted. Every event owns its reservations, so this
+/// is the only safe failure path that can release in-flight edges without a
+/// repository-wide lock.
+fn cancel_unstarted_eval_events(shared: &SharedPipeline, events: impl Iterator<Item = NodeEvent>) {
+    for event in events {
+        let node = shared.repository.get_or_insert(event.node_key);
+        if node.expansion_state() == ExpansionState::Evaluating {
+            node.abort_evaluation();
+        }
+        event.cancel();
+        shared.finish(false);
+    }
+}
+
 fn backprop_worker(shared: Arc<SharedPipeline>, receiver: Receiver<BackpropEvent>) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
@@ -562,11 +585,28 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
+    use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
     use super::{StreamSearchLimits, StreamWorkerConfig, StreamWorkerPipeline};
-    use crate::neural::backend::UniformBackend;
+    use crate::neural::backend::{Backend, BackendAttributes, BackendComputation, EvalResult, UniformBackend};
     use crate::search::stream::{root_stats, SearchGeneration, StreamSearch};
+    use crate::EnginError;
+
+    struct FailingComputationBackend;
+
+    impl Backend for FailingComputationBackend {
+        fn evaluate(&self, _history: &PositionHistory, _legal_moves: &[Move]) -> Arc<EvalResult> {
+            unreachable!("stream worker must use BackendComputation")
+        }
+
+        fn attributes(&self) -> BackendAttributes {
+            BackendAttributes::default()
+        }
+
+        fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
+            Err(EnginError::Onnx("test computation failure".to_owned()))
+        }
+    }
 
     fn startpos_history() -> Arc<PositionHistory> {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -761,5 +801,20 @@ mod tests {
         assert_eq!(serial_priors, worker_priors);
 
         workers.stop_and_join();
+    }
+
+    #[test]
+    fn computation_creation_failure_drains_claimed_events() {
+        let mut pipeline = StreamWorkerPipeline::new(
+            Arc::new(FailingComputationBackend),
+            SearchGeneration(28),
+            startpos_history(),
+            StreamWorkerConfig::default(),
+        );
+        let error = pipeline.run_playouts(1).expect_err("computation creation must fail");
+        assert_eq!(error, EnginError::Onnx("test computation failure".to_owned()));
+        pipeline.wait_for_idle().expect_err("pipeline retains the worker error");
+        assert_eq!(pipeline.stats().completed_playouts, 0);
+        pipeline.stop_and_join();
     }
 }
