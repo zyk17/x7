@@ -205,6 +205,11 @@ impl Backend for OnnxBackend {
     fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
         Ok(Box::new(OnnxBackendComputation::new(self.sessions.clone())))
     }
+
+    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+        let mut sessions = self.sessions.lock().expect("ONNX session lock");
+        infer_encoded_planes(&mut sessions, planes, batch)
+    }
 }
 
 /// px0 `NetworkAsBackendComputation` (`wrapper.cc:100-172`)。
@@ -250,45 +255,29 @@ impl BackendComputation for OnnxBackendComputation {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut results = HashMap::with_capacity(entries.len());
+        let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
+        let mut packed = vec![0.0; entries.len() * plane_len];
+        for (index, (_, entry)) in entries.iter().enumerate() {
+            let history = xiangqi_core::PositionHistory::from_positions(entry.positions.clone());
+            let planes = encode_position_for_nn(&history, FillEmptyHistory::FenOnly);
+            packed[index * plane_len..(index + 1) * plane_len].copy_from_slice(&planes);
+        }
         let mut sessions = self.sessions.lock().expect("ONNX session lock");
-        let chunk_size = sessions.chunk_size();
-        for chunk in entries.chunks(chunk_size) {
-            let actual_batch = chunk.len();
-            let run_batch = sessions.run_batch_size(actual_batch);
-            let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
-            // px0 zero-pads each DirectML minibatch before execution
-            // (`network_onnx.cc:398-447`). Only real entries are read back.
-            let mut input = vec![0.0; run_batch * plane_len];
-            for (index, (_, entry)) in chunk.iter().enumerate() {
-                let history = xiangqi_core::PositionHistory::from_positions(entry.positions.clone());
-                let planes = encode_position_for_nn(&history, FillEmptyHistory::FenOnly);
-                input[index * plane_len..(index + 1) * plane_len].copy_from_slice(&planes);
-            }
-            let board = Array4::from_shape_vec((run_batch, INPUT_PLANES, BOARD_ROWS, BOARD_COLS), input)
-                .map_err(|error| EnginError::Onnx(format!("invalid batch input: {error}")))?;
-            let tensor = TensorRef::from_array_view(&board).map_err(onnx_error)?;
-            let outputs = sessions
-                .session_for(run_batch)?
-                .run(ort::inputs!["board" => tensor])
-                .map_err(onnx_error)?;
-            let logits = tensor_output(&outputs, "logits", run_batch, POLICY_SIZE)?;
-            let wdl = tensor_output(&outputs, "value", run_batch, 3)?;
-
-            for (index, (ticket, entry)) in chunk.iter().enumerate() {
-                let values = &logits[index * POLICY_SIZE..(index + 1) * POLICY_SIZE];
-                let policies = softmax_legal_policy(values, &entry.legal_moves)?;
-                let value = &wdl[index * 3..(index + 1) * 3];
-                results.insert(
-                    ticket.0,
-                    Arc::new(EvalResult {
-                        wl: value[0] - value[2],
-                        d: value[1],
-                        m: 0.0,
-                        policies,
-                    }),
-                );
-            }
+        let (logits, wdl) = infer_encoded_planes(&mut sessions, &packed, entries.len())?;
+        let mut results = HashMap::with_capacity(entries.len());
+        for (index, (ticket, entry)) in entries.iter().enumerate() {
+            let values = &logits[index * POLICY_SIZE..(index + 1) * POLICY_SIZE];
+            let policies = softmax_legal_policy(values, &entry.legal_moves)?;
+            let value = &wdl[index * 3..(index + 1) * 3];
+            results.insert(
+                ticket.0,
+                Arc::new(EvalResult {
+                    wl: value[0] - value[2],
+                    d: value[1],
+                    m: 0.0,
+                    policies,
+                }),
+            );
         }
         self.state
             .lock()
@@ -309,7 +298,7 @@ impl BackendComputation for OnnxBackendComputation {
 }
 
 /// px0 `NetworkAsBackendComputation::SoftmaxPolicy` (`wrapper.cc:135-164`)。
-fn softmax_legal_policy(logits: &[f32], legal_moves: &[xiangqi_core::Move]) -> Result<Vec<f32>, EnginError> {
+pub fn softmax_legal_policy(logits: &[f32], legal_moves: &[xiangqi_core::Move]) -> Result<Vec<f32>, EnginError> {
     let mut selected = Vec::with_capacity(legal_moves.len());
     let mut maximum = f32::NEG_INFINITY;
     for &mv in legal_moves {
@@ -333,6 +322,49 @@ fn softmax_legal_policy(logits: &[f32], legal_moves: &[xiangqi_core::Move]) -> R
         *value /= total;
     }
     Ok(selected)
+}
+
+
+/// ONNX-only: padded DirectML/CPU session run on pre-encoded planes.
+fn infer_encoded_planes(
+    sessions: &mut OnnxSessions,
+    planes: &[f32],
+    batch: usize,
+) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+    let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
+    if planes.len() != batch * plane_len {
+        return Err(EnginError::Onnx(format!(
+            "encoded planes length {} != batch {batch} * {plane_len}",
+            planes.len()
+        )));
+    }
+    if batch == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut all_logits = Vec::with_capacity(batch * POLICY_SIZE);
+    let mut all_wdl = Vec::with_capacity(batch * 3);
+    let chunk_size = sessions.chunk_size();
+    for chunk_start in (0..batch).step_by(chunk_size.min(batch).max(1)) {
+        let end = (chunk_start + chunk_size).min(batch);
+        let actual_batch = end - chunk_start;
+        let run_batch = sessions.run_batch_size(actual_batch);
+        // px0 zero-pads each DirectML minibatch (`network_onnx.cc:398-447`).
+        let mut input = vec![0.0; run_batch * plane_len];
+        input[..actual_batch * plane_len]
+            .copy_from_slice(&planes[chunk_start * plane_len..end * plane_len]);
+        let board = Array4::from_shape_vec((run_batch, INPUT_PLANES, BOARD_ROWS, BOARD_COLS), input)
+            .map_err(|error| EnginError::Onnx(format!("invalid batch input: {error}")))?;
+        let tensor = TensorRef::from_array_view(&board).map_err(onnx_error)?;
+        let outputs = sessions
+            .session_for(run_batch)?
+            .run(ort::inputs!["board" => tensor])
+            .map_err(onnx_error)?;
+        let logits = tensor_output(&outputs, "logits", run_batch, POLICY_SIZE)?;
+        let wdl = tensor_output(&outputs, "value", run_batch, 3)?;
+        all_logits.extend_from_slice(&logits[..actual_batch * POLICY_SIZE]);
+        all_wdl.extend_from_slice(&wdl[..actual_batch * 3]);
+    }
+    Ok((all_logits, all_wdl))
 }
 
 fn validate_model_io(session: &Session) -> Result<(), EnginError> {

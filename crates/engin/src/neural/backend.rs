@@ -8,6 +8,7 @@ use xiangqi_core::{Move, MoveList, Position, PositionHistory};
 use crate::EnginError;
 
 use super::cache::{CachedEval, EvalCache, DEFAULT_NN_CACHE_SIZE};
+use super::{BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE};
 
 /// px0 `BackendAttributes` (`src/neural/backend.h:45-52`)。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +94,15 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Stream NN worker: inference on already-encoded NCHW planes only.
+    /// Returns `logits[batch * POLICY_SIZE]` and WDL `value[batch * 3]`.
+    fn infer_encoded(&self, _planes: &[f32], _batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+        Err(EnginError::PortIncomplete("backend has no encoded inference"))
+    }
+
+    /// Optional MemCache insert after Eval builds a completed `EvalResult`.
+    fn store_evaluation(&self, _position: &EvalPosition, _result: Arc<EvalResult>) {}
+
     /// px0 `CachingBackend::ClearCache` (`src/neural/memcache.h:34-38`).
     /// Non-caching backends deliberately keep the no-op default.
     fn clear_cache(&self) {}
@@ -159,6 +169,20 @@ impl Backend for CachingBackend {
 
     fn cached_evaluation(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
         self.cached(position)
+    }
+
+    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+        self.wrapped.infer_encoded(planes, batch)
+    }
+
+    fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {
+        self.cache.insert_if_absent(
+            Self::cache_key(position),
+            CachedEval {
+                result,
+                num_moves: position.legal_moves.len(),
+            },
+        );
     }
 
     fn clear_cache(&self) {
@@ -391,6 +415,24 @@ impl Backend for UniformBackend {
 
     fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
         Ok(Box::new(UniformBackendComputation::new(self.clone())))
+    }
+
+    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+        let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
+        if planes.len() != batch * plane_len {
+            return Err(EnginError::PortIncomplete("uniform encoded planes length"));
+        }
+        // Equal logits → Eval softmax is uniform over legal moves.
+        let logits = vec![0.0; batch * POLICY_SIZE];
+        let mut wdl = Vec::with_capacity(batch * 3);
+        for _ in 0..batch {
+            wdl.extend_from_slice(&[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
+        }
+        Ok((logits, wdl))
+    }
+
+    fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {
+        self.store_cache(position, result);
     }
 
     fn clear_cache(&self) {
