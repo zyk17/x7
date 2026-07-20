@@ -21,20 +21,19 @@
 
 ## Stream 搜索（进行中）
 
-`crates/engin/src/search/stream` 是独立于 `classic` 的新搜索实现。它采用 LC3 文档描述的 streaming
-MCTS 形态：sharded node repository、edge-local in-flight visit、owned `NodeEvent`，以及后续的
-Gather -> Eval -> Backprop 有界队列。第一版只使用 parent-key + move 的**树 key**，不合并局面成为 DAG。
-每个 event 保留 root history 与 variation，保证 rule60/repetition 在异步路径里仍可重建。
+`crates/engin/src/search/stream` 是独立于 `classic` 的新搜索实现。主线入口是
+`search/stream/search.rs` 的 `Search`（常驻 Gather/Eval/Backprop）。它采用 LC3 文档描述的
+streaming MCTS **形态**：sharded node repository、edge-local in-flight、owned `NodeEvent`。
+第一版只使用 parent-key + move 的**树 key**，不合并成 DAG。协作式单线程 `pipeline` 已删除。
 
-参考只限 LC3 官方设计文档：
+**现状边界**：库内可搜、可对拍；selection/bestmove 走项目批准的 X7↔classic 对照，不是正式 LC3
+policy。每次搜索新建空 repository，**无 tree reuse / 无剪枝**；正式 UCI 仍只接 classic。
+
+参考只限 LC3 官方设计文档（无本地 LC3 源码，禁止标称逐行翻译）：
 
 - <https://lczero.org/dev/lc0/search/lc3/overview/>
 - <https://lczero.org/dev/lc0/search/lc3/policy/>
 - <https://lczero.org/dev/lc0/search/lc3/glossary/>
-
-本地 `C:\Users\Administrator\projects\lc0` 未包含 LC3 源码；因此 stream 不得标注为 LC3 的逐行 Rust
-翻译，也不得复用 classic 的 mutable arena、snapshot/replay 或 task-worker 所有权模型。完成完整 pipeline
-和 fixed-visits 结构对拍前，stream 不接入 UCI。
 
 只有 px0 主线翻译完成并有对拍测试后，才允许比较 lc0 或 KataGo，并将明确记录的差异作为独立优化事项。
 

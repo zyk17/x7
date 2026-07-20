@@ -22,12 +22,9 @@ bridge 已删除。当前队列仍由 owner 同步 drain，**不是**常驻并�
 px0 `RunTasks/WaitForTasks`，先打通 processing，再在 owned selection delta 可证明后处理 gathering。task 不会
 借用 `NodeTree`、minibatch 或 backend computation。
 
-`search::stream` 是正在建立的下一代搜索，不复用 classic 的树或 worker。它参考
-[LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、
-[Policy](https://lczero.org/dev/lc0/search/lc3/policy/) 与
-[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/) 的 event-queue / node-repository 架构；
-LC3 实现源码未在本地 lc0 checkout 公开，因此它是明确标注的架构参考，不是伪称的逐行翻译。stream 完整
-Gather -> Eval -> Backprop 对拍前，UCI 仍使用 classic。
+`search::stream` 是独立于 classic 的下一代搜索骨架（LC3 文档形态：repository + owned event 流水线），
+不是 LC3 源码翻译，也不接正式 UCI。当前已有库内 worker/ONNX 与对拍工具；**无 tree reuse、无 UCI
+会话**，正式对局仍走 classic。细节以 `temp.md` / `temp_stream_x7_policy.md` 为准。
 
 主 UCI 使用 px0 名称 `WeightsFile` 配置 ONNX 权重，并会在下一条 `position` 前加载它。正式
 `ClassicEngine` 在权重成功加载前没有 `ClassicSearch`，不会以 `UniformBackend` 代替模型搜索。

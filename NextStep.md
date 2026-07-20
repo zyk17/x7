@@ -29,19 +29,16 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
 
 - 独立 `NodeRepository`：分片 map，只锁查找/插入；节点/边统计不持有 whole-tree lock。
 - `NodeKey = HashConcatenate(parent_key, move)`，明确是 tree key。
-- `StreamEdge`：`started` 含 in-flight，completed Q 聚合局部锁保护；`EdgeReservation` 只能移动完成或取消。
+- `Edge`：`started` 含 in-flight，completed Q 聚合局部锁保护；`EdgeReservation` 只能移动完成或取消。
 - `NodeEvent`：拥有 generation、root history、variation 和 reservation；不得 clone reservation。
 
 ### S1：Gather -> Eval -> Backprop 串行语义
 
-1. LC3 Policy 文档定义了 `GetNumEdgesToFetch`、`DistributeVisits`、`ValueDelta`、
-   `NodeEventToValueDelta`、`MergeNodeUpdates` 等职责，但**没有公开选择公式、edge visit 分配规则或
-   moves-left backup 公式**。现有最小 selection 仅用于驱动 pipeline 结构测试，不是可作为正式棋力语义的
-   LC3 翻译；不得据此接入 UCI 或继续调参。
+1. Selection / visit 走项目批准的 **X7↔classic** 对照（FPU、`ComputeCpuct`、edge N 含 in-flight），
+   **不是** LC3 Policy 文档里的公开公式（该文档仍无具体式 / multivisit）。不得标称正式 LC3 policy。
 2. 已在单线程上实现 owned event 的 Gather、合法着/Eval、terminal 和 Backprop。失败 Eval 会撤销 reservation 并
    将 node 从 `Evaluating` 恢复为 `Unexpanded`。
-3. 下一步为 LC3 已定义的不变量回归：root edge `N/Q/P`、terminal、two-fold、rule60、stop 与所有
-   reservation 回收。PV、bestmove 和 moves-left 不属于可从公开 LC3 文档推导的范围。
+3. 结构不变量：root edge `N/Q/P`、terminal、two-fold、rule60、stop 与 reservation 回收；由对拍与单测覆盖。
 
 门槛：`NInFlight==0` 等价物为所有 edge `started == completed`；不接 UCI。
 
@@ -55,7 +52,7 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
    generation gate 和 stop/join，不引入 classic shared mutable tree。`request_stop()` 与 `stop_and_join()` 已拆开：
    前者是未来 UCI `stop` 的正常搜索边界，后者只负责 owner 析构/join。固定 playout、根扩展后立即 stop/join，
    以及大量 playout 中外部 stop 返回部分统计且回收所有 reservation 均已回归。
-4. `StreamSearchLimits` 已统一相对 playout 预算、绝对 deadline 与显式 stop；返回前必定等待已提交 event
+4. `SearchLimits` 已统一相对 playout 预算、绝对 deadline 与显式 stop；返回前必定等待已提交 event
    完成或取消。它是后续 single Watchdog 将 `go nodes` / `go movetime` 映射到 stream 的内部边界，不直接复用
    classic stopper 或提前切换 UCI。
 5. 固定 visits 的串行/常驻 worker root contract 已回归：同一 UniformBackend 下 root `N`、合法 edge 集合和
@@ -65,16 +62,24 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
 7. `stream_compare --movetime-ms 30000` 已在 `data/x7.onnx` / DirectML 下运行：30.012 秒内完成
    292,409 playout、11,935 个 NN batch，deadline 后根无 in-flight。该工具不走 UCI，只证明常驻 pipeline
    的长期推进与收敛。
-8. **明确缺口**：LC3 Policy 文档把“search finished 后走哪步”标为 TBD，且没有公开 final move、PV、
-   moves-left backup、terminal tie-break 或 MultiPV 的语义。stream 不得从 px0 classic 借用这些规则，也不得
-   自行定义替代策略。
-9. stream 目前只能提供 `root_stats()` 诊断快照；不得接入 UCI `info pv` 或 `bestmove`。UCI 切换的前置条件是
-   LC3 上游公开该 policy，或项目单独批准一份 X7 stream output policy（含 final move、PV、moves-left、
-   terminal/tie-break 和 MultiPV 语义）。
+8. **X7 output policy（已批准并落地）**：LC3 仍把 final move 标为 TBD；项目批准对照 classic/px0 的
+   selection + bestmove/PV（见 `temp_stream_x7_policy.md`）。库内已有 `best_move` /
+   `principal_variation` / `root_stats`；对拍用 `stream_compare` / `stream_behavior_compare`。
+   **仍不是 UCI 引擎路径。**
+9. **真实能力边界（勿乐观）**：
+   - 每次 `stream::Search::new` 新建空 `NodeRepository`；**无 tree reuse**，
+     上一手搜索对下一手零帮助。协作式 `Pipeline` 已删，主线仅 `Search`。
+   - 无 repository 剪枝/GC（因尚无跨手共用容器）。
+   - 无 stream Watchdog / UCI `info` 周期、无 MultiPV、无 multivisit 批量分配。
+   - **明确不做** contempt / 非零 `draw_score`（固定 0）。
+   - **后续精简**：stream 不需要整份 classic `SearchParams`；目前主要为 `compute_cpuct` 等从
+     `classic::uct` 导入。接 UCI / 调参面之前再拆出最小 stream 参数（或共享纯函数），不阻塞主线。
+   - NN `m`（plies）未做 classic 式 backup 聚合进节点统计；终局 `m` 仅用于 bestmove 档内 tie-break。
+   - UCI 仍只走 classic；接 stream 前还要做会话级 lifecycle（`position/go/stop`、generation、
+     恰好一次 bestmove）以及可选的 tree reuse。
 
-门槛：真实 ONNX stream 30 秒 deadline 持续推进；若要接 UCI，必须先取得 LC3 上游或项目批准的 output
-policy，再验证 `position -> go -> stop -> position -> go` 无旧 generation 更新、无 reservation 泄漏、恰好一次
-bestmove。
+门槛：库内/对拍工具可持续推进且 settled；接 UCI 前必须补齐会话生命周期，并决定是否做 tree reuse
+（做则必须同时有剪枝，否则跨手共用 repository 会泄漏）。
 
 ## NN：x7 v2 固定 trunk
 

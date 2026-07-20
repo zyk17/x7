@@ -29,30 +29,24 @@
 
 - [x] S0 repository/event：sharded tree repository、edge-local started/completed、不可复制 reservation、
   owned history/variation/generation event；覆盖 collision claim 与 cancel/complete 不变量。
-- [ ] S1 policy blocked：LC3 Policy 文档定义 selection/visit distribution 的职责，但没有公开具体公式、
-  multivisit 分配或 moves-left backup 语义。现有最小 selection 只用于 pipeline 结构验证，不能标为正式
-  LC3 policy，也不得接 UCI 或作为棋力调参对象。
+- [x] S1 policy（X7↔classic，非 LC3 公式）：selection 对照 classic FPU/`ComputeCpuct`；不得标称正式
+  LC3 Policy 文档公式（该文档无公开具体式）。
 - [x] S1 pipeline：单线程 Gather -> Eval -> Backprop 已接正式 `Backend`；terminal 和 failed Eval 均完成或撤销
   reservation。two-fold/rule60 通过 `PositionHistory::compute_game_result()` 进入 terminal 路径。
-- [ ] S1 回归：fixed-visits 固定 FEN，root edge `N/Q/P`、terminal、two-fold、rule60 与所有 edge
-  `started == completed`。PV/bestmove 按 S2c 的明确缺口保持阻塞。
-- [x] S2a queues：bounded cooperative gather/eval/backprop queue、search generation、stop/drain；仅收发 owned event/result。
-- [x] S2a NN：接入 `BackendComputation`、ONNX minibatch 和 cache-hit backprop；不得共享 classic backend computation workspace。
-- [x] S2b workers：S2a queue stage 已搬到常驻 Gather/Eval/Backprop worker；worker 只收发 owned event，覆盖
-  fixed playout、析构 `stop_and_join`，以及正常 `request_stop` 返回部分统计后的 reservation drain。
-- [x] S2b lifecycle：以 `StreamSearchLimits` 统一相对 playout budget、绝对 deadline 与显式 stop；返回前
-  必须完成或取消所有已提交 event，不允许 root snapshot 留下 in-flight reservation。
-- [x] S2b fixed-visits：串行与常驻 worker 在同一 UniformBackend 下对拍 root `N`、合法 edge 集合与 `P`；
-  不要求不同 event 调度得到逐边相同 `N/Q`，但完成时所有 `started == completed`。
-- [x] S2b error propagation：`create_computation` / `add_input` 失败必须 cancel/finish 全部已 claim、未处理的
-  Eval event；owner 获得原始错误，`wait_for_idle` 不可死等。
-- [x] S2b 长 ONNX：`stream_compare --movetime-ms 30000` 在 `data/x7.onnx` / DirectML 下完成 292,409
-  playout、11,935 NN batch，deadline 后 root settled；该二进制不接 UCI。
-- [ ] S2c policy output blocked：LC3 Policy 文档将 final move 明确列为 TBD，未定义 PV、moves-left backup、
-  terminal/tie-break 或 MultiPV。stream 只能暴露 `root_stats()`；没有 LC3 上游语义或项目批准的 X7 output
-  policy 时，不实现 UCI `info pv` / `bestmove`，也不从 px0 classic 移植。
-- [ ] S3 UCI blocked：仅在 S2c 解除后让 stream 替代 classic；验证 bare `go`、nodes、movetime、infinite/stop、
-  position replacement、ucinewgame、exactly-one bestmove。
+- [x] S2a–S2b：queues、常驻 worker、ONNX minibatch、SearchLimits、error cancel、长 movetime 冒烟（见历史条目）。
+- [x] S1/S2 库内路径：主线 `stream::Search`（`search/stream/search.rs`）、ONNX minibatch、stop/drain、
+  generation、settled；对拍 `stream_compare` / `stream_behavior_compare`（bestmove/legal；
+  **不保证整条 PV 与 classic 一致**）。
+- [x] S2c X7 output（库内，非 UCI）：项目批准对照 classic 的 selection + bestmove/PV；详见
+  `temp_stream_x7_policy.md`。LC3 final-move 仍为 TBD，故不得标称正式 LC3 policy。
+- [ ] S2d tree reuse：**未做**。每次搜索空 repository；无剪枝/GC。接跨手 reuse 前必须设计 prune。
+- [ ] S2e 未做：stream Watchdog/`info`、MultiPV、NN `m` backup 聚合、multivisit 分配。
+- [x] stream **不做** contempt / 非零 `draw_score`（收益低；`draw_score=0` 固定）。
+- [ ] 后续：stream **精简 SearchParams**——多数 classic UCI 旋钮用不到；现为 `compute_cpuct` 等
+  从 `classic::uct` / `classic::params` 整模块导入，应抽成 stream 自用的小参数面（或共享纯函数 +
+  最小字段集），不再挂整份 classic 参数表。
+- [ ] S3 UCI blocked：正式引擎仍走 classic。接 stream 需会话 lifecycle +（可选）reuse，并验证
+  `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏、恰好一次 bestmove。
 
 ## 停止路线：classic TaskWorkers T1-T3
 
