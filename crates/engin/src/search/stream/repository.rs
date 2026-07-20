@@ -7,9 +7,11 @@
 //! its parent key and move, so transpositions are not merged into a DAG yet.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
+use nohash_hasher::{IsEnabled, NoHashHasher};
 use parking_lot::{Mutex, RwLock};
 use xiangqi_core::Move;
 
@@ -17,8 +19,21 @@ use super::ValueDelta;
 
 /// Repository identity. It is a tree key, not a position-only transposition
 /// key: equal positions reached by different paths remain different nodes.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+///
+/// The `u64` is already mixed by `hash_cat`. The shard map uses
+/// `nohash_hasher::NoHashHasher` so this value is used as the bucket index
+/// directly (no second hash pass).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct NodeKey(u64);
+
+impl Hash for NodeKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0);
+    }
+}
+
+// Asserts `Hash` only calls `write_u64` once — required by `NoHashHasher`.
+impl IsEnabled for NodeKey {}
 
 impl NodeKey {
     pub const fn root(position_hash: u64) -> Self {
@@ -58,28 +73,43 @@ impl ExpansionState {
 /// A child edge. In-flight visits live on the incoming edge, never in the
 /// child node's completed visit count, matching the LC3 node invariant.
 #[derive(Debug)]
-pub struct StreamEdge {
+pub struct Edge {
     mv: Move,
+    /// Policy prior as IEEE-754 `f32` bit pattern (`f32::to_bits` /
+    /// `from_bits`). Stored in `AtomicU32` because std has no `AtomicF32`.
     prior_bits: AtomicU32,
     started: AtomicU32,
     /// Protected aggregate: Q and completed N must be observed together.
     completed: Mutex<CompletedStats>,
 }
 
+/// Completed edge aggregate (no draw on edges).
+/// `wl_sum` is mover-perspective totals; Q = wl_sum / visits.
 #[derive(Debug, Default)]
 struct CompletedStats {
     visits: u32,
-    value_sum: f32,
+    wl_sum: f32,
 }
 
+/// Completed node WDL aggregate (`wl_sum` / `draw_sum` ↔ px0 `wl_` / `d_`).
 #[derive(Debug, Default)]
 struct NodeStats {
     visits: u32,
-    value_sum: f32,
+    wl_sum: f32,
     draw_sum: f32,
 }
 
-impl StreamEdge {
+impl Edge {
+    fn new(mv: Move, prior: f32) -> Self {
+        assert!((0.0..=1.0).contains(&prior), "policy prior must be normalized");
+        Self {
+            mv,
+            prior_bits: AtomicU32::new(prior.to_bits()),
+            started: AtomicU32::new(0),
+            completed: Mutex::new(CompletedStats::default()),
+        }
+    }
+    
     pub fn mv(&self) -> Move {
         self.mv
     }
@@ -103,17 +133,7 @@ impl StreamEdge {
         if completed.visits == 0 {
             return 0.0;
         }
-        completed.value_sum / completed.visits as f32
-    }
-
-    fn new(mv: Move, prior: f32) -> Self {
-        assert!((0.0..=1.0).contains(&prior), "policy prior must be normalized");
-        Self {
-            mv,
-            prior_bits: AtomicU32::new(prior.to_bits()),
-            started: AtomicU32::new(0),
-            completed: Mutex::new(CompletedStats::default()),
-        }
+        completed.wl_sum / completed.visits as f32
     }
 
     fn reserve(self: &Arc<Self>) -> EdgeReservation {
@@ -135,14 +155,14 @@ impl StreamEdge {
         }
     }
 
-    fn complete(&self, value: f32) {
+    fn complete(&self, wl: f32) {
         let mut completed = self.completed.lock();
         assert!(
             self.started.load(Ordering::Acquire) > completed.visits,
             "stream edge completion without reservation"
         );
         completed.visits += 1;
-        completed.value_sum += value;
+        completed.wl_sum += wl;
     }
 }
 
@@ -151,7 +171,7 @@ impl StreamEdge {
 /// cleanup.
 #[derive(Debug)]
 pub struct EdgeReservation {
-    edge: Arc<StreamEdge>,
+    edge: Arc<Edge>,
 }
 
 impl EdgeReservation {
@@ -159,8 +179,8 @@ impl EdgeReservation {
         self.edge.mv()
     }
 
-    pub fn complete(self, value: f32) {
-        self.edge.complete(value);
+    pub fn complete(self, wl: f32) {
+        self.edge.complete(wl);
     }
 
     pub fn cancel(self) {
@@ -169,23 +189,27 @@ impl EdgeReservation {
 
     #[cfg(test)]
     pub(crate) fn test_only(mv: Move) -> Self {
-        Arc::new(StreamEdge::new(mv, 1.0)).reserve()
+        Arc::new(Edge::new(mv, 1.0)).reserve()
     }
 }
 
 /// A repository value. Expansion publishes its edge vector once; per-edge
 /// statistics can then progress independently without a whole-tree lock.
 #[derive(Debug, Default)]
-pub struct StreamNode {
+pub struct Node {
+    /// Lifecycle: Unexpanded → Evaluating → Expanded|Terminal (`ExpansionState` as u8 for CAS).
     expansion: AtomicU8,
-    edges: RwLock<Arc<[Arc<StreamEdge>]>>,
+    edges: RwLock<Arc<[Arc<Edge>]>>,
     /// LC3 nodes retain their completed aggregate. In-flight visits remain
     /// edge-local and are deliberately excluded from this value.
     stats: Mutex<NodeStats>,
-    terminal: Mutex<Option<(f32, f32)>>,
+    /// Terminal WDL + plies: `(wl, draw≡d, plies_left≡m)`.
+    /// `m` is stored in plies (half-moves), same as px0 `MakeTerminal(plies_left)`;
+    /// UCI “moves left” is a separate full-move conversion.
+    terminal: Mutex<Option<(f32, f32, f32)>>,
 }
 
-impl StreamNode {
+impl Node {
     pub fn completed_visits(&self) -> u32 {
         self.stats.lock().visits
     }
@@ -195,7 +219,7 @@ impl StreamNode {
         if stats.visits == 0 {
             0.0
         } else {
-            stats.value_sum / stats.visits as f32
+            stats.wl_sum / stats.visits as f32
         }
     }
 
@@ -208,10 +232,10 @@ impl StreamNode {
         }
     }
 
-    pub(crate) fn add_value(&self, delta: ValueDelta) {
+    pub(crate) fn add_delta(&self, delta: ValueDelta) {
         let mut stats = self.stats.lock();
         stats.visits += delta.visits;
-        stats.value_sum += delta.value_sum;
+        stats.wl_sum += delta.wl_sum;
         stats.draw_sum += delta.draw_sum;
     }
 
@@ -239,9 +263,17 @@ impl StreamNode {
             ExpansionState::Evaluating,
             "node must be evaluating"
         );
-        let edges: Arc<[Arc<StreamEdge>]> = edges
+        // px0 `Node::SortEdges` after policy init (`node.cc:291-297`).
+        let mut edges = edges;
+        edges.sort_unstable_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let edges: Arc<[Arc<Edge>]> = edges
             .into_iter()
-            .map(|(mv, prior)| Arc::new(StreamEdge::new(mv, prior)))
+            .map(|(mv, prior)| Arc::new(Edge::new(mv, prior)))
             .collect();
         *self.edges.write() = edges;
         self.expansion.store(ExpansionState::Expanded as u8, Ordering::Release);
@@ -261,31 +293,33 @@ impl StreamNode {
             .expect("only evaluating stream nodes can abort evaluation");
     }
 
-    pub fn mark_terminal(&self, value: f32, draw: f32) {
-        assert!(
-            self.expansion_state() == ExpansionState::Evaluating,
-            "node must be evaluating"
-        );
-        *self.terminal.lock() = Some((value, draw));
+    pub fn mark_terminal(&self, wl: f32, draw: f32, plies_left: f32) {
+        assert_eq!(self.expansion_state(), ExpansionState::Evaluating, "node must be evaluating");
+        *self.terminal.lock() = Some((wl, draw, plies_left));
         self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
     }
 
-    pub fn terminal_value(&self) -> Option<(f32, f32)> {
-        *self.terminal.lock()
+    pub fn terminal_wl(&self) -> Option<(f32, f32)> {
+        (*self.terminal.lock()).map(|(wl, draw, _)| (wl, draw))
     }
 
-    pub fn edges(&self) -> Arc<[Arc<StreamEdge>]> {
+    pub fn terminal_plies_left(&self) -> Option<f32> {
+        (*self.terminal.lock()).map(|(_, _, plies)| plies)
+    }
+
+    pub fn edges(&self) -> Arc<[Arc<Edge>]> {
         Arc::clone(&self.edges.read())
     }
 
     pub fn reserve_edge(&self, edge_index: usize) -> Option<EdgeReservation> {
-        self.edges().get(edge_index).map(StreamEdge::reserve)
+        self.edges().get(edge_index).map(Edge::reserve)
     }
 }
 
 #[derive(Debug)]
 struct RepositoryShard {
-    nodes: RwLock<HashMap<NodeKey, Arc<StreamNode>>>,
+    /// `NoHashHasher`: `NodeKey` is already `hash_cat`'d; do not hash again.
+    nodes: RwLock<HashMap<NodeKey, Arc<Node>, BuildHasherDefault<NoHashHasher<u64>>>>,
 }
 
 /// Sharded key-value repository. A shard lock only protects map lookup and
@@ -305,22 +339,22 @@ impl NodeRepository {
         Self {
             shards: (0..shard_count)
                 .map(|_| RepositoryShard {
-                    nodes: RwLock::new(HashMap::new()),
+                    nodes: RwLock::new(HashMap::default()),
                 })
                 .collect(),
         }
     }
 
-    pub fn get_or_insert(&self, key: NodeKey) -> Arc<StreamNode> {
+    pub fn get_or_insert(&self, key: NodeKey) -> Arc<Node> {
         let shard = &self.shards[key.0 as usize & (self.shards.len() - 1)];
         if let Some(node) = shard.nodes.read().get(&key) {
             return Arc::clone(node);
         }
         let mut nodes = shard.nodes.write();
-        Arc::clone(nodes.entry(key).or_insert_with(|| Arc::new(StreamNode::default())))
+        Arc::clone(nodes.entry(key).or_insert_with(|| Arc::new(Node::default())))
     }
 
-    pub fn get(&self, key: NodeKey) -> Option<Arc<StreamNode>> {
+    pub fn get(&self, key: NodeKey) -> Option<Arc<Node>> {
         let shard = &self.shards[key.0 as usize & (self.shards.len() - 1)];
         shard.nodes.read().get(&key).cloned()
     }
