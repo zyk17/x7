@@ -175,7 +175,8 @@ pub struct SearchParams {
     // 引擎试图打包多少个局面（positions）进行神经网络的并行计算。较大的 Batch 可能会稍微降低棋力，
     // 特别是在总模拟次数（playouts）较少的情况下。设置为 0 则使用后端推荐的默认值。
     pub minibatch_size: i32,
-    // 较高的值会促进更多的探索（更宽的搜索），较低的值会促进更多的置信度（更深的搜索）。
+    // 较高的值会促进更多的探索（更宽的搜索）.       更信P
+    // 较低的值会促进更多的置信度（更深的搜索）。    更信实战 Q 
     pub cpuct: f32,
     /// px0 `CpuctAtRoot` (`src/search/classic/params.cc:543-551`).
     pub cpuct_at_root: f32,

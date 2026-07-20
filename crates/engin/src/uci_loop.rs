@@ -299,11 +299,16 @@ impl<'a> UciLoop<'a> {
             }
             "go" => {
                 let mut go_params = GoParams::default();
-                if contains_key(params, "infinite") {
-                    if !get_or_empty(params, "infinite").is_empty() {
+                // px0 only accepts `infinite` (`uciloop.cc:70,209-213`). `infinity`
+                // is a local alias that sets the same `GoParams::infinite` flag.
+                for flag in ["infinite", "infinity"] {
+                    if !contains_key(params, flag) {
+                        continue;
+                    }
+                    if !get_or_empty(params, flag).is_empty() {
                         return Err(EnginError::Uci(format!(
                             "Unexpected token {}",
-                            get_or_empty(params, "infinite")
+                            get_or_empty(params, flag)
                         )));
                     }
                     go_params.infinite = true;
@@ -620,6 +625,7 @@ fn known_command_keys(command: &str) -> HashSet<&'static str> {
         "position" => HashSet::from(["fen", "startpos", "moves"]),
         "go" => HashSet::from([
             "infinite",
+            "infinity",
             "wtime",
             "btime",
             "winc",
@@ -808,6 +814,7 @@ pub struct RecordingEngine {
     pub position: Option<GameState>,
     pub ready: bool,
     pub go_count: u32,
+    pub last_go: Option<GoParams>,
     pub responder_registrations: u32,
 }
 
@@ -834,8 +841,9 @@ impl EngineController for RecordingEngine {
         Ok(())
     }
 
-    fn go(&mut self, _params: &GoParams, _responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
+    fn go(&mut self, params: &GoParams, _responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
         self.go_count += 1;
+        self.last_go = Some(params.clone());
         Ok(())
     }
 
@@ -890,6 +898,29 @@ mod tests {
         assert_eq!(command, "setoption");
         assert_eq!(get_or_empty(&params, "name"), "UCI_ShowWDL");
         assert_eq!(get_or_empty(&params, "value"), "true");
+    }
+
+    #[test]
+    fn go_infinity_aliases_infinite() {
+        let (command, params) = parse_command("go infinity").expect("parse go infinity");
+        assert_eq!(command, "go");
+        assert!(contains_key(&params, "infinity"));
+        assert!(!contains_key(&params, "infinite"));
+
+        let mut options = UciOptions::populate_defaults();
+        let mut engine = RecordingEngine::default();
+        let mut responder = VecUciResponder::default();
+        let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+        assert!(uci.process_line("go infinity", "0.0.0").expect("go infinity"));
+        drop(uci);
+        assert_eq!(engine.go_count, 1);
+        assert_eq!(
+            engine.last_go.expect("recorded go"),
+            GoParams {
+                infinite: true,
+                ..GoParams::default()
+            }
+        );
     }
 
     #[test]
