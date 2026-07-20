@@ -15,7 +15,6 @@
 use xiangqi_core::GameResult;
 
 mod event;
-mod output;
 mod pipeline;
 mod policy;
 mod repository;
@@ -24,7 +23,6 @@ mod stats;
 mod workers;
 
 pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
-pub use output::{best_children_no_temperature, principal_variation, StreamPrincipalVariation};
 pub use pipeline::{StreamPipeline, StreamPipelineConfig};
 pub use policy::{select_edge, ValueDelta};
 pub use repository::{EdgeReservation, ExpansionState, NodeKey, NodeRepository, StreamEdge, StreamNode};

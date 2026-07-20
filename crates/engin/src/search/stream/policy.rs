@@ -16,22 +16,16 @@ pub struct ValueDelta {
     pub visits: u32,
     pub value_sum: f32,
     pub draw_sum: f32,
-    pub moves_left_sum: f32,
 }
 
 impl ValueDelta {
-    pub fn one(value: f32, draw: f32, moves_left: f32) -> Self {
+    pub fn one(value: f32, draw: f32) -> Self {
         assert!((-1.0..=1.0).contains(&value), "WDL value must be normalized");
         assert!((0.0..=1.0).contains(&draw), "WDL draw must be normalized");
-        assert!(
-            moves_left.is_finite() && moves_left >= 0.0,
-            "moves-left must be non-negative"
-        );
         Self {
             visits: 1,
             value_sum: value,
             draw_sum: draw,
-            moves_left_sum: moves_left,
         }
     }
 
@@ -41,9 +35,6 @@ impl ValueDelta {
             visits: self.visits,
             value_sum: -self.value_sum,
             draw_sum: self.draw_sum,
-            // px0 `SearchWorker::DoBackupUpdate` (`search.cc:2189-2234`):
-            // after updating a node, flip V and add one ply for its parent.
-            moves_left_sum: self.moves_left_sum + self.visits as f32,
         }
     }
 
@@ -90,8 +81,8 @@ mod tests {
 
     #[test]
     fn parent_delta_flips_value_not_draw() {
-        let leaf = ValueDelta::one(0.6, 0.2, 7.0);
-        assert_eq!(leaf.for_parent(), ValueDelta::one(-0.6, 0.2, 8.0));
+        let leaf = ValueDelta::one(0.6, 0.2);
+        assert_eq!(leaf.for_parent(), ValueDelta::one(-0.6, 0.2));
     }
 
     #[test]
