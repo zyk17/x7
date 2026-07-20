@@ -1,49 +1,47 @@
-//! Real-ONNX equivalence probe for the LC3-style stream search.
+//! Classic ↔ stream diagnostic compare (not a UCI path).
 //!
-//! Reference: LC3 overview, "Workers" and "Node repository":
-//! <https://lczero.org/dev/lc0/search/lc3/overview/>.
-//! This binary compares the deterministic serial baseline with the owned-event
-//! worker pipeline. It deliberately does not compare exact edge visit counts:
-//! queue scheduling changes selection order. Fixed-playout mode requires the
-//! same completed count; timed mode requires continued progress until its
-//! deadline. Both require legal root expansion and no root reservation left
-//! in flight.
+//! Compares fixed-visit root structure and classic-aligned bestmove ranking
+//! (N then Q then P; terminal win > loss). Scheduling may change per-edge N/Q;
+//! failures are unsettled roots, missing bestmove, or budget mismatches.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engin::neural::backend::{Backend, CachingBackend};
+use engin::neural::backend::{Backend, CachingBackend, UniformBackend};
 use engin::neural::onnx::OnnxBackend;
-use engin::search::classic::ClassicSearch;
+use engin::search::classic::{ClassicRootStats, ClassicSearch};
 use engin::search::stream::{
-    SearchGeneration, StreamSearch, StreamSearchLimits, StreamStats, StreamWorkerConfig, StreamWorkerPipeline,
+    best_move, principal_variation, root_settled, root_stats, SearchGeneration, SearchLimits,
+    Stats, SearchConfig, Search,
 };
 use engin::SearchBase;
-use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
+use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
 const DEFAULT_PLAYOUTS: u64 = 128;
 const ROOT_TOP: usize = 8;
 
-/// CLI parsing is intentionally local to this diagnostic binary. The search
-/// contract is defined by `search::stream`, not by an additional UCI option.
 struct Args {
-    onnx: PathBuf,
+    onnx: Option<PathBuf>,
     fen: String,
     playouts: u64,
     stream_movetime: Option<Duration>,
+    skip_classic: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut onnx = PathBuf::from("data/x7.onnx");
+    let mut onnx = None;
     let mut fen = STARTPOS_FEN.to_owned();
     let mut playouts = DEFAULT_PLAYOUTS;
     let mut stream_movetime = None;
+    let mut skip_classic = false;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--onnx" => onnx = PathBuf::from(args.next().ok_or("--onnx requires a path")?),
+            "--onnx" => onnx = Some(PathBuf::from(args.next().ok_or("--onnx requires a path")?)),
+            "--uniform" => onnx = None,
             "--fen" => fen = args.next().ok_or("--fen requires a quoted FEN")?,
             "--playouts" => {
                 playouts = args
@@ -60,9 +58,10 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| "--movetime-ms must be an unsigned integer")?;
                 stream_movetime = Some(Duration::from_millis(millis));
             }
+            "--skip-classic" => skip_classic = true,
             "--help" | "-h" => {
                 return Err(
-                    "usage: stream_compare [--onnx data/x7.onnx] [--playouts 128] [--movetime-ms 30000] [--fen \"...\"]"
+                    "usage: stream_compare [--onnx data/x7.onnx | --uniform] [--playouts 128] [--movetime-ms N] [--skip-classic] [--fen \"...\"]"
                         .to_owned(),
                 );
             }
@@ -77,69 +76,42 @@ fn parse_args() -> Result<Args, String> {
         fen,
         playouts,
         stream_movetime,
+        skip_classic,
     })
 }
 
-/// LC3 stream roots retain completed node statistics while in-flight visits
-/// live on edges. This output samples the stable root view only.
-fn print_root(label: &str, stats: StreamStats, root: &engin::search::stream::StreamNode) -> bool {
-    let mut edges = root.edges().to_vec();
-    edges.sort_unstable_by(|left, right| {
-        right
-            .completed_visits()
-            .cmp(&left.completed_visits())
-            .then_with(|| right.prior().partial_cmp(&left.prior()).unwrap_or(Ordering::Equal))
-            .then_with(|| left.mv().to_uci().cmp(&right.mv().to_uci()))
-    });
-    let root_settled = edges.iter().all(|edge| edge.visits() == edge.completed_visits());
-    println!(
-        "{label}: completed={} collisions={} network_batches={} network_evaluations={} root_N={} root_Q={:.5} root_D={:.5} root_settled={root_settled}",
-        stats.completed_playouts,
-        stats.collisions,
-        stats.network_batches,
-        stats.network_evaluations,
-        root.completed_visits(),
-        root.q(),
-        root.draw(),
-    );
-    for edge in edges.iter().take(ROOT_TOP) {
-        println!(
-            "  {} N={}/{} Q={:.5} P={:.5}",
-            edge.mv().to_uci(),
-            edge.completed_visits(),
-            edge.visits(),
-            edge.q(),
-            edge.prior(),
-        );
+fn load_backend(onnx: &Option<PathBuf>) -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
+    match onnx {
+        Some(path) => {
+            let backend = OnnxBackend::from_file(path)?;
+            println!("provider={}", backend.provider().name());
+            Ok(Arc::new(CachingBackend::new(Box::new(backend))))
+        }
+        None => {
+            println!("provider=uniform");
+            Ok(Arc::new(UniformBackend::default()))
+        }
     }
-    root_settled
 }
 
-/// Each search gets an independent cache so the comparison observes its own
-/// batch lifecycle rather than cross-run cache hits.
-fn load_backend(path: &PathBuf) -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
-    let backend = OnnxBackend::from_file(path)?;
-    println!("provider={}", backend.provider().name());
-    Ok(Arc::new(CachingBackend::new(Box::new(backend))))
-}
-
-/// Classic and stream use different scheduling and node storage, so this
-/// prints their stable root-level interpretation rather than requiring exact
-/// visit-by-visit equality.
-fn print_classic_root(stats: &engin::search::classic::ClassicRootStats) -> bool {
+fn print_classic_root(stats: &ClassicRootStats, best: Move) -> bool {
     let mut edges = stats.edges.clone();
     edges.sort_unstable_by(|left, right| {
         right
             .completed_visits
             .cmp(&left.completed_visits)
+            .then_with(|| right.q.partial_cmp(&left.q).unwrap_or(Ordering::Equal))
             .then_with(|| right.prior.partial_cmp(&left.prior).unwrap_or(Ordering::Equal))
             .then_with(|| left.mv.to_uci().cmp(&right.mv.to_uci()))
     });
     let root_settled =
         stats.in_flight_visits == 0 && edges.iter().all(|edge| edge.started_visits == edge.completed_visits);
     println!(
-        "classic: root_N={} root_Q={:.5} root_D={:.5} root_settled={root_settled}",
-        stats.completed_visits, stats.q, stats.draw,
+        "classic: bestmove={} root_N={} root_Q={:.5} root_D={:.5} root_settled={root_settled}",
+        best.to_uci(),
+        stats.completed_visits,
+        stats.q,
+        stats.draw,
     );
     for edge in edges.iter().take(ROOT_TOP) {
         println!(
@@ -154,96 +126,176 @@ fn print_classic_root(stats: &engin::search::classic::ClassicRootStats) -> bool 
     root_settled
 }
 
-/// Reference execution: serial `Gather -> Eval -> Backprop` versus persistent
-/// LC3-style workers. This is not a classic-vs-stream strength comparison.
+struct RootReport {
+    settled: bool,
+    best: Option<Move>,
+    legal: BTreeSet<String>,
+}
+
+fn print_root(
+    label: &str,
+    stats: Stats,
+    repository: &engin::search::stream::NodeRepository,
+    root_key: engin::search::stream::NodeKey,
+    root_is_black: bool,
+) -> Result<RootReport, Box<dyn std::error::Error>> {
+    let root = root_stats(repository, root_key).ok_or("missing stream root stats")?;
+    let mut edges = root.edges.clone();
+    edges.sort_unstable_by(|left, right| {
+        right
+            .completed_visits
+            .cmp(&left.completed_visits)
+            .then_with(|| right.q.partial_cmp(&left.q).unwrap_or(Ordering::Equal))
+            .then_with(|| right.prior.partial_cmp(&left.prior).unwrap_or(Ordering::Equal))
+            .then_with(|| left.mv.to_uci().cmp(&right.mv.to_uci()))
+    });
+    let settled = root_settled(repository, root_key);
+    let best = best_move(repository, root_key, root_is_black);
+    let pv = principal_variation(repository, root_key, root_is_black);
+    let legal: BTreeSet<String> = edges.iter().map(|edge| edge.mv.to_uci()).collect();
+    println!(
+        "{label}: completed={} collisions={} network_batches={} network_evaluations={} root_N={} root_Q={:.5} root_D={:.5} root_settled={settled}",
+        stats.completed_playouts,
+        stats.collisions,
+        stats.network_batches,
+        stats.network_evaluations,
+        root.completed_visits,
+        root.q,
+        root.draw,
+    );
+    println!(
+        "{label}_bestmove={} pv={}",
+        best.map(|mv| mv.to_uci()).unwrap_or_else(|| "-".into()),
+        pv.iter().map(|mv| mv.to_uci()).collect::<Vec<_>>().join(" "),
+    );
+    for edge in edges.iter().take(ROOT_TOP) {
+        println!(
+            "  {} N={}/{} Q={:.5} P={:.5}",
+            edge.mv.to_uci(),
+            edge.completed_visits,
+            edge.started_visits,
+            edge.q,
+            edge.prior,
+        );
+    }
+    Ok(RootReport {
+        settled,
+        best,
+        legal,
+    })
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args().map_err(std::io::Error::other)?;
     let state = GameState::from_fen_moves(&args.fen, &[] as &[&str])?;
     let history = Arc::new(PositionHistory::from_positions(state.positions()));
     let legal_moves = history.last().board().generate_legal_moves();
+    let board_legal: BTreeSet<String> = legal_moves.iter().map(|mv| mv.to_uci()).collect();
 
-    println!("onnx={}", args.onnx.display());
-    println!("fen={}", args.fen);
+    println!(
+        "backend={} fen={}",
+        args.onnx
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "uniform".into()),
+        args.fen
+    );
     println!("requested_playouts={} legal_moves={}", args.playouts, legal_moves.len());
 
-    let mut classic = ClassicSearch::new(Box::new(CachingBackend::new(Box::new(OnnxBackend::from_file(
-        &args.onnx,
-    )?))));
-    classic.set_position(&state)?;
-    let (classic_best, classic_visits) = classic.run_blocking_nodes(args.playouts as u32);
-    let classic_root = classic.root_stats_snapshot();
-    println!(
-        "classic_bestmove={} returned_visits={classic_visits}",
-        classic_best.to_uci()
-    );
-    let classic_settled = print_classic_root(&classic_root);
-    drop(classic);
+    let mut comparison_playouts = args.playouts;
+    let mut classic_best = None;
+    let mut classic_legal = BTreeSet::new();
+    let mut classic_settled = true;
 
-    // Classic's fixed-node stopper can complete a final already-submitted
-    // minibatch after the requested limit. Compare stream against the classic
-    // root's actual completed N, while reporting the original request above.
-    let comparison_playouts = u64::from(classic_root.completed_visits);
+    if !args.skip_classic {
+        let classic_boxed: Box<dyn Backend> = match &args.onnx {
+            Some(path) => Box::new(CachingBackend::new(Box::new(OnnxBackend::from_file(path)?))),
+            None => Box::new(UniformBackend::default()),
+        };
+        let mut classic = ClassicSearch::new(classic_boxed);
+        classic.set_position(&state)?;
+        let started = Instant::now();
+        let (best, classic_visits) = classic.run_blocking_nodes(args.playouts as u32);
+        let classic_root = classic.root_stats_snapshot();
+        println!(
+            "classic_elapsed_ms={} returned_visits={classic_visits}",
+            started.elapsed().as_millis()
+        );
+        classic_settled = print_classic_root(&classic_root, best);
+        classic_best = Some(best);
+        classic_legal = classic_root.edges.iter().map(|edge| edge.mv.to_uci()).collect();
+        comparison_playouts = u64::from(classic_root.completed_visits);
+        println!(
+            "classic_budget_delta={}",
+            i64::from(classic_root.completed_visits) - args.playouts as i64
+        );
+        drop(classic);
+    }
+
     println!("stream_comparison_playouts={comparison_playouts}");
 
-    let serial_backend = load_backend(&args.onnx)?;
-    let root_eval = serial_backend.evaluate(&history, &legal_moves);
-    println!(
-        "root_network: W={:.5} D={:.5} L={:.5} Q={:.5}",
-        (root_eval.wl + 1.0 - root_eval.d) * 0.5,
-        root_eval.d,
-        (1.0 - root_eval.d - root_eval.wl) * 0.5,
-        root_eval.wl,
-    );
-    let mut serial = StreamSearch::new(serial_backend, SearchGeneration(1), Arc::clone(&history), 1.0);
-    let serial_stats = serial.run_playouts(comparison_playouts)?;
-    let serial_root = serial.repository().get(serial.root_key()).expect("serial root exists");
-    let serial_settled = print_root("serial", serial_stats, &serial_root);
-
-    let worker_backend = load_backend(&args.onnx)?;
-    let mut workers = StreamWorkerPipeline::new(
-        worker_backend,
+    let root_is_black = history.is_black_to_move();
+    let stream_backend = load_backend(&args.onnx)?;
+    let mut search = Search::new(
+        stream_backend,
         SearchGeneration(1),
         history,
-        StreamWorkerConfig::default(),
+        SearchConfig::default(),
     );
-    let (worker_stats, worker_budget_satisfied) = match args.stream_movetime {
+    let stream_started = Instant::now();
+    let (stream_stats, stream_budget_satisfied) = match args.stream_movetime {
         Some(movetime) => {
-            let start = Instant::now();
-            let stats = workers.run_with_limits(StreamSearchLimits {
+            let stats = search.run_with_limits(SearchLimits {
                 max_playouts: None,
-                deadline: Some(start + movetime),
+                deadline: Some(stream_started + movetime),
             })?;
             println!(
                 "stream_movetime_ms={} elapsed_ms={} completed_playouts={}",
                 movetime.as_millis(),
-                start.elapsed().as_millis(),
+                stream_started.elapsed().as_millis(),
                 stats.completed_playouts,
             );
             (stats, stats.completed_playouts > 0)
         }
         None => {
-            let stats = workers.run_playouts(comparison_playouts)?;
+            let stats = search.run_playouts(comparison_playouts)?;
+            println!("stream_elapsed_ms={}", stream_started.elapsed().as_millis());
             (stats, stats.completed_playouts == comparison_playouts)
         }
     };
-    let worker_root = workers
-        .repository()
-        .get(workers.root_key())
-        .expect("worker root exists");
-    let worker_settled = print_root("workers", worker_stats, &worker_root);
-    workers.stop_and_join();
+    let stream_report = print_root(
+        "stream",
+        stream_stats,
+        search.repository(),
+        search.root_key(),
+        root_is_black,
+    )?;
+    let stream_settled = stream_report.settled;
+    let stream_best = stream_report.best;
+    let stream_legal = stream_report.legal;
+    search.stop_and_join();
 
-    let stream_passed = serial_stats.completed_playouts == comparison_playouts
-        && worker_budget_satisfied
+    let legal_ok = stream_legal == board_legal
+        && (args.skip_classic || classic_legal.len() == board_legal.len());
+    let bestmove_ok = stream_best.is_some() && (args.skip_classic || classic_best.is_some());
+
+    if let (Some(classic), Some(stream)) = (classic_best, stream_best) {
+        println!(
+            "bestmove_compare classic={} stream={} classic_eq_stream={}",
+            classic.to_uci(),
+            stream.to_uci(),
+            classic == stream,
+        );
+    }
+
+    let passed = stream_budget_satisfied
         && classic_settled
-        && serial_settled
-        && worker_settled;
-    println!(
-        "classic_budget_delta={}",
-        i64::from(classic_root.completed_visits) - args.playouts as i64
-    );
-    println!("stream_pipeline={}", if stream_passed { "PASS" } else { "FAIL" });
-    if stream_passed {
+        && stream_settled
+        && legal_ok
+        && bestmove_ok;
+    println!("legal_moves_match={legal_ok}");
+    println!("stream_compare={}", if passed { "PASS" } else { "FAIL" });
+    if passed {
         Ok(())
     } else {
         Err("stream comparison invariant failed".into())
