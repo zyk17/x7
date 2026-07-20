@@ -387,16 +387,12 @@ fn process_gather_event(shared: &SharedPipeline, mut event: NodeEvent) {
                 }
             }
             ExpansionState::Evaluating => {
-                shared.cancel_and_finish(event, true);
+                shared.send_backprop(BackpropEvent::collision(event));
                 return;
             }
             ExpansionState::Terminal => {
                 let (value, draw) = node.terminal_value().expect("terminal stream value");
-                shared.send_backprop(BackpropEvent {
-                    node: event,
-                    value,
-                    draw,
-                });
+                shared.send_backprop(BackpropEvent::evaluation(event, value, draw));
                 return;
             }
             ExpansionState::Expanded => {
@@ -485,11 +481,7 @@ fn process_eval_events(shared: &SharedPipeline, events: Vec<NodeEvent>) -> Resul
             result => {
                 let (value, draw) = terminal_value_for_side_to_move(result, history.last().is_black_to_move());
                 node.mark_terminal(value, draw);
-                shared.send_backprop(BackpropEvent {
-                    node: event,
-                    value,
-                    draw,
-                });
+                shared.send_backprop(BackpropEvent::evaluation(event, value, draw));
             }
         }
     }
@@ -528,11 +520,7 @@ fn process_eval_events(shared: &SharedPipeline, events: Vec<NodeEvent>) -> Resul
                 .zip(eval.policies.iter().copied())
                 .collect(),
         );
-        shared.send_backprop(BackpropEvent {
-            node: item.event,
-            value: eval.wl,
-            draw: eval.d,
-        });
+        shared.send_backprop(BackpropEvent::evaluation(item.event, eval.wl, eval.d));
     }
     Ok(())
 }
@@ -568,8 +556,14 @@ fn backprop_worker(shared: Arc<SharedPipeline>, receiver: Receiver<BackpropEvent
                     event.cancel();
                     shared.finish(false);
                 } else {
-                    event.complete(&shared.repository);
-                    shared.finish(true);
+                    let result = event.complete(&shared.repository);
+                    for _ in 0..result.completed_playouts {
+                        shared.finish(true);
+                    }
+                    for _ in 0..result.collisions {
+                        shared.collisions.fetch_add(1, Ordering::AcqRel);
+                        shared.finish(false);
+                    }
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,

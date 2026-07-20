@@ -214,16 +214,11 @@ impl StreamPipeline {
                 }
             }
             ExpansionState::Evaluating => {
-                event.cancel();
-                self.stats.collisions += 1;
+                self.forward_backprop(BackpropEvent::collision(event))?;
             }
             ExpansionState::Terminal => {
                 let (value, draw) = node.terminal_value().expect("terminal stream value");
-                self.forward_backprop(BackpropEvent {
-                    node: event,
-                    value,
-                    draw,
-                })?;
+                self.forward_backprop(BackpropEvent::evaluation(event, value, draw))?;
             }
             ExpansionState::Expanded => {
                 let edges = node.edges();
@@ -274,11 +269,7 @@ impl StreamPipeline {
                 result => {
                     let (value, draw) = terminal_value_for_side_to_move(result, history.last().is_black_to_move());
                     node.mark_terminal(value, draw);
-                    self.forward_backprop(BackpropEvent {
-                        node: event,
-                        value,
-                        draw,
-                    })?;
+                    self.forward_backprop(BackpropEvent::evaluation(event, value, draw))?;
                 }
             }
         }
@@ -321,11 +312,7 @@ impl StreamPipeline {
             }
             let legal_moves = event.variation.replay_history().last().board().generate_legal_moves();
             node.publish_edges(legal_moves.into_iter().zip(eval.policies.iter().copied()).collect());
-            self.forward_backprop(BackpropEvent {
-                node: event,
-                value: eval.wl,
-                draw: eval.d,
-            })?;
+            self.forward_backprop(BackpropEvent::evaluation(event, eval.wl, eval.d))?;
         }
         Ok(true)
     }
@@ -333,8 +320,9 @@ impl StreamPipeline {
     fn process_backprop(&mut self) -> bool {
         let mut progressed = false;
         while let Ok(event) = self.backprop_rx.try_recv() {
-            event.complete(&self.repository);
-            self.stats.completed_playouts += 1;
+            let result = event.complete(&self.repository);
+            self.stats.completed_playouts += u64::from(result.completed_playouts);
+            self.stats.collisions += u64::from(result.collisions);
             progressed = true;
         }
         progressed

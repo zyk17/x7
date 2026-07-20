@@ -34,11 +34,14 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
 
 ### S1：Gather -> Eval -> Backprop 串行语义
 
-1. 已定义 LC3 policy 子集：edge selection、collision、`ValueDelta`、edge/node update；参考 LC3 Policy 的
-   `GetNumEdgesToFetch`、`DistributeVisits`、`NodeEventToValueDelta`、`MergeNodeUpdates` 标题。
+1. LC3 Policy 文档定义了 `GetNumEdgesToFetch`、`DistributeVisits`、`ValueDelta`、
+   `NodeEventToValueDelta`、`MergeNodeUpdates` 等职责，但**没有公开选择公式、edge visit 分配规则或
+   moves-left backup 公式**。现有最小 selection 仅用于驱动 pipeline 结构测试，不是可作为正式棋力语义的
+   LC3 翻译；不得据此接入 UCI 或继续调参。
 2. 已在单线程上实现 owned event 的 Gather、合法着/Eval、terminal 和 Backprop。失败 Eval 会撤销 reservation 并
    将 node 从 `Evaluating` 恢复为 `Unexpanded`。
-3. 下一步为固定 visits 结构对拍：root edge `N/Q/P`、PV、bestmove，并补 terminal、two-fold、rule60、stop。
+3. 下一步为 LC3 已定义的不变量回归：root edge `N/Q/P`、terminal、two-fold、rule60、stop 与所有
+   reservation 回收。PV、bestmove 和 moves-left 不属于可从公开 LC3 文档推导的范围。
 
 门槛：`NInFlight==0` 等价物为所有 edge `started == completed`；不接 UCI。
 
@@ -62,11 +65,16 @@ classic 的 P4 T3 要求将 px0 `RunTasks()` 的共享 mutable `NodeTree` 翻译
 7. `stream_compare --movetime-ms 30000` 已在 `data/x7.onnx` / DirectML 下运行：30.012 秒内完成
    292,409 playout、11,935 个 NN batch，deadline 后根无 in-flight。该工具不走 UCI，只证明常驻 pipeline
    的长期推进与收敛。
-8. 下一项是 PV/final move policy 与 Watchdog/UCI。LC3 Policy 文档把“search finished 后走哪步”明确列为
-   TBD，不能未经决策直接复用 classic 的 best-child 规则后宣称这是 LC3；这些明确后才切换 UCI。
+8. **明确缺口**：LC3 Policy 文档把“search finished 后走哪步”标为 TBD，且没有公开 final move、PV、
+   moves-left backup、terminal tie-break 或 MultiPV 的语义。stream 不得从 px0 classic 借用这些规则，也不得
+   自行定义替代策略。
+9. stream 目前只能提供 `root_stats()` 诊断快照；不得接入 UCI `info pv` 或 `bestmove`。UCI 切换的前置条件是
+   LC3 上游公开该 policy，或项目单独批准一份 X7 stream output policy（含 final move、PV、moves-left、
+   terminal/tie-break 和 MultiPV 语义）。
 
-门槛：真实 ONNX stream 30 秒 deadline 持续推进；完成 final-move/watchdog 设计后再验证
-`position -> go -> stop -> position -> go` 无旧 generation 更新、无 reservation 泄漏、恰好一次 bestmove。
+门槛：真实 ONNX stream 30 秒 deadline 持续推进；若要接 UCI，必须先取得 LC3 上游或项目批准的 output
+policy，再验证 `position -> go -> stop -> position -> go` 无旧 generation 更新、无 reservation 泄漏、恰好一次
+bestmove。
 
 ## NN：x7 v2 固定 trunk
 

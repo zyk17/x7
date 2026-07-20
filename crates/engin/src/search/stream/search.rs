@@ -99,19 +99,14 @@ impl StreamSearch {
                     return self.evaluate_and_backprop(node.as_ref(), event);
                 }
                 ExpansionState::Evaluating => {
-                    event.cancel();
-                    self.stats.collisions += 1;
+                    let result = BackpropEvent::collision(event).complete(&self.repository);
+                    self.stats.collisions += u64::from(result.collisions);
                     return Ok(StreamOutcome::Collision);
                 }
                 ExpansionState::Terminal => {
                     let (value, draw) = node.terminal_value().expect("terminal stream value");
-                    BackpropEvent {
-                        node: event,
-                        value,
-                        draw,
-                    }
-                    .complete(&self.repository);
-                    self.stats.completed_playouts += 1;
+                    let result = BackpropEvent::evaluation(event, value, draw).complete(&self.repository);
+                    self.stats.completed_playouts += u64::from(result.completed_playouts);
                     return Ok(StreamOutcome::Completed);
                 }
                 ExpansionState::Expanded => {
@@ -142,25 +137,16 @@ impl StreamSearch {
                     return Err(EnginError::PortIncomplete("stream backend policy length"));
                 }
                 node.publish_edges(legal_moves.into_iter().zip(eval.policies.iter().copied()).collect());
-                BackpropEvent {
-                    node: event,
-                    value: eval.wl,
-                    draw: eval.d,
-                }
-                .complete(&self.repository);
+                let result = BackpropEvent::evaluation(event, eval.wl, eval.d).complete(&self.repository);
+                self.stats.completed_playouts += u64::from(result.completed_playouts);
             }
             result => {
                 let (value, draw) = terminal_value_for_side_to_move(result, history.last().is_black_to_move());
                 node.mark_terminal(value, draw);
-                BackpropEvent {
-                    node: event,
-                    value,
-                    draw,
-                }
-                .complete(&self.repository);
+                let result = BackpropEvent::evaluation(event, value, draw).complete(&self.repository);
+                self.stats.completed_playouts += u64::from(result.completed_playouts);
             }
         }
-        self.stats.completed_playouts += 1;
         Ok(StreamOutcome::Completed)
     }
 }
