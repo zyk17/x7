@@ -85,7 +85,7 @@ fn parse_args() -> Result<Args, String> {
         ("--evals", &evals),
         ("--backprops", &backprops),
     ] {
-        if values.iter().any(|&v| v == 0) {
+        if values.contains(&0) {
             return Err(format!("{name} entries must be > 0"));
         }
     }
@@ -114,10 +114,12 @@ fn parse_list(text: &str) -> Result<Vec<usize>, String> {
         .collect()
 }
 
+type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
+
 fn make_backend(
     path: &PathBuf,
     cache: bool,
-) -> Result<(Arc<dyn Backend>, &'static str, usize), Box<dyn std::error::Error>> {
+) -> Result<BackendSetup, Box<dyn std::error::Error>> {
     let onnx = OnnxBackend::from_file(path)?;
     let provider = onnx.provider().name();
     let recommended = onnx.attributes().recommended_batch_size;

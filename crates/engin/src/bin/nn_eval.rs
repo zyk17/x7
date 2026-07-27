@@ -61,7 +61,7 @@ fn parse_args() -> Result<Args, String> {
     if top == 0 {
         return Err("--top must be > 0".into());
     }
-    if batches.iter().any(|&b| b == 0) {
+    if batches.contains(&0) {
         return Err("--batch sizes must be > 0".into());
     }
     Ok(Args {

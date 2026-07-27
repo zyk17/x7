@@ -18,13 +18,12 @@ use xiangqi_core::{Move, PositionHistory};
 use crate::neural::backend::{Backend, EvalPosition, EvalResult};
 use crate::neural::onnx::softmax_legal_policy;
 use crate::neural::{encode_position_for_nn, FillEmptyHistory, INPUT_PLANES, BOARD_ROWS, BOARD_COLS, POLICY_SIZE};
-use crate::search::classic::params::SearchParams;
 use crate::EnginError;
 
 use super::extension::{classify_extension, ExtensionKind};
 use super::{
     network_wl_to_node, select_edge_from_node, BackpropEvent, ExpansionState, NodeEvent, NodeKey,
-    NodeRepository, SearchGeneration, Node,
+    NodeRepository, SearchGeneration, SearchParams, Node,
 };
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
@@ -64,8 +63,7 @@ pub struct SearchConfig {
     /// NN GPU merge size when several encoded positions are already queued. `0` →
     /// backend `recommended_batch_size`. Eval does not wait to fill this.
     pub eval_batch_size: usize,
-    /// px0 `CPuct` default is `1.0` (`params.cc:547`).
-    pub cpuct: f32,
+    pub params: SearchParams,
     pub gather_workers: usize,
     /// LC3 EvalWorker count. Prep/cache/legal moves; NN inference is a separate thread.
     pub eval_workers: usize,
@@ -79,7 +77,7 @@ impl Default for SearchConfig {
         Self {
             queue_capacity: 0,
             eval_batch_size: 0,
-            cpuct: 1.0,
+            params: SearchParams::default(),
             gather_workers: 4,
             eval_workers: 2,
             backprop_workers: 1,
@@ -90,10 +88,7 @@ impl Default for SearchConfig {
 
 impl SearchConfig {
     fn validate(&self) {
-        assert!(
-            self.cpuct.is_finite() && self.cpuct >= 0.0,
-            "stream cpuct must be finite and non-negative"
-        );
+        self.params.validate();
         assert!(self.gather_workers > 0, "stream requires at least one gather worker");
         assert!(self.eval_workers > 0, "stream requires at least one eval worker");
         assert!(
@@ -124,7 +119,7 @@ impl SearchConfig {
         ResolvedSearchConfig {
             queue_capacity,
             eval_batch_size,
-            cpuct: self.cpuct,
+            params: self.params,
         }
     }
 }
@@ -133,16 +128,7 @@ impl SearchConfig {
 struct ResolvedSearchConfig {
     queue_capacity: usize,
     eval_batch_size: usize,
-    cpuct: f32,
-}
-
-impl ResolvedSearchConfig {
-    fn search_params(self) -> SearchParams {
-        SearchParams {
-            cpuct: self.cpuct,
-            ..SearchParams::default()
-        }
-    }
+    params: SearchParams,
 }
 
 struct Shared {
@@ -281,7 +267,7 @@ impl Search {
             backend,
             repository: Arc::new(NodeRepository::default()),
             generation,
-            params: resolved.search_params(),
+            params: resolved.params,
             root_move_filter: config.root_move_filter.clone(),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
@@ -548,10 +534,13 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
     }
 }
 
+/// Raw logits[POLICY] plus WDL[3] returned by the NN worker.
+type NnReply = Result<(Vec<f32>, Vec<f32>), EnginError>;
+
 /// One encoded position for the NN thread. Reply is raw logits[POLICY] + WDL[3].
 struct NnRequest {
     planes: Vec<f32>,
-    reply: Sender<Result<(Vec<f32>, Vec<f32>), EnginError>>,
+    reply: Sender<NnReply>,
 }
 
 /// Eval is waiting on NN for this node (LC3: after NN completes → Backprop).
@@ -560,7 +549,7 @@ struct WaitingNn {
     node: Arc<Node>,
     legal_moves: Vec<xiangqi_core::Move>,
     input: EvalPosition,
-    reply: Receiver<Result<(Vec<f32>, Vec<f32>), EnginError>>,
+    reply: Receiver<NnReply>,
 }
 
 /// LC3 EvalWorker:
@@ -667,7 +656,7 @@ fn handle_eval_event(
     let node = shared.repository.get_or_insert(event.node_key);
     let history = event.variation.replay_history();
     let depth = event.variation.moves().len();
-    match classify_extension(&history, depth, shared.params.two_fold_draws) {
+    match classify_extension(&history, depth) {
         ExtensionKind::Terminal {
             wl,
             draw,

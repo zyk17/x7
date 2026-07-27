@@ -22,7 +22,6 @@ pub(crate) enum ExtensionKind {
 pub(crate) fn classify_extension(
     history: &PositionHistory,
     depth: usize,
-    two_fold_draws: bool,
 ) -> ExtensionKind {
     let is_root = depth == 0;
     let board = history.last().board();
@@ -48,8 +47,7 @@ pub(crate) fn classify_extension(
         // px0 `search.cc:1930-1959`: initial repetition may become TwoFold.
         if history.last().repetitions() == 1
             && depth.saturating_sub(1) >= 4
-            && two_fold_draws
-            && u32::from(depth.saturating_sub(1) as u32) >= history.last().cycle_length()
+            && depth.saturating_sub(1) as u32 >= history.last().cycle_length()
         {
             let cycle_length = history.last().cycle_length() as f32;
             let result = history.rule_judge();

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use xiangqi_core::Move;
 
 use super::{Edge, Node};
-use crate::search::classic::params::SearchParams;
-use crate::search::classic::uct::compute_cpuct;
+use super::params::compute_cpuct;
+use super::SearchParams;
 
 /// Compact WDL update used by stream backpropagation.
 ///
@@ -74,14 +74,8 @@ pub fn get_fpu(
     params: &SearchParams,
     parent_wl: f32,
     edges: &[Arc<Edge>],
-    is_root: bool,
 ) -> f32 {
-    let value = params.fpu_value(is_root);
-    if params.fpu_absolute(is_root) {
-        value
-    } else {
-        -parent_wl - value * visited_policy(edges).sqrt()
-    }
+    -parent_wl - params.fpu_reduction * visited_policy(edges).sqrt()
 }
 
 /// Visited-edge Q, or FPU when the edge has no completed visit.
@@ -118,9 +112,9 @@ pub fn select_edge(
     } else {
         0
     };
-    let cpuct = compute_cpuct(params, parent_completed_visits, is_root);
+    let cpuct = compute_cpuct(*params, parent_completed_visits);
     let u_coeff = cpuct * (children_visits.max(1) as f32).sqrt();
-    let fpu = get_fpu(params, parent_wl, edges, is_root);
+    let fpu = get_fpu(params, parent_wl, edges);
     let mut best: Option<(usize, f32)> = None;
     for (index, edge) in edges.iter().enumerate() {
         if !root_filter_allows(is_root, root_move_filter, edge.mv()) {
@@ -158,8 +152,7 @@ mod tests {
     use xiangqi_core::{Move, Square};
 
     use super::{edge_utility, select_edge, ValueDelta};
-    use crate::search::classic::params::SearchParams;
-    use crate::search::stream::{NodeKey, NodeRepository};
+    use crate::search::stream::{NodeKey, NodeRepository, SearchParams};
 
     fn mv(from: &str, to: &str) -> Move {
         Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))

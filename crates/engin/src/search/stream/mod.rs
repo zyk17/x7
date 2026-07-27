@@ -13,12 +13,14 @@ use xiangqi_core::GameResult;
 
 mod event;
 mod extension;
+mod params;
 mod policy;
 mod repository;
 mod search;
 mod stats;
 
 pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
+pub use params::SearchParams;
 pub use policy::{select_edge, select_edge_from_node, ValueDelta};
 pub use repository::{EdgeReservation, ExpansionState, NodeKey, NodeRepository, Edge, Node};
 pub use search::{Search, SearchConfig, SearchLimits, Stats};

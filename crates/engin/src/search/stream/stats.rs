@@ -249,10 +249,7 @@ pub fn principal_variation_filtered(
     let mut pv = Vec::new();
     let mut key = root_key;
     let mut flip = root_is_black;
-    loop {
-        let Some(node) = repository.get(key) else {
-            break;
-        };
+    while let Some(node) = repository.get(key) {
         if node.completed_visits() == 0 {
             break;
         }
