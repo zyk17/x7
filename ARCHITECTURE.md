@@ -1,61 +1,48 @@
 # ARCHITECTURE
 
-## 当前目标
+## 目标与参考
 
-这是一次 Rust 版 px0 的逐函数翻译，不是对旧实现做兼容或修补。
+这是 px0 的 Rust 重写，不是兼容层。规则、classic 搜索和网络外围按 px0 逐函数对照；stream 只按 LC3 的公开架构文档实现等价设计，不能标称为源码翻译。
 
-翻译顺序固定为：
+- px0：`C:\Users\Administrator\projects\px0`
+- 训练参考：`C:\Users\Administrator\projects\pxzero-training`
+- stream 参考：[LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/)
 
-1. `xiangqi_core`：px0 `src/chess` 的棋盘、合法着、FEN、Position、PositionHistory、RuleJudge。
-2. `engin` 外围：`GameState`、UCI controller/loop、`SearchBase` 与 px0
-   `NetworkAsBackendComputation`。P4 的真实 history、124-plane 编码、policy 映射、ONNX batch 和
-   `WeightsFile -> OnnxBackend` 子集已接入。
-3. `engin/mcts`：px0 `src/search` 的 classic worker 主线；minibatch、collision、prefetch、tree reuse 与
-   watchdog 已接线。task 已有 owned leaf path/history/workspace/result 的安全边界，owner 在
-   `WaitForTasks` 后独占写 tree 和提交 backend；当前 task queue 仍由 owner 同步 drain，常驻并行
-   task-worker 是 P4 的下一项逐段翻译任务。旧 scoped raw-pointer bridge 已删除。
-4. prefetch、tree reuse、并发与真实 ONNX 的 px0 `MemCache` wrapper 已接线。缓存通用容器采用
-   `quick_cache` 分片 S3-FIFO，value 以 `Arc<EvalResult>` 共享；px0 的 key/collision guard/completed-only
-   回填时序不变，但淘汰策略不是严格 FIFO。后续改动只能在明确引用的 px0 语义上继续。
-5. `pxzero-training`：数据、训练与 ONNX 导出契约。
+## 模块
 
-## Stream 搜索（进行中）
+| 模块 | 职责 | 当前状态 |
+| --- | --- | --- |
+| `crates/xiangqi_core` | 唯一规则真相：棋盘、合法着、FEN、Position、history、RuleJudge | 已完成 |
+| `crates/engin/src/search/classic` | 当前正式 MCTS 与 UCI 行为基线 | 稳定维护，不再推进共享树 TaskWorkers |
+| `crates/engin/src/search/stream` | LC3-style streaming tree MCTS | 正在迁移，暂不接 UCI |
+| `crates/engin/src/neural` | 124-plane 编码、policy 映射、ONNX、缓存 | classic 与 stream 共用 backend 契约 |
+| `nn/` | px0 record、训练、checkpoint、ONNX 导出 | 独立 Python 子项目 |
 
-`crates/engin/src/search/stream` 是独立于 `classic` 的新搜索实现。主线入口是
-`search/stream/search.rs` 的 `Search`（常驻 Gather/Eval/Backprop）。它采用 LC3 文档描述的
-streaming MCTS **形态**：sharded node repository、edge-local in-flight、owned `NodeEvent`。
-第一版只使用 parent-key + move 的**树 key**，不合并成 DAG。协作式单线程 `pipeline` 已删除。
+## Classic
 
-**现状边界**：库内可搜、可对拍；selection/bestmove 走项目批准的 X7↔classic 对照，不是正式 LC3
-policy。每次搜索新建空 repository，**无 tree reuse / 无剪枝**；正式 UCI 仍只接 classic。
+classic 是当前正式 UCI 路径。已具备 `CachingBackend`、ONNX batch、collision、prefetch、tree reuse、WDL/info、watchdog、legacy 时控和 `Abort + Wait` 会话边界。正式 UCI 只能在 `WeightsFile` 成功加载后搜索，`UniformBackend` 仅用于测试。
 
-参考只限 LC3 官方设计文档（无本地 LC3 源码，禁止标称逐行翻译）：
+classic 的 `TaskWorkers` 共享可变 `NodeTree` 模型不继续迁移：它依赖 px0 C++ 的别名约定，不能在不引入 `unsafe`、raw pointer 或整树锁的条件下安全等价实现。classic 不得再引入此类并发补丁。
 
-- <https://lczero.org/dev/lc0/search/lc3/overview/>
-- <https://lczero.org/dev/lc0/search/lc3/policy/>
-- <https://lczero.org/dev/lc0/search/lc3/glossary/>
+## Stream
 
-只有 px0 主线翻译完成并有对拍测试后，才允许比较 lc0 或 KataGo，并将明确记录的差异作为独立优化事项。
+stream 与 classic 隔离，不复用 classic tree、worker 或 replay/snapshot delta。
 
-## 模块边界
+- repository 使用分片 map 和 `parent-key + move` 的 tree key；首版不做 DAG/TT。
+- 事件拥有完整 root history、variation、generation 和 edge reservation。
+- worker 拓扑为 Gather×4、Eval×2、NN×1、Backprop×1。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
+- `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现。
+- 当前没有 tree reuse/prune、UCI/watchdog/info、MultiPV、multivisit 或 NN `m` 聚合；`draw_score` 固定为零，不做 contempt。
 
-`crates/xiangqi_core`：px0 `src/chess` 的 Rust 翻译，是唯一规则真相。
+stream 的 selection 与 bestmove 暂以项目批准的 X7↔classic 对照为准，不是 LC3 Policy 的正式公式。
 
-`crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。P2 UCI、P3 tree 与 P4 的 ONNX、MemCache、collision、prefetch、owner tree phase、watchdog、WDL display 已接入。task 仅持有输入/workspace/result，主 worker 在 `WaitForTasks` 后写 tree 和提交 backend；当前 task queue 的执行仍是 owner 同步 drain，常驻 processing task-worker 尚待逐段翻译。这替代了已删除、会在真实 ONNX 长 `go movetime` 停顿的 scoped raw-pointer bridge。gathering 仍在 owner 的 tree phase 执行。`WeightsFile` 保持 px0 的 UCI 名称，但只接受本项目 ONNX 模型，不实现 px0 的 backend registry、protobuf weight 或 autodiscover。P4 的 `SendUciInfo` 已生成深度、NPS/EPS、WDL、PV、MultiPV、ScoreType 与完整 WDL calibration display 语义。`ClassicEngine` 保持 px0 的会话边界：每个新 `go`、`position`、`ucinewgame` 都先回收旧搜索；`setoption` 只更新下一次 `go` 的参数快照，不中断当前搜索（`src/engine.cc:148-224`、`src/search/classic/wrapper.cc:100-140`）。
+## 模型
 
-未完成对应 px0 stopper 或生命周期的 UCI 命令不得伪装支持：`nodes`、`movetime`、`infinite` 与
-px0 factory 默认 legacy 时钟字段可启动搜索。`depth/mate` 仍等待完整 stopper 翻译，
-`ponder/ponderhit` 仍等待 `engine.cc` 的 Ponder option/重设局面链路；`simple/smooth/alphazero`
-时间管理器不暴露。
+正式契约固定为 `124x10x9 -> 2062 + WDL`。x7 v2 基准为 `width=256`、`blocks=12`、`bottleneck_channels=112`，带两次 Global Broadcast；训练、续训和导出严格校验 checkpoint 元数据，避免模型尺寸漂移。
 
-`nn/`：pxzero-training 的 `dataset / model / training` 配置布局为参考的独立 Python 训练子项目；训练从单一 YAML 启动，固定 `124x10x9 -> 2062 + WDL` 的纯 CNN 契约。x7 v2 trunk 是 `3x3 stem + PreAct bottleneck + 两次 Global Broadcast` 的结构族；当前基准为 width=256、12 个 bottleneck（`BN/SiLU -> 1x1 256->112 -> 3x3 112->112 -> 3x3 112->112 -> 1x1 112->256 + identity`），并在三个 trunk stage 之间加入独立 Global Broadcast：`BN/SiLU -> 3x3 -> mean/max -> Linear -> x + bias`。YAML 可以试验其他正偶数 width 与不少于 3 个 blocks；恢复/初始化只接受尺寸与 checkpoint 元数据完全一致的 v2 权重。policy 保留 spatial 输出并注入 mean/max global bias；WDL 与 moves-left 共享 global readout：`1x1 conv -> mean/max pool -> FC` 后分为两个线性输出，不再展平 90 个格点。训练主线使用无权重的 policy CE、qMix WDL CE 和 pxzero 语义的 raw-plies Huber moves-left loss；学习率采用 YAML 分段计划，不使用隐藏的全程 cosine 衰减。训练 stream 使用有界 record shuffle，验证集保留文件级 10% 切分，并固定为持久化的 record-level material-stratified sample manifest，避免相邻局面相关性和每次只读取排序文件前缀；不进入规则或搜索热路径。
+## 纪律
 
-`model.bottleneck_channels` 是 YAML 的正式模型尺寸参数；省略时保持历史默认值 `width * 7 // 16`，当前
-`width=256` 对应 `112`。该值与 width/blocks 一样写入 checkpoint，并在续训、初始化和 ONNX 导出时严格校验。
-
-## 翻译纪律
-
-- 每个 Rust 函数必须标明 px0 文件与连续行区间。
-- 没有 px0 对照位置，不实现。
-- 旧 Rust 代码不得作为参考或兼容目标。
-- 规则测试优先移植 px0 `board_test.cc` 与 `position_test.cc`，搜索测试优先使用同 FEN、同 budget 的 px0 trace。
+- px0 路径的新 Rust 函数必须记录连续 px0 参考区间；stream 新函数记录 LC3 URL 与对应标题。
+- 找不到参考语义时记录缺口，不自行添加搜索启发式。
+- `position ... moves ...` 必须保留完整历史。
+- stream 接 UCI 前，必须验证 `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏且恰好一次 `bestmove`。
