@@ -1,4 +1,4 @@
-//! Sweep Gather × Eval × Backprop for search NPS / collisions.
+//! Sweep Gather × Eval × Backprop for search throughput and collisions.
 //!
 //! Topology: independent NN thread (ONNX only). Eval does terminal/cache/encode;
 //! NN merges queued tensors up to `--eval-batch`. Default workers: 4/2/1.
@@ -6,22 +6,25 @@
 //!
 //! ```text
 //! cargo run -p engin --release --bin feed_bench -- --cache --playouts 20000
+//! cargo run -p engin --release --bin feed_bench -- --movetime 3000 --repeat 3
 //! cargo run -p engin --release --bin feed_bench -- --gathers 4,8 --evals 1,2 --backprops 1,2 --cache
 //! ```
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use engin::neural::backend::{Backend, CachingBackend};
 use engin::neural::onnx::OnnxBackend;
-use engin::search::{Search, SearchConfig, SearchGeneration};
+use engin::search::{root_stats, QueueStats, Search, SearchConfig, SearchGeneration, SearchLimits, Stats};
 use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
 struct Args {
     onnx: PathBuf,
     fen: String,
-    playouts: u64,
+    playouts: Option<u64>,
+    movetime: Option<u64>,
+    repeat: usize,
     gathers: Vec<usize>,
     evals: Vec<usize>,
     backprops: Vec<usize>,
@@ -30,14 +33,16 @@ struct Args {
 }
 
 fn usage() -> &'static str {
-    "usage: feed_bench [--onnx data/x7.onnx] [--fen \"...\"] [--playouts 20000] \
-     [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache]"
+    "usage: feed_bench [--onnx data/x7.onnx] [--fen \"...\"] [--playouts 20000 | --movetime 3000] \
+     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache]"
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut onnx = PathBuf::from("data/x7.onnx");
     let mut fen = STARTPOS_FEN.to_owned();
-    let mut playouts = 20_000;
+    let mut playouts = Some(20_000);
+    let mut movetime = None;
+    let mut repeat = 1;
     let mut gathers = vec![4, 8];
     let mut evals = vec![1, 2];
     let mut backprops = vec![1, 2];
@@ -49,11 +54,29 @@ fn parse_args() -> Result<Args, String> {
             "--onnx" => onnx = PathBuf::from(args.next().ok_or("--onnx requires a path")?),
             "--fen" => fen = args.next().ok_or("--fen requires a quoted FEN")?,
             "--playouts" => {
-                playouts = args
+                playouts = Some(
+                    args.next()
+                        .ok_or("--playouts requires an integer")?
+                        .parse()
+                        .map_err(|_| "--playouts must be an unsigned integer")?,
+                );
+                movetime = None;
+            }
+            "--movetime" => {
+                movetime = Some(
+                    args.next()
+                        .ok_or("--movetime requires milliseconds")?
+                        .parse()
+                        .map_err(|_| "--movetime must be an unsigned integer")?,
+                );
+                playouts = None;
+            }
+            "--repeat" => {
+                repeat = args
                     .next()
-                    .ok_or("--playouts requires an integer")?
+                    .ok_or("--repeat requires an integer")?
                     .parse()
-                    .map_err(|_| "--playouts must be an unsigned integer")?;
+                    .map_err(|_| "--repeat must be an unsigned integer")?;
             }
             "--gathers" => {
                 gathers = parse_list(&args.next().ok_or("--gathers requires list like 4,8")?)?;
@@ -77,8 +100,14 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown argument: {argument}\n{}", usage())),
         }
     }
-    if playouts == 0 {
+    if playouts == Some(0) {
         return Err("--playouts must be > 0".into());
+    }
+    if movetime == Some(0) {
+        return Err("--movetime must be > 0".into());
+    }
+    if repeat == 0 {
+        return Err("--repeat must be > 0".into());
     }
     for (name, values) in [
         ("--gathers", &gathers),
@@ -96,12 +125,43 @@ fn parse_args() -> Result<Args, String> {
         onnx,
         fen,
         playouts,
+        movetime,
+        repeat,
         gathers,
         evals,
         backprops,
         eval_batch,
         cache,
     })
+}
+
+/// Formats one average queue delay from benchmark-only stream telemetry.
+///
+/// Reference: LC3 overview, "Stats Collection".
+fn average_wait_us(queue: QueueStats) -> f64 {
+    if queue.samples == 0 {
+        0.0
+    } else {
+        queue.total_wait_ns as f64 / queue.samples as f64 / 1e3
+    }
+}
+
+/// Formats non-zero collision buckets without widening the result table.
+///
+/// Reference: LC3 overview, "Stats Collection".
+fn collision_depths(stats: &Stats) -> String {
+    let buckets: Vec<String> = stats
+        .collisions_by_depth
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 0)
+        .map(|(depth, count)| format!("d{depth}:{count}"))
+        .collect();
+    if buckets.is_empty() {
+        "-".into()
+    } else {
+        buckets.join(",")
+    }
 }
 
 fn parse_list(text: &str) -> Result<Vec<usize>, String> {
@@ -137,19 +197,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let cells = args.gathers.len() * args.evals.len() * args.backprops.len();
     println!(
-        "onnx={} provider={} cache={} recommended_batch={} target_batch={} playouts={} matrix={}",
+        "onnx={} provider={} cache={} recommended_batch={} target_batch={} budget={} repeat={} matrix={}",
         args.onnx.display(),
         provider,
         args.cache,
         recommended,
         target_batch,
-        args.playouts,
+        args.playouts
+            .map(|n| format!("playouts={n}"))
+            .unwrap_or_else(|| format!("movetime={}ms", args.movetime.unwrap_or(0))),
+        args.repeat,
         cells
     );
-    println!("note: fresh backend/cache per cell; nn_eval=GPU-only; NN merges queued tensors up to target_batch");
+    println!("note: fresh backend/cache per run; eps=NN-only; q_* is average queue delay in us");
     println!(
-        "{:>3} {:>3} {:>3} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "G", "E", "B", "ms", "nps", "done", "coll", "nn_eval", "avg_b", "max_b"
+        "{:>3} {:>3} {:>3} {:>3} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6}",
+        "G", "E", "B", "run", "ms", "nps", "eps", "done", "coll%", "peak", "root%", "q_g", "q_e", "q_n"
     );
 
     let state = GameState::from_fen_moves(&args.fen, &[] as &[&str])?;
@@ -159,46 +222,75 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for &gather_workers in &args.gathers {
         for &eval_workers in &args.evals {
             for &backprop_workers in &args.backprops {
-                generation += 1;
-                let (backend, _, _) = make_backend(&args.onnx, args.cache)?;
-                let search = Search::new(
-                    backend,
-                    SearchGeneration(generation),
-                    Arc::clone(&history),
-                    SearchConfig {
-                        eval_batch_size: target_batch,
-                        gather_workers,
-                        eval_workers,
-                        backprop_workers,
-                        ..SearchConfig::default()
-                    },
-                );
-                let t0 = Instant::now();
-                let stats = search.run_playouts(args.playouts)?;
-                let ms = t0.elapsed().as_secs_f64() * 1e3;
-                let nps = if ms > 0.0 {
-                    stats.completed_playouts as f64 / (ms / 1e3)
-                } else {
-                    0.0
-                };
-                let avg_batch = if stats.network_batches > 0 {
-                    stats.network_evaluations as f64 / stats.network_batches as f64
-                } else {
-                    0.0
-                };
-                println!(
-                    "{:>3} {:>3} {:>3} {:>8.1} {:>8.0} {:>8} {:>8} {:>8} {:>8.2} {:>8}",
-                    gather_workers,
-                    eval_workers,
-                    backprop_workers,
-                    ms,
-                    nps,
-                    stats.completed_playouts,
-                    stats.collisions,
-                    stats.network_evaluations,
-                    avg_batch,
-                    stats.network_batch_size_max
-                );
+                for run_index in 1..=args.repeat {
+                    generation += 1;
+                    let (backend, _, _) = make_backend(&args.onnx, args.cache)?;
+                    let mut search = Search::new(
+                        backend,
+                        SearchGeneration(generation),
+                        Arc::clone(&history),
+                        SearchConfig {
+                            eval_batch_size: target_batch,
+                            gather_workers,
+                            eval_workers,
+                            backprop_workers,
+                            benchmark_telemetry: true,
+                            ..SearchConfig::default()
+                        },
+                    );
+                    let t0 = Instant::now();
+                    let stats = search.run_with_limits(SearchLimits {
+                        max_playouts: args.playouts,
+                        deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
+                    })?;
+                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    let seconds = ms / 1e3;
+                    let nps = if seconds > 0.0 {
+                        stats.completed_playouts as f64 / seconds
+                    } else {
+                        0.0
+                    };
+                    let eps = if seconds > 0.0 {
+                        stats.network_evaluations as f64 / seconds
+                    } else {
+                        0.0
+                    };
+                    let total = stats.completed_playouts + stats.collisions;
+                    let collision_rate = if total > 0 {
+                        stats.collisions as f64 * 100.0 / total as f64
+                    } else {
+                        0.0
+                    };
+                    let root_share = root_stats(search.repository(), search.root_key())
+                        .and_then(|root| {
+                            root.edges
+                                .into_iter()
+                                .map(|edge| edge.completed_visits)
+                                .max()
+                                .map(|best| (best, root.completed_visits))
+                        })
+                        .map(|(best, total)| best as f64 * 100.0 / total.max(1) as f64)
+                        .unwrap_or(0.0);
+                    println!(
+                        "{:>3} {:>3} {:>3} {:>3} {:>8.1} {:>8.0} {:>8.0} {:>7} {:>6.1} {:>7} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
+                        gather_workers, eval_workers, backprop_workers, run_index, ms, nps, eps,
+                        stats.completed_playouts, collision_rate, stats.peak_in_flight, root_share,
+                        average_wait_us(stats.gather_queue), average_wait_us(stats.eval_queue), average_wait_us(stats.nn_queue),
+                    );
+                    println!(
+                        "    batch avg={:.2} max={} q_backprop={:.1}us submitted={} collision_depths={}",
+                        if stats.network_batches > 0 {
+                            stats.network_evaluations as f64 / stats.network_batches as f64
+                        } else {
+                            0.0
+                        },
+                        stats.network_batch_size_max,
+                        average_wait_us(stats.backprop_queue),
+                        stats.submitted_playouts,
+                        collision_depths(&stats),
+                    );
+                    search.stop_and_join();
+                }
             }
         }
     }

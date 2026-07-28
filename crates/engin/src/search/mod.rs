@@ -25,7 +25,7 @@ mod tree;
 
 pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
 pub use params::SearchParams;
-pub use pipeline::{Search, SearchConfig, SearchControl, SearchLimits, Stats};
+pub use pipeline::{QueueStats, Search, SearchConfig, SearchControl, SearchLimits, Stats};
 pub use policy::{select_edge, select_edge_from_node, ValueDelta};
 pub use repository::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository};
 pub(crate) use session::SearchSession;

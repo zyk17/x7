@@ -46,8 +46,22 @@ impl SearchLimits {
     }
 }
 
+/// One queue's optional benchmark timing snapshot.
+///
+/// Reference: LC3 overview, "Stats Collection".
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueueStats {
+    pub samples: u64,
+    pub total_wait_ns: u64,
+    pub max_wait_ns: u64,
+}
+
+/// Normal search counters plus benchmark-only pipeline telemetry.
+///
+/// Reference: LC3 overview, "Stats Collection".
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Stats {
+    pub submitted_playouts: u64,
     pub completed_playouts: u64,
     /// Mean completed leaf depth, with the root at depth one. This follows
     /// classic `ThinkingInfo::depth` rather than current PV length.
@@ -59,6 +73,43 @@ pub struct Stats {
     pub network_evaluations: u64,
     /// Largest `BackendComputation` batch observed this search.
     pub network_batch_size_max: u64,
+    pub peak_in_flight: u64,
+    /// Collisions indexed by variation depth from the root.
+    pub collisions_by_depth: Vec<u64>,
+    pub gather_queue: QueueStats,
+    pub eval_queue: QueueStats,
+    pub nn_queue: QueueStats,
+    pub backprop_queue: QueueStats,
+}
+
+#[derive(Default)]
+struct QueueMetrics {
+    samples: AtomicU64,
+    total_wait_ns: AtomicU64,
+    max_wait_ns: AtomicU64,
+}
+
+impl QueueMetrics {
+    /// Records one event handoff for `feed_bench` only.
+    ///
+    /// Reference: LC3 overview, "Stats Collection".
+    fn record(&self, wait: Duration) {
+        let nanos = wait.as_nanos().min(u64::MAX as u128) as u64;
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        self.total_wait_ns.fetch_add(nanos, Ordering::Relaxed);
+        self.max_wait_ns.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    /// Reads a consistent-enough diagnostic snapshot; it is not search state.
+    ///
+    /// Reference: LC3 overview, "Stats Collection".
+    fn snapshot(&self) -> QueueStats {
+        QueueStats {
+            samples: self.samples.load(Ordering::Relaxed),
+            total_wait_ns: self.total_wait_ns.load(Ordering::Relaxed),
+            max_wait_ns: self.max_wait_ns.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Cloneable stop boundary for a running stream search.
@@ -95,6 +146,9 @@ pub struct SearchConfig {
     pub backprop_workers: usize,
     /// px0 `root_move_filter_` from UCI `go searchmoves` (empty = unrestricted).
     pub root_move_filter: Vec<Move>,
+    /// Enables timing/distribution counters used only by `feed_bench`.
+    /// Reference: LC3 overview, "Stats Collection".
+    pub benchmark_telemetry: bool,
 }
 
 impl Default for SearchConfig {
@@ -107,6 +161,7 @@ impl Default for SearchConfig {
             eval_workers: 2,
             backprop_workers: 1,
             root_move_filter: Vec::new(),
+            benchmark_telemetry: false,
         }
     }
 }
@@ -145,6 +200,7 @@ impl SearchConfig {
             queue_capacity,
             eval_batch_size,
             params: self.params,
+            benchmark_telemetry: self.benchmark_telemetry,
         }
     }
 }
@@ -154,6 +210,7 @@ struct ResolvedSearchConfig {
     queue_capacity: usize,
     eval_batch_size: usize,
     params: SearchParams,
+    benchmark_telemetry: bool,
 }
 
 struct Shared {
@@ -162,9 +219,12 @@ struct Shared {
     root_key: NodeKey,
     generation: SearchGeneration,
     params: SearchParams,
+    benchmark_telemetry: bool,
     root_move_filter: Vec<Move>,
     stopping: AtomicBool,
     outstanding: AtomicUsize,
+    submitted: AtomicU64,
+    peak_in_flight: AtomicU64,
     completed: AtomicU64,
     completed_depth: AtomicU64,
     max_depth: AtomicU64,
@@ -172,6 +232,11 @@ struct Shared {
     network_batches: AtomicU64,
     network_evaluations: AtomicU64,
     network_batch_size_max: AtomicU64,
+    collisions_by_depth: Mutex<Vec<u64>>,
+    gather_queue: QueueMetrics,
+    eval_queue: QueueMetrics,
+    nn_queue: QueueMetrics,
+    backprop_queue: QueueMetrics,
     error: Mutex<Option<EnginError>>,
     idle_lock: Mutex<()>,
     idle: Condvar,
@@ -226,6 +291,9 @@ impl Shared {
     /// Non-blocking enqueue: `try_send` + yield instead of parking on a full
     /// queue so Gather can keep polling `stopping` and stay schedulable.
     fn send_eval(&self, mut event: NodeEvent) {
+        if self.benchmark_telemetry {
+            event.mark_queued();
+        }
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 self.cancel_claimed_evaluation(event);
@@ -246,6 +314,9 @@ impl Shared {
     }
 
     fn send_backprop(&self, mut event: BackpropEvent) {
+        if self.benchmark_telemetry {
+            event.mark_queued();
+        }
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 event.cancel();
@@ -269,7 +340,37 @@ impl Shared {
 
     fn stats(&self) -> Stats {
         let completed_playouts = self.completed.load(Ordering::Acquire);
+        let (
+            submitted_playouts,
+            peak_in_flight,
+            collisions_by_depth,
+            gather_queue,
+            eval_queue,
+            nn_queue,
+            backprop_queue,
+        ) = if self.benchmark_telemetry {
+            (
+                self.submitted.load(Ordering::Acquire),
+                self.peak_in_flight.load(Ordering::Acquire),
+                self.collisions_by_depth.lock().clone(),
+                self.gather_queue.snapshot(),
+                self.eval_queue.snapshot(),
+                self.nn_queue.snapshot(),
+                self.backprop_queue.snapshot(),
+            )
+        } else {
+            (
+                0,
+                0,
+                Vec::new(),
+                QueueStats::default(),
+                QueueStats::default(),
+                QueueStats::default(),
+                QueueStats::default(),
+            )
+        };
         Stats {
+            submitted_playouts,
             completed_playouts,
             average_depth: self.completed_depth.load(Ordering::Acquire) / completed_playouts.max(1),
             max_depth: self.max_depth.load(Ordering::Acquire),
@@ -277,6 +378,28 @@ impl Shared {
             network_batches: self.network_batches.load(Ordering::Acquire),
             network_evaluations: self.network_evaluations.load(Ordering::Acquire),
             network_batch_size_max: self.network_batch_size_max.load(Ordering::Acquire),
+            peak_in_flight,
+            collisions_by_depth,
+            gather_queue,
+            eval_queue,
+            nn_queue,
+            backprop_queue,
+        }
+    }
+
+    /// Adds per-depth collision counts without changing selection behavior.
+    ///
+    /// Reference: LC3 overview, "Stats Collection".
+    fn record_collision_depths(&self, depths: &[usize]) {
+        if !self.benchmark_telemetry {
+            return;
+        }
+        let mut counts = self.collisions_by_depth.lock();
+        for &depth in depths {
+            if counts.len() <= depth {
+                counts.resize(depth + 1, 0);
+            }
+            counts[depth] += 1;
         }
     }
 }
@@ -326,9 +449,12 @@ impl Search {
             root_key,
             generation,
             params: resolved.params,
+            benchmark_telemetry: resolved.benchmark_telemetry,
             root_move_filter: config.root_move_filter.clone(),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
+            submitted: AtomicU64::new(0),
+            peak_in_flight: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             completed_depth: AtomicU64::new(0),
             max_depth: AtomicU64::new(0),
@@ -336,6 +462,11 @@ impl Search {
             network_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
             network_batch_size_max: AtomicU64::new(0),
+            collisions_by_depth: Mutex::new(Vec::new()),
+            gather_queue: QueueMetrics::default(),
+            eval_queue: QueueMetrics::default(),
+            nn_queue: QueueMetrics::default(),
+            backprop_queue: QueueMetrics::default(),
             error: Mutex::new(None),
             idle_lock: Mutex::new(()),
             idle: Condvar::new(),
@@ -431,8 +562,17 @@ impl Search {
             event.cancel();
             return Err(EnginError::PortIncomplete("stale stream search generation"));
         }
-        self.shared.outstanding.fetch_add(1, Ordering::AcqRel);
+        let outstanding = self.shared.outstanding.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.shared.benchmark_telemetry {
+            self.shared.submitted.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .peak_in_flight
+                .fetch_max(outstanding as u64, Ordering::Relaxed);
+        }
         let mut event = event;
+        if self.shared.benchmark_telemetry {
+            event.mark_queued();
+        }
         loop {
             if self.shared.stopping.load(Ordering::Acquire) {
                 self.shared.cancel_and_finish(event, false);
@@ -552,7 +692,12 @@ impl Drop for Search {
 fn gather_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
-            Ok(event) => {
+            Ok(mut event) => {
+                if shared.benchmark_telemetry {
+                    if let Some(wait) = event.take_queue_wait() {
+                        shared.gather_queue.record(wait);
+                    }
+                }
                 if shared.stopping.load(Ordering::Acquire) {
                     shared.cancel_and_finish(event, false);
                     continue;
@@ -613,6 +758,23 @@ type NnReply = Result<(Vec<f32>, Vec<f32>, f32), EnginError>;
 struct NnRequest {
     planes: Vec<f32>,
     reply: Sender<NnReply>,
+    queued_at: Option<Instant>,
+}
+
+impl NnRequest {
+    /// Records the NN queue handoff when benchmark telemetry is enabled.
+    ///
+    /// Reference: LC3 overview, "Stats Collection".
+    fn mark_queued(&mut self) {
+        self.queued_at = Some(Instant::now());
+    }
+
+    /// Returns the NN queue delay for benchmark reporting.
+    ///
+    /// Reference: LC3 overview, "Stats Collection".
+    fn take_queue_wait(&mut self) -> Option<Duration> {
+        self.queued_at.take().map(|queued_at| queued_at.elapsed())
+    }
 }
 
 /// Eval is waiting on NN for this node (LC3: after NN completes → Backprop).
@@ -645,7 +807,12 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender
         poll_nn_completions(&shared, &mut waiting);
 
         match receiver.recv_timeout(RECEIVE_POLL) {
-            Ok(event) => {
+            Ok(mut event) => {
+                if shared.benchmark_telemetry {
+                    if let Some(wait) = event.take_queue_wait() {
+                        shared.eval_queue.record(wait);
+                    }
+                }
                 if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
                     shared.fail(error);
                 }
@@ -762,6 +929,7 @@ fn handle_eval_event(
                 NnRequest {
                     planes,
                     reply: reply_tx,
+                    queued_at: None,
                 },
             ) {
                 cancel_evaluation(shared, event, node);
@@ -784,6 +952,9 @@ fn handle_eval_event(
 }
 
 fn send_nn_request(shared: &Shared, nn_tx: &Sender<NnRequest>, mut request: NnRequest) -> Result<(), EnginError> {
+    if shared.benchmark_telemetry {
+        request.mark_queued();
+    }
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             return Err(EnginError::PortIncomplete("stream nn stopping"));
@@ -894,16 +1065,28 @@ fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>) {
 fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usize) {
     let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
     loop {
-        let first = match receiver.recv_timeout(RECEIVE_POLL) {
+        let mut first = match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(request) => request,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        if shared.benchmark_telemetry {
+            if let Some(wait) = first.take_queue_wait() {
+                shared.nn_queue.record(wait);
+            }
+        }
         let mut requests = vec![first];
         while requests.len() < batch_size {
             match receiver.try_recv() {
-                Ok(request) => requests.push(request),
+                Ok(mut request) => {
+                    if shared.benchmark_telemetry {
+                        if let Some(wait) = request.take_queue_wait() {
+                            shared.nn_queue.record(wait);
+                        }
+                    }
+                    requests.push(request);
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
@@ -951,9 +1134,21 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
 fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
-            Ok(first) => {
+            Ok(mut first) => {
+                if shared.benchmark_telemetry {
+                    if let Some(wait) = first.take_queue_wait() {
+                        shared.backprop_queue.record(wait);
+                    }
+                }
                 let mut events = vec![first];
-                events.extend(receiver.try_iter());
+                for mut event in receiver.try_iter() {
+                    if shared.benchmark_telemetry {
+                        if let Some(wait) = event.take_queue_wait() {
+                            shared.backprop_queue.record(wait);
+                        }
+                    }
+                    events.push(event);
+                }
                 if shared.stopping.load(Ordering::Acquire) {
                     for event in events {
                         event.cancel();
@@ -961,6 +1156,7 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
                     }
                 } else {
                     let result = BackpropEvent::complete_batch(events, &shared.repository);
+                    shared.record_collision_depths(&result.collision_depths);
                     shared
                         .completed_depth
                         .fetch_add(result.completed_depth, Ordering::AcqRel);
@@ -1077,6 +1273,28 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_telemetry_reports_pipeline_handoffs() {
+        let mut pipeline = Search::new(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(22),
+            startpos_history(),
+            SearchConfig {
+                benchmark_telemetry: true,
+                ..SearchConfig::default()
+            },
+        );
+
+        let stats = pipeline.run_playouts(16).expect("benchmark playouts");
+
+        assert!(stats.submitted_playouts >= stats.completed_playouts);
+        assert!(stats.peak_in_flight > 0);
+        assert!(stats.gather_queue.samples >= stats.completed_playouts);
+        assert!(stats.eval_queue.samples > 0);
+        assert!(stats.backprop_queue.samples > 0);
+        pipeline.stop_and_join();
+    }
+
+    #[test]
     fn stop_join_drains_in_flight_reservations() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
@@ -1155,9 +1373,12 @@ mod tests {
             assert!(stats.completed_playouts < 1_000_000);
         });
 
-        let root = pipeline.repository().get(pipeline.root_key()).expect("root");
-        for edge in root.edges().iter() {
-            assert_eq!(edge.visits(), edge.completed_visits());
+        // Stop may win the race before Gather creates the root. If it did
+        // create it, every reservation still has to be released.
+        if let Some(root) = pipeline.repository().get(pipeline.root_key()) {
+            for edge in root.edges().iter() {
+                assert_eq!(edge.visits(), edge.completed_visits());
+            }
         }
         pipeline.stop_and_join();
     }
@@ -1286,9 +1507,12 @@ mod tests {
             root_key,
             generation: SearchGeneration(30),
             params: SearchParams::default(),
+            benchmark_telemetry: false,
             root_move_filter: Vec::new(),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(1),
+            submitted: AtomicU64::new(0),
+            peak_in_flight: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             completed_depth: AtomicU64::new(0),
             max_depth: AtomicU64::new(0),
@@ -1296,6 +1520,11 @@ mod tests {
             network_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
             network_batch_size_max: AtomicU64::new(0),
+            collisions_by_depth: Mutex::new(Vec::new()),
+            gather_queue: super::QueueMetrics::default(),
+            eval_queue: super::QueueMetrics::default(),
+            nn_queue: super::QueueMetrics::default(),
+            backprop_queue: super::QueueMetrics::default(),
             error: Mutex::new(None),
             idle_lock: Mutex::new(()),
             idle: Condvar::new(),

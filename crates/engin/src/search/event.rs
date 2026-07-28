@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
+use std::time::Instant;
 
 use nohash_hasher::NoHashHasher;
 use xiangqi_core::{Move, PositionHistory};
@@ -74,6 +75,7 @@ pub struct NodeEvent {
     node_path: Vec<NodeKey>,
     pub variation: Variation,
     pub reservations: Vec<EdgeReservation>,
+    queued_at: Option<Instant>,
 }
 
 impl NodeEvent {
@@ -88,6 +90,7 @@ impl NodeEvent {
             node_path: vec![root_key],
             variation: Variation::root(root_history),
             reservations: Vec::new(),
+            queued_at: None,
         }
     }
 
@@ -111,6 +114,18 @@ impl NodeEvent {
     pub fn node_path(&self) -> &[NodeKey] {
         &self.node_path
     }
+
+    /// Marks one worker-queue handoff for optional benchmark telemetry.
+    ///
+    /// Reference: LC3 overview, "Stats Collection". Normal UCI searches keep
+    /// this unset, so timing collection is outside their hot path.
+    pub(crate) fn mark_queued(&mut self) {
+        self.queued_at = Some(Instant::now());
+    }
+
+    pub(crate) fn take_queue_wait(&mut self) -> Option<std::time::Duration> {
+        self.queued_at.take().map(|queued_at| queued_at.elapsed())
+    }
 }
 
 /// A Gather/Eval outcome routed to Backprop.
@@ -122,6 +137,7 @@ impl NodeEvent {
 pub struct BackpropEvent {
     node: NodeEvent,
     outcome: BackpropOutcome,
+    queued_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -130,10 +146,11 @@ enum BackpropOutcome {
     Collision,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackpropResult {
     pub completed_playouts: u32,
     pub collisions: u32,
+    pub collision_depths: Vec<usize>,
     /// Sum of completed leaf depths, with the root at depth one. This matches
     /// px0 classic's `cum_depth_` accounting (`search.cc:2157-2167`).
     pub completed_depth: u64,
@@ -145,6 +162,7 @@ impl BackpropEvent {
         Self {
             node,
             outcome: BackpropOutcome::Evaluation { wl, draw, plies_left },
+            queued_at: None,
         }
     }
 
@@ -152,6 +170,7 @@ impl BackpropEvent {
         Self {
             node,
             outcome: BackpropOutcome::Collision,
+            queued_at: None,
         }
     }
 
@@ -170,8 +189,9 @@ impl BackpropEvent {
         let mut result = BackpropResult::default();
 
         for event in events {
-            let Self { node, outcome } = event;
+            let Self { node, outcome, .. } = event;
             let BackpropOutcome::Evaluation { wl, draw, plies_left } = outcome else {
+                result.collision_depths.push(node.variation.moves().len());
                 node.cancel();
                 result.collisions += 1;
                 continue;
@@ -212,6 +232,17 @@ impl BackpropEvent {
 
     pub fn cancel(self) {
         self.node.cancel();
+    }
+
+    pub(crate) fn mark_queued(&mut self) {
+        self.queued_at = Some(Instant::now());
+    }
+
+    /// Returns the optional delay since the Backprop queue handoff.
+    ///
+    /// Reference: LC3 overview, "Stats Collection".
+    pub(crate) fn take_queue_wait(&mut self) -> Option<std::time::Duration> {
+        self.queued_at.take().map(|queued_at| queued_at.elapsed())
     }
 }
 

@@ -61,7 +61,7 @@ fn watchdog(
                 }
                 match result {
                     Ok(result) => {
-                        let mut info = snapshot.thinking_info(result.stats, started);
+                        let mut info = snapshot.thinking_info(result.stats.clone(), started);
                         info.pv = result.principal_variation.clone();
                         responder.output_thinking_info(&[info]);
                         responder
