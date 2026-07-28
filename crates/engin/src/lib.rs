@@ -13,8 +13,7 @@ pub use callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo, Wdl};
 pub use engine::Engine;
 pub use error::EnginError;
 pub use options::Options;
-pub use search::{classic, SearchBase, SearchFactory};
 pub use uci_loop::{
-    contains_key, format_best_move, format_thinking_info, get_numeric, get_or_empty, parse_command, EngineController,
-    GoParams, RecordingEngine, StdoutUciResponder, StringUciResponder, UciLoop, UciResponder, VecUciResponder,
+    contains_key, format_best_move, format_thinking_info, get_numeric, get_or_empty, parse_command, GoParams,
+    StdoutUciResponder, StringUciResponder, UciLoop, UciResponder, VecUciResponder,
 };

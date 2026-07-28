@@ -2,14 +2,14 @@
 //!
 //! LC3 Policy documents the worker/policy architecture but does not publish a
 //! concrete PUCT formula. Until a stream-native policy is approved, these
-//! defaults intentionally preserve the project's X7↔classic comparison policy
+//! defaults intentionally preserve the project's approved X7 policy
 //! (px0 `src/search/classic/search.cc:408-433`).
 
 use crate::utils::fastmath::fast_log;
 
 /// Small, stream-owned selection parameter set.
 ///
-/// Root-specific variants, absolute FPU, draw score, contempt, and classic
+/// Root-specific variants, absolute FPU, draw score, contempt, and legacy
 /// task-worker controls are deliberately absent. Stream always uses neutral
 /// draw score and reduction FPU.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,7 +67,7 @@ mod tests {
     use super::{compute_cpuct, SearchParams};
 
     #[test]
-    fn defaults_preserve_the_approved_classic_alignment() {
+    fn defaults_preserve_the_approved_x7_policy() {
         let params = SearchParams::default();
         assert_eq!(params.cpuct, 1.0);
         assert_eq!(params.cpuct_base, 38_739.0);

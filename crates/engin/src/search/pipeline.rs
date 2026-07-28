@@ -95,9 +95,6 @@ pub struct SearchConfig {
     pub backprop_workers: usize,
     /// px0 `root_move_filter_` from UCI `go searchmoves` (empty = unrestricted).
     pub root_move_filter: Vec<Move>,
-    /// Watchdog score representation. It is internal until score selection is
-    /// deliberately added to the minimal UCI option set.
-    pub score_type: super::ScoreType,
 }
 
 impl Default for SearchConfig {
@@ -110,7 +107,6 @@ impl Default for SearchConfig {
             eval_workers: 2,
             backprop_workers: 1,
             root_move_filter: Vec::new(),
-            score_type: super::ScoreType::Q,
         }
     }
 }
@@ -205,6 +201,19 @@ impl Shared {
         self.finish(false);
     }
 
+    /// Cancels an event after Gather has claimed its leaf for Eval.
+    ///
+    /// Reference: LC3 overview's EvalWorker ownership model. Releasing only
+    /// the edge reservations would leave the claimed node permanently
+    /// `Evaluating`, so this also restores it to `Unexpanded`.
+    fn cancel_claimed_evaluation(&self, event: NodeEvent) {
+        let node = self
+            .repository
+            .get(event.node_key)
+            .expect("claimed stream node remains in the repository");
+        cancel_evaluation(self, event, node);
+    }
+
     fn fail(&self, error: EnginError) {
         let mut current = self.error.lock();
         if current.is_none() {
@@ -219,7 +228,7 @@ impl Shared {
     fn send_eval(&self, mut event: NodeEvent) {
         loop {
             if self.stopping.load(Ordering::Acquire) {
-                self.cancel_and_finish(event, false);
+                self.cancel_claimed_evaluation(event);
                 return;
             }
             match self.eval_tx.try_send(event) {
@@ -229,7 +238,7 @@ impl Shared {
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    self.cancel_and_finish(returned, false);
+                    self.cancel_claimed_evaluation(returned);
                     return;
                 }
             }
@@ -462,12 +471,15 @@ impl Search {
         let target = initial_completed.saturating_add(limits.max_playouts.unwrap_or(u64::MAX));
         let max_in_flight = self.max_in_flight;
         while !self.is_stopping() && !limits.is_exhausted(self.stats().completed_playouts, target) {
-            let root_is_expanded = self
+            let root_state = self
                 .shared
                 .repository
                 .get(self.root_key)
-                .is_some_and(|root| root.expansion_state() == ExpansionState::Expanded);
-            if !root_is_expanded {
+                .map(|root| root.expansion_state());
+            if root_state == Some(ExpansionState::Terminal) {
+                break;
+            }
+            if root_state != Some(ExpansionState::Expanded) {
                 // Bootstrap: one playout at a time until the root is expanded.
                 if let Err(error) = self.submit_playout() {
                     if self.is_stopping() {
@@ -578,7 +590,7 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                     event,
                     wl,
                     draw,
-                    node.terminal_plies_left().unwrap_or(0.0),
+                    node.terminal_plies_left().expect("terminal stream plies"),
                 ));
                 return;
             }
@@ -625,7 +637,7 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender
                 cancel_waiting_item(&shared, item);
             }
             while let Ok(event) = receiver.try_recv() {
-                shared.cancel_and_finish(event, false);
+                shared.cancel_claimed_evaluation(event);
             }
             break;
         }
@@ -718,7 +730,7 @@ fn handle_eval_event(
     event: NodeEvent,
 ) -> Result<(), EnginError> {
     if shared.stopping.load(Ordering::Acquire) {
-        shared.cancel_and_finish(event, false);
+        shared.cancel_claimed_evaluation(event);
         return Ok(());
     }
     let node = shared.repository.get_or_insert(event.node_key);
@@ -740,18 +752,25 @@ fn handle_eval_event(
                 legal_moves: legal_moves.clone(),
             };
             if let Some(eval) = shared.backend.cached_evaluation(&input) {
-                publish_eval(shared, event, node, legal_moves, eval);
-                return Ok(());
+                return publish_eval(shared, event, node, legal_moves, eval);
             }
             let planes = encode_position_for_nn(&history, FillEmptyHistory::FenOnly);
             let (reply_tx, reply_rx) = bounded(1);
-            send_nn_request(
+            if let Err(error) = send_nn_request(
+                shared,
                 nn_tx,
                 NnRequest {
                     planes,
                     reply: reply_tx,
                 },
-            )?;
+            ) {
+                cancel_evaluation(shared, event, node);
+                return if shared.stopping.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
+            }
             waiting.push(WaitingNn {
                 event,
                 node,
@@ -764,8 +783,11 @@ fn handle_eval_event(
     }
 }
 
-fn send_nn_request(nn_tx: &Sender<NnRequest>, mut request: NnRequest) -> Result<(), EnginError> {
+fn send_nn_request(shared: &Shared, nn_tx: &Sender<NnRequest>, mut request: NnRequest) -> Result<(), EnginError> {
     loop {
+        if shared.stopping.load(Ordering::Acquire) {
+            return Err(EnginError::PortIncomplete("stream nn stopping"));
+        }
         match nn_tx.try_send(request) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Full(returned)) => {
@@ -797,43 +819,72 @@ fn complete_nn_item(
         cancel_waiting_item(shared, item);
         return Err(EnginError::PortIncomplete("stream nn wdl length"));
     }
+    if !wdl.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        || (wdl.iter().sum::<f32>() - 1.0).abs() > 1e-3
+        || !moves_left.is_finite()
+        || moves_left < 0.0
+    {
+        cancel_waiting_item(shared, item);
+        return Err(EnginError::Onnx("stream nn values are invalid".into()));
+    }
     let eval = Arc::new(EvalResult {
         wl: wdl[0] - wdl[2],
         d: wdl[1],
-        m: moves_left,
+        plies_left: moves_left,
         policies,
     });
     shared.backend.store_evaluation(&item.input, Arc::clone(&eval));
-    publish_eval(shared, item.event, item.node, item.legal_moves, eval);
-    Ok(())
+    publish_eval(shared, item.event, item.node, item.legal_moves, eval)
 }
 
+/// Validates a completed backend result before it reaches the tree.
+///
+/// Reference: the fixed `WDL + moves-left` backend contract in ARCHITECTURE;
+/// worker failures must return through LC3's cancellation path, never panic
+/// after retaining an owned event.
 fn publish_eval(
     shared: &Shared,
     event: NodeEvent,
     node: Arc<Node>,
     legal_moves: Vec<xiangqi_core::Move>,
     eval: Arc<EvalResult>,
-) {
-    if eval.policies.len() != legal_moves.len() {
-        event.cancel();
-        node.abort_evaluation();
-        shared.finish(false);
-        shared.fail(EnginError::PortIncomplete("stream backend policy length"));
-        return;
+) -> Result<(), EnginError> {
+    let value_is_valid = eval.wl.is_finite()
+        && eval.d.is_finite()
+        && (0.0..=1.0).contains(&eval.d)
+        && eval.wl.abs() <= 1.0 - eval.d + f32::EPSILON
+        && eval.plies_left.is_finite()
+        && eval.plies_left >= 0.0;
+    let policy_sum: f32 = eval.policies.iter().sum();
+    let policy_is_valid = eval.policies.len() == legal_moves.len()
+        && eval.policies.iter().all(|policy| policy.is_finite() && *policy >= 0.0)
+        && policy_sum.is_finite()
+        && (policy_sum - 1.0).abs() <= 1e-3;
+    if !value_is_valid || !policy_is_valid {
+        cancel_evaluation(shared, event, node);
+        return Err(EnginError::Onnx("stream backend evaluation is invalid".into()));
     }
     node.publish_edges(legal_moves.into_iter().zip(eval.policies.iter().copied()).collect());
     shared.send_backprop(BackpropEvent::evaluation(
         event,
         network_wl_to_node(eval.wl),
         eval.d,
-        eval.m,
+        eval.plies_left,
     ));
+    Ok(())
 }
 
 fn cancel_waiting_item(shared: &Shared, item: WaitingNn) {
-    item.event.cancel();
-    item.node.abort_evaluation();
+    cancel_evaluation(shared, item.event, item.node);
+}
+
+/// Releases a claimed evaluation event that will not publish a result.
+///
+/// Reference: LC3 overview's EvalWorker ownership model: each owned event
+/// must finish through backpropagation or explicit cancellation.
+fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>) {
+    event.cancel();
+    node.abort_evaluation();
     shared.finish(false);
 }
 
@@ -932,20 +983,25 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use crossbeam_channel::bounded;
+    use parking_lot::{Condvar, Mutex};
     use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
-    use super::{Search, SearchConfig, SearchLimits};
+    use super::{NodeEvent, Search, SearchConfig, SearchLimits, Shared};
     use crate::neural::backend::{
         Backend, BackendAttributes, BackendComputation, EncodedInference, EvalResult, UniformBackend,
     };
-    use crate::search::stream::{best_move, root_settled, root_stats, SearchGeneration};
+    use crate::search::{best_move, root_stats, ExpansionState, NodeRepository, SearchGeneration, SearchParams};
     use crate::EnginError;
 
     struct FailingComputationBackend;
+
+    struct InvalidValueBackend;
 
     impl Backend for FailingComputationBackend {
         fn evaluate(&self, _history: &PositionHistory, _legal_moves: &[Move]) -> Arc<EvalResult> {
@@ -962,6 +1018,28 @@ mod tests {
 
         fn infer_encoded(&self, _planes: &[f32], _batch: usize) -> Result<EncodedInference, EnginError> {
             Err(EnginError::Onnx("test computation failure".to_owned()))
+        }
+    }
+
+    impl Backend for InvalidValueBackend {
+        fn evaluate(&self, _history: &PositionHistory, _legal_moves: &[Move]) -> Arc<EvalResult> {
+            unreachable!("stream worker must use encoded inference")
+        }
+
+        fn attributes(&self) -> BackendAttributes {
+            BackendAttributes::default()
+        }
+
+        fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
+            Err(EnginError::Onnx("test computation failure".to_owned()))
+        }
+
+        fn infer_encoded(&self, _planes: &[f32], batch: usize) -> Result<EncodedInference, EnginError> {
+            Ok((
+                vec![0.0; batch * crate::neural::POLICY_SIZE],
+                (0..batch).flat_map(|_| [f32::NAN, 0.0, 0.0]).collect(),
+                vec![0.0; batch],
+            ))
         }
     }
 
@@ -1104,6 +1182,31 @@ mod tests {
     }
 
     #[test]
+    fn terminal_root_finishes_after_its_initial_evaluation() {
+        let state = GameState::from_fen_moves("4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", &[] as &[&str])
+            .expect("checkmated root");
+        let mut pipeline = Search::new(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(26),
+            Arc::new(PositionHistory::from_positions(state.positions())),
+            SearchConfig::default(),
+        );
+
+        let stats = pipeline.run_playouts(8).expect("terminal search");
+
+        assert_eq!(stats.completed_playouts, 1);
+        assert_eq!(
+            pipeline
+                .repository()
+                .get(pipeline.root_key())
+                .expect("terminal root")
+                .expansion_state(),
+            super::ExpansionState::Terminal
+        );
+        pipeline.stop_and_join();
+    }
+
+    #[test]
     fn fixed_playout_root_contract() {
         let count = 64;
         let mut workers = Search::new(
@@ -1151,6 +1254,63 @@ mod tests {
     }
 
     #[test]
+    fn invalid_nn_values_fail_without_leaking_the_claimed_event() {
+        let mut pipeline = Search::new(
+            Arc::new(InvalidValueBackend),
+            SearchGeneration(29),
+            startpos_history(),
+            SearchConfig::default(),
+        );
+
+        let error = pipeline.run_playouts(1).expect_err("invalid network values must fail");
+
+        assert_eq!(error, EnginError::Onnx("stream nn values are invalid".into()));
+        assert_eq!(pipeline.stats().completed_playouts, 0);
+        pipeline.stop_and_join();
+    }
+
+    #[test]
+    fn failed_eval_enqueue_releases_the_claimed_node() {
+        let history = startpos_history();
+        let root_key = crate::search::NodeKey::root(history.last().hash());
+        let repository = Arc::new(NodeRepository::default());
+        let root = repository.get_or_insert(root_key);
+        assert!(root.try_begin_evaluation());
+        let (gather_tx, _gather_rx) = bounded(1);
+        let (eval_tx, eval_rx) = bounded(1);
+        let (backprop_tx, _backprop_rx) = bounded(1);
+        drop(eval_rx);
+        let shared = Shared {
+            backend: Arc::new(UniformBackend::default()),
+            repository,
+            root_key,
+            generation: SearchGeneration(30),
+            params: SearchParams::default(),
+            root_move_filter: Vec::new(),
+            stopping: AtomicBool::new(false),
+            outstanding: AtomicUsize::new(1),
+            completed: AtomicU64::new(0),
+            completed_depth: AtomicU64::new(0),
+            max_depth: AtomicU64::new(0),
+            collisions: AtomicU64::new(0),
+            network_batches: AtomicU64::new(0),
+            network_evaluations: AtomicU64::new(0),
+            network_batch_size_max: AtomicU64::new(0),
+            error: Mutex::new(None),
+            idle_lock: Mutex::new(()),
+            idle: Condvar::new(),
+            gather_tx,
+            eval_tx,
+            backprop_tx,
+        };
+
+        shared.send_eval(NodeEvent::root(SearchGeneration(30), history));
+
+        assert_eq!(root.expansion_state(), ExpansionState::Unexpanded);
+        assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn completed_search_can_reuse_a_tree_at_its_played_child() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
@@ -1173,7 +1333,8 @@ mod tests {
 
         let mut second = Search::new_with_tree(backend, SearchGeneration(30), &tree, SearchConfig::default());
         second.run_playouts(8).expect("reused search");
-        assert!(root_settled(second.repository(), second.root_key()));
+        let root = second.repository().get(second.root_key()).expect("reused root");
+        assert!(root.edges().iter().all(|edge| edge.visits() == edge.completed_visits()));
         second.stop_and_join();
     }
 }

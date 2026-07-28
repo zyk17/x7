@@ -1,6 +1,5 @@
-//! Stream implementation of the generic search construction boundary.
+//! UCI lifecycle adapter for the stream search.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -11,37 +10,24 @@ use xiangqi_core::{GameState, PositionHistory};
 
 use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo};
 use crate::neural::backend::Backend;
-use crate::search::{SearchBase, SearchFactory};
 use crate::{EnginError, GoParams};
 
-use super::{Runner, SearchControl, SearchLimits, WatchdogSnapshot};
+use super::{SearchControl, SearchLimits, SearchState, WatchdogSnapshot};
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Factory;
-
-impl SearchFactory for Factory {
-    fn create(&self, backend: Arc<dyn Backend>) -> Box<dyn SearchBase> {
-        Box::new(StreamSearch {
-            controller: Runner::new(backend),
-            active: None,
-            completed: None,
-            responder: None,
-        })
-    }
-}
-
-/// `SearchBase` adapter for the LC3-style search.
-pub struct StreamSearch {
-    controller: Runner,
+/// Engine-owned search session for the LC3-style search.
+///
+/// UCI only drives `Engine`; the Engine owns this session and its worker
+/// lifecycle.
+pub(crate) struct SearchSession {
+    state: SearchState,
     active: Option<ActiveSearch>,
-    completed: Option<super::SearchResult>,
     responder: Option<Arc<dyn SearchResponder>>,
 }
 
 struct ActiveSearch {
     control: SearchControl,
     completion: Arc<Completion>,
-    publish_bestmove: Arc<AtomicBool>,
+    publish_output: Arc<Mutex<bool>>,
     search_thread: JoinHandle<()>,
     watchdog_thread: JoinHandle<()>,
 }
@@ -56,7 +42,7 @@ fn watchdog(
     control: SearchControl,
     snapshot: WatchdogSnapshot,
     completion: Arc<Completion>,
-    publish_bestmove: Arc<AtomicBool>,
+    publish_output: Arc<Mutex<bool>>,
     responder: Option<Arc<dyn SearchResponder>>,
     started: Instant,
 ) {
@@ -69,16 +55,17 @@ fn watchdog(
         }
         if let Some(result) = result.as_ref() {
             if let Some(responder) = responder.as_ref() {
+                let publishing = publish_output.lock();
+                if !*publishing {
+                    return;
+                }
                 match result {
                     Ok(result) => {
                         let mut info = snapshot.thinking_info(result.stats, started);
                         info.pv = result.principal_variation.clone();
                         responder.output_thinking_info(&[info]);
-                        if publish_bestmove.load(Ordering::Acquire) {
-                            responder.output_best_move(&BestMoveInfo::new(
-                                result.best_move.unwrap_or(xiangqi_core::Move::NULL),
-                            ));
-                        }
+                        responder
+                            .output_best_move(&BestMoveInfo::new(result.best_move.unwrap_or(xiangqi_core::Move::NULL)));
                     }
                     Err(error) => responder.output_thinking_info(&[ThinkingInfo {
                         comment: format!("stream search failed: {error}"),
@@ -90,31 +77,36 @@ fn watchdog(
         }
         drop(result);
         if let Some(responder) = responder.as_ref() {
+            let publishing = publish_output.lock();
+            if !*publishing {
+                return;
+            }
             responder.output_thinking_info(&[snapshot.thinking_info(control.stats(), started)]);
         }
     }
 }
 
-impl SearchBase for StreamSearch {
-    fn set_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>) {
+impl SearchSession {
+    pub(crate) fn new(backend: Arc<dyn Backend>) -> Self {
+        Self {
+            state: SearchState::new(backend),
+            active: None,
+            responder: None,
+        }
+    }
+
+    pub(crate) fn set_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>) {
         self.responder = responder;
     }
 
-    fn new_game(&mut self) -> Result<(), EnginError> {
-        self.abort_search()?;
-        self.completed = None;
-        Ok(())
-    }
-
-    fn set_position(&mut self, state: &GameState) -> Result<(), EnginError> {
-        self.abort_search()?;
-        self.completed = None;
-        self.controller
+    pub(crate) fn set_position(&mut self, state: &GameState) -> Result<(), EnginError> {
+        self.abort()?;
+        self.state
             .set_position(Arc::new(PositionHistory::from_positions(state.positions())))
             .map(|_| ())
     }
 
-    fn validate_go(&self, params: &GoParams) -> Result<(), EnginError> {
+    pub(crate) fn validate_go(&self, params: &GoParams) -> Result<(), EnginError> {
         let unsupported = [
             (
                 params.wtime.is_some() || params.btime.is_some(),
@@ -148,11 +140,10 @@ impl SearchBase for StreamSearch {
         Ok(())
     }
 
-    fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError> {
+    pub(crate) fn start(&mut self, params: &GoParams) -> Result<(), EnginError> {
         self.validate_go(params)?;
-        self.abort_search()?;
-        self.completed = None;
-        let running = self.controller.begin_search(&params.searchmoves)?;
+        self.abort()?;
+        let running = self.state.begin_search(&params.searchmoves)?;
         let control = running.control();
         let snapshot = running.watchdog_snapshot();
         let limits = SearchLimits {
@@ -168,38 +159,25 @@ impl SearchBase for StreamSearch {
             *search_completion.result.lock() = Some(result);
             search_completion.ready.notify_all();
         });
-        let publish_bestmove = Arc::new(AtomicBool::new(true));
+        let publish_output = Arc::new(Mutex::new(true));
         let watchdog_thread = std::thread::spawn({
             let completion = Arc::clone(&completion);
-            let publish_bestmove = Arc::clone(&publish_bestmove);
+            let publish_output = Arc::clone(&publish_output);
             let responder = self.responder.clone();
             let control = control.clone();
-            move || {
-                watchdog(
-                    control,
-                    snapshot,
-                    completion,
-                    publish_bestmove,
-                    responder,
-                    Instant::now(),
-                )
-            }
+            move || watchdog(control, snapshot, completion, publish_output, responder, Instant::now())
         });
         self.active = Some(ActiveSearch {
             control,
             completion,
-            publish_bestmove,
+            publish_output,
             search_thread,
             watchdog_thread,
         });
         Ok(())
     }
 
-    fn start_clock(&mut self) -> Result<(), EnginError> {
-        Ok(())
-    }
-
-    fn wait_search(&mut self) -> Result<(), EnginError> {
+    pub(crate) fn wait(&mut self) -> Result<(), EnginError> {
         let Some(active) = self.active.take() else {
             return Ok(());
         };
@@ -218,27 +196,21 @@ impl SearchBase for StreamSearch {
             .lock()
             .take()
             .expect("completed stream search has a result");
-        self.completed = Some(result?);
-        Ok(())
+        result.map(|_| ())
     }
 
-    fn stop_search(&mut self) -> Result<(), EnginError> {
+    pub(crate) fn stop(&mut self) {
         if let Some(active) = &self.active {
             active.control.request_stop();
         }
-        Ok(())
     }
 
-    fn abort_search(&mut self) -> Result<(), EnginError> {
+    pub(crate) fn abort(&mut self) -> Result<(), EnginError> {
         if let Some(active) = &self.active {
-            active.publish_bestmove.store(false, Ordering::Release);
+            *active.publish_output.lock() = false;
         }
-        self.stop_search()?;
-        self.wait_search()
-    }
-
-    fn best_move(&self) -> Option<xiangqi_core::Move> {
-        self.completed.as_ref().and_then(|result| result.best_move)
+        self.stop();
+        self.wait()
     }
 }
 
@@ -250,10 +222,9 @@ mod tests {
 
     use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo};
     use crate::neural::backend::UniformBackend;
-    use crate::search::SearchBase;
     use crate::GoParams;
 
-    use super::StreamSearch;
+    use super::SearchSession;
 
     static INIT: Once = Once::new();
 
@@ -277,21 +248,17 @@ mod tests {
     fn watchdog_reports_info_and_one_bestmove() {
         INIT.call_once(initialize_magic_bitboards);
         let responder = Arc::new(RecordingResponder::default());
-        let mut search = StreamSearch {
-            controller: super::Runner::new(Arc::new(UniformBackend::default())),
-            active: None,
-            completed: None,
-            responder: Some(Arc::clone(&responder) as Arc<dyn SearchResponder>),
-        };
+        let mut search = SearchSession::new(Arc::new(UniformBackend::default()));
+        search.set_responder(Some(Arc::clone(&responder) as Arc<dyn SearchResponder>));
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         search.set_position(&state).expect("position");
         search
-            .start_search(&GoParams {
+            .start(&GoParams {
                 nodes: Some(8),
                 ..GoParams::default()
             })
             .expect("start");
-        search.wait_search().expect("wait");
+        search.wait().expect("wait");
 
         let infos = responder.infos.lock().expect("info lock");
         let final_info = infos.last().expect("watchdog info");

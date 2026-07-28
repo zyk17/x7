@@ -1,4 +1,4 @@
-//! Stream search runner state.
+//! Reusable stream search state.
 //!
 //! Reference: LC3 overview, "Search" / "WatchdogWorker":
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>.
@@ -19,18 +19,6 @@ use super::{
     SearchConfig, SearchControl, SearchGeneration, SearchLimits, Stats, Tree,
 };
 
-/// Stream scores that have an implemented, unambiguous meaning today.
-///
-/// `Q` and `Wl` coincide while stream uses the approved zero draw-score
-/// policy. Keeping them distinct avoids inventing Centipawn/WDL_mu before
-/// their calibration semantics exist.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ScoreType {
-    #[default]
-    Q,
-    Wl,
-}
-
 /// Read-only root view owned by the watchdog, never by a search worker.
 #[derive(Clone)]
 pub(crate) struct WatchdogSnapshot {
@@ -38,7 +26,6 @@ pub(crate) struct WatchdogSnapshot {
     root_key: NodeKey,
     root_is_black: bool,
     root_move_filter: Vec<xiangqi_core::Move>,
-    score_type: ScoreType,
 }
 
 impl WatchdogSnapshot {
@@ -69,10 +56,6 @@ impl WatchdogSnapshot {
         let draw = root.draw.clamp(0.0, 1.0);
         let win = ((1.0 - draw + wl) * 0.5).clamp(0.0, 1.0);
         let loss = ((1.0 - draw - wl) * 0.5).clamp(0.0, 1.0);
-        let score = match self.score_type {
-            ScoreType::Q => wl,
-            ScoreType::Wl => win - loss,
-        };
         let mate = best_mate(&self.repository, self.root_key, &self.root_move_filter);
         ThinkingInfo {
             depth: stats.average_depth.min(i32::MAX as u64) as i32,
@@ -82,7 +65,7 @@ impl WatchdogSnapshot {
             nps,
             eps,
             mate,
-            score: mate.is_none().then_some((score * 1000.0).round() as i32),
+            score: mate.is_none().then_some((wl * 1000.0).round() as i32),
             wdl: Some(Wdl {
                 w: (win * 1000.0).round() as i32,
                 d: (draw * 1000.0).round() as i32,
@@ -108,9 +91,8 @@ pub struct SearchResult {
 }
 
 /// Reusable stream state: backend, retained tree, and search generation.
-pub(crate) struct Runner {
+pub(crate) struct SearchState {
     backend: Arc<dyn Backend>,
-    config: SearchConfig,
     tree: Option<Tree>,
     next_generation: u64,
 }
@@ -120,7 +102,6 @@ pub(crate) struct RunningSearch {
     search: Search,
     root_is_black: bool,
     root_move_filter: Vec<xiangqi_core::Move>,
-    score_type: ScoreType,
 }
 
 impl RunningSearch {
@@ -134,7 +115,6 @@ impl RunningSearch {
             root_key: self.search.root_key(),
             root_is_black: self.root_is_black,
             root_move_filter: self.root_move_filter.clone(),
-            score_type: self.score_type,
         }
     }
 
@@ -161,11 +141,10 @@ impl RunningSearch {
     }
 }
 
-impl Runner {
+impl SearchState {
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self {
             backend,
-            config: SearchConfig::default(),
             tree: None,
             next_generation: 0,
         }
@@ -183,7 +162,7 @@ impl Runner {
         }
     }
 
-    /// Starts one owned search. The runner keeps the resulting tree
+    /// Starts one owned search. This state keeps the resulting tree
     /// only after all worker threads joined, which is the reservation boundary
     /// required before the next `set_position` can prune or rewind it.
     pub fn begin_search(&mut self, searchmoves: &[String]) -> Result<RunningSearch, EnginError> {
@@ -204,8 +183,10 @@ impl Runner {
             return Err(EnginError::Uci("No legal searchmoves.".into()));
         }
         self.next_generation = self.next_generation.wrapping_add(1);
-        let mut config = self.config.clone();
-        config.root_move_filter = root_move_filter.clone();
+        let config = SearchConfig {
+            root_move_filter: root_move_filter.clone(),
+            ..SearchConfig::default()
+        };
         let search = Search::new_with_tree(
             Arc::clone(&self.backend),
             SearchGeneration(self.next_generation),
@@ -217,7 +198,6 @@ impl Runner {
             search,
             root_is_black,
             root_move_filter,
-            score_type: self.config.score_type,
         })
     }
 }
@@ -230,16 +210,16 @@ mod tests {
 
     use crate::neural::backend::UniformBackend;
 
-    use super::{Runner, SearchLimits};
+    use super::{SearchLimits, SearchState};
 
     #[test]
-    fn runner_reuses_tree_between_completed_searches() {
-        let mut runner = Runner::new(Arc::new(UniformBackend::default()));
+    fn state_reuses_tree_between_completed_searches() {
+        let mut state = SearchState::new(Arc::new(UniformBackend::default()));
         let start = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        runner
+        state
             .set_position(Arc::new(PositionHistory::from_positions(start.positions())))
             .expect("set startpos");
-        let first = runner
+        let first = state
             .begin_search(&[])
             .expect("start first")
             .run(SearchLimits {
@@ -250,10 +230,10 @@ mod tests {
         let best = first.best_move.expect("best move");
 
         let next = GameState::from_fen_moves(STARTPOS_FEN, &[best.to_string()]).expect("played move");
-        runner
+        state
             .set_position(Arc::new(PositionHistory::from_positions(next.positions())))
             .expect("advance tree");
-        let second = runner
+        let second = state
             .begin_search(&[])
             .expect("start second")
             .run(SearchLimits {

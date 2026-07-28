@@ -2,7 +2,7 @@
 
 use std::sync::Once;
 
-use engin::{Engine, Options, UciLoop, VecUciResponder};
+use engin::{Engine, UciLoop, VecUciResponder};
 use xiangqi_core::initialize_magic_bitboards;
 
 static INIT: Once = Once::new();
@@ -14,10 +14,9 @@ fn ensure_init() {
 #[test]
 fn go_nodes_reports_info_and_bestmove() {
     ensure_init();
-    let mut options = Options::populate_defaults();
     let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
     uci.process_line("position startpos", "test").expect("position");
     uci.process_line("go nodes 8", "test").expect("go");
     uci.process_line("wait", "test").expect("wait");
@@ -35,10 +34,9 @@ fn go_nodes_reports_info_and_bestmove() {
 #[test]
 fn stop_emits_exactly_one_bestmove() {
     ensure_init();
-    let mut options = Options::populate_defaults();
     let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
     uci.process_line("position startpos", "test").expect("position");
     uci.process_line("go infinite", "test").expect("go");
     uci.process_line("stop", "test").expect("stop");
@@ -58,10 +56,9 @@ fn stop_emits_exactly_one_bestmove() {
 #[test]
 fn searchmoves_restricts_the_selected_move() {
     ensure_init();
-    let mut options = Options::populate_defaults();
     let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
     uci.process_line("position startpos", "test").expect("position");
     uci.process_line("go nodes 8 searchmoves h2h3", "test").expect("go");
     uci.process_line("wait", "test").expect("wait");
@@ -73,10 +70,9 @@ fn searchmoves_restricts_the_selected_move() {
 #[test]
 fn proven_terminal_child_reports_uci_mate() {
     ensure_init();
-    let mut options = Options::populate_defaults();
     let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
     uci.process_line("position fen 4k4/4PR3/3RC4/9/9/9/9/9/9/4K4 w - - 0 1", "test")
         .expect("position");
     uci.process_line("go nodes 8 searchmoves d7d8", "test").expect("go");
@@ -90,10 +86,9 @@ fn proven_terminal_child_reports_uci_mate() {
 #[test]
 fn checkmated_root_reports_negative_uci_mate() {
     ensure_init();
-    let mut options = Options::populate_defaults();
     let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
     uci.process_line("position fen 4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", "test")
         .expect("position");
     uci.process_line("go nodes 1", "test").expect("go");
@@ -107,10 +102,9 @@ fn checkmated_root_reports_negative_uci_mate() {
 #[test]
 fn missing_weights_never_falls_back_to_uniform_search() {
     ensure_init();
-    let mut options = Options::populate_defaults();
     let mut engine = Engine::new();
     let mut responder = VecUciResponder::default();
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
     uci.process_line("position startpos", "test").expect("position");
     uci.process_line("go nodes 8", "test").expect("go");
     drop(uci);
@@ -125,10 +119,9 @@ fn missing_weights_never_falls_back_to_uniform_search() {
 #[test]
 fn unsupported_go_limits_are_rejected_without_stopping_the_current_search() {
     ensure_init();
-    let mut options = Options::populate_defaults();
     let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
     uci.process_line("position startpos", "test").expect("position");
     uci.process_line("go infinite", "test").expect("infinite go");
 

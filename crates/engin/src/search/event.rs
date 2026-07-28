@@ -81,11 +81,11 @@ impl NodeEvent {
         Self::at_root(generation, NodeKey::root(root_history.last().hash()), root_history)
     }
 
-    pub fn at_root(generation: SearchGeneration, node_key: NodeKey, root_history: Arc<PositionHistory>) -> Self {
+    pub fn at_root(generation: SearchGeneration, root_key: NodeKey, root_history: Arc<PositionHistory>) -> Self {
         Self {
             generation,
-            node_key,
-            node_path: vec![node_key],
+            node_key: root_key,
+            node_path: vec![root_key],
             variation: Variation::root(root_history),
             reservations: Vec::new(),
         }
@@ -126,7 +126,7 @@ pub struct BackpropEvent {
 
 #[derive(Debug)]
 enum BackpropOutcome {
-    Evaluation { wl: f32, draw: f32, m: f32 },
+    Evaluation { wl: f32, draw: f32, plies_left: f32 },
     Collision,
 }
 
@@ -141,10 +141,10 @@ pub(crate) struct BackpropResult {
 }
 
 impl BackpropEvent {
-    pub(crate) fn evaluation(node: NodeEvent, wl: f32, draw: f32, m: f32) -> Self {
+    pub(crate) fn evaluation(node: NodeEvent, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
             node,
-            outcome: BackpropOutcome::Evaluation { wl, draw, m },
+            outcome: BackpropOutcome::Evaluation { wl, draw, plies_left },
         }
     }
 
@@ -171,20 +171,20 @@ impl BackpropEvent {
 
         for event in events {
             let Self { node, outcome } = event;
-            let BackpropOutcome::Evaluation { wl, draw, m } = outcome else {
+            let BackpropOutcome::Evaluation { wl, draw, plies_left } = outcome else {
                 node.cancel();
                 result.collisions += 1;
                 continue;
             };
             debug_assert_eq!(node.node_path.len(), node.reservations.len() + 1);
             let depth = node.node_path.len() as u64;
-            let mut delta = ValueDelta::with_m(wl, draw, m);
+            let mut delta = ValueDelta::with_plies_left(wl, draw, plies_left);
             let mut reservations = node.reservations.into_iter().rev();
             for (node_index, node_key) in node.node_path.into_iter().enumerate().rev() {
                 if let Some((terminal_wl, terminal_draw, terminal_m)) =
                     repository.get(node_key).and_then(|node| node.terminal_value())
                 {
-                    delta = ValueDelta::with_m(terminal_wl, terminal_draw, terminal_m);
+                    delta = ValueDelta::with_plies_left(terminal_wl, terminal_draw, terminal_m);
                 }
                 node_deltas
                     .entry(node_key)
@@ -222,7 +222,7 @@ mod tests {
     use xiangqi_core::{GameState, Move, STARTPOS_FEN};
 
     use super::{BackpropEvent, NodeEvent, SearchGeneration};
-    use crate::search::stream::{NodeKey, NodeRepository};
+    use crate::search::{NodeKey, NodeRepository};
 
     #[test]
     fn variation_keeps_root_history_and_owns_its_path() {
@@ -237,7 +237,7 @@ mod tests {
         );
         let child_key = root.node_key.child(mv);
         let root_history_len = root.variation.root_history().len();
-        let next = root.descend(child_key, crate::search::stream::EdgeReservation::test_only(mv));
+        let next = root.descend(child_key, crate::search::EdgeReservation::test_only(mv));
 
         assert_eq!(next.variation.moves(), &[mv]);
         assert_eq!(next.variation.root_history().len(), root_history_len);

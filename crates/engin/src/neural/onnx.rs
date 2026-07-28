@@ -275,7 +275,7 @@ impl BackendComputation for OnnxBackendComputation {
                 Arc::new(EvalResult {
                     wl: value[0] - value[2],
                     d: value[1],
-                    m: moves_left[index],
+                    plies_left: moves_left[index],
                     policies,
                 }),
             );
@@ -444,6 +444,6 @@ mod tests {
         let eval = backend.evaluate(&history, &legal);
         assert_eq!(eval.policies.len(), legal.len());
         assert!((eval.policies.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        assert!(eval.wl.is_finite() && eval.d.is_finite() && eval.m.is_finite());
+        assert!(eval.wl.is_finite() && eval.d.is_finite() && eval.plies_left.is_finite());
     }
 }

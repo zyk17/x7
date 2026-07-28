@@ -183,7 +183,7 @@ impl Edge {
 }
 
 /// One pending visit. It must be consumed exactly once by `complete` or
-/// `cancel`; this is the stream replacement for classic's node virtual-loss
+/// `cancel`; this is the stream reservation cleanup for pending visits.
 /// cleanup.
 #[derive(Debug)]
 pub struct EdgeReservation {
@@ -633,20 +633,20 @@ mod tests {
 
     #[test]
     fn cancelled_reservation_does_not_leave_virtual_visit() {
-        let node = NodeRepository::default().get_or_insert(NodeKey::root(321));
-        assert!(node.try_begin_evaluation());
-        node.publish_edges(vec![(b2_b3(), 1.0)]);
-        node.reserve_edge(0).expect("edge").cancel();
-        assert_eq!(node.edges()[0].visits(), 0);
-        assert_eq!(node.edges()[0].completed_visits(), 0);
+        let root = NodeRepository::default().get_or_insert(NodeKey::root(321));
+        assert!(root.try_begin_evaluation());
+        root.publish_edges(vec![(b2_b3(), 1.0)]);
+        root.reserve_edge(0).expect("edge").cancel();
+        assert_eq!(root.edges()[0].visits(), 0);
+        assert_eq!(root.edges()[0].completed_visits(), 0);
     }
 
     #[test]
     fn failed_evaluation_returns_node_to_claimable_state() {
-        let node = NodeRepository::default().get_or_insert(NodeKey::root(456));
-        assert!(node.try_begin_evaluation());
-        node.abort_evaluation();
-        assert_eq!(node.expansion_state(), ExpansionState::Unexpanded);
-        assert!(node.try_begin_evaluation());
+        let root = NodeRepository::default().get_or_insert(NodeKey::root(456));
+        assert!(root.try_begin_evaluation());
+        root.abort_evaluation();
+        assert_eq!(root.expansion_state(), ExpansionState::Unexpanded);
+        assert!(root.try_begin_evaluation());
     }
 }

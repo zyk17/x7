@@ -1,9 +1,4 @@
 //! Read-only stream root statistics, bestmove, and principal variation.
-//!
-//! Bestmove / PV ranking follows px0 `GetBestChildrenNoTemperature`
-//! (`search.cc:705-808`) and classic `search.rs`, with stream `draw_score = 0`.
-//! Returned moves are UCI-oriented (px0 `GetMove(flip)`): flipped when the
-//! side to move at that PV ply is black.
 
 use std::sync::Arc;
 
@@ -50,7 +45,6 @@ pub fn root_stats(repository: &NodeRepository, root_key: NodeKey) -> Option<Root
     })
 }
 
-/// px0 `EdgeAndNode::GetMove` orientation for UCI (`node.h` / `search.cc` PV loop).
 fn orient_move(mv: Move, flip: bool) -> Move {
     if flip && !mv.is_null() {
         mv.flip()
@@ -79,8 +73,6 @@ fn best_edge_rank(edge: &Edge, child: Option<&Node>) -> BestEdgeRank {
     if child.expansion_state() != ExpansionState::Terminal || edge.completed_visits() == 0 {
         return BestEdgeRank::NonTerminal;
     }
-    // Terminal nodes are proofs. Use their exact incoming-edge value rather
-    // than an edge average that may still contain pre-proof in-flight visits.
     let q = child.terminal_wl().expect("terminal stream wl").0;
     if q > 0.0 {
         BestEdgeRank::TerminalWin
@@ -99,32 +91,27 @@ fn edge_q_for_ranking(edge: &Edge) -> f32 {
     }
 }
 
-fn terminal_plies(child: Option<&Node>) -> f32 {
-    child.and_then(Node::terminal_plies_left).unwrap_or(0.0)
+fn terminal_plies(child: &Node) -> f32 {
+    child.terminal_plies_left().expect("terminal node has terminal plies")
 }
 
 fn is_visited_terminal(edge: &Edge, child: Option<&Node>) -> bool {
     child.is_some_and(|node| node.expansion_state() == ExpansionState::Terminal && edge.completed_visits() > 0)
 }
 
-/// px0 `GetBestChildrenNoTemperature` (`search.cc:776-795`): lexicographic
-/// compare, not a weighted blend of N/Q/P.
-///
-/// `true` when `left` is strictly better than `right`.
 fn edge_is_better(left: &Arc<Edge>, left_child: Option<&Node>, right: &Arc<Edge>, right_child: Option<&Node>) -> bool {
     let left_rank = best_edge_rank(left, left_child);
     let right_rank = best_edge_rank(right, right_child);
     if left_rank != right_rank {
         return left_rank > right_rank;
     }
-    // px0: both NonTerminal and both terminal (draws) → shorter m.
-    // Tablebase preference omitted (stream has no TB).
+    // 如果和棋找最短的
     if left_rank == BestEdgeRank::NonTerminal
         && is_visited_terminal(left, left_child)
         && is_visited_terminal(right, right_child)
     {
-        let left_m = terminal_plies(left_child);
-        let right_m = terminal_plies(right_child);
+        let left_m = terminal_plies(left_child.expect("visited terminal child"));
+        let right_m = terminal_plies(right_child.expect("visited terminal child"));
         if (left_m - right_m).abs() > f32::EPSILON {
             return left_m < right_m;
         }
@@ -142,10 +129,12 @@ fn edge_is_better(left: &Arc<Edge>, left_child: Option<&Node>, right: &Arc<Edge>
         }
         return left.prior() > right.prior();
     }
-    if left_rank > BestEdgeRank::NonTerminal {
-        terminal_plies(left_child) < terminal_plies(right_child)
+    if left_rank == BestEdgeRank::TerminalWin {
+        terminal_plies(left_child.expect("terminal winning child"))
+            < terminal_plies(right_child.expect("terminal winning child"))
     } else {
-        terminal_plies(left_child) > terminal_plies(right_child)
+        terminal_plies(left_child.expect("terminal losing child"))
+            > terminal_plies(right_child.expect("terminal losing child"))
     }
 }
 
@@ -154,27 +143,25 @@ fn first_filtered_move(edges: &[Arc<Edge>], root_move_filter: &[Move]) -> Option
         return root_move_filter
             .iter()
             .find(|mv| edges.iter().any(|edge| edge.mv() == **mv))
-            .copied()
-            .or_else(|| edges.first().map(|edge| edge.mv()));
+            .copied();
     }
     edges.first().map(|edge| edge.mv())
 }
 
-/// Absolute (board) best edge, before UCI orientation.
+/// 在当前根节点的边中，按内部棋盘坐标和搜索排名选出最佳的那条边；尚未转换为 UCI 坐标。
 fn best_edge_absolute(repository: &NodeRepository, root_key: NodeKey, root_move_filter: &[Move]) -> Option<Move> {
-    let node = repository.get(root_key)?;
-    let edges = node.edges();
+    let root = repository.get(root_key)?;
+    let edges = root.edges();
     if edges.is_empty() {
-        return if node.expansion_state() == ExpansionState::Terminal || node.completed_visits() > 0 {
+        return if root.expansion_state() == ExpansionState::Terminal || root.completed_visits() > 0 {
             Some(Move::NULL)
         } else {
             None
         };
     }
-    // Parent N == 0: px0 `GetBestChildrenNoTemperature` returns empty
-    // (`search.cc:710`). Classic Rust then falls back to searchmoves / first
-    // edge so UCI still gets a legal reply (`classic/search.rs:31-43`).
-    if node.completed_visits() == 0 {
+    // Before any completed visit, the edge list is already generated from
+    // legal moves. Return a verified searchmove, or the first legal edge.
+    if root.completed_visits() == 0 {
         return first_filtered_move(&edges, root_move_filter);
     }
     let mut best: Option<(Arc<Edge>, Option<Arc<Node>>)> = None;
@@ -276,22 +263,15 @@ pub fn principal_variation_filtered(
     pv
 }
 
-/// True when every root edge has `started == completed` (no in-flight).
-pub fn root_settled(repository: &NodeRepository, root_key: NodeKey) -> bool {
-    repository
-        .get(root_key)
-        .is_some_and(|root| root.edges().iter().all(|edge| edge.visits() == edge.completed_visits()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use xiangqi_core::{GameState, Move, PositionHistory, Square, STARTPOS_FEN};
 
-    use super::{best_mate, best_move, best_move_filtered, principal_variation, root_settled, root_stats};
+    use super::{best_mate, best_move, best_move_filtered, principal_variation, root_stats};
     use crate::neural::backend::UniformBackend;
-    use crate::search::stream::{Search, SearchConfig, SearchGeneration};
+    use crate::search::{Search, SearchConfig, SearchGeneration};
 
     #[test]
     fn root_snapshot_reports_completed_and_in_flight_visits_separately() {
@@ -309,7 +289,10 @@ mod tests {
         let stats = root_stats(pipeline.repository(), pipeline.root_key()).expect("root snapshot");
         assert_eq!(stats.completed_visits, 16);
         assert!(stats.edges.iter().any(|edge| edge.completed_visits > 0));
-        assert!(root_settled(pipeline.repository(), pipeline.root_key()));
+        assert!(stats
+            .edges
+            .iter()
+            .all(|edge| edge.started_visits == edge.completed_visits));
         let mv = best_move(pipeline.repository(), pipeline.root_key(), root_is_black).expect("bestmove");
         assert!(!mv.is_null());
         let pv = principal_variation(pipeline.repository(), pipeline.root_key(), root_is_black);
@@ -340,7 +323,7 @@ mod tests {
 
     #[test]
     fn terminal_win_outranks_higher_n_terminal_loss() {
-        use crate::search::stream::{ExpansionState, NodeKey, NodeRepository, ValueDelta};
+        use crate::search::{ExpansionState, NodeKey, NodeRepository, ValueDelta};
 
         fn mv(from: &str, to: &str) -> Move {
             Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
@@ -394,7 +377,7 @@ mod tests {
 
     #[test]
     fn best_mate_reports_proven_terminal_child_distance() {
-        use crate::search::stream::{NodeKey, NodeRepository, ValueDelta};
+        use crate::search::{NodeKey, NodeRepository, ValueDelta};
 
         let repository = NodeRepository::default();
         let root_key = NodeKey::root(99);
@@ -412,7 +395,7 @@ mod tests {
 
     #[test]
     fn best_mate_reports_a_checkmated_root() {
-        use crate::search::stream::{NodeKey, NodeRepository};
+        use crate::search::{NodeKey, NodeRepository};
 
         let repository = NodeRepository::default();
         let root = repository.get_or_insert(NodeKey::root(100));
@@ -424,7 +407,7 @@ mod tests {
 
     #[test]
     fn root_move_filter_applies_before_visits() {
-        use crate::search::stream::{NodeKey, NodeRepository};
+        use crate::search::{NodeKey, NodeRepository};
 
         fn mv(from: &str, to: &str) -> Move {
             Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
@@ -444,7 +427,7 @@ mod tests {
 
     #[test]
     fn shorter_terminal_draw_outranks_longer_draw_at_equal_n() {
-        use crate::search::stream::{NodeKey, NodeRepository, ValueDelta};
+        use crate::search::{NodeKey, NodeRepository, ValueDelta};
 
         fn mv(from: &str, to: &str) -> Move {
             Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))

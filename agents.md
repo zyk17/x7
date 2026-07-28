@@ -7,23 +7,22 @@
 ## 工程共识
 
 - 这是全新 Rust 实现；旧 Rust 核心与旧 MCTS 不是兼容目标。
-- `xiangqi_core`、classic 和 NN 的工程参考为 `C:\Users\Administrator\projects\px0` 与 `C:\Users\Administrator\projects\pxzero-training`。
+- `xiangqi_core`、网络外围和 NN 的工程参考为 `C:\Users\Administrator\projects\px0` 与 `C:\Users\Administrator\projects\pxzero-training`。
 - stream 仅参考 LC3 官方文档；本地没有 LC3 源码，不得宣称 1:1 翻译。
 - 正式模型契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。
-- 搜索主路线是 stream；classic 是独立对照实现，**不再推进 classic TaskWorkers**。
+- 搜索只有 stream；不维护 classic 对照实现或 `TaskWorkers`。
 
 ## 模块边界
 
 - `crates/xiangqi_core`：唯一规则真相，翻译 px0 `src/chess`。
-- `crates/engin`：UCI、网络外围、classic 基线与 stream 搜索。
-- `crates/engin/src/search/stream`：独立的 LC3-style streaming MCTS；事件必须 owned 并携带完整 root history 与 variation。不得复用 classic `NodeTree`、`Node`、worker 或 replay delta；首版只做 tree，不做 DAG/TT。
+- `crates/engin`：UCI、网络外围、stream 搜索与独立 stoppers。
+- `crates/engin/src/search`：独立的 LC3-style streaming MCTS；事件必须 owned 并携带完整 root history 与 variation。首版只做 tree，不做 DAG/TT。
 - `nn/`：独立训练与 ONNX 导出，不进入规则或搜索热路径。
 
 ## 禁止项
 
 - 不引入多套正式训练格式、未经参考支持的搜索参数或启发式。
-- classic 不恢复 raw pointer、`unsafe impl Send`、共享 `&mut SearchWorker`/`NodeTree`，也不以整树锁伪造并行 TaskWorkers。
-- stream 不移植 classic 的共享可变树/task-worker 模型，不吸收 KataGo graph/DAG。
+- stream 不引入共享可变树/task-worker 模型，不吸收 KataGo graph/DAG。
 - 正式 UCI 不得使用 `UniformBackend`；未接入的 UCI 命令必须明确拒绝，不能伪装支持。
 
 ## 参考与文档

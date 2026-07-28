@@ -6,7 +6,7 @@ use xiangqi_core::Position;
 
 use crate::uci_loop::GoParams;
 
-use super::stoppers::{SearchStopper, TimeLimitStopper};
+use super::stopper::{SearchStopper, TimeLimitStopper};
 use super::timemgr::{IterationStats, StoppersHints};
 
 const DEFAULT_MIDPOINT: f32 = 51.5;
@@ -134,7 +134,7 @@ mod tests {
     use xiangqi_core::{Position, STARTPOS_FEN};
 
     use super::{compute_estimated_moves_to_go, LegacyTimeManager};
-    use crate::search::classic::stoppers::{IterationStats, StoppersHints};
+    use crate::search::stoppers::{IterationStats, StoppersHints};
     use crate::uci_loop::GoParams;
 
     #[test]

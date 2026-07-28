@@ -1,6 +1,6 @@
 //! Position classification before NN / terminal marking.
 //!
-//! Mirrors classic `evaluate_extension` / px0 `search.cc:1913-1959` enough for
+//! Mirrors px0 `evaluate_extension` (`search.cc:1913-1959`) enough for
 //! X7 stream: checkmate, repetitions, early two-fold, and draw-by-material/rule60.
 //! Plies-left `m` is recorded on terminals for ranking; MultiPV/TB stay out of scope.
 

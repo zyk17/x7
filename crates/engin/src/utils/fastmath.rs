@@ -1,6 +1,6 @@
 //! px0 `src/utils/fastmath.h:38-103`。
 //!
-//! These approximations are part of px0 classic search semantics: `FastLog`
+//! These approximations are part of px0 PUCT semantics: `FastLog`
 //! feeds PUCT and WDL score conversion, so replacing them with the platform
 //! libm changes tie-breaking and reported scores.
 

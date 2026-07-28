@@ -1,37 +1,61 @@
-//! px0 `src/search/search.h:45-99` 的 P3 搜索接口。
+//! LC3-style streaming search.
+//!
+//! Design references (LC3 code is not published in the local lc0 checkout):
+//! - <https://lczero.org/dev/lc0/search/lc3/overview/>
+//! - <https://lczero.org/dev/lc0/search/lc3/policy/>
+//! - <https://lczero.org/dev/lc0/search/lc3/glossary/>
+//!
+//! This module owns its tree and workers. Selection and final-move rules use
+//! the documented px0 PUCT / N-Q-P references where LC3 has no public formula.
 
-pub mod classic;
-pub mod factory;
-pub mod stream;
+use xiangqi_core::GameResult;
 
-use xiangqi_core::GameState;
+pub mod stoppers;
 
-use std::sync::Arc;
+mod event;
+mod extension;
+mod params;
+mod pipeline;
+mod policy;
+mod repository;
+mod session;
+mod state;
+mod stats;
+mod tree;
 
-use crate::{callbacks::SearchResponder, EnginError, GoParams};
+pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
+pub use params::SearchParams;
+pub use pipeline::{Search, SearchConfig, SearchControl, SearchLimits, Stats};
+pub use policy::{select_edge, select_edge_from_node, ValueDelta};
+pub use repository::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository};
+pub(crate) use session::SearchSession;
+pub use state::SearchResult;
+pub(crate) use state::{SearchState, WatchdogSnapshot};
+pub(crate) use stats::best_mate;
+pub use stats::{
+    best_move, best_move_filtered, principal_variation, principal_variation_filtered, root_stats, RootEdgeStats,
+    RootStats,
+};
+pub use tree::{GcStats, Tree};
 
-pub use factory::SearchFactory;
+/// px0 `FetchSingleNodeResult`: `eval->q = -eval->q` (`search.cc:2129`).
+/// Network WDL is side-to-move; node statistics use the incoming-edge / mover
+/// perspective, matching px0 `Node::wl_`.
+pub(crate) fn network_wl_to_node(stm_wl: f32) -> f32 {
+    -stm_wl
+}
 
-/// px0 `SearchBase` (`src/search/search.h:45-84`)。
-pub trait SearchBase {
-    /// Installs the structured output sink before a search starts.  The sink
-    /// is owned by the caller and may safely be used by a watchdog thread.
-    fn set_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>);
-    fn new_game(&mut self) -> Result<(), EnginError>;
-    fn set_position(&mut self, state: &GameState) -> Result<(), EnginError>;
-    /// Validates implementation-specific UCI limits before Engine interrupts
-    /// an active search. px0 applies its stopper configuration before worker
-    /// startup (`src/search/classic/wrapper.cc:114-140`).
-    fn validate_go(&self, _params: &GoParams) -> Result<(), EnginError> {
-        Ok(())
-    }
-    fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError>;
-    fn start_clock(&mut self) -> Result<(), EnginError>;
-    fn wait_search(&mut self) -> Result<(), EnginError>;
-    fn stop_search(&mut self) -> Result<(), EnginError>;
-    fn abort_search(&mut self) -> Result<(), EnginError>;
-
-    fn best_move(&self) -> Option<xiangqi_core::Move> {
-        None
-    }
+/// Absolute game result → mover-perspective `(wl, d)` for a terminal leaf.
+///
+/// Equivalent to converting to STM then applying the same negate as NN fetch,
+/// which matches px0 writing `WHITE_WON` (+1) for a checkmated leaf
+/// (`search.cc:1913-1919`, `node.cc:300-317`).
+pub(crate) fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (f32, f32) {
+    let (stm_wl, draw) = match result {
+        GameResult::WhiteWon => (if black_to_move { -1.0 } else { 1.0 }, 0.0),
+        GameResult::BlackWon => (if black_to_move { 1.0 } else { -1.0 }, 0.0),
+        GameResult::Draw => (0.0, 1.0),
+        GameResult::Undecided => unreachable!("terminal search evaluation requires a result"),
+    };
+    (-stm_wl, draw)
 }

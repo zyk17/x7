@@ -1,4 +1,7 @@
-//! px0 `stoppers/stoppers.h`、`stoppers.cc:39-131`、`common.cc:118-165`。
+//! Search stopper chain and individual stop conditions.
+//!
+//! Reference: px0 `stoppers/stoppers.h`, `stoppers.cc:39-131`, and
+//! `common.cc:118-165`.
 
 use super::timemgr::{IterationStats, StoppersHints};
 use crate::uci_loop::GoParams;
@@ -162,7 +165,7 @@ pub fn build_search_stoppers(
 #[cfg(test)]
 mod tests {
     use super::{build_search_stoppers, SearchStopper, TimeLimitStopper};
-    use crate::search::classic::stoppers::timemgr::{IterationStats, StoppersHints};
+    use crate::search::stoppers::timemgr::{IterationStats, StoppersHints};
     use crate::uci_loop::GoParams;
 
     /// px0 `TimeLimitStopper::ShouldStop` depends only on elapsed time

@@ -134,8 +134,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let eval_ms = t0.elapsed().as_secs_f64() * 1e3;
     let (w, d, l) = wdl_from_eval(eval.wl, eval.d);
     println!(
-        "eval_ms={eval_ms:.3} wdl W={w:.6} D={d:.6} L={l:.6} Q(wl)={:.6} moves_left(m)={:.6}",
-        eval.wl, eval.m
+        "eval_ms={eval_ms:.3} wdl W={w:.6} D={d:.6} L={l:.6} Q(wl)={:.6} plies_left={:.6}",
+        eval.wl, eval.plies_left
     );
 
     let mut ranked: Vec<(Move, f32)> = legal.iter().copied().zip(eval.policies.iter().copied()).collect();

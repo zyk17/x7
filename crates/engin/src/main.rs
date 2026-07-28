@@ -1,10 +1,10 @@
-//! px0 UCI stdin/stdout entry with P4 classic search.
+//! UCI stdin/stdout entry for the stream search.
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use engin::{Engine, EngineController, Options, StdoutUciResponder, UciLoop};
+use engin::{Engine, StdoutUciResponder, UciLoop};
 
 /// Resolves the bundled formal ONNX weight before UCI starts.
 ///
@@ -33,16 +33,12 @@ fn default_weights_file() -> PathBuf {
 
 fn main() {
     let mut responder = StdoutUciResponder::default();
-    let mut options = Options::populate_defaults();
-    options.weights_file = default_weights_file().to_string_lossy().into_owned();
     let mut engine = Engine::new();
-    // Seed the formal `WeightsFile` before `UciLoop` registers the responder.
-    // The backend is created by the first SetPosition, matching px0's
-    // configuration update order (`src/engine.cc:187-197`).
+    // The backend is created by the first `position` command.
     engine
-        .set_uci_options(&options)
+        .set_option("WeightsFile", &default_weights_file().to_string_lossy())
         .expect("default UCI options must be valid");
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
 
     // Watchdog callbacks must reach stdout even while a GUI is waiting for a
     // finite `go` result and sends no additional input.

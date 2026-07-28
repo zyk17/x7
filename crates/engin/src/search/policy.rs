@@ -1,7 +1,7 @@
-//! Stream search policy (classic-aligned selection + WDL deltas).
+//! Stream search policy (px0-referenced selection + WDL deltas).
 //!
-//! Selection mirrors classic `ComputeCpuct` / `GetFpu` / PUCT edge scoring
-//! (`crates/engin/src/search/classic/uct.rs`, px0 `search.cc:408-433`) with
+//! Selection mirrors px0 `ComputeCpuct` / `GetFpu` / PUCT edge scoring
+//! (`src/search/classic/search.cc:408-433`) with
 //! `draw_score` fixed at 0 (Q is raw mover-perspective `wl`). Edge visit counts
 //! include in-flight reservations (LC3 node structure).
 
@@ -37,10 +37,10 @@ impl ValueDelta {
         }
     }
 
-    pub fn with_m(wl: f32, draw: f32, m: f32) -> Self {
-        assert!(m >= 0.0, "moves-left must be non-negative");
+    pub fn with_plies_left(wl: f32, draw: f32, plies_left: f32) -> Self {
+        assert!(plies_left >= 0.0, "plies-left must be non-negative");
         Self {
-            m_sum: m,
+            m_sum: plies_left,
             ..Self::one(wl, draw)
         }
     }
@@ -79,7 +79,7 @@ impl ValueDelta {
     }
 }
 
-/// Classic `Node::GetVisitedPolicy` over stream edges.
+/// px0 `Node::GetVisitedPolicy` over stream edges.
 pub fn visited_policy(edges: &[Arc<Edge>]) -> f32 {
     edges
         .iter()
@@ -88,7 +88,7 @@ pub fn visited_policy(edges: &[Arc<Edge>]) -> f32 {
         .sum()
 }
 
-/// Classic `GetFpu` (`search.cc:408-424`) with `draw_score = 0`.
+/// px0 `GetFpu` (`search.cc:408-424`) with `draw_score = 0`.
 pub fn get_fpu(params: &SearchParams, parent_wl: f32, edges: &[Arc<Edge>]) -> f32 {
     -parent_wl - params.fpu_reduction * visited_policy(edges).sqrt()
 }
@@ -106,7 +106,7 @@ fn root_filter_allows(is_root: bool, filter: &[Move], mv: Move) -> bool {
     !is_root || filter.is_empty() || filter.contains(&mv)
 }
 
-/// Selects the highest classic-style PUCT edge.
+/// Selects the highest px0-style PUCT edge.
 ///
 /// `root_move_filter` mirrors px0 `Search::root_move_filter_` from UCI
 /// `go searchmoves` (`search.cc:53-58,721-724,1668-1739`): empty means no filter.
@@ -167,7 +167,7 @@ mod tests {
     use xiangqi_core::{Move, Square};
 
     use super::{edge_utility, select_edge, ValueDelta};
-    use crate::search::stream::{NodeKey, NodeRepository, SearchParams};
+    use crate::search::{NodeKey, NodeRepository, SearchParams};
 
     fn mv(from: &str, to: &str) -> Move {
         Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))

@@ -23,12 +23,12 @@ pub struct GcStats {
 #[derive(Debug)]
 pub struct Tree {
     repository: Arc<NodeRepository>,
-    root_history: Arc<PositionHistory>,
-    roots: Vec<NodeKey>,
-    /// Full histories aligned with `roots`. Keeping these snapshots lets UCI
-    /// reset to a retained ancestor without attempting to reconstruct moves
-    /// from hashes.
-    histories: Vec<Arc<PositionHistory>>,
+    /// Retained played line, from its oldest root to the current root.
+    root_keys: Vec<NodeKey>,
+    /// Full histories aligned with `root_keys`; their final entry is the
+    /// current root history. Snapshots make UCI rewind/reuse exact without
+    /// reconstructing positions from hashes.
+    root_histories: Vec<Arc<PositionHistory>>,
 }
 
 impl Tree {
@@ -36,9 +36,8 @@ impl Tree {
         let root = NodeKey::root(root_history.last().hash());
         Self {
             repository: Arc::new(NodeRepository::default()),
-            root_history: root_history.clone(),
-            roots: vec![root],
-            histories: vec![root_history],
+            root_keys: vec![root],
+            root_histories: vec![root_history],
         }
     }
 
@@ -47,11 +46,13 @@ impl Tree {
     }
 
     pub fn root_key(&self) -> NodeKey {
-        *self.roots.last().expect("stream tree always has a root")
+        *self.root_keys.last().expect("stream tree always has a root")
     }
 
     pub fn root_history(&self) -> &Arc<PositionHistory> {
-        &self.root_history
+        self.root_histories
+            .last()
+            .expect("stream tree always has a root history")
     }
 
     /// Advances to a legal child after all events below the current root have
@@ -64,13 +65,13 @@ impl Tree {
                 "stream tree advance requires settled reservations",
             ));
         }
-        if !self.root_history.last().board().is_legal_move(mv) {
+        if !self.root_history().last().board().is_legal_move(mv) {
             return Err(EnginError::PortIncomplete("stream tree advance requires a legal move"));
         }
 
         let mut stats = GcStats::default();
-        if let Some(node) = self.repository.get(old_root) {
-            for edge in node.edges().iter() {
+        if let Some(root) = self.repository.get(old_root) {
+            for edge in root.edges().iter() {
                 if edge.mv() != mv {
                     stats.removed_nodes += self.repository.remove_subtree(old_root.child(edge.mv()));
                 }
@@ -79,18 +80,17 @@ impl Tree {
 
         let new_root = old_root.child(mv);
         self.repository.get_or_insert(new_root);
-        let mut history = self.root_history.as_ref().clone();
+        let mut history = self.root_history().as_ref().clone();
         history.append(mv);
-        self.root_history = Arc::new(history);
-        self.roots.push(new_root);
-        self.histories.push(self.root_history.clone());
+        self.root_keys.push(new_root);
+        self.root_histories.push(Arc::new(history));
         Ok(stats)
     }
 
     /// Returns to the immediately previous retained root. It does not reclaim
     /// the future child; a later different `advance` will prune it as a sibling.
     pub fn rewind_one(&mut self) -> Result<bool, EnginError> {
-        if self.roots.len() == 1 {
+        if self.root_keys.len() == 1 {
             return Ok(false);
         }
         if !self.repository.subtree_is_settled(self.root_key()) {
@@ -98,13 +98,8 @@ impl Tree {
                 "stream tree rewind requires settled reservations",
             ));
         }
-        self.roots.pop();
-        self.histories.pop();
-        self.root_history = self
-            .histories
-            .last()
-            .expect("stream tree always retains its initial history")
-            .clone();
+        self.root_keys.pop();
+        self.root_histories.pop();
         Ok(true)
     }
 
@@ -121,27 +116,26 @@ impl Tree {
             ));
         }
 
-        if let Some(index) = self.histories.iter().position(|history| history == &target) {
-            self.roots.truncate(index + 1);
-            self.histories.truncate(index + 1);
-            self.root_history = target;
+        if let Some(index) = self.root_histories.iter().position(|history| history == &target) {
+            self.root_keys.truncate(index + 1);
+            self.root_histories.truncate(index + 1);
             return Ok(GcStats::default());
         }
 
-        if target.len() > self.root_history.len()
-            && target.positions()[..self.root_history.len()] == *self.root_history.positions()
+        if target.len() > self.root_history().len()
+            && target.positions()[..self.root_history().len()] == *self.root_history().positions()
         {
             let mut stats = GcStats::default();
-            while self.root_history.len() < target.len() {
-                let next = target.get(self.root_history.len());
+            while self.root_history().len() < target.len() {
+                let next = target.get(self.root_history().len());
                 let mv = self
-                    .root_history
+                    .root_history()
                     .last()
                     .board()
                     .generate_legal_moves()
                     .into_iter()
                     .find(|mv| {
-                        let mut candidate = self.root_history.as_ref().clone();
+                        let mut candidate = self.root_history().as_ref().clone();
                         candidate.append(*mv);
                         candidate.last().board() == next.board()
                     })
@@ -156,9 +150,8 @@ impl Tree {
 
         let root = NodeKey::root(target.last().hash());
         self.repository = Arc::new(NodeRepository::default());
-        self.root_history = target.clone();
-        self.roots = vec![root];
-        self.histories = vec![target];
+        self.root_keys = vec![root];
+        self.root_histories = vec![target];
         Ok(GcStats::default())
     }
 }

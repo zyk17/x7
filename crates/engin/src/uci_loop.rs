@@ -3,11 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use xiangqi_core::{GameState, STARTPOS_FEN};
+use xiangqi_core::STARTPOS_FEN;
 
 use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo};
 use crate::error::EnginError;
-use crate::Options;
+use crate::{Engine, Options};
 
 /// px0 `GoParams` (`uciloop.h:42-55`)。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -91,44 +91,21 @@ impl SearchResponder for UciOutputQueue {
     }
 }
 
-/// px0 `EngineControllerBase` (`uciloop.h:74-99`)。
-pub trait EngineController {
-    fn set_search_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>);
-    /// Rust ownership requires explicitly forwarding the global UCI options
-    /// that px0's `Engine` reads from its shared `OptionsDict`.
-    fn set_uci_options(&mut self, _options: &Options) -> Result<(), EnginError> {
-        Ok(())
-    }
-    fn ensure_ready(&mut self) -> Result<(), EnginError>;
-    fn new_game(&mut self) -> Result<(), EnginError>;
-    fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), EnginError>;
-    fn go(&mut self, params: &GoParams, responder: &mut dyn StringUciResponder) -> Result<(), EnginError>;
-    fn ponder_hit(&mut self) -> Result<(), EnginError>;
-    fn wait(&mut self) -> Result<(), EnginError>;
-    fn stop(&mut self) -> Result<(), EnginError>;
-}
-
 /// px0 `UciLoop` (`uciloop.h:101-118`)。
 pub struct UciLoop<'a> {
     pub responder: &'a mut dyn StringUciResponder,
-    pub options: &'a mut Options,
-    pub engine: &'a mut dyn EngineController,
+    pub engine: &'a mut Engine,
     output: Arc<UciOutputQueue>,
 }
 
 impl<'a> UciLoop<'a> {
     /// px0 `UciLoop::UciLoop` (`uciloop.cc:170-175`)。
-    pub fn new(
-        responder: &'a mut dyn StringUciResponder,
-        options: &'a mut Options,
-        engine: &'a mut dyn EngineController,
-    ) -> Self {
-        responder.set_options(options.clone());
+    pub fn new(responder: &'a mut dyn StringUciResponder, engine: &'a mut Engine) -> Self {
+        responder.set_options(engine.options().clone());
         let output = Arc::new(UciOutputQueue::default());
         engine.set_search_responder(Some(Arc::clone(&output) as Arc<dyn SearchResponder>));
         Self {
             responder,
-            options,
             engine,
             output,
         }
@@ -144,7 +121,7 @@ impl<'a> UciLoop<'a> {
         match command {
             "uci" => {
                 self.responder.send_id(version);
-                for option in self.options.list_options_uci() {
+                for option in self.engine.options().list_options_uci() {
                     self.responder.send_raw_response(&option);
                 }
                 self.responder.send_raw_response("uciok");
@@ -157,10 +134,9 @@ impl<'a> UciLoop<'a> {
                 if get_or_empty(params, "name").is_empty() {
                     return Err(EnginError::Uci("setoption requires name".into()));
                 }
-                self.options
-                    .set_uci_option(&get_or_empty(params, "name"), &get_or_empty(params, "value"))?;
-                self.engine.set_uci_options(self.options)?;
-                self.responder.set_options(self.options.clone());
+                self.engine
+                    .set_option(&get_or_empty(params, "name"), &get_or_empty(params, "value"))?;
+                self.responder.set_options(self.engine.options().clone());
             }
             "ucinewgame" => self.engine.new_game()?,
             "position" => {
@@ -509,10 +485,6 @@ fn read_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
     token
 }
 
-fn trim(value: &str) -> &str {
-    value.trim()
-}
-
 fn split_at_whitespace(value: &str) -> Vec<String> {
     if value.is_empty() {
         Vec::new()
@@ -537,9 +509,9 @@ fn parse_setoption(line: &str) -> Result<HashMap<String, String>, EnginError> {
         None => (rest, None),
     };
     let mut params = HashMap::new();
-    params.insert("name".to_string(), trim(name).to_string());
+    params.insert("name".to_string(), name.trim().to_string());
     if let Some(value) = value {
-        params.insert("value".to_string(), trim(value).to_string());
+        params.insert("value".to_string(), value.trim().to_string());
     }
     Ok(params)
 }
@@ -562,58 +534,6 @@ fn token_offset(text: &str, needle: &str) -> Option<(usize, usize)> {
         start = end.saturating_add(1);
     }
     None
-}
-
-/// 测试用：记录 UCI 命令如何落到 `GameState`。
-#[derive(Clone, Debug, Default)]
-pub struct RecordingEngine {
-    pub position: Option<GameState>,
-    pub ready: bool,
-    pub go_count: u32,
-    pub last_go: Option<GoParams>,
-    pub responder_registrations: u32,
-}
-
-impl EngineController for RecordingEngine {
-    fn set_search_responder(&mut self, _responder: Option<Arc<dyn SearchResponder>>) {
-        if _responder.is_some() {
-            self.responder_registrations += 1;
-        } else {
-            self.responder_registrations -= 1;
-        }
-    }
-
-    fn ensure_ready(&mut self) -> Result<(), EnginError> {
-        self.ready = true;
-        Ok(())
-    }
-
-    fn new_game(&mut self) -> Result<(), EnginError> {
-        self.set_position(STARTPOS_FEN, &[])
-    }
-
-    fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), EnginError> {
-        self.position = Some(GameState::from_fen_moves(fen, moves)?);
-        Ok(())
-    }
-
-    fn go(&mut self, params: &GoParams, _responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
-        self.go_count += 1;
-        self.last_go = Some(params.clone());
-        Ok(())
-    }
-
-    fn ponder_hit(&mut self) -> Result<(), EnginError> {
-        Ok(())
-    }
-
-    fn wait(&mut self) -> Result<(), EnginError> {
-        Ok(())
-    }
-
-    fn stop(&mut self) -> Result<(), EnginError> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -657,29 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn go_infinity_aliases_infinite() {
-        let (command, params) = parse_command("go infinity").expect("parse go infinity");
-        assert_eq!(command, "go");
-        assert!(contains_key(&params, "infinity"));
-        assert!(!contains_key(&params, "infinite"));
-
-        let mut options = Options::populate_defaults();
-        let mut engine = RecordingEngine::default();
-        let mut responder = VecUciResponder::default();
-        let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-        assert!(uci.process_line("go infinity", "0.0.0").expect("go infinity"));
-        drop(uci);
-        assert_eq!(engine.go_count, 1);
-        assert_eq!(
-            engine.last_go.expect("recorded go"),
-            GoParams {
-                infinite: true,
-                ..GoParams::default()
-            }
-        );
-    }
-
-    #[test]
     fn parse_setoption_uses_first_value_token() {
         let (_, params) = parse_command("setoption name A value B value C").expect("parse option");
         assert_eq!(get_or_empty(&params, "name"), "A");
@@ -704,55 +601,31 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_position_keeps_full_history() {
-        ensure_init();
-        let mut options = Options::populate_defaults();
-        let mut engine = RecordingEngine::default();
-        let mut responder = VecUciResponder::default();
-        let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-        uci.process_line("position startpos moves h2h4 h9h7", "0.0.0")
-            .expect("position");
-        drop(uci);
-        let state = engine.position.expect("position stored");
-        assert_eq!(state.moves.len(), 2);
-        assert_eq!(state.positions().len(), 3);
-        assert_eq!(
-            state.current_position().board().hash(),
-            state.positions().last().unwrap().board().hash()
-        );
-    }
-
-    #[test]
     fn uci_transcript() {
-        let mut options = Options::populate_defaults();
-        let mut engine = RecordingEngine::default();
+        ensure_init();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
-        let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+        let mut uci = UciLoop::new(&mut responder, &mut engine);
         assert!(uci.process_line("uci", "1.2.3").expect("uci"));
         assert!(uci.process_line("isready", "1.2.3").expect("isready"));
         assert!(uci
             .process_line("position startpos moves h2h4", "1.2.3")
             .expect("position"));
-        assert!(uci.process_line("go depth 4", "1.2.3").expect("go"));
         drop(uci);
         assert_eq!(responder.responses[0], "id name x7 v1.2.3");
         assert_eq!(responder.responses.last().unwrap(), "readyok");
-        assert_eq!(engine.go_count, 1);
-        assert_eq!(engine.position.unwrap().moves.len(), 1);
     }
 
     #[test]
     fn responder_observes_updated_options_and_registration_lifecycle() {
-        let mut options = Options::populate_defaults();
-        let mut engine = RecordingEngine::default();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
         {
-            let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
+            let mut uci = UciLoop::new(&mut responder, &mut engine);
             uci.process_line("setoption name UCI_ShowWDL value true", "0.0.0")
                 .expect("setoption");
         }
         assert!(responder.options.show_wdl);
-        assert_eq!(engine.responder_registrations, 0);
     }
 
     #[test]

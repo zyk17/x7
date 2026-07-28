@@ -1,12 +1,12 @@
-//! Sweep Gather × Eval × Backprop for stream NPS / collisions.
+//! Sweep Gather × Eval × Backprop for search NPS / collisions.
 //!
 //! Topology: independent NN thread (ONNX only). Eval does terminal/cache/encode;
 //! NN merges queued tensors up to `--eval-batch`. Default workers: 4/2/1.
 //! Not a UCI path.
 //!
 //! ```text
-//! cargo run -p engin --release --bin stream_feed_bench -- --cache --playouts 20000
-//! cargo run -p engin --release --bin stream_feed_bench -- --gathers 4,8 --evals 1,2 --backprops 1,2 --cache
+//! cargo run -p engin --release --bin feed_bench -- --cache --playouts 20000
+//! cargo run -p engin --release --bin feed_bench -- --gathers 4,8 --evals 1,2 --backprops 1,2 --cache
 //! ```
 
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use engin::neural::backend::{Backend, CachingBackend};
 use engin::neural::onnx::OnnxBackend;
-use engin::search::stream::{Search, SearchConfig, SearchGeneration};
+use engin::search::{Search, SearchConfig, SearchGeneration};
 use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
 struct Args {
@@ -30,7 +30,7 @@ struct Args {
 }
 
 fn usage() -> &'static str {
-    "usage: stream_feed_bench [--onnx data/x7.onnx] [--fen \"...\"] [--playouts 20000] \
+    "usage: feed_bench [--onnx data/x7.onnx] [--fen \"...\"] [--playouts 20000] \
      [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache]"
 }
 
@@ -207,7 +207,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("stream_feed_bench: {error}");
+        eprintln!("feed_bench: {error}");
         std::process::exit(2);
     }
 }

@@ -37,9 +37,16 @@ impl Default for BackendAttributes {
 /// px0 `EvalResult` / backend 评估输出子集。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EvalResult {
+    /// Win probability minus loss probability, from the side to move.
     pub wl: f32,
+    /// Draw probability, from the side to move.
     pub d: f32,
-    pub m: f32,
+    /// Predicted distance to the result, in plies (half-moves).
+    ///
+    /// The ONNX output is named `moves_left`, but training records and search
+    /// backup measure this value in plies rather than full moves.
+    pub plies_left: f32,
+    /// Probabilities aligned with the supplied legal-move list.
     pub policies: Vec<f32>,
 }
 
@@ -365,7 +372,7 @@ impl BackendComputation for UniformBackendComputation {
 pub struct UniformBackend {
     pub wl: f32,
     pub d: f32,
-    pub m: f32,
+    pub plies_left: f32,
     cache: Arc<EvalCache>,
 }
 
@@ -374,7 +381,7 @@ impl Default for UniformBackend {
         Self {
             wl: 0.0,
             d: 0.0,
-            m: 0.0,
+            plies_left: 0.0,
             cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
         }
     }
@@ -385,11 +392,11 @@ impl UniformBackend {
         position.positions.last().map(|p| p.hash()).unwrap_or(0)
     }
 
-    pub fn with_wdl(wl: f32, d: f32, m: f32) -> Self {
+    pub fn with_wdl(wl: f32, d: f32, plies_left: f32) -> Self {
         Self {
             wl,
             d,
-            m,
+            plies_left,
             cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
         }
     }
@@ -402,7 +409,7 @@ impl Backend for UniformBackend {
         Arc::new(EvalResult {
             wl: self.wl,
             d: self.d,
-            m: self.m,
+            plies_left: self.plies_left,
             policies: vec![p; legal_moves.len()],
         })
     }
@@ -432,7 +439,7 @@ impl Backend for UniformBackend {
         for _ in 0..batch {
             wdl.extend_from_slice(&[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
         }
-        Ok((logits, wdl, vec![self.m; batch]))
+        Ok((logits, wdl, vec![self.plies_left; batch]))
     }
 
     fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {

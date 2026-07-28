@@ -5,8 +5,7 @@
 ## 当前状态
 
 - `xiangqi_core` 已完成棋盘、合法着、FEN、`PositionHistory` 与规则裁判。
-- 正式 UCI 默认走 **stream MCTS**：常驻 Gather / Eval / NN / Backprop 流水线（默认 `4 / 2 / 1 + 1×NN`）、ONNX、缓存、tree reuse/prune、Watchdog 与完整会话生命周期。
-- classic 保留为独立的对照实现；不再推进 classic `TaskWorkers` 的共享可变树并行路线。
+- 正式 UCI 使用唯一的 **stream MCTS**：Gather / Eval / NN / Backprop 流水线（默认 `4 / 2 / 1 + 1×NN`）、ONNX、缓存、tree reuse/prune、Watchdog 与完整会话生命周期。
 
 正式模型契约固定为：`124 x 10 x 9 -> 2062 policy + WDL[win, draw, loss] + moves-left`，引擎 value 为 `win - loss`。
 
