@@ -7,9 +7,6 @@ use xiangqi_core::Move;
 pub struct BestMoveInfo {
     pub bestmove: Move,
     pub ponder: Move,
-    pub player: i32,
-    pub game_id: i32,
-    pub is_black: Option<bool>,
 }
 
 impl BestMoveInfo {
@@ -17,9 +14,6 @@ impl BestMoveInfo {
         Self {
             bestmove,
             ponder: Move::NULL,
-            player: -1,
-            game_id: -1,
-            is_black: None,
         }
     }
 }
@@ -41,18 +35,12 @@ pub struct ThinkingInfo {
     pub nodes: i64,
     pub nps: i32,
     pub eps: i32,
-    pub hashfull: i32,
     pub mate: Option<i32>,
     pub score: Option<i32>,
     pub wdl: Option<Wdl>,
-    pub tb_hits: i32,
     pub pv: Vec<Move>,
     pub multipv: i32,
     pub comment: String,
-    pub player: i32,
-    pub game_id: i32,
-    pub is_black: Option<bool>,
-    pub moves_left: Option<i32>,
 }
 
 impl Default for ThinkingInfo {
@@ -65,18 +53,12 @@ impl Default for ThinkingInfo {
             nodes: -1,
             nps: -1,
             eps: -1,
-            hashfull: -1,
             mate: None,
             score: None,
             wdl: None,
-            tb_hits: -1,
             pv: Vec::new(),
             multipv: -1,
             comment: String::new(),
-            player: -1,
-            game_id: -1,
-            is_black: None,
-            moves_left: None,
         }
     }
 }

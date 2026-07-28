@@ -12,13 +12,11 @@ use xiangqi_core::{GameState, Move};
 use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo, Wdl};
 use crate::neural::backend::Backend;
 use crate::search::SearchBase;
-use crate::uci_loop::{GoParams, UciOptions};
 use crate::EnginError;
+use crate::GoParams;
 
 use super::node::{Node, NodeTree};
-use super::params::{
-    accurate_wdl_rescale_params, get_contempt, simplified_wdl_rescale_params, ContemptMode, ScoreType, SearchParams,
-};
+use super::params::{ContemptMode, ScoreType, SearchParams};
 use super::stoppers::timemgr::{IterationStats, StoppersHints};
 use super::stoppers::{build_search_stoppers, ChainedSearchStopper, LegacyTimeManager, SearchStopper};
 use super::worker::{cancel_shared_collisions, SearchWorker, WorkerSearchState};
@@ -559,8 +557,31 @@ pub struct ClassicSearch {
     slowmover: f32,
 }
 
+pub trait IntoBackendArc {
+    fn into_backend_arc(self) -> Arc<dyn Backend>;
+}
+
+impl<T: Backend + 'static> IntoBackendArc for Box<T> {
+    fn into_backend_arc(self) -> Arc<dyn Backend> {
+        let backend: Box<dyn Backend> = self;
+        Arc::from(backend)
+    }
+}
+
+impl IntoBackendArc for Box<dyn Backend> {
+    fn into_backend_arc(self) -> Arc<dyn Backend> {
+        Arc::from(self)
+    }
+}
+
+impl IntoBackendArc for Arc<dyn Backend> {
+    fn into_backend_arc(self) -> Arc<dyn Backend> {
+        self
+    }
+}
+
 impl ClassicSearch {
-    pub fn new(backend: Box<dyn Backend>) -> Self {
+    pub fn new(backend: impl IntoBackendArc) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let meta = Arc::new(Mutex::new(SearchMeta {
             params: SearchParams::default(),
@@ -576,7 +597,7 @@ impl ClassicSearch {
             tree: Arc::new(RwLock::new(NodeTree::default())),
             worker_state: Arc::new(WorkerSearchState::new(Arc::clone(&stop))),
             meta: Arc::clone(&meta),
-            backend: Arc::from(backend),
+            backend: backend.into_backend_arc(),
             stop,
             stopper: Arc::clone(&stopper),
             stop_controller: Arc::new(SearchStopController {
@@ -640,16 +661,16 @@ impl ClassicSearch {
 
     /// px0 `SearchBase` receives its responder during search construction
     /// (`src/search/search.h:45-55`). It is immutable while workers run.
-    pub fn set_uci_responder(&mut self, responder: Arc<dyn SearchResponder>) {
-        self.responder = Some(responder);
+    pub fn set_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>) {
+        self.responder = responder;
     }
 
     /// px0 `SearchBase::SetBackend` (`src/search/search.h:48-55`). Callers
     /// must stop search first; a worker holds a cloned backend for its full
     /// lifetime, exactly as px0 changes the backend only while stopped.
-    pub fn set_backend(&mut self, backend: Box<dyn Backend>) -> Result<(), EnginError> {
+    pub fn set_backend(&mut self, backend: impl IntoBackendArc) -> Result<(), EnginError> {
         self.abort_search()?;
-        self.backend = Arc::from(backend);
+        self.backend = backend.into_backend_arc();
         Ok(())
     }
 
@@ -672,41 +693,6 @@ impl ClassicSearch {
         Ok(())
     }
 
-    /// px0 `BaseSearchParams` freezes WDL calibration from OptionsDict before
-    /// worker construction (`src/search/classic/params.cc:688-703`).
-    pub fn set_wdl_options(&mut self, options: &UciOptions) -> Result<(), EnginError> {
-        self.abort_search()?;
-        let contempt =
-            get_contempt(&options.uci_opponent, &options.contempt, options.uci_rating_adv).map_err(EnginError::Uci)?;
-        let rescale = if options.wdl_calibration_elo == 0.0 {
-            accurate_wdl_rescale_params(
-                contempt,
-                options.wdl_draw_rate_target,
-                options.wdl_draw_rate_reference,
-                options.wdl_book_exit_bias,
-                options.contempt_max_value,
-                options.wdl_contempt_attenuation,
-            )
-        } else {
-            simplified_wdl_rescale_params(
-                contempt,
-                options.wdl_draw_rate_reference,
-                options.wdl_calibration_elo,
-                options.contempt_max_value,
-                options.wdl_contempt_attenuation,
-            )
-        };
-        let mut meta = self.meta.lock().expect("meta lock");
-        meta.params.wdl_rescale_ratio = rescale.ratio;
-        meta.params.wdl_rescale_diff = rescale.diff;
-        meta.params.wdl_max_s = options.wdl_max_s;
-        meta.params.wdl_eval_objectivity = options.wdl_eval_objectivity;
-        meta.params.contempt_mode = options.contempt_mode;
-        Ok(())
-    }
-
-    /// px0 applies `NNCacheSize` through `Engine::UpdateBackendConfig`
-    /// (`src/engine.cc:153-167`) before each new search parameter snapshot.
     pub fn set_nn_cache_size(&mut self, size: usize) {
         self.backend.set_cache_size(size);
     }
@@ -814,7 +800,6 @@ impl ClassicSearch {
                 mate,
                 score: mate.is_none().then_some(score),
                 wdl: Some(wdl_from_wl_d(wl, d)),
-                tb_hits: 0,
                 pv: principal_variation(tree, &meta.params, edge_idx),
                 multipv: if meta.params.multi_pv > 1 { index as i32 + 1 } else { -1 },
                 ..ThinkingInfo::default()
@@ -992,6 +977,10 @@ impl ClassicSearch {
 }
 
 impl SearchBase for ClassicSearch {
+    fn set_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>) {
+        Self::set_responder(self, responder);
+    }
+
     fn new_game(&mut self) -> Result<(), EnginError> {
         self.wait_search()?;
         // px0 `Engine::NewGame` clears the `CachingBackend` before rebuilding
@@ -1012,7 +1001,7 @@ impl SearchBase for ClassicSearch {
         Ok(())
     }
 
-    fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError> {
+    fn validate_go(&self, params: &GoParams) -> Result<(), EnginError> {
         // px0 translates these limits through DepthStopper/MateStopper
         // (`src/search/classic/stoppers/common.cc:118-160`). This port has not
         // translated their complete IterationStats dependencies, so reject the
@@ -1021,6 +1010,11 @@ impl SearchBase for ClassicSearch {
         if params.depth.is_some() || params.mate.is_some() {
             return Err(EnginError::PortIncomplete("go depth/go mate stopper"));
         }
+        Ok(())
+    }
+
+    fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError> {
+        self.validate_go(params)?;
         self.stop.store(false, Ordering::Release);
         self.infinite.store(params.infinite, Ordering::Release);
         // px0 initializes this as `!infinite && !ponder` in `Search::Search`
@@ -1685,7 +1679,7 @@ mod tests {
         search.meta.lock().expect("meta lock").params.wdl_rescale_diff = 0.1;
 
         let responder = Arc::new(RecordingSearchResponder::default());
-        search.set_uci_responder(Arc::clone(&responder) as Arc<dyn SearchResponder>);
+        search.set_responder(Some(Arc::clone(&responder) as Arc<dyn SearchResponder>));
         search
             .start_search(&crate::uci_loop::GoParams {
                 infinite: true,

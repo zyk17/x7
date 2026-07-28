@@ -4,16 +4,17 @@ pub mod callbacks;
 pub mod engine;
 pub mod error;
 pub mod neural;
+pub mod options;
 pub mod search;
 pub mod uci_loop;
 pub mod utils;
 
-pub use callbacks::{BestMoveInfo, ThinkingInfo, Wdl};
-pub use engine::ClassicEngine;
+pub use callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo, Wdl};
+pub use engine::Engine;
 pub use error::EnginError;
-pub use search::{classic, SearchBase};
+pub use options::Options;
+pub use search::{classic, SearchBase, SearchFactory};
 pub use uci_loop::{
     contains_key, format_best_move, format_thinking_info, get_numeric, get_or_empty, parse_command, EngineController,
-    GoParams, RecordingEngine, StdoutUciResponder, StringUciResponder, UciLoop, UciOptions, UciResponder,
-    VecUciResponder,
+    GoParams, RecordingEngine, StdoutUciResponder, StringUciResponder, UciLoop, UciResponder, VecUciResponder,
 };

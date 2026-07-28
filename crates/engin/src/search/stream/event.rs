@@ -78,7 +78,10 @@ pub struct NodeEvent {
 
 impl NodeEvent {
     pub fn root(generation: SearchGeneration, root_history: Arc<PositionHistory>) -> Self {
-        let node_key = NodeKey::root(root_history.last().hash());
+        Self::at_root(generation, NodeKey::root(root_history.last().hash()), root_history)
+    }
+
+    pub fn at_root(generation: SearchGeneration, node_key: NodeKey, root_history: Arc<PositionHistory>) -> Self {
         Self {
             generation,
             node_key,
@@ -123,7 +126,7 @@ pub struct BackpropEvent {
 
 #[derive(Debug)]
 enum BackpropOutcome {
-    Evaluation { wl: f32, draw: f32 },
+    Evaluation { wl: f32, draw: f32, m: f32 },
     Collision,
 }
 
@@ -131,13 +134,17 @@ enum BackpropOutcome {
 pub(crate) struct BackpropResult {
     pub completed_playouts: u32,
     pub collisions: u32,
+    /// Sum of completed leaf depths, with the root at depth one. This matches
+    /// px0 classic's `cum_depth_` accounting (`search.cc:2157-2167`).
+    pub completed_depth: u64,
+    pub max_depth: u64,
 }
 
 impl BackpropEvent {
-    pub(crate) fn evaluation(node: NodeEvent, wl: f32, draw: f32) -> Self {
+    pub(crate) fn evaluation(node: NodeEvent, wl: f32, draw: f32, m: f32) -> Self {
         Self {
             node,
-            outcome: BackpropOutcome::Evaluation { wl, draw },
+            outcome: BackpropOutcome::Evaluation { wl, draw, m },
         }
     }
 
@@ -164,15 +171,21 @@ impl BackpropEvent {
 
         for event in events {
             let Self { node, outcome } = event;
-            let BackpropOutcome::Evaluation { wl, draw } = outcome else {
+            let BackpropOutcome::Evaluation { wl, draw, m } = outcome else {
                 node.cancel();
                 result.collisions += 1;
                 continue;
             };
             debug_assert_eq!(node.node_path.len(), node.reservations.len() + 1);
-            let mut delta = ValueDelta::one(wl, draw);
+            let depth = node.node_path.len() as u64;
+            let mut delta = ValueDelta::with_m(wl, draw, m);
             let mut reservations = node.reservations.into_iter().rev();
             for (node_index, node_key) in node.node_path.into_iter().enumerate().rev() {
+                if let Some((terminal_wl, terminal_draw, terminal_m)) =
+                    repository.get(node_key).and_then(|node| node.terminal_value())
+                {
+                    delta = ValueDelta::with_m(terminal_wl, terminal_draw, terminal_m);
+                }
                 node_deltas
                     .entry(node_key)
                     .and_modify(|aggregate| *aggregate = aggregate.merge(delta))
@@ -184,9 +197,11 @@ impl BackpropEvent {
                 // the edge with the child delta, then flip for the parent node
                 // (`search.cc:2175-2257`: finalize(v); v = -v).
                 reservations.next().expect("path reservation").complete(delta.q());
-                delta = delta.for_parent();
+                delta = delta.for_parent().one_ply_up();
             }
             result.completed_playouts += 1;
+            result.completed_depth += depth;
+            result.max_depth = result.max_depth.max(depth);
         }
 
         for (node_key, delta) in node_deltas {
@@ -249,10 +264,7 @@ mod tests {
         root_node.publish_edges(vec![(mv, 1.0)]);
         let child = root.descend(NodeKey::root(42), root_node.reserve_edge(0).expect("edge"));
 
-        BackpropEvent::complete_batch(
-            [BackpropEvent::evaluation(child, 0.4, 0.2)],
-            &repository,
-        );
+        BackpropEvent::complete_batch([BackpropEvent::evaluation(child, 0.4, 0.2, 2.0)], &repository);
 
         let edge = &root_node.edges()[0];
         assert_eq!(edge.visits(), 1);
@@ -262,9 +274,11 @@ mod tests {
         assert!((edge.q() - 0.4).abs() < f32::EPSILON);
         assert_eq!(root_node.completed_visits(), 1);
         assert!((root_node.q() + 0.4).abs() < f32::EPSILON);
+        assert!((root_node.m() - 3.0).abs() < f32::EPSILON);
         let child_node = repository.get(NodeKey::root(42)).expect("child node");
         assert_eq!(child_node.completed_visits(), 1);
         assert!((child_node.q() - 0.4).abs() < f32::EPSILON);
+        assert!((child_node.m() - 2.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -284,10 +298,7 @@ mod tests {
         root_node.publish_edges(vec![(mv, 1.0)]);
         let child = root.descend(NodeKey::root(42), root_node.reserve_edge(0).expect("edge"));
 
-        let result = BackpropEvent::complete_batch(
-            [BackpropEvent::collision(child)],
-            &repository,
-        );
+        let result = BackpropEvent::complete_batch([BackpropEvent::collision(child)], &repository);
 
         let edge = &root_node.edges()[0];
         assert_eq!(result.completed_playouts, 0);
@@ -318,8 +329,8 @@ mod tests {
 
         let result = BackpropEvent::complete_batch(
             [
-                BackpropEvent::evaluation(first, 0.4, 0.2),
-                BackpropEvent::evaluation(second, 0.2, 0.4),
+                BackpropEvent::evaluation(first, 0.4, 0.2, 0.0),
+                BackpropEvent::evaluation(second, 0.2, 0.4, 0.0),
             ],
             &repository,
         );
@@ -328,6 +339,8 @@ mod tests {
         let child_node = repository.get(child_key).expect("child node");
         assert_eq!(result.completed_playouts, 2);
         assert_eq!(result.collisions, 0);
+        assert_eq!(result.completed_depth, 4);
+        assert_eq!(result.max_depth, 2);
         assert_eq!(edge.visits(), 2);
         assert_eq!(edge.completed_visits(), 2);
         assert!((edge.q() - 0.3).abs() < f32::EPSILON);

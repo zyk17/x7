@@ -1,9 +1,8 @@
-//! P3 `go nodes` UCI transcript 验收。
+//! Stream UCI lifecycle regressions.
 
-use std::path::Path;
 use std::sync::Once;
 
-use engin::{ClassicEngine, UciLoop, UciOptions, VecUciResponder};
+use engin::{Engine, Options, UciLoop, VecUciResponder};
 use xiangqi_core::initialize_magic_bitboards;
 
 static INIT: Once = Once::new();
@@ -13,60 +12,37 @@ fn ensure_init() {
 }
 
 #[test]
-fn classic_engine_go_nodes_emits_bestmove() {
+fn go_nodes_reports_info_and_bestmove() {
     ensure_init();
-    let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::uniform();
+    let mut options = Options::populate_defaults();
+    let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-    uci.process_line("position startpos", "0.0.0").expect("position");
-    uci.process_line("go nodes 8", "0.0.0").expect("go nodes");
-    uci.process_line("wait", "0.0.0").expect("wait");
+    uci.process_line("position startpos", "test").expect("position");
+    uci.process_line("go nodes 8", "test").expect("go");
+    uci.process_line("wait", "test").expect("wait");
     drop(uci);
-    assert!(
-        responder.responses.iter().any(|line| line.starts_with("bestmove ")),
-        "expected bestmove, got {:?}",
-        responder.responses
-    );
-    assert_eq!(engine.search().expect("uniform search").total_root_visits(), 8);
-    let bestmove = responder
+
+    assert!(responder.responses.iter().any(|line| line.starts_with("info ")));
+    assert!(responder
         .responses
         .iter()
-        .find(|line| line.starts_with("bestmove "))
-        .expect("bestmove line");
-    assert!(bestmove.contains(" ponder a9a8"), "unexpected ponder: {bestmove}");
-}
-
-#[test]
-fn classic_engine_movetime_runs_at_least_one_simulation() {
-    ensure_init();
-    let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::uniform();
-    let mut responder = VecUciResponder::default();
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-    uci.process_line("position startpos", "0.0.0").expect("position");
-    uci.process_line("go movetime 0", "0.0.0").expect("go movetime");
-    uci.process_line("wait", "0.0.0").expect("wait");
-    drop(uci);
-
-    assert!(engine.search().expect("uniform search").total_root_visits() >= 1);
+        .any(|line| line.contains(" depth ") && line.contains(" seldepth ")));
+    assert!(responder.responses.iter().any(|line| line.contains(" score cp ")));
     assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
 }
 
-/// px0 `Search::StartThreads/WatchdogThread/Stop/Wait` keeps `go` non-blocking
-/// and lets the watchdog emit exactly one bestmove after an explicit stop
-/// (`src/search/classic/search.cc:874-1041`).
 #[test]
-fn classic_engine_infinite_stop_is_async_and_emits_one_bestmove() {
+fn stop_emits_exactly_one_bestmove() {
     ensure_init();
-    let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::uniform();
+    let mut options = Options::populate_defaults();
+    let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-    uci.process_line("position startpos", "0.0.0").expect("position");
-    uci.process_line("go infinite", "0.0.0").expect("go must not block");
-    uci.process_line("stop", "0.0.0").expect("stop must not block");
-    uci.process_line("wait", "0.0.0").expect("wait");
+    uci.process_line("position startpos", "test").expect("position");
+    uci.process_line("go infinite", "test").expect("go");
+    uci.process_line("stop", "test").expect("stop");
+    uci.process_line("wait", "test").expect("wait");
     drop(uci);
 
     assert_eq!(
@@ -75,121 +51,70 @@ fn classic_engine_infinite_stop_is_async_and_emits_one_bestmove() {
             .iter()
             .filter(|line| line.starts_with("bestmove "))
             .count(),
-        1,
-        "responses: {:?}",
-        responder.responses
+        1
     );
 }
 
-/// px0 `MultiPV` returns the independently ranked root children from
-/// `Search::GetBestChildrenNoTemperature` (`search.cc:239-246,705-808`).
 #[test]
-fn classic_engine_multipv_emits_ranked_root_lines() {
+fn searchmoves_restricts_the_selected_move() {
     ensure_init();
-    let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::uniform();
+    let mut options = Options::populate_defaults();
+    let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-    uci.process_line("setoption name MultiPV value 2", "0.0.0")
-        .expect("multipv option");
-    uci.process_line("setoption name ScoreType value Q", "0.0.0")
-        .expect("score type option");
-    uci.process_line("position startpos", "0.0.0").expect("position");
-    uci.process_line("go nodes 32", "0.0.0").expect("go nodes");
-    uci.process_line("wait", "0.0.0").expect("wait");
+    uci.process_line("position startpos", "test").expect("position");
+    uci.process_line("go nodes 8 searchmoves h2h3", "test").expect("go");
+    uci.process_line("wait", "test").expect("wait");
     drop(uci);
 
-    assert!(
-        responder.responses.iter().any(|line| line.contains(" multipv 1 pv ")),
-        "responses: {:?}",
-        responder.responses
-    );
-    assert!(
-        responder.responses.iter().any(|line| line.contains(" multipv 2 pv ")),
-        "responses: {:?}",
-        responder.responses
-    );
-    assert!(
-        responder.responses.iter().any(|line| line.contains(" score cp 0 ")),
-        "responses: {:?}",
-        responder.responses
-    );
+    assert!(responder.responses.iter().any(|line| line.starts_with("bestmove h2h3")));
 }
 
-/// px0 passes a parsed `go nodes 0` unchanged to `VisitsStopper`; it is an
-/// immediate visit cap, not a UCI parse error (`chess/uciloop.cc:230-237`,
-/// `search/classic/stoppers/common.cc:133-145`). The worker still completes
-/// its initial iteration before observing the stopper.
 #[test]
-fn classic_engine_accepts_zero_node_budget_as_immediate_cap() {
+fn proven_terminal_child_reports_uci_mate() {
     ensure_init();
-    let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::uniform();
+    let mut options = Options::populate_defaults();
+    let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-    uci.process_line("position startpos", "0.0.0").expect("position");
-    uci.process_line("go nodes 0", "0.0.0").expect("px0 accepts zero nodes");
-    uci.process_line("wait", "0.0.0").expect("wait");
+    uci.process_line("position fen 4k4/4PR3/3RC4/9/9/9/9/9/9/4K4 w - - 0 1", "test")
+        .expect("position");
+    uci.process_line("go nodes 8 searchmoves d7d8", "test").expect("go");
+    uci.process_line("wait", "test").expect("wait");
     drop(uci);
 
-    assert!(
-        responder.responses.iter().any(|line| line.starts_with("bestmove ")),
-        "responses: {:?}",
-        responder.responses
-    );
+    assert!(responder.responses.iter().any(|line| line.contains("score mate 1")));
+    assert!(responder.responses.iter().any(|line| line.starts_with("bestmove d7d8")));
 }
 
-/// px0 `StringsToMovelist` filters root selection itself, not just the final
-/// response (`src/search/classic/wrapper.cc:78-100`, `search.cc:1668-1740`).
 #[test]
-fn classic_engine_searchmoves_restricts_root_selection() {
+fn checkmated_root_reports_negative_uci_mate() {
     ensure_init();
-    let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::uniform();
+    let mut options = Options::populate_defaults();
+    let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-    uci.process_line("position startpos", "0.0.0").expect("position");
-    uci.process_line("go nodes 8 searchmoves a0a1", "0.0.0")
-        .expect("go searchmoves");
-    uci.process_line("wait", "0.0.0").expect("wait");
+    uci.process_line("position fen 4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", "test")
+        .expect("position");
+    uci.process_line("go nodes 1", "test").expect("go");
+    uci.process_line("wait", "test").expect("wait");
     drop(uci);
 
-    assert!(
-        responder.responses.iter().any(|line| line.starts_with("bestmove a0a1")),
-        "responses: {:?}",
-        responder.responses
-    );
-    for info in responder.responses.iter().filter(|line| line.starts_with("info ")) {
-        assert!(info.contains(" pv a0a1"), "response escaped root filter: {info}");
-    }
-}
-
-/// px0 throws when every requested `searchmoves` entry is illegal
-/// (`src/search/classic/wrapper.cc:88-98`).
-#[test]
-fn classic_engine_rejects_all_illegal_searchmoves() {
-    ensure_init();
-    let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::uniform();
-    let mut responder = VecUciResponder::default();
-    let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-    uci.process_line("position startpos", "0.0.0").expect("position");
-    let error = uci
-        .process_line("go nodes 8 searchmoves a0a9", "0.0.0")
-        .expect_err("illegal searchmoves must fail");
-    assert_eq!(error.to_string(), "No legal searchmoves.");
+    assert!(responder.responses.iter().any(|line| line.contains("score mate -1")));
+    assert!(responder.responses.iter().any(|line| line == "bestmove a0a0"));
 }
 
 #[test]
-fn unavailable_engine_does_not_return_uniform_bestmove() {
+fn missing_weights_never_falls_back_to_uniform_search() {
     ensure_init();
-    let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::new();
+    let mut options = Options::populate_defaults();
+    let mut engine = Engine::new();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-    uci.process_line("position startpos", "0.0.0").expect("position");
-    uci.process_line("go nodes 8", "0.0.0").expect("go nodes");
+    uci.process_line("position startpos", "test").expect("position");
+    uci.process_line("go nodes 8", "test").expect("go");
     drop(uci);
+
     assert!(responder
         .responses
         .iter()
@@ -197,26 +122,29 @@ fn unavailable_engine_does_not_return_uniform_bestmove() {
     assert!(!responder.responses.iter().any(|line| line.starts_with("bestmove ")));
 }
 
-/// px0 updates its backend configuration before accepting a new position
-/// (`src/engine.cc:153-167,187-197`). The Rust `WeightsFile` subset accepts
-/// the formal ONNX artifact instead of px0 protobuf weights.
 #[test]
-fn weights_file_enables_main_uci_onnx_search_if_local_x7_exists() {
+fn unsupported_go_limits_are_rejected_without_stopping_the_current_search() {
     ensure_init();
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx");
-    if !path.is_file() {
-        eprintln!("skip: {} is absent", path.display());
-        return;
-    }
-    let mut options = UciOptions::populate_defaults();
-    let mut engine = ClassicEngine::new();
+    let mut options = Options::populate_defaults();
+    let mut engine = Engine::uniform();
     let mut responder = VecUciResponder::default();
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
-    uci.process_line(&format!("setoption name WeightsFile value {}", path.display()), "0.0.0")
-        .expect("configure weights");
-    uci.process_line("position startpos", "0.0.0").expect("position");
-    uci.process_line("go nodes 1", "0.0.0").expect("go nodes");
-    uci.process_line("wait", "0.0.0").expect("wait");
+    uci.process_line("position startpos", "test").expect("position");
+    uci.process_line("go infinite", "test").expect("infinite go");
+
+    for command in ["go depth 1", "go mate 1", "go wtime 1000", "go nodes 0"] {
+        assert!(uci.process_line(command, "test").is_err(), "{command}");
+    }
+
+    uci.process_line("stop", "test").expect("stop");
+    uci.process_line("wait", "test").expect("wait");
     drop(uci);
-    assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
+    assert_eq!(
+        responder
+            .responses
+            .iter()
+            .filter(|line| line.starts_with("bestmove "))
+            .count(),
+        1
+    );
 }

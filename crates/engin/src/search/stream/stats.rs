@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use xiangqi_core::Move;
 
-use super::{ExpansionState, NodeKey, NodeRepository, Edge, Node};
+use super::{Edge, ExpansionState, Node, NodeKey, NodeRepository};
 
 /// One root edge snapshot. `started_visits` includes in-flight; Q uses completed only.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -79,8 +79,9 @@ fn best_edge_rank(edge: &Edge, child: Option<&Node>) -> BestEdgeRank {
     if child.expansion_state() != ExpansionState::Terminal || edge.completed_visits() == 0 {
         return BestEdgeRank::NonTerminal;
     }
-    // Terminal leaves store hard wl ∈ {+1, 0, -1}; edge Q is that average.
-    let q = edge.q();
+    // Terminal nodes are proofs. Use their exact incoming-edge value rather
+    // than an edge average that may still contain pre-proof in-flight visits.
+    let q = child.terminal_wl().expect("terminal stream wl").0;
     if q > 0.0 {
         BestEdgeRank::TerminalWin
     } else if q < 0.0 {
@@ -103,21 +104,14 @@ fn terminal_plies(child: Option<&Node>) -> f32 {
 }
 
 fn is_visited_terminal(edge: &Edge, child: Option<&Node>) -> bool {
-    child.is_some_and(|node| {
-        node.expansion_state() == ExpansionState::Terminal && edge.completed_visits() > 0
-    })
+    child.is_some_and(|node| node.expansion_state() == ExpansionState::Terminal && edge.completed_visits() > 0)
 }
 
 /// px0 `GetBestChildrenNoTemperature` (`search.cc:776-795`): lexicographic
 /// compare, not a weighted blend of N/Q/P.
 ///
 /// `true` when `left` is strictly better than `right`.
-fn edge_is_better(
-    left: &Arc<Edge>,
-    left_child: Option<&Node>,
-    right: &Arc<Edge>,
-    right_child: Option<&Node>,
-) -> bool {
+fn edge_is_better(left: &Arc<Edge>, left_child: Option<&Node>, right: &Arc<Edge>, right_child: Option<&Node>) -> bool {
     let left_rank = best_edge_rank(left, left_child);
     let right_rank = best_edge_rank(right, right_child);
     if left_rank != right_rank {
@@ -167,11 +161,7 @@ fn first_filtered_move(edges: &[Arc<Edge>], root_move_filter: &[Move]) -> Option
 }
 
 /// Absolute (board) best edge, before UCI orientation.
-fn best_edge_absolute(
-    repository: &NodeRepository,
-    root_key: NodeKey,
-    root_move_filter: &[Move],
-) -> Option<Move> {
+fn best_edge_absolute(repository: &NodeRepository, root_key: NodeKey, root_move_filter: &[Move]) -> Option<Move> {
     let node = repository.get(root_key)?;
     let edges = node.edges();
     if edges.is_empty() {
@@ -195,9 +185,7 @@ fn best_edge_absolute(
         let child = repository.get(root_key.child(edge.mv()));
         let better = match &best {
             None => true,
-            Some((best_edge, best_child)) => {
-                edge_is_better(edge, child.as_deref(), best_edge, best_child.as_deref())
-            }
+            Some((best_edge, best_child)) => edge_is_better(edge, child.as_deref(), best_edge, best_child.as_deref()),
         };
         if better {
             best = Some((Arc::clone(edge), child));
@@ -216,27 +204,45 @@ pub fn best_move_filtered(
     root_is_black: bool,
     root_move_filter: &[Move],
 ) -> Option<Move> {
-    best_edge_absolute(repository, root_key, root_move_filter)
-        .map(|mv| orient_move(mv, root_is_black))
+    best_edge_absolute(repository, root_key, root_move_filter).map(|mv| orient_move(mv, root_is_black))
 }
 
-pub fn best_move(
-    repository: &NodeRepository,
-    root_key: NodeKey,
-    root_is_black: bool,
-) -> Option<Move> {
+pub fn best_move(repository: &NodeRepository, root_key: NodeKey, root_is_black: bool) -> Option<Move> {
     best_move_filtered(repository, root_key, root_is_black, &[])
+}
+
+/// Proven mate score for the selected root edge. `m` is in plies from that
+/// child, matching px0 `SendUciInfo` (`search.cc:249-336`).
+pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_move_filter: &[Move]) -> Option<i32> {
+    let root = repository.get(root_key)?;
+    if let Some((wl, _, m)) = root.terminal_value() {
+        return (wl != 0.0).then(|| {
+            let distance = m.round() as i32 / 2 + 1;
+            if wl < 0.0 {
+                distance
+            } else {
+                -distance
+            }
+        });
+    }
+    let mv = best_edge_absolute(repository, root_key, root_move_filter)?;
+    let child = repository.get(root_key.child(mv))?;
+    let (wl, _, m) = child.terminal_value()?;
+    (wl != 0.0).then(|| {
+        let distance = m.round() as i32 / 2 + 1;
+        if wl > 0.0 {
+            distance
+        } else {
+            -distance
+        }
+    })
 }
 
 /// Principal variation (UCI `pv` line). Not policy/value.
 ///
 /// Walks like px0 `SendUciInfo` (`search.cc:345-350`): best child while parent
 /// `N > 0`; zero-visit child edges may appear once (dangling), then stop.
-pub fn principal_variation(
-    repository: &NodeRepository,
-    root_key: NodeKey,
-    root_is_black: bool,
-) -> Vec<Move> {
+pub fn principal_variation(repository: &NodeRepository, root_key: NodeKey, root_is_black: bool) -> Vec<Move> {
     principal_variation_filtered(repository, root_key, root_is_black, &[])
 }
 
@@ -272,11 +278,9 @@ pub fn principal_variation_filtered(
 
 /// True when every root edge has `started == completed` (no in-flight).
 pub fn root_settled(repository: &NodeRepository, root_key: NodeKey) -> bool {
-    repository.get(root_key).is_some_and(|root| {
-        root.edges()
-            .iter()
-            .all(|edge| edge.visits() == edge.completed_visits())
-    })
+    repository
+        .get(root_key)
+        .is_some_and(|root| root.edges().iter().all(|edge| edge.visits() == edge.completed_visits()))
 }
 
 #[cfg(test)]
@@ -285,9 +289,9 @@ mod tests {
 
     use xiangqi_core::{GameState, Move, PositionHistory, Square, STARTPOS_FEN};
 
-    use super::{best_move, best_move_filtered, principal_variation, root_settled, root_stats};
+    use super::{best_mate, best_move, best_move_filtered, principal_variation, root_settled, root_stats};
     use crate::neural::backend::UniformBackend;
-    use crate::search::stream::{SearchGeneration, SearchConfig, Search};
+    use crate::search::stream::{Search, SearchConfig, SearchGeneration};
 
     #[test]
     fn root_snapshot_reports_completed_and_in_flight_visits_separately() {
@@ -352,12 +356,7 @@ mod tests {
             (mv("c0", "c1"), 0.70),
         ]);
         let edges = root.edges();
-        let idx = |target: Move| {
-            edges
-                .iter()
-                .position(|edge| edge.mv() == target)
-                .expect("edge")
-        };
+        let idx = |target: Move| edges.iter().position(|edge| edge.mv() == target).expect("edge");
         let loss_idx = idx(mv("a0", "a1"));
         let win_idx = idx(mv("b0", "b1"));
         let other_idx = idx(mv("c0", "c1"));
@@ -391,6 +390,36 @@ mod tests {
             mv("b0", "b1"),
             "proven terminal win must beat higher-N loss and non-terminal"
         );
+    }
+
+    #[test]
+    fn best_mate_reports_proven_terminal_child_distance() {
+        use crate::search::stream::{NodeKey, NodeRepository, ValueDelta};
+
+        let repository = NodeRepository::default();
+        let root_key = NodeKey::root(99);
+        let root = repository.get_or_insert(root_key);
+        let mv = Move::new(Square::parse("b2").expect("from"), Square::parse("b3").expect("to"));
+        assert!(root.try_begin_evaluation());
+        root.publish_edges(vec![(mv, 1.0)]);
+        root.add_delta(ValueDelta::one(0.0, 0.0));
+        let child = repository.get_or_insert(root_key.child(mv));
+        assert!(child.try_begin_evaluation());
+        child.mark_terminal(1.0, 0.0, 3.0);
+
+        assert_eq!(best_mate(&repository, root_key, &[]), Some(2));
+    }
+
+    #[test]
+    fn best_mate_reports_a_checkmated_root() {
+        use crate::search::stream::{NodeKey, NodeRepository};
+
+        let repository = NodeRepository::default();
+        let root = repository.get_or_insert(NodeKey::root(100));
+        assert!(root.try_begin_evaluation());
+        root.mark_terminal(1.0, 0.0, 0.0);
+
+        assert_eq!(best_mate(&repository, NodeKey::root(100), &[]), Some(-1));
     }
 
     #[test]

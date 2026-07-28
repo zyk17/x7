@@ -43,6 +43,9 @@ pub struct EvalResult {
     pub policies: Vec<f32>,
 }
 
+/// Batched raw network outputs: policy logits, WDL probabilities, moves-left.
+pub type EncodedInference = (Vec<f32>, Vec<f32>, Vec<f32>);
+
 /// px0 `EvalPosition` (`src/neural/backend.h:62-65`) 的所有权版本。
 ///
 /// P4 computation 会跨 `ComputeBlocking()` 保存请求；因此 Rust 不保存 C++ 的
@@ -95,8 +98,9 @@ pub trait Backend: Send + Sync {
     }
 
     /// Stream NN worker: inference on already-encoded NCHW planes only.
-    /// Returns `logits[batch * POLICY_SIZE]` and WDL `value[batch * 3]`.
-    fn infer_encoded(&self, _planes: &[f32], _batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+    /// Returns logits, WDL probabilities and moves-left, respectively shaped
+    /// `[batch * POLICY_SIZE]`, `[batch * 3]`, and `[batch]`.
+    fn infer_encoded(&self, _planes: &[f32], _batch: usize) -> Result<EncodedInference, EnginError> {
         Err(EnginError::PortIncomplete("backend has no encoded inference"))
     }
 
@@ -171,7 +175,7 @@ impl Backend for CachingBackend {
         self.cached(position)
     }
 
-    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<EncodedInference, EnginError> {
         self.wrapped.infer_encoded(planes, batch)
     }
 
@@ -417,7 +421,7 @@ impl Backend for UniformBackend {
         Ok(Box::new(UniformBackendComputation::new(self.clone())))
     }
 
-    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<EncodedInference, EnginError> {
         let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
         if planes.len() != batch * plane_len {
             return Err(EnginError::PortIncomplete("uniform encoded planes length"));
@@ -428,7 +432,7 @@ impl Backend for UniformBackend {
         for _ in 0..batch {
             wdl.extend_from_slice(&[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
         }
-        Ok((logits, wdl))
+        Ok((logits, wdl, vec![self.m; batch]))
     }
 
     fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {
@@ -498,6 +502,14 @@ mod tests {
         for ticket in tickets {
             assert!(computation.take_result(ticket).is_ok());
         }
+    }
+
+    #[test]
+    fn encoded_uniform_inference_keeps_moves_left_per_position() {
+        let backend = UniformBackend::with_wdl(0.0, 0.0, 17.0);
+        let planes = vec![0.0; 2 * INPUT_PLANES * BOARD_ROWS * BOARD_COLS];
+        let (_, _, moves_left) = backend.infer_encoded(&planes, 2).expect("infer");
+        assert_eq!(moves_left, vec![17.0, 17.0]);
     }
 
     /// px0 `MemCacheComputation::AddInput/ComputeBlocking`

@@ -299,41 +299,6 @@ def masked_log_softmax(logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.
     return F.log_softmax(logits, dim=1)
 
 
-def policy_cross_entropy(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    legal_mask: torch.Tensor,
-    *,
-    label_smoothing: float = 0.0,
-    reduction: str = "mean",
-) -> torch.Tensor:
-    if reduction not in ("mean", "none"):
-        raise ValueError("reduction 须为 mean 或 none")
-
-    device = logits.device
-    batch_size, vocab_size = logits.shape
-    logp = masked_log_softmax(logits, legal_mask)
-    safe_logp = torch.where(legal_mask, logp, torch.zeros_like(logp))
-
-    if label_smoothing <= 0.0:
-        nll = -safe_logp[torch.arange(batch_size, device=device), targets]
-    else:
-        eps = float(label_smoothing)
-        one_hot = F.one_hot(targets, num_classes=vocab_size).float()
-        legal_f = legal_mask.float()
-        legal_count = legal_mask.sum(dim=1).clamp(min=1)
-        only_one = (legal_count == 1).unsqueeze(1)
-        denom = (legal_count - 1).clamp(min=1).float().unsqueeze(1)
-        others = (legal_f - one_hot).clamp(min=0) / denom
-        target_dist = (1.0 - eps) * one_hot + eps * others
-        target_dist = torch.where(only_one, one_hot, target_dist)
-        nll = -(target_dist * safe_logp).sum(dim=1)
-
-    if reduction == "mean":
-        return nll.mean()
-    return nll
-
-
 def soft_policy_cross_entropy(
     logits: torch.Tensor,
     target_probs: torch.Tensor,

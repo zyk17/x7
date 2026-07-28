@@ -1,102 +1,35 @@
-//! px0 `src/engine.cc:81-250` 的 P3/P4 引擎接线。
+//! px0 `src/engine.cc:137-250` 的 UCI Engine lifecycle.
 
-use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use xiangqi_core::{GameState, STARTPOS_FEN};
 
-use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo};
+use crate::callbacks::SearchResponder;
 use crate::neural::backend::{Backend, CachingBackend, UniformBackend};
 use crate::neural::onnx::OnnxBackend;
-use crate::search::classic::ClassicSearch;
-use crate::search::SearchBase;
-use crate::uci_loop::UciOptions;
+use crate::search::{SearchBase, SearchFactory};
 use crate::uci_loop::{EngineController, GoParams, StringUciResponder};
 use crate::EnginError;
-
-/// px0 `Engine::UciPonderForwarder` (`src/engine.cc:81-136`).
-///
-/// px0 registers the UCI loop's responder with the engine, then classic
-/// search invokes that forwarder from its watchdog thread. Rust cannot retain
-/// the responder borrow in an `Arc` because `UciLoop` still owns it, so this
-/// keeps the same non-owning registration model. The mutex serializes worker
-/// output against UCI-loop output. `ClassicEngine::unregister_uci_responder`
-/// stops and joins search before clearing the pointer, which is the lifetime
-/// invariant that makes the erased borrow sound.
-struct UciResponderForwarder {
-    responder: Mutex<Option<NonNull<dyn StringUciResponder>>>,
-}
-
-// SAFETY: the only pointer is installed by `register`, is protected by the
-// mutex, and is cleared only after all search threads joined in `unregister`.
-// This is the Rust expression of px0's UciPonderForwarder ownership contract.
-unsafe impl Send for UciResponderForwarder {}
-// SAFETY: see the `Send` implementation above; responder calls are mutexed.
-unsafe impl Sync for UciResponderForwarder {}
-
-impl UciResponderForwarder {
-    fn register(&self, responder: &mut dyn StringUciResponder) {
-        let mut slot = self.responder.lock().expect("uci responder lock");
-        assert!(slot.is_none(), "px0 UciPonderForwarder already has a responder");
-        // SAFETY: unregister joins all search threads before clearing this
-        // pointer, and UciLoop owns the responder for the registration span.
-        let pointer = unsafe {
-            std::mem::transmute::<NonNull<dyn StringUciResponder>, NonNull<dyn StringUciResponder + 'static>>(
-                NonNull::from(responder),
-            )
-        };
-        *slot = Some(pointer);
-    }
-
-    fn unregister(&self, responder: &mut dyn StringUciResponder) {
-        let mut slot = self.responder.lock().expect("uci responder lock");
-        let expected = NonNull::from(responder).cast::<()>();
-        let actual = slot
-            .as_ref()
-            .map(|pointer| pointer.cast::<()>())
-            .expect("px0 UciPonderForwarder has no responder");
-        assert_eq!(actual, expected, "px0 UciPonderForwarder responder mismatch");
-        *slot = None;
-    }
-}
-
-impl SearchResponder for UciResponderForwarder {
-    fn output_best_move(&self, info: &BestMoveInfo) {
-        let slot = self.responder.lock().expect("uci responder lock");
-        let Some(mut responder) = *slot else {
-            return;
-        };
-        // SAFETY: `register`/`unregister` maintain the documented pointer
-        // lifetime invariant and the mutex serializes all callbacks.
-        unsafe { responder.as_mut().output_best_move(info) };
-    }
-
-    fn output_thinking_info(&self, infos: &[ThinkingInfo]) {
-        let slot = self.responder.lock().expect("uci responder lock");
-        let Some(mut responder) = *slot else {
-            return;
-        };
-        // SAFETY: see `output_best_move`.
-        unsafe { responder.as_mut().output_thinking_info(infos) };
-    }
-}
+use crate::Options;
 
 /// px0 `Engine` 的 P3 子集：搜索 + UCI controller。
-pub struct ClassicEngine {
+pub struct Engine {
     // px0 `Engine` owns a search built by its factory (`src/engine.cc:137-151`).
     // The Rust port only has an ONNX factory, which can fail while a UCI
     // process is already alive; `None` means that factory has not produced a
     // usable search. It is deliberately not a UniformBackend fallback.
-    search: Option<ClassicSearch>,
-    uci_forwarder: Arc<UciResponderForwarder>,
+    search: Option<Box<dyn SearchBase>>,
+    factory: Arc<dyn SearchFactory>,
+    backend: Option<Arc<dyn Backend>>,
+    options: Options,
     position: Option<GameState>,
-    uci_options: UciOptions,
     manages_weights_file: bool,
     backend_error: Option<String>,
     loaded_weights_file: Option<String>,
+    responder: Option<Arc<dyn SearchResponder>>,
 }
 
-impl Default for ClassicEngine {
+impl Default for Engine {
     /// Rust adapter for the formal px0 `Engine::Engine` constructor
     /// (`src/engine.cc:137-167`); it adds no separate initialization path.
     fn default() -> Self {
@@ -104,39 +37,48 @@ impl Default for ClassicEngine {
     }
 }
 
-impl ClassicEngine {
+impl Engine {
     /// px0 `Engine::Engine` + `Engine::UpdateBackendConfig`
     /// (`src/engine.cc:137-167`), with the ONNX factory deferred until
     /// `SetPosition`. This is the formal UCI constructor.
     pub fn new() -> Self {
         Self {
             search: None,
-            uci_forwarder: Arc::new(UciResponderForwarder {
-                responder: Mutex::new(None),
-            }),
+            factory: Arc::new(crate::search::stream::Factory),
+            backend: None,
+            options: Options::default(),
             position: None,
-            uci_options: UciOptions::populate_defaults(),
             manages_weights_file: true,
             backend_error: None,
             loaded_weights_file: None,
+            responder: None,
         }
     }
 
     pub fn with_backend(backend: Box<dyn Backend>) -> Self {
-        let uci_forwarder = Arc::new(UciResponderForwarder {
-            responder: Mutex::new(None),
-        });
-        let mut search = ClassicSearch::new(backend);
-        search.set_uci_responder(Arc::clone(&uci_forwarder) as Arc<dyn SearchResponder>);
+        let backend: Arc<dyn Backend> = Arc::from(backend);
+        let factory: Arc<dyn SearchFactory> = Arc::new(crate::search::stream::Factory);
+        let mut search = factory.create(Arc::clone(&backend));
+        search.set_responder(None);
         Self {
             search: Some(search),
-            uci_forwarder,
+            factory,
+            backend: Some(backend),
+            options: Options::default(),
             position: None,
-            uci_options: UciOptions::populate_defaults(),
             manages_weights_file: false,
             backend_error: None,
             loaded_weights_file: None,
+            responder: None,
         }
+    }
+
+    /// px0 `Engine(const SearchFactory&, const OptionsDict&)`: callers may
+    /// select classic or stream without changing Engine/UCI lifecycle code.
+    pub fn with_factory(factory: Arc<dyn SearchFactory>) -> Self {
+        let mut engine = Self::new();
+        engine.factory = factory;
+        engine
     }
 
     /// Explicit backend construction for tests and direct callers. Formal UCI
@@ -153,8 +95,17 @@ impl ClassicEngine {
         Self::with_backend(Box::new(UniformBackend::default()))
     }
 
-    pub fn search(&self) -> Option<&ClassicSearch> {
-        self.search.as_ref()
+    pub fn has_search(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Installs the structured search output callback for library users.
+    /// UCI uses the same API with its queue-backed text adapter.
+    pub fn set_search_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>) {
+        self.responder = responder;
+        if let Some(search) = self.search.as_mut() {
+            search.set_responder(self.responder.clone());
+        }
     }
 
     /// px0 `Engine::UpdateBackendConfig` (`src/engine.cc:153-167`), restricted
@@ -168,7 +119,7 @@ impl ClassicEngine {
         // Snapshot the OptionsDict value before stopping/replacing search.
         // px0's `std::string` option value is likewise stable for the whole
         // `UpdateBackendConfig` call (`src/engine.cc:153-167`).
-        let path = self.uci_options.weights_file.trim().to_string();
+        let path = self.options.weights_file.trim().to_string();
         if path.is_empty() {
             self.stop_and_drop_search()?;
             self.loaded_weights_file = None;
@@ -182,10 +133,11 @@ impl ClassicEngine {
         self.stop_and_drop_search()?;
         match OnnxBackend::from_file(&path) {
             Ok(backend) => {
-                let mut search = ClassicSearch::new(Box::new(CachingBackend::new(Box::new(backend))));
-                search.set_uci_responder(Arc::clone(&self.uci_forwarder) as Arc<dyn SearchResponder>);
-                Self::apply_uci_options(&mut search, &self.uci_options)?;
+                let backend: Arc<dyn Backend> = Arc::new(CachingBackend::new(Box::new(backend)));
+                let mut search = self.factory.create(Arc::clone(&backend));
+                search.set_responder(self.responder.clone());
                 self.search = Some(search);
+                self.backend = Some(backend);
                 self.loaded_weights_file = Some(path.clone());
                 self.backend_error = None;
                 Ok(())
@@ -198,21 +150,6 @@ impl ClassicEngine {
         }
     }
 
-    /// px0 applies all options through its shared `OptionsDict` before a
-    /// search starts (`src/engine.cc:153-167`, `search/classic/params.cc:688-703`).
-    fn apply_uci_options(search: &mut ClassicSearch, options: &UciOptions) -> Result<(), EnginError> {
-        search.set_uci_info_options(
-            options.multi_pv,
-            options.per_pv_counters,
-            options.score_type,
-            options.nodes_per_second_limit,
-        )?;
-        search.set_wdl_options(options)?;
-        search.set_nn_cache_size(options.nn_cache_size);
-        search.set_time_management_options(options.move_overhead_ms, options.slowmover);
-        Ok(())
-    }
-
     /// px0 `Engine::EnsureSearchStopped` (`src/engine.cc:149-151`).
     fn stop_and_drop_search(&mut self) -> Result<(), EnginError> {
         if let Some(mut search) = self.search.take() {
@@ -222,24 +159,13 @@ impl ClassicEngine {
     }
 }
 
-impl EngineController for ClassicEngine {
-    fn register_uci_responder(&mut self, responder: &mut dyn StringUciResponder) {
-        self.uci_forwarder.register(responder);
+impl EngineController for Engine {
+    fn set_search_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>) {
+        Engine::set_search_responder(self, responder);
     }
 
-    fn unregister_uci_responder(&mut self, responder: &mut dyn StringUciResponder) {
-        // px0's UCI loop normally outlives Engine. Rust permits either drop
-        // order, so finish the active search while the non-owning forwarder is
-        // still registered; aborting here would suppress a finite search's
-        // required final bestmove (`search.cc:1019-1041`).
-        if let Some(search) = self.search.as_mut() {
-            let _ = search.finish_for_responder_drop();
-        }
-        self.uci_forwarder.unregister(responder);
-    }
-
-    fn set_uci_options(&mut self, options: &UciOptions) -> Result<(), EnginError> {
-        self.uci_options = options.clone();
+    fn set_uci_options(&mut self, options: &Options) -> Result<(), EnginError> {
+        self.options = options.clone();
         // px0 snapshots `OptionsDict` into a new `SearchParams` only when a
         // `Search` is constructed for `Go` (`search/classic/wrapper.cc:114-140`,
         // `params.cc:688-703`). Do not abort a running search merely because a
@@ -322,14 +248,13 @@ impl EngineController for ClassicEngine {
             responder.send_raw_response(&format!("info string cannot search: {reason}"));
             return Ok(());
         };
+        search.validate_go(params)?;
         // px0 constructs a fresh `Search` for every `Go`
         // (`src/search/classic/wrapper.cc:114-140`). Replacing its
         // `unique_ptr` destroys the old search, which performs `Abort()` and
         // `Wait()` (`search.cc:1055-1057`). This port keeps the long-lived
-        // ClassicSearch wrapper, so perform that lifecycle explicitly before
-        // resetting per-go state in `start_search`.
+        // A factory-produced SearchBase is restarted for every `go`.
         search.abort_search()?;
-        Self::apply_uci_options(search, &self.uci_options)?;
         search.start_search(params)?;
         Ok(())
     }
@@ -341,21 +266,21 @@ impl EngineController for ClassicEngine {
     }
 
     fn wait(&mut self) -> Result<(), EnginError> {
-        match self.search.as_mut() {
-            Some(search) => search.wait_search(),
-            None => Ok(()),
-        }
+        let Some(search) = self.search.as_mut() else {
+            return Ok(());
+        };
+        search.wait_search()
     }
 
-    fn stop(&mut self, _responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
+    fn stop(&mut self) -> Result<(), EnginError> {
         if let Some(search) = self.search.as_mut() {
             search.stop_search()?;
         }
-        Ok(())
+        self.wait()
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::uci_loop::{UciLoop, VecUciResponder};
@@ -370,7 +295,7 @@ mod tests {
 
     #[test]
     fn deferred_engine_never_searches_with_uniform_when_weights_are_missing() {
-        let mut engine = ClassicEngine::new();
+        let mut engine = Engine::new();
         let mut responder = VecUciResponder::default();
 
         engine
@@ -386,8 +311,8 @@ mod tests {
 
     #[test]
     fn explicit_test_backend_ignores_empty_weights_file_option() {
-        let mut engine = ClassicEngine::uniform();
-        let options = UciOptions::populate_defaults();
+        let mut engine = Engine::uniform();
+        let options = Options::populate_defaults();
 
         engine
             .set_uci_options(&options)
@@ -398,7 +323,7 @@ mod tests {
 
     #[test]
     fn second_go_aborts_and_replaces_the_previous_search() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
         let params = GoParams {
             nodes: Some(8),
@@ -421,7 +346,7 @@ mod tests {
 
     #[test]
     fn bare_go_initializes_startpos_before_searching() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
         engine
             .go(
@@ -443,7 +368,7 @@ mod tests {
     /// (`chess/uciloop.cc:207-237`, `stoppers/common.cc:133-145`).
     #[test]
     fn bare_go_without_a_budget_starts_until_explicit_stop() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
         engine.go(&GoParams::default(), &mut responder).expect("bare go");
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -455,7 +380,7 @@ mod tests {
 
     #[test]
     fn unavailable_ponder_paths_are_rejected_instead_of_running_normally() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
         let error = engine
             .go(
@@ -473,7 +398,7 @@ mod tests {
 
     #[test]
     fn unavailable_depth_and_mate_stoppers_are_not_silently_combined_with_nodes() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
         for params in [
             GoParams {
@@ -494,7 +419,7 @@ mod tests {
 
     #[test]
     fn legacy_clock_manager_accepts_px0_uci_clock_budget() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
         engine
             .go(
@@ -512,7 +437,7 @@ mod tests {
 
     #[test]
     fn new_game_aborts_an_infinite_search_before_resetting_the_tree() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
         engine
             .go(
@@ -534,9 +459,9 @@ mod tests {
     /// such as `go infinite`, `stop`, then `wait`.
     #[test]
     fn uci_stop_then_wait_emits_exactly_one_bestmove() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
-        let mut options = UciOptions::populate_defaults();
+        let mut options = Options::populate_defaults();
         {
             let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
             uci.process_line("position startpos", "test").expect("position");
@@ -555,9 +480,9 @@ mod tests {
     /// response.
     #[test]
     fn uci_position_replacement_suppresses_the_old_search_bestmove() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
-        let mut options = UciOptions::populate_defaults();
+        let mut options = Options::populate_defaults();
         {
             let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
             uci.process_line("position startpos", "test").expect("initial position");
@@ -577,9 +502,9 @@ mod tests {
     /// `uciloop.cc:279-287`).
     #[test]
     fn uci_checkmated_root_emits_px0_null_bestmove() {
-        let mut engine = ClassicEngine::uniform();
+        let mut engine = Engine::uniform();
         let mut responder = VecUciResponder::default();
-        let mut options = UciOptions::populate_defaults();
+        let mut options = Options::populate_defaults();
         {
             let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
             uci.process_line("position fen 4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", "test")

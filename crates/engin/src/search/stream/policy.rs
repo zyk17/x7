@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use xiangqi_core::Move;
 
-use super::{Edge, Node};
 use super::params::compute_cpuct;
 use super::SearchParams;
+use super::{Edge, Node};
 
 /// Compact WDL update used by stream backpropagation.
 ///
@@ -22,6 +22,7 @@ pub struct ValueDelta {
     pub visits: u32,
     pub wl_sum: f32,
     pub draw_sum: f32,
+    pub m_sum: f32,
 }
 
 impl ValueDelta {
@@ -32,6 +33,15 @@ impl ValueDelta {
             visits: 1,
             wl_sum: wl,
             draw_sum: draw,
+            m_sum: 0.0,
+        }
+    }
+
+    pub fn with_m(wl: f32, draw: f32, m: f32) -> Self {
+        assert!(m >= 0.0, "moves-left must be non-negative");
+        Self {
+            m_sum: m,
+            ..Self::one(wl, draw)
         }
     }
 
@@ -40,6 +50,14 @@ impl ValueDelta {
             visits: self.visits,
             wl_sum: -self.wl_sum,
             draw_sum: self.draw_sum,
+            m_sum: self.m_sum,
+        }
+    }
+
+    pub fn one_ply_up(self) -> Self {
+        Self {
+            m_sum: self.m_sum + self.visits as f32,
+            ..self
         }
     }
 
@@ -48,6 +66,7 @@ impl ValueDelta {
             visits: self.visits + other.visits,
             wl_sum: self.wl_sum + other.wl_sum,
             draw_sum: self.draw_sum + other.draw_sum,
+            m_sum: self.m_sum + other.m_sum,
         }
     }
 
@@ -70,11 +89,7 @@ pub fn visited_policy(edges: &[Arc<Edge>]) -> f32 {
 }
 
 /// Classic `GetFpu` (`search.cc:408-424`) with `draw_score = 0`.
-pub fn get_fpu(
-    params: &SearchParams,
-    parent_wl: f32,
-    edges: &[Arc<Edge>],
-) -> f32 {
+pub fn get_fpu(params: &SearchParams, parent_wl: f32, edges: &[Arc<Edge>]) -> f32 {
     -parent_wl - params.fpu_reduction * visited_policy(edges).sqrt()
 }
 

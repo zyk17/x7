@@ -7,18 +7,19 @@ torch = pytest.importorskip("torch")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts" / "export"))
 
 from nn import (
     PolicyResNet,
     soft_policy_cross_entropy,
     mix_wdl_targets,
     moves_left_loss,
-    policy_cross_entropy,
     value_q_mse_from_wdl,
     value_wdl_cross_entropy,
     wdl_logits_to_q,
 )
 from nn.model import GlobalBroadcast, PreActBottleneck, ValueAuxHead, _load_move_vocab
+from export_onnx import PolicyOnnxExport
 
 
 def test_policy_vocab_is_packaged_with_python_module():
@@ -32,19 +33,11 @@ def test_px0_contract_shape():
     assert tuple(x.shape) == (124, 10, 9)
 
 
-def test_policy_forward_and_masked_loss():
+def test_policy_forward_shape():
     m = PolicyResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
     x = torch.zeros((1, 124, 10, 9), dtype=torch.float32)
     logits = m(x)
     assert logits.shape == (1, 2062)
-    mask = torch.zeros(1, 2062, dtype=torch.bool)
-    mask[0, :8] = True
-    tgt = torch.tensor([3])
-    loss = policy_cross_entropy(logits, tgt, mask)
-    assert loss.ndim == 0 and torch.isfinite(loss)
-
-    loss_s = policy_cross_entropy(logits, tgt, mask, label_smoothing=0.1, reduction="mean")
-    assert loss_s.ndim == 0 and torch.isfinite(loss_s)
 
 
 def test_value_wdl_forward_and_loss():
@@ -68,6 +61,15 @@ def test_value_wdl_forward_and_loss():
     assert q.shape == (1,)
     ml_loss = moves_left_loss(moves_left, torch.tensor([[24.0]], dtype=torch.float32))
     assert ml_loss.ndim == 0 and torch.isfinite(ml_loss)
+
+
+def test_onnx_export_wrapper_keeps_moves_left_output():
+    model = PolicyResNet(width=32, num_blocks=12, value_head=True, moves_left_head=True)
+    logits, value, moves_left = PolicyOnnxExport(model)(torch.zeros((1, 124, 10, 9)))
+    assert logits.shape == (1, 2062)
+    assert value.shape == (1, 3)
+    assert moves_left.shape == (1, 1)
+    assert torch.allclose(value.sum(dim=1), torch.ones(1))
 
 
 def test_pure_cnn_policy_head_forward_shape():

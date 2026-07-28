@@ -5,7 +5,7 @@
 - `PX0 v6 chunks`
 - 小型 `policy + value`
 - 输入 `124 x 10 x 9`
-- 输出 `2062 + WDL`
+- 输出 `2062 policy + WDL + moves-left`
 
 ## 当前目录职责
 

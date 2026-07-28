@@ -176,7 +176,7 @@ pub struct SearchParams {
     // 特别是在总模拟次数（playouts）较少的情况下。设置为 0 则使用后端推荐的默认值。
     pub minibatch_size: i32,
     // 较高的值会促进更多的探索（更宽的搜索）.       更信P
-    // 较低的值会促进更多的置信度（更深的搜索）。    更信实战 Q 
+    // 较低的值会促进更多的置信度（更深的搜索）。    更信实战 Q
     pub cpuct: f32,
     /// px0 `CpuctAtRoot` (`src/search/classic/params.cc:543-551`).
     pub cpuct_at_root: f32,

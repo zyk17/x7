@@ -2,15 +2,15 @@
 
 ## 开始前
 
-依次阅读：`README.MD`、`ARCHITECTURE.md`、`AGENTS.md`、`NextStep.md`、`TODO.md`、`temp.md`。
+依次阅读：`README.MD`、`ARCHITECTURE.md`、`AGENTS.md`、`NextStep.md`、`TODO.md`。
 
 ## 工程共识
 
 - 这是全新 Rust 实现；旧 Rust 核心与旧 MCTS 不是兼容目标。
 - `xiangqi_core`、classic 和 NN 的工程参考为 `C:\Users\Administrator\projects\px0` 与 `C:\Users\Administrator\projects\pxzero-training`。
 - stream 仅参考 LC3 官方文档；本地没有 LC3 源码，不得宣称 1:1 翻译。
-- 正式模型契约固定为 `124x10x9 -> 2062 + WDL`。
-- 搜索主路线正在迁移到 stream；classic 是当前 UCI 行为基线，**不再推进 classic TaskWorkers**。
+- 正式模型契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。
+- 搜索主路线是 stream；classic 是独立对照实现，**不再推进 classic TaskWorkers**。
 
 ## 模块边界
 
@@ -30,4 +30,4 @@
 
 - 每个新 Rust 函数必须在代码注释、变更说明、`NextStep.md`、`TODO.md` 或 review 记录中标明参考位置。
 - px0 找不到连续参考、或 LC3 找不到对应语义时，先记录缺口，再决定是否实现。
-- 稳定文档：`README.MD`、`ARCHITECTURE.md`、`AGENTS.md`；活动路线：`NextStep.md`、`TODO.md`；临时基准与调参：`temp.md`。
+- 稳定文档：`README.MD`、`ARCHITECTURE.md`、`AGENTS.md`；活动路线：`NextStep.md`、`TODO.md`。不要新增长期未合并的 `temp*.md` 记录。

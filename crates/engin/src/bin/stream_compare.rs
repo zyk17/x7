@@ -14,8 +14,8 @@ use engin::neural::backend::{Backend, CachingBackend, UniformBackend};
 use engin::neural::onnx::OnnxBackend;
 use engin::search::classic::{ClassicRootStats, ClassicSearch};
 use engin::search::stream::{
-    best_move, principal_variation, root_settled, root_stats, SearchGeneration, SearchLimits,
-    Stats, SearchConfig, Search,
+    best_move, principal_variation, root_settled, root_stats, Search, SearchConfig, SearchGeneration, SearchLimits,
+    Stats,
 };
 use engin::SearchBase;
 use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
@@ -178,11 +178,7 @@ fn print_root(
             edge.prior,
         );
     }
-    Ok(RootReport {
-        settled,
-        best,
-        legal,
-    })
+    Ok(RootReport { settled, best, legal })
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -236,12 +232,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let root_is_black = history.is_black_to_move();
     let stream_backend = load_backend(&args.onnx)?;
-    let mut search = Search::new(
-        stream_backend,
-        SearchGeneration(1),
-        history,
-        SearchConfig::default(),
-    );
+    let mut search = Search::new(stream_backend, SearchGeneration(1), history, SearchConfig::default());
     let stream_started = Instant::now();
     let (stream_stats, stream_budget_satisfied) = match args.stream_movetime {
         Some(movetime) => {
@@ -275,8 +266,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let stream_legal = stream_report.legal;
     search.stop_and_join();
 
-    let legal_ok = stream_legal == board_legal
-        && (args.skip_classic || classic_legal.len() == board_legal.len());
+    let legal_ok = stream_legal == board_legal && (args.skip_classic || classic_legal.len() == board_legal.len());
     let bestmove_ok = stream_best.is_some() && (args.skip_classic || classic_best.is_some());
 
     if let (Some(classic), Some(stream)) = (classic_best, stream_best) {
@@ -288,11 +278,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let passed = stream_budget_satisfied
-        && classic_settled
-        && stream_settled
-        && legal_ok
-        && bestmove_ok;
+    let passed = stream_budget_satisfied && classic_settled && stream_settled && legal_ok && bestmove_ok;
     println!("legal_moves_match={legal_ok}");
     println!("stream_compare={}", if passed { "PASS" } else { "FAIL" });
     if passed {

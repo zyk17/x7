@@ -13,21 +13,29 @@ use xiangqi_core::GameResult;
 
 mod event;
 mod extension;
+mod factory;
 mod params;
 mod policy;
 mod repository;
+mod runner;
 mod search;
 mod stats;
+mod tree;
 
 pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
+pub use factory::{Factory, StreamSearch};
 pub use params::SearchParams;
 pub use policy::{select_edge, select_edge_from_node, ValueDelta};
-pub use repository::{EdgeReservation, ExpansionState, NodeKey, NodeRepository, Edge, Node};
-pub use search::{Search, SearchConfig, SearchLimits, Stats};
+pub use repository::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository};
+pub(crate) use runner::{Runner, WatchdogSnapshot};
+pub use runner::{ScoreType, SearchResult};
+pub use search::{Search, SearchConfig, SearchControl, SearchLimits, Stats};
+pub(crate) use stats::best_mate;
 pub use stats::{
-    best_move, best_move_filtered, principal_variation, principal_variation_filtered, root_settled,
-    root_stats, RootEdgeStats, RootStats,
+    best_move, best_move_filtered, principal_variation, principal_variation_filtered, root_settled, root_stats,
+    RootEdgeStats, RootStats,
 };
+pub use tree::{GcStats, Tree};
 
 /// px0 `FetchSingleNodeResult`: `eval->q = -eval->q` (`search.cc:2129`).
 /// Network WDL is side-to-move; node statistics use the incoming-edge / mover

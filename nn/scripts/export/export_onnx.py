@@ -20,23 +20,15 @@ TRUNK_KIND = "x7_v2_bottleneck_gbroadcast"
 
 
 class PolicyOnnxExport(nn.Module):
-    """导出用包装：value 导出为 WDL 概率，与引擎消费语义一致。"""
+    """导出 logits、WDL 概率和 moves-left，与引擎模型契约一致。"""
 
     def __init__(self, inner: PolicyResNet) -> None:
         super().__init__()
         self.inner = inner
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        out = self.inner(x)
-        if isinstance(out, torch.Tensor):
-            return out
-        if len(out) == 2:
-            logits, value = out
-        elif len(out) == 3:
-            logits, value, _moves_left = out
-        else:
-            raise TypeError(f"unexpected model output len={len(out)}")
-        return logits, torch.softmax(value, dim=1)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits, value, moves_left = self.inner(x)
+        return logits, torch.softmax(value, dim=1), moves_left
 
 
 def main() -> None:
@@ -58,6 +50,8 @@ def main() -> None:
     moves_left_head = bool(ckpt.get("moves_left_head", False))
     if not value_head and "fc_value.weight" in sd:
         value_head = True
+    if not value_head or not moves_left_head:
+        raise SystemExit("当前 ONNX 契约要求 checkpoint 同时包含 WDL 与 moves-left head")
     model = PolicyResNet(
         in_planes=in_planes,
         width=width,
@@ -74,9 +68,7 @@ def main() -> None:
 
     dummy = torch.zeros(1, in_planes, 10, 9)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    out_names = ["logits"]
-    if value_head:
-        out_names.append("value")
+    out_names = ["logits", "value", "moves_left"]
     # dynamo=False：使用 TorchScript 导出路径，无需 onnxscript（PyTorch 2.x 默认 dynamo=True）
     torch.onnx.export(
         export_mod,
@@ -88,14 +80,14 @@ def main() -> None:
         dynamic_axes={
             "board": {0: "batch"},
             "logits": {0: "batch"},
-            **({"value": {0: "batch"}} if value_head else {}),
+            "value": {0: "batch"},
+            "moves_left": {0: "batch"},
         },
         dynamo=False,
     )
-    tail = "（value 已为 WDL 概率）" if value_head else ""
     print(
         f"exported -> {args.out} moves={n_moves} width={width} blocks={blocks} bt={bottleneck_channels} "
-        f"in_planes={in_planes} outputs={out_names}{tail}"
+        f"in_planes={in_planes} outputs={out_names}（value 已为 WDL 概率）"
     )
 
 

@@ -6,7 +6,7 @@
 //! x7 deliberately uses tree keys in the first version: a child key combines
 //! its parent key and move, so transpositions are not merged into a DAG yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -97,6 +97,22 @@ struct NodeStats {
     visits: u32,
     wl_sum: f32,
     draw_sum: f32,
+    m_sum: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    lower: f32,
+    upper: f32,
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Self {
+            lower: -1.0,
+            upper: 1.0,
+        }
+    }
 }
 
 impl Edge {
@@ -109,7 +125,7 @@ impl Edge {
             completed: Mutex::new(CompletedStats::default()),
         }
     }
-    
+
     pub fn mv(&self) -> Move {
         self.mv
     }
@@ -207,6 +223,9 @@ pub struct Node {
     /// `m` is stored in plies (half-moves), same as px0 `MakeTerminal(plies_left)`;
     /// UCI “moves left” is a separate full-move conversion.
     terminal: Mutex<Option<(f32, f32, f32)>>,
+    /// Exact interval in the incoming-edge perspective. This is the stream
+    /// equivalent of px0 `lower_bound_` / `upper_bound_` (`node.h:191-204`).
+    bounds: Mutex<Bounds>,
 }
 
 impl Node {
@@ -232,11 +251,21 @@ impl Node {
         }
     }
 
+    pub fn m(&self) -> f32 {
+        let stats = self.stats.lock();
+        if stats.visits == 0 {
+            0.0
+        } else {
+            stats.m_sum / stats.visits as f32
+        }
+    }
+
     pub(crate) fn add_delta(&self, delta: ValueDelta) {
         let mut stats = self.stats.lock();
         stats.visits += delta.visits;
         stats.wl_sum += delta.wl_sum;
         stats.draw_sum += delta.draw_sum;
+        stats.m_sum += delta.m_sum;
     }
 
     pub fn expansion_state(&self) -> ExpansionState {
@@ -265,12 +294,7 @@ impl Node {
         );
         // px0 `Node::SortEdges` after policy init (`node.cc:291-297`).
         let mut edges = edges;
-        edges.sort_unstable_by(|left, right| {
-            right
-                .1
-                .partial_cmp(&left.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        edges.sort_unstable_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal));
         let edges: Arc<[Arc<Edge>]> = edges
             .into_iter()
             .map(|(mv, prior)| Arc::new(Edge::new(mv, prior)))
@@ -294,13 +318,44 @@ impl Node {
     }
 
     pub fn mark_terminal(&self, wl: f32, draw: f32, plies_left: f32) {
-        assert_eq!(self.expansion_state(), ExpansionState::Evaluating, "node must be evaluating");
+        assert_eq!(
+            self.expansion_state(),
+            ExpansionState::Evaluating,
+            "node must be evaluating"
+        );
         *self.terminal.lock() = Some((wl, draw, plies_left));
+        *self.bounds.lock() = Bounds { lower: wl, upper: wl };
         self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
+    }
+
+    fn bounds(&self) -> Bounds {
+        *self.bounds.lock()
+    }
+
+    fn update_bounds(&self, bounds: Bounds) {
+        let mut current = self.bounds.lock();
+        current.lower = current.lower.max(bounds.lower);
+        current.upper = current.upper.min(bounds.upper);
+        debug_assert!(current.lower <= current.upper + f32::EPSILON);
+    }
+
+    fn mark_proven_terminal(&self, wl: f32, draw: f32, plies_left: f32) -> bool {
+        let mut terminal = self.terminal.lock();
+        if self.expansion_state() != ExpansionState::Expanded {
+            return false;
+        }
+        *terminal = Some((wl, draw, plies_left));
+        *self.bounds.lock() = Bounds { lower: wl, upper: wl };
+        self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
+        true
     }
 
     pub fn terminal_wl(&self) -> Option<(f32, f32)> {
         (*self.terminal.lock()).map(|(wl, draw, _)| (wl, draw))
+    }
+
+    pub fn terminal_value(&self) -> Option<(f32, f32, f32)> {
+        *self.terminal.lock()
     }
 
     pub fn terminal_plies_left(&self) -> Option<f32> {
@@ -358,6 +413,110 @@ impl NodeRepository {
         let shard = &self.shards[key.0 as usize & (self.shards.len() - 1)];
         shard.nodes.read().get(&key).cloned()
     }
+
+    /// Propagates exact terminal bounds along one owned variation. A parent is
+    /// made terminal only when its child intervals prove one exact outcome;
+    /// an unknown sibling keeps the parent interval open. This is the stream
+    /// counterpart of px0 `MaybeSetBounds` (`search.cc:2229-2289`).
+    pub(crate) fn propagate_proven_bounds(&self, node_path: &[NodeKey], root: NodeKey) {
+        for &parent_key in node_path.iter().rev().skip(1) {
+            if parent_key == root {
+                break;
+            }
+            let Some(parent) = self.get(parent_key) else {
+                continue;
+            };
+            if parent.expansion_state() == ExpansionState::Terminal {
+                continue;
+            }
+            let mut child_lower = -1.0_f32;
+            let mut child_upper = -1.0_f32;
+            let mut children = Vec::new();
+            for edge in parent.edges().iter() {
+                let child = self.get(parent_key.child(edge.mv()));
+                let bounds = child.as_ref().map_or_else(Bounds::default, |node| node.bounds());
+                child_lower = child_lower.max(bounds.lower);
+                child_upper = child_upper.max(bounds.upper);
+                children.push((bounds, child.and_then(|node| node.terminal_plies_left())));
+            }
+            // Children are measured in the parent side-to-move perspective;
+            // this node is measured from its incoming edge, hence negation.
+            parent.update_bounds(Bounds {
+                lower: -child_upper,
+                upper: -child_lower,
+            });
+            let bounds = parent.bounds();
+            if (bounds.upper - bounds.lower).abs() > f32::EPSILON {
+                continue;
+            }
+            let wl = bounds.lower;
+            let plies_left = if wl < 0.0 {
+                // The side to move can force a win: choose the shortest win.
+                children
+                    .iter()
+                    .filter(|(child, _)| child.lower > 0.0)
+                    .filter_map(|(_, m)| *m)
+                    .reduce(f32::min)
+                    .unwrap_or(0.0)
+                    + 1.0
+            } else if wl > 0.0 {
+                // Every move loses: choose the longest loss.
+                children.iter().filter_map(|(_, m)| *m).reduce(f32::max).unwrap_or(0.0) + 1.0
+            } else {
+                children.iter().filter_map(|(_, m)| *m).reduce(f32::min).unwrap_or(0.0) + 1.0
+            };
+            parent.mark_proven_terminal(wl, if wl == 0.0 { 1.0 } else { 0.0 }, plies_left);
+        }
+    }
+
+    fn remove(&self, key: NodeKey) -> Option<Arc<Node>> {
+        let shard = &self.shards[key.0 as usize & (self.shards.len() - 1)];
+        shard.nodes.write().remove(&key)
+    }
+
+    /// Removes one detached tree subtree and returns its node count.
+    ///
+    /// Reference: LC3 overview, "Node repository". LC3 does not define a
+    /// tree-reuse GC policy; x7's tree-only policy follows the sibling release
+    /// shape of px0 `Node::ReleaseChildrenExceptOne` (`node.cc:417-445`).
+    /// The caller must first drain all events and reservations.
+    pub(crate) fn remove_subtree(&self, root: NodeKey) -> usize {
+        let mut pending = vec![root];
+        let mut removed = 0;
+        while let Some(key) = pending.pop() {
+            let Some(node) = self.remove(key) else {
+                continue;
+            };
+            removed += 1;
+            pending.extend(node.edges().iter().map(|edge| key.child(edge.mv())));
+        }
+        removed
+    }
+
+    /// Checks the edge-local reservation invariant below `root`.
+    pub(crate) fn subtree_is_settled(&self, root: NodeKey) -> bool {
+        let mut pending = vec![root];
+        let mut seen: HashSet<NodeKey, BuildHasherDefault<NoHashHasher<u64>>> = HashSet::default();
+        while let Some(key) = pending.pop() {
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(node) = self.get(key) else {
+                continue;
+            };
+            let edges = node.edges();
+            if edges.iter().any(|edge| edge.visits() != edge.completed_visits()) {
+                return false;
+            }
+            pending.extend(edges.iter().map(|edge| key.child(edge.mv())));
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.nodes.read().len()).sum()
+    }
 }
 
 impl Default for NodeRepository {
@@ -414,6 +573,62 @@ mod tests {
         edge.complete(0.5);
         assert_eq!(node.edges()[0].completed_visits(), 1);
         assert!((node.edges()[0].q() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sticky_proof_needs_all_losing_replies_and_keeps_the_longest_loss() {
+        let repository = NodeRepository::default();
+        let root = NodeKey::root(1);
+        let parent_move = b2_b3();
+        let parent_key = root.child(parent_move);
+        let first_move = Move::new(Square::parse("c3").expect("from"), Square::parse("c4").expect("to"));
+        let second_move = Move::new(Square::parse("d3").expect("from"), Square::parse("d4").expect("to"));
+        let root_node = repository.get_or_insert(root);
+        assert!(root_node.try_begin_evaluation());
+        root_node.publish_edges(vec![(parent_move, 1.0)]);
+        let parent = repository.get_or_insert(parent_key);
+        assert!(parent.try_begin_evaluation());
+        parent.publish_edges(vec![(first_move, 0.5), (second_move, 0.5)]);
+
+        let first = repository.get_or_insert(parent_key.child(first_move));
+        assert!(first.try_begin_evaluation());
+        first.mark_terminal(-1.0, 0.0, 2.0);
+        repository.propagate_proven_bounds(&[root, parent_key, parent_key.child(first_move)], root);
+        assert_eq!(parent.expansion_state(), ExpansionState::Expanded);
+
+        let second = repository.get_or_insert(parent_key.child(second_move));
+        assert!(second.try_begin_evaluation());
+        second.mark_terminal(-1.0, 0.0, 6.0);
+        repository.propagate_proven_bounds(&[root, parent_key, parent_key.child(second_move)], root);
+        assert_eq!(parent.expansion_state(), ExpansionState::Terminal);
+        assert_eq!(parent.terminal_wl(), Some((1.0, 0.0)));
+        assert_eq!(parent.terminal_plies_left(), Some(7.0));
+        assert_ne!(root_node.expansion_state(), ExpansionState::Terminal);
+    }
+
+    #[test]
+    fn sticky_proof_keeps_the_shortest_forced_win() {
+        let repository = NodeRepository::default();
+        let root = NodeKey::root(2);
+        let parent_move = b2_b3();
+        let parent_key = root.child(parent_move);
+        let first_move = Move::new(Square::parse("c3").expect("from"), Square::parse("c4").expect("to"));
+        let second_move = Move::new(Square::parse("d3").expect("from"), Square::parse("d4").expect("to"));
+        let root_node = repository.get_or_insert(root);
+        assert!(root_node.try_begin_evaluation());
+        root_node.publish_edges(vec![(parent_move, 1.0)]);
+        let parent = repository.get_or_insert(parent_key);
+        assert!(parent.try_begin_evaluation());
+        parent.publish_edges(vec![(first_move, 0.5), (second_move, 0.5)]);
+        for (mv, m) in [(first_move, 2.0), (second_move, 6.0)] {
+            let child = repository.get_or_insert(parent_key.child(mv));
+            assert!(child.try_begin_evaluation());
+            child.mark_terminal(1.0, 0.0, m);
+            repository.propagate_proven_bounds(&[root, parent_key, parent_key.child(mv)], root);
+        }
+        assert_eq!(parent.expansion_state(), ExpansionState::Terminal);
+        assert_eq!(parent.terminal_wl(), Some((-1.0, 0.0)));
+        assert_eq!(parent.terminal_plies_left(), Some(3.0));
     }
 
     #[test]

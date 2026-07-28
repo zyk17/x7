@@ -116,10 +116,7 @@ fn parse_list(text: &str) -> Result<Vec<usize>, String> {
 
 type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
-fn make_backend(
-    path: &PathBuf,
-    cache: bool,
-) -> Result<BackendSetup, Box<dyn std::error::Error>> {
+fn make_backend(path: &PathBuf, cache: bool) -> Result<BackendSetup, Box<dyn std::error::Error>> {
     let onnx = OnnxBackend::from_file(path)?;
     let provider = onnx.provider().name();
     let recommended = onnx.attributes().recommended_batch_size;
@@ -149,9 +146,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.playouts,
         cells
     );
-    println!(
-        "note: fresh backend/cache per cell; nn_eval=GPU-only; NN merges queued tensors up to target_batch"
-    );
+    println!("note: fresh backend/cache per cell; nn_eval=GPU-only; NN merges queued tensors up to target_batch");
     println!(
         "{:>3} {:>3} {:>3} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "G", "E", "B", "ms", "nps", "done", "coll", "nn_eval", "avg_b", "max_b"

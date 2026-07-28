@@ -112,9 +112,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         backend.attributes().has_wdl,
         backend.attributes().has_mlh
     );
-    println!(
-        "note: current export keeps logits+value only; EvalResult.m is 0 unless ONNX gains moves_left"
-    );
 
     let move_refs: Vec<&str> = args.moves.iter().map(String::as_str).collect();
     let state = GameState::from_fen_moves(&args.fen, &move_refs)?;
@@ -128,11 +125,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             args.moves.join(" ")
         },
-        if history.is_black_to_move() {
-            "black"
-        } else {
-            "red"
-        },
+        if history.is_black_to_move() { "black" } else { "red" },
         legal.len()
     );
 
@@ -145,11 +138,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eval.wl, eval.m
     );
 
-    let mut ranked: Vec<(Move, f32)> = legal
-        .iter()
-        .copied()
-        .zip(eval.policies.iter().copied())
-        .collect();
+    let mut ranked: Vec<(Move, f32)> = legal.iter().copied().zip(eval.policies.iter().copied()).collect();
     ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let show = ranked.len().min(args.top);
     println!("policy top {show}/{} (legal softmax):", ranked.len());
@@ -188,9 +177,7 @@ fn run_bench(
         let p50 = samples[samples.len() / 2];
         let p95 = samples[((samples.len() as f64 * 0.95) as usize).min(samples.len() - 1)];
         let pos_per_s = (batch as f64) / (avg / 1e3);
-        println!(
-            "  batch={batch:>3}  avg_ms={avg:.3}  p50_ms={p50:.3}  p95_ms={p95:.3}  pos/s={pos_per_s:.0}"
-        );
+        println!("  batch={batch:>3}  avg_ms={avg:.3}  p50_ms={p50:.3}  p95_ms={p95:.3}  pos/s={pos_per_s:.0}");
     }
     Ok(())
 }

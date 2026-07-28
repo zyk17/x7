@@ -19,15 +19,15 @@ pub(crate) enum ExtensionKind {
 /// Classifies the leaf at `history` for stream Gather/Eval.
 ///
 /// `depth` is variation length from the search root (0 = root).
-pub(crate) fn classify_extension(
-    history: &PositionHistory,
-    depth: usize,
-) -> ExtensionKind {
+pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> ExtensionKind {
     let is_root = depth == 0;
     let board = history.last().board();
     let legal_moves = board.generate_legal_moves();
     if legal_moves.is_empty() {
-        // px0 always writes WHITE_WON (+1 mover view) for no-legal-move leaves.
+        // `wl` is stored from the incoming edge / previous mover perspective.
+        // A no-legal-move Xiangqi position therefore always wins for it.
+        // This matches px0's `WHITE_WON` canonical-board shortcut
+        // (`search.cc:1913-1919`, `node.cc:300-317`).
         return ExtensionKind::Terminal {
             wl: 1.0,
             draw: 0.0,
@@ -116,4 +116,29 @@ fn two_fold_chase_or_check_cycle(history: &PositionHistory) -> bool {
         }
     }
     idx2 == idx
+}
+
+#[cfg(test)]
+mod tests {
+    use xiangqi_core::{GameState, PositionHistory};
+
+    use super::{classify_extension, ExtensionKind};
+
+    #[test]
+    fn checkmated_side_to_move_is_a_terminal_win_for_the_incoming_edge() {
+        // Black is checkmated. This is also used by the stream root terminal
+        // test; here it protects the non-root incoming-edge value contract.
+        let state = GameState::from_fen_moves("4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", &[] as &[&str])
+            .expect("checkmate fen");
+        let history = PositionHistory::from_positions(state.positions());
+
+        assert_eq!(
+            classify_extension(&history, 1),
+            ExtensionKind::Terminal {
+                wl: 1.0,
+                draw: 0.0,
+                plies_left: 0.0,
+            }
+        );
+    }
 }

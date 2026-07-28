@@ -1,8 +1,10 @@
 //! px0 UCI stdin/stdout entry with P4 classic search.
 use std::io::{self, BufRead};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
 
-use engin::{ClassicEngine, EngineController, StdoutUciResponder, UciLoop, UciOptions};
+use engin::{Engine, EngineController, Options, StdoutUciResponder, UciLoop};
 
 /// Resolves the bundled formal ONNX weight before UCI starts.
 ///
@@ -30,11 +32,10 @@ fn default_weights_file() -> PathBuf {
 }
 
 fn main() {
-    let stdin = io::stdin();
     let mut responder = StdoutUciResponder::default();
-    let mut options = UciOptions::populate_defaults();
+    let mut options = Options::populate_defaults();
     options.weights_file = default_weights_file().to_string_lossy().into_owned();
-    let mut engine = ClassicEngine::new();
+    let mut engine = Engine::new();
     // Seed the formal `WeightsFile` before `UciLoop` registers the responder.
     // The backend is created by the first SetPosition, matching px0's
     // configuration update order (`src/engine.cc:187-197`).
@@ -43,14 +44,25 @@ fn main() {
         .expect("default UCI options must be valid");
     let mut uci = UciLoop::new(&mut responder, &mut options, &mut engine);
 
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else {
-            break;
-        };
-        match uci.process_line(&line, env!("CARGO_PKG_VERSION")) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(error) => eprintln!("UCI error: {error}"),
+    // Watchdog callbacks must reach stdout even while a GUI is waiting for a
+    // finite `go` result and sends no additional input.
+    let (input_tx, input_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if input_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        match input_rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(Ok(line)) => match uci.process_line(&line, env!("CARGO_PKG_VERSION")) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => eprintln!("UCI error: {error}"),
+            },
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => uci.flush_output(),
         }
     }
 }

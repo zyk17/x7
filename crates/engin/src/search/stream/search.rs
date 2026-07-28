@@ -17,13 +17,13 @@ use xiangqi_core::{Move, PositionHistory};
 
 use crate::neural::backend::{Backend, EvalPosition, EvalResult};
 use crate::neural::onnx::softmax_legal_policy;
-use crate::neural::{encode_position_for_nn, FillEmptyHistory, INPUT_PLANES, BOARD_ROWS, BOARD_COLS, POLICY_SIZE};
+use crate::neural::{encode_position_for_nn, FillEmptyHistory, BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE};
 use crate::EnginError;
 
 use super::extension::{classify_extension, ExtensionKind};
 use super::{
-    network_wl_to_node, select_edge_from_node, BackpropEvent, ExpansionState, NodeEvent, NodeKey,
-    NodeRepository, SearchGeneration, SearchParams, Node,
+    network_wl_to_node, select_edge_from_node, BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository,
+    SearchGeneration, SearchParams, Tree,
 };
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
@@ -49,11 +49,36 @@ impl SearchLimits {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Stats {
     pub completed_playouts: u64,
+    /// Mean completed leaf depth, with the root at depth one. This follows
+    /// classic `ThinkingInfo::depth` rather than current PV length.
+    pub average_depth: u64,
+    /// Deepest completed leaf depth, matching classic `seldepth`.
+    pub max_depth: u64,
     pub collisions: u64,
     pub network_batches: u64,
     pub network_evaluations: u64,
     /// Largest `BackendComputation` batch observed this search.
     pub network_batch_size_max: u64,
+}
+
+/// Cloneable stop boundary for a running stream search.
+///
+/// The controller may hold this while the owning thread retains `Search` and
+/// its worker join handles. Reference: LC3 overview, "WatchdogWorker".
+#[derive(Clone)]
+pub struct SearchControl {
+    shared: Arc<Shared>,
+}
+
+impl SearchControl {
+    pub fn request_stop(&self) {
+        self.shared.stopping.store(true, Ordering::Release);
+        self.shared.idle.notify_all();
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.shared.stats()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +95,9 @@ pub struct SearchConfig {
     pub backprop_workers: usize,
     /// px0 `root_move_filter_` from UCI `go searchmoves` (empty = unrestricted).
     pub root_move_filter: Vec<Move>,
+    /// Watchdog score representation. It is internal until score selection is
+    /// deliberately added to the minimal UCI option set.
+    pub score_type: super::ScoreType,
 }
 
 impl Default for SearchConfig {
@@ -82,6 +110,7 @@ impl Default for SearchConfig {
             eval_workers: 2,
             backprop_workers: 1,
             root_move_filter: Vec::new(),
+            score_type: super::ScoreType::Q,
         }
     }
 }
@@ -134,12 +163,15 @@ struct ResolvedSearchConfig {
 struct Shared {
     backend: Arc<dyn Backend>,
     repository: Arc<NodeRepository>,
+    root_key: NodeKey,
     generation: SearchGeneration,
     params: SearchParams,
     root_move_filter: Vec<Move>,
     stopping: AtomicBool,
     outstanding: AtomicUsize,
     completed: AtomicU64,
+    completed_depth: AtomicU64,
+    max_depth: AtomicU64,
     collisions: AtomicU64,
     network_batches: AtomicU64,
     network_evaluations: AtomicU64,
@@ -227,8 +259,11 @@ impl Shared {
     }
 
     fn stats(&self) -> Stats {
+        let completed_playouts = self.completed.load(Ordering::Acquire);
         Stats {
-            completed_playouts: self.completed.load(Ordering::Acquire),
+            completed_playouts,
+            average_depth: self.completed_depth.load(Ordering::Acquire) / completed_playouts.max(1),
+            max_depth: self.max_depth.load(Ordering::Acquire),
             collisions: self.collisions.load(Ordering::Acquire),
             network_batches: self.network_batches.load(Ordering::Acquire),
             network_evaluations: self.network_evaluations.load(Ordering::Acquire),
@@ -257,21 +292,37 @@ impl Search {
         root_history: Arc<PositionHistory>,
         config: SearchConfig,
     ) -> Self {
+        let tree = Tree::new(root_history);
+        Self::new_with_tree(backend, generation, &tree, config)
+    }
+
+    /// Starts workers from a previously retained tree root. The caller must
+    /// stop and join this search before advancing or rewinding `tree`.
+    pub fn new_with_tree(
+        backend: Arc<dyn Backend>,
+        generation: SearchGeneration,
+        tree: &Tree,
+        config: SearchConfig,
+    ) -> Self {
         config.validate();
         let resolved = config.resolve(backend.as_ref());
         let (gather_tx, gather_rx) = bounded(resolved.queue_capacity);
         let (eval_tx, eval_rx) = bounded(resolved.queue_capacity);
         let (backprop_tx, backprop_rx) = bounded(resolved.queue_capacity);
-        let root_key = NodeKey::root(root_history.last().hash());
+        let root_history = Arc::clone(tree.root_history());
+        let root_key = tree.root_key();
         let shared = Arc::new(Shared {
             backend,
-            repository: Arc::new(NodeRepository::default()),
+            repository: Arc::clone(tree.repository()),
+            root_key,
             generation,
             params: resolved.params,
             root_move_filter: config.root_move_filter.clone(),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
             completed: AtomicU64::new(0),
+            completed_depth: AtomicU64::new(0),
+            max_depth: AtomicU64::new(0),
             collisions: AtomicU64::new(0),
             network_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
@@ -284,9 +335,7 @@ impl Search {
             backprop_tx,
         });
         let (nn_tx, nn_rx) = bounded::<NnRequest>(resolved.queue_capacity);
-        let mut workers = Vec::with_capacity(
-            config.gather_workers + config.eval_workers + config.backprop_workers + 1,
-        );
+        let mut workers = Vec::with_capacity(config.gather_workers + config.eval_workers + config.backprop_workers + 1);
         for _ in 0..config.gather_workers {
             let shared = Arc::clone(&shared);
             let receiver = gather_rx.clone();
@@ -335,6 +384,12 @@ impl Search {
         self.shared.stats()
     }
 
+    pub fn control(&self) -> SearchControl {
+        SearchControl {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     /// Requests a normal stream-search stop without tearing down worker
     /// threads. Gather/Eval/Backprop cancel every unfinished event and its
     /// edge reservation before becoming idle. This is the boundary a later
@@ -343,8 +398,7 @@ impl Search {
     ///
     /// Reference: LC3 overview, "Watchdog" and worker stop coordination.
     pub fn request_stop(&self) {
-        self.shared.stopping.store(true, Ordering::Release);
-        self.shared.idle.notify_all();
+        self.control().request_stop();
     }
 
     pub fn is_stopping(&self) -> bool {
@@ -352,7 +406,11 @@ impl Search {
     }
 
     pub fn submit_playout(&self) -> Result<(), EnginError> {
-        self.submit_event(NodeEvent::root(self.shared.generation, Arc::clone(&self.root_history)))
+        self.submit_event(NodeEvent::at_root(
+            self.shared.generation,
+            self.root_key,
+            Arc::clone(&self.root_history),
+        ))
     }
 
     pub fn submit_event(&self, event: NodeEvent) -> Result<(), EnginError> {
@@ -455,9 +513,7 @@ impl Search {
     /// Blocks until `outstanding < limit` (or an error/stop drains work).
     fn wait_until_outstanding_below(&self, limit: usize) -> Result<(), EnginError> {
         let mut guard = self.shared.idle_lock.lock();
-        while self.shared.outstanding.load(Ordering::Acquire) >= limit
-            && self.shared.error.lock().is_none()
-        {
+        while self.shared.outstanding.load(Ordering::Acquire) >= limit && self.shared.error.lock().is_none() {
             self.shared.idle.wait(&mut guard);
         }
         if let Some(error) = self.shared.error.lock().clone() {
@@ -518,14 +574,18 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
             }
             ExpansionState::Terminal => {
                 let (wl, draw) = node.terminal_wl().expect("terminal stream wl");
-                shared.send_backprop(BackpropEvent::evaluation(event, wl, draw));
+                shared.send_backprop(BackpropEvent::evaluation(
+                    event,
+                    wl,
+                    draw,
+                    node.terminal_plies_left().unwrap_or(0.0),
+                ));
                 return;
             }
             ExpansionState::Expanded => {
                 let depth = event.variation.moves().len();
-                let edge_index =
-                    select_edge_from_node(node.as_ref(), depth, &shared.params, &shared.root_move_filter)
-                        .expect("expanded stream node must have an edge");
+                let edge_index = select_edge_from_node(node.as_ref(), depth, &shared.params, &shared.root_move_filter)
+                    .expect("expanded stream node must have an edge");
                 let reservation = node.reserve_edge(edge_index).expect("selected stream edge");
                 let child_key = event.node_key.child(reservation.mv());
                 event = event.descend(child_key, reservation);
@@ -534,10 +594,10 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
     }
 }
 
-/// Raw logits[POLICY] plus WDL[3] returned by the NN worker.
-type NnReply = Result<(Vec<f32>, Vec<f32>), EnginError>;
+/// Raw logits[POLICY], WDL[3] and moves-left[1] returned by the NN worker.
+type NnReply = Result<(Vec<f32>, Vec<f32>, f32), EnginError>;
 
-/// One encoded position for the NN thread. Reply is raw logits[POLICY] + WDL[3].
+/// One encoded position for the NN thread. Reply owns all three model heads.
 struct NnRequest {
     planes: Vec<f32>,
     reply: Sender<NnReply>,
@@ -594,9 +654,9 @@ fn poll_nn_completions(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
     let mut i = 0;
     while i < waiting.len() {
         match waiting[i].reply.try_recv() {
-            Ok(Ok((logits, wdl))) => {
+            Ok(Ok((logits, wdl, moves_left))) => {
                 let item = waiting.swap_remove(i);
-                if let Err(error) = complete_nn_item(shared, item, logits, wdl) {
+                if let Err(error) = complete_nn_item(shared, item, logits, wdl, moves_left) {
                     shared.fail(error);
                     return;
                 }
@@ -604,14 +664,18 @@ fn poll_nn_completions(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
             Ok(Err(error)) => {
                 let item = waiting.swap_remove(i);
                 cancel_waiting_item(shared, item);
-                shared.fail(error);
+                if !shared.stopping.load(Ordering::Acquire) {
+                    shared.fail(error);
+                }
                 return;
             }
             Err(TryRecvError::Empty) => i += 1,
             Err(TryRecvError::Disconnected) => {
                 let item = waiting.swap_remove(i);
                 cancel_waiting_item(shared, item);
-                shared.fail(EnginError::PortIncomplete("stream nn reply disconnected"));
+                if !shared.stopping.load(Ordering::Acquire) {
+                    shared.fail(EnginError::PortIncomplete("stream nn reply disconnected"));
+                }
                 return;
             }
         }
@@ -623,22 +687,26 @@ fn wait_one_nn_completion(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
         return;
     }
     match waiting[0].reply.recv_timeout(RECEIVE_POLL) {
-        Ok(Ok((logits, wdl))) => {
+        Ok(Ok((logits, wdl, moves_left))) => {
             let item = waiting.remove(0);
-            if let Err(error) = complete_nn_item(shared, item, logits, wdl) {
+            if let Err(error) = complete_nn_item(shared, item, logits, wdl, moves_left) {
                 shared.fail(error);
             }
         }
         Ok(Err(error)) => {
             let item = waiting.remove(0);
             cancel_waiting_item(shared, item);
-            shared.fail(error);
+            if !shared.stopping.load(Ordering::Acquire) {
+                shared.fail(error);
+            }
         }
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
             let item = waiting.remove(0);
             cancel_waiting_item(shared, item);
-            shared.fail(EnginError::PortIncomplete("stream nn reply disconnected"));
+            if !shared.stopping.load(Ordering::Acquire) {
+                shared.fail(EnginError::PortIncomplete("stream nn reply disconnected"));
+            }
         }
     }
 }
@@ -657,13 +725,12 @@ fn handle_eval_event(
     let history = event.variation.replay_history();
     let depth = event.variation.moves().len();
     match classify_extension(&history, depth) {
-        ExtensionKind::Terminal {
-            wl,
-            draw,
-            plies_left,
-        } => {
+        ExtensionKind::Terminal { wl, draw, plies_left } => {
             node.mark_terminal(wl, draw, plies_left);
-            shared.send_backprop(BackpropEvent::evaluation(event, wl, draw));
+            shared
+                .repository
+                .propagate_proven_bounds(event.node_path(), shared.root_key);
+            shared.send_backprop(BackpropEvent::evaluation(event, wl, draw, plies_left));
             Ok(())
         }
         ExtensionKind::Evaluate => {
@@ -678,10 +745,13 @@ fn handle_eval_event(
             }
             let planes = encode_position_for_nn(&history, FillEmptyHistory::FenOnly);
             let (reply_tx, reply_rx) = bounded(1);
-            send_nn_request(nn_tx, NnRequest {
-                planes,
-                reply: reply_tx,
-            })?;
+            send_nn_request(
+                nn_tx,
+                NnRequest {
+                    planes,
+                    reply: reply_tx,
+                },
+            )?;
             waiting.push(WaitingNn {
                 event,
                 node,
@@ -714,6 +784,7 @@ fn complete_nn_item(
     item: WaitingNn,
     logits: Vec<f32>,
     wdl: Vec<f32>,
+    moves_left: f32,
 ) -> Result<(), EnginError> {
     let policies = match softmax_legal_policy(&logits, &item.legal_moves) {
         Ok(policies) => policies,
@@ -729,7 +800,7 @@ fn complete_nn_item(
     let eval = Arc::new(EvalResult {
         wl: wdl[0] - wdl[2],
         d: wdl[1],
-        m: 0.0,
+        m: moves_left,
         policies,
     });
     shared.backend.store_evaluation(&item.input, Arc::clone(&eval));
@@ -751,16 +822,12 @@ fn publish_eval(
         shared.fail(EnginError::PortIncomplete("stream backend policy length"));
         return;
     }
-    node.publish_edges(
-        legal_moves
-            .into_iter()
-            .zip(eval.policies.iter().copied())
-            .collect(),
-    );
+    node.publish_edges(legal_moves.into_iter().zip(eval.policies.iter().copied()).collect());
     shared.send_backprop(BackpropEvent::evaluation(
         event,
         network_wl_to_node(eval.wl),
         eval.d,
+        eval.m,
     ));
 }
 
@@ -778,11 +845,7 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
     loop {
         let first = match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(request) => request,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout)
-                if shared.stopping.load(Ordering::Acquire) =>
-            {
-                break
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
@@ -808,18 +871,21 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
             packed.extend_from_slice(&request.planes);
         }
         match shared.backend.infer_encoded(&packed, batch) {
-            Ok((logits, wdl)) => {
+            Ok((logits, wdl, moves_left)) => {
+                if logits.len() != batch * POLICY_SIZE || wdl.len() != batch * 3 || moves_left.len() != batch {
+                    let error = EnginError::PortIncomplete("stream nn output shape");
+                    for request in requests {
+                        let _ = request.reply.send(Err(error.clone()));
+                    }
+                    continue;
+                }
                 shared.network_batches.fetch_add(1, Ordering::AcqRel);
-                shared
-                    .network_evaluations
-                    .fetch_add(batch as u64, Ordering::AcqRel);
-                shared
-                    .network_batch_size_max
-                    .fetch_max(batch as u64, Ordering::AcqRel);
+                shared.network_evaluations.fetch_add(batch as u64, Ordering::AcqRel);
+                shared.network_batch_size_max.fetch_max(batch as u64, Ordering::AcqRel);
                 for (index, request) in requests.into_iter().enumerate() {
                     let part_logits = logits[index * POLICY_SIZE..(index + 1) * POLICY_SIZE].to_vec();
                     let part_wdl = wdl[index * 3..(index + 1) * 3].to_vec();
-                    let _ = request.reply.send(Ok((part_logits, part_wdl)));
+                    let _ = request.reply.send(Ok((part_logits, part_wdl, moves_left[index])));
                 }
             }
             Err(error) => {
@@ -844,6 +910,10 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
                     }
                 } else {
                     let result = BackpropEvent::complete_batch(events, &shared.repository);
+                    shared
+                        .completed_depth
+                        .fetch_add(result.completed_depth, Ordering::AcqRel);
+                    shared.max_depth.fetch_max(result.max_depth, Ordering::AcqRel);
                     for _ in 0..result.completed_playouts {
                         shared.finish(true);
                     }
@@ -869,8 +939,10 @@ mod tests {
     use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
     use super::{Search, SearchConfig, SearchLimits};
-    use crate::neural::backend::{Backend, BackendAttributes, BackendComputation, EvalResult, UniformBackend};
-    use crate::search::stream::{root_stats, SearchGeneration};
+    use crate::neural::backend::{
+        Backend, BackendAttributes, BackendComputation, EncodedInference, EvalResult, UniformBackend,
+    };
+    use crate::search::stream::{best_move, root_settled, root_stats, SearchGeneration};
     use crate::EnginError;
 
     struct FailingComputationBackend;
@@ -888,7 +960,7 @@ mod tests {
             Err(EnginError::Onnx("test computation failure".to_owned()))
         }
 
-        fn infer_encoded(&self, _planes: &[f32], _batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+        fn infer_encoded(&self, _planes: &[f32], _batch: usize) -> Result<EncodedInference, EnginError> {
             Err(EnginError::Onnx("test computation failure".to_owned()))
         }
     }
@@ -916,9 +988,12 @@ mod tests {
         let stats = pipeline.run_playouts(32).expect("playouts");
         assert_eq!(stats.completed_playouts, 32);
         assert!(stats.network_batches > 0);
-        let root = pipeline.repository().get(pipeline.root_key()).expect("root");
-        for edge in root.edges().iter() {
-            assert_eq!(edge.visits(), edge.completed_visits());
+        // A very fast stop may win the race before Gather expands the root.
+        // If it did expand, every reservation must still be released.
+        if let Some(root) = pipeline.repository().get(pipeline.root_key()) {
+            for edge in root.edges().iter() {
+                assert_eq!(edge.visits(), edge.completed_visits());
+            }
         }
         pipeline.stop_and_join();
     }
@@ -944,9 +1019,12 @@ mod tests {
         }
         pipeline.stop_and_join();
 
-        let root = pipeline.repository().get(pipeline.root_key()).expect("root");
-        for edge in root.edges().iter() {
-            assert_eq!(edge.visits(), edge.completed_visits());
+        // Stop may arrive before Gather expands the root. If it did expand,
+        // every reservation still has to be released.
+        if let Some(root) = pipeline.repository().get(pipeline.root_key()) {
+            for edge in root.edges().iter() {
+                assert_eq!(edge.visits(), edge.completed_visits());
+            }
         }
     }
 
@@ -1045,6 +1123,8 @@ mod tests {
         let worker_root = root_stats(workers.repository(), workers.root_key()).expect("worker root");
 
         assert_eq!(worker_stats.completed_playouts, count);
+        assert!(worker_stats.average_depth >= 1);
+        assert!(worker_stats.max_depth >= worker_stats.average_depth);
         assert_eq!(worker_root.completed_visits, count as u32);
         assert!(worker_root
             .edges
@@ -1068,5 +1148,32 @@ mod tests {
         pipeline.wait_for_idle().expect_err("pipeline retains the worker error");
         assert_eq!(pipeline.stats().completed_playouts, 0);
         pipeline.stop_and_join();
+    }
+
+    #[test]
+    fn completed_search_can_reuse_a_tree_at_its_played_child() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(PositionHistory::from_positions(state.positions()));
+        let mut tree = super::Tree::new(history);
+        let backend = Arc::new(UniformBackend::default()) as Arc<dyn Backend>;
+
+        let mut first = Search::new_with_tree(
+            Arc::clone(&backend),
+            SearchGeneration(29),
+            &tree,
+            SearchConfig::default(),
+        );
+        first.run_playouts(16).expect("first search");
+        let old_root = tree.root_key();
+        let played = best_move(first.repository(), first.root_key(), false).expect("best move");
+        first.stop_and_join();
+
+        tree.advance(played).expect("advance retained tree");
+        assert!(tree.repository().get(old_root).is_some());
+
+        let mut second = Search::new_with_tree(backend, SearchGeneration(30), &tree, SearchConfig::default());
+        second.run_playouts(8).expect("reused search");
+        assert!(root_settled(second.repository(), second.root_key()));
+        second.stop_and_join();
     }
 }
