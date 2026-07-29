@@ -43,8 +43,10 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 
 配置分为 `dataset`、`model`、`training` 三段，格式参考
 `C:\Users\Administrator\projects\pxzero-training\tf\configs\example.yaml`，但只保留当前 PyTorch/PX0
-主线需要的字段。`124x10x9 -> 2062 + WDL`、纯 CNN trunk 与 loss 语义固定，不能通过配置切换。
-优化器固定为 pxzero-training 的 `SGD(momentum=0.9, nesterov=true)`。
+主线需要的字段。正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`；x7 v2 的纯 CNN trunk、
+正式 head 和 loss 语义不能通过配置切换。训练期 Auxiliary Soft Policy 与 root-WDL head 不进入 ONNX。
+优化器固定为 AdamW：Conv/Linear weights 使用 decoupled weight decay，BatchNorm 与 bias 不 decay；学习率为
+线性 warmup 后 cosine decay。
 所有可配置字段、默认值与注释见 [nn/configs/example.yaml](C:/projects/77xiangqi_engine/nn/configs/example.yaml)。
 `example.yaml` 是唯一提交到 Git 的配置文件；复制出的实验 YAML 被忽略。
 
@@ -55,10 +57,10 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 再次运行同一条 YAML 命令即可。`training.out` 已存在时自动恢复；只需把 YAML 中的
 `training.steps` 调大。
 
-## 5. 开启新阶段训练（从旧权重起步）
+## 5. 从旧权重初始化新实验
 
-复制 YAML，修改 `name`、`training.out`、`training.init_from`、`training.q_ratio` 和 `training.steps`。
-例如先用 `q_ratio=0.0` 训出第一阶段，再切到新的 `q_ratio`：
+复制 YAML，修改 `name`、`training.out`、`training.init_from` 和 `training.steps`。`init_from` 只加载模型权重；
+width、blocks、bottleneck_channels 必须与来源 checkpoint 一致。
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
@@ -74,18 +76,18 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
   --checkpoint data\checkpoints\x7_v2_01.best.pt `
-  --out data\x7.onnx
+  --out data\x7.onnx `
+  --precision mixed-fp16
 ```
 
 说明：
 
 - `value` 输出是 `WDL` 概率
 - 引擎侧按 `q = W - L` 消费 value
-- 当前 trunk：`pre-activation residual + global-pooling residual`
+- 当前 trunk：`pre-activation bottleneck residual + two Global Broadcast`
 - 当前 policy：`pure CNN conv head`
-- 当前引擎正式只消费：`policy + WDL`
-- `q_ratio=0.0` 表示纯最终结果监督
-- `q_ratio=1.0` 表示纯搜索监督
+- 当前引擎正式消费：`policy + WDL + moves-left`
+- Auxiliary Soft Policy 与 root-WDL 是训练期 head，不在 ONNX 中
 
 ## 8. 检查 ONNX 合约
 
