@@ -193,6 +193,34 @@ target\release\stream_compare.exe `
 
 ## 11. 质量检查
 
+在仓库根目录执行：
+
+```powershell
+cargo fmt --check
+cargo test -p engin --lib
+cargo test -p engin --test uci_search_test
+cargo clippy -p engin --all-targets -- -D warnings
+```
+
+规则层的 release perft 对拍较慢，按需单独运行：
+
+```powershell
+cargo test --release -p xiangqi_core
+```
+
+NN 检查使用项目自己的虚拟环境：
+
+```powershell
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m ruff check nn\src nn\scripts nn\tests
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests -q
+```
+
+需要检查格式而非修正格式时：
+
+```powershell
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m ruff format --check nn\src nn\scripts nn\tests
+```
+
 ## 12. Windows DirectML 打包
 
 清理 Rust 构建产物、以 DirectML-only `ort` 重编译并生成可分发目录。脚本会复制实际需要的
@@ -208,26 +236,4 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1 `
   -ModelPath C:\models\x7.onnx `
   -BundleDir C:\dist\x7-directml
-```
-
-```powershell
-cargo check
-```
-
-```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m ruff check nn
-```
-
-```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests
-```
-
-```powershell
-cargo test -p engin --lib
-```
-
-P1 px0 规则对拍包含 depth-5 perft，建议只在 release 运行：
-
-```powershell
-cargo test --release -p xiangqi_core
 ```
