@@ -1,6 +1,6 @@
-//! Owned event payloads for LC3-style streaming workers.
+//! LC3 风格流水线 worker 之间传递的 owned event。
 //!
-//! Reference: LC3 overview, "Workers" and glossary "Variation":
+//! 参考：LC3 Overview 的 “Workers” 与 Glossary 的 “Variation”：
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 //! <https://lczero.org/dev/lc0/search/lc3/glossary/>
 
@@ -16,18 +16,17 @@ use super::{EdgeReservation, NodeKey, ValueDelta};
 
 type NodeDeltaMap = HashMap<NodeKey, ValueDelta, BuildHasherDefault<NoHashHasher<u64>>>;
 
-/// Rejects stale events after `position`, `ucinewgame`, or a replacement `go`.
+/// 拒绝 `position`、`ucinewgame` 或替换 `go` 之后残留的旧 event。
 ///
-/// LC3 events belong to one streaming search. x7 gives every UCI search a
-/// monotonic generation instead of allowing an old event to update a new root.
+/// 一个 LC3 event 只属于一次流式搜索。x7 为每次 UCI 搜索分配单调递增 generation，
+/// 不让旧 event 更新新的 root。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct SearchGeneration(pub u64);
 
-/// A root history plus the moves from that root to a repository node.
+/// root history 加上从 root 到 repository node 的走法。
 ///
-/// Repetition and rule60 are history-sensitive in Xiangqi, so an event cannot
-/// contain only a board hash. The root history is shared immutably; the
-/// move path is owned and grown in place as Gather descends.
+/// 中国象棋重复局面和 rule60 依赖历史，因此 event 不能只保存棋盘 hash。root history
+/// 以不可变方式共享；Gather 下行时在本 event 内扩展其 owned 走法路径。
 #[derive(Clone, Debug)]
 pub struct Variation {
     root_history: Arc<PositionHistory>,
@@ -54,7 +53,7 @@ impl Variation {
         &self.moves
     }
 
-    /// Rebuilds the exact leaf history in a worker-local workspace.
+    /// 在 worker 私有工作区重建准确的叶子 history。
     pub fn replay_history(&self) -> PositionHistory {
         let mut history = self.root_history.as_ref().clone();
         for &mv in self.moves.iter() {
@@ -64,10 +63,10 @@ impl Variation {
     }
 }
 
-/// Work item passed between Gather, Eval, and Backprop workers.
+/// Gather、Eval 与 Backprop worker 间传递的工作项。
 ///
-/// The event owns all search-specific data. It holds no `&mut` tree/backend
-/// references and is therefore safe to send through a bounded worker queue.
+/// event 拥有全部搜索专用数据，不持有 tree/backend 的 `&mut` 引用，因此可安全地通过
+/// 有界 worker 队列发送。
 #[derive(Debug)]
 pub struct NodeEvent {
     pub generation: SearchGeneration,
@@ -102,9 +101,8 @@ impl NodeEvent {
         self
     }
 
-    /// Releases every edge-local in-flight visit after a collision, stop, or
-    /// failed evaluation. Consuming `self` makes leaving reservations behind
-    /// an explicit bug at the caller.
+    /// collision、停止或评估失败后释放全部 edge-local in-flight visit。消费 `self`
+    /// 让调用方遗漏 reservation 成为显式错误。
     pub fn cancel(self) {
         for reservation in self.reservations.into_iter().rev() {
             reservation.cancel();
@@ -115,10 +113,10 @@ impl NodeEvent {
         &self.node_path
     }
 
-    /// Marks one worker-queue handoff for optional benchmark telemetry.
+    /// 标记一次 worker 队列交接，供可选 benchmark 遥测使用。
     ///
-    /// Reference: LC3 overview, "Stats Collection". Normal UCI searches keep
-    /// this unset, so timing collection is outside their hot path.
+    /// 参考：LC3 Overview 的 “Stats Collection”。普通 UCI 搜索不设置它，因此计时
+    /// 不在其热路径上。
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at = Some(Instant::now());
     }
@@ -128,11 +126,11 @@ impl NodeEvent {
     }
 }
 
-/// A Gather/Eval outcome routed to Backprop.
+/// 由 Gather/Eval 路由给 Backprop 的结果。
 ///
-/// Reference: LC3 Overview, "GatherWorker" and "BackpropWorker":
-/// <https://lczero.org/dev/lc0/search/lc3/overview/>. A collision must reach
-/// Backprop so the same terminal stage releases its edge-local in-flight visit.
+/// 参考：LC3 Overview 的 “GatherWorker” 和 “BackpropWorker”：
+/// <https://lczero.org/dev/lc0/search/lc3/overview/>。collision 必须到达 Backprop，
+/// 让相同的收尾阶段释放 edge-local in-flight visit。
 #[derive(Debug)]
 pub struct BackpropEvent {
     node: NodeEvent,
@@ -151,8 +149,8 @@ pub(crate) struct BackpropResult {
     pub completed_playouts: u32,
     pub collisions: u32,
     pub collision_depths: Vec<usize>,
-    /// Sum of completed leaf depths, with the root at depth one. This matches
-    /// px0 classic's `cum_depth_` accounting (`search.cc:2157-2167`).
+    /// 已完成叶子深度之和，root 记为深度一。对齐 px0 `cum_depth_` 的计数方式
+    /// （`search.cc:2157-2167`）。
     pub completed_depth: u64,
     pub max_depth: u64,
 }
@@ -174,9 +172,8 @@ impl BackpropEvent {
         }
     }
 
-    /// Completes events through the aggregate path used by Backprop workers.
-    /// Edge reservations remain per-event because each owns exactly one
-    /// in-flight visit.
+    /// 经 Backprop worker 使用的聚合路径完成 event。edge reservation 保持为每 event
+    /// 一份，因为每份恰好拥有一个 in-flight visit。
     ///
     /// LC3 Overview, "BackpropWorker":
     /// <https://lczero.org/dev/lc0/search/lc3/overview/>.
@@ -184,7 +181,7 @@ impl BackpropEvent {
         events: impl IntoIterator<Item = Self>,
         repository: &super::NodeRepository,
     ) -> BackpropResult {
-        // `NodeKey` is already mixed; same identity hasher as the repository.
+        // `NodeKey` 已混合；与 repository 使用相同的 identity hasher。
         let mut node_deltas = NodeDeltaMap::default();
         let mut result = BackpropResult::default();
 
@@ -213,9 +210,9 @@ impl BackpropEvent {
                 if node_index == 0 {
                     break;
                 }
-                // px0 `EdgeAndNode::GetQ` reads child.wl (mover view). Complete
-                // the edge with the child delta, then flip for the parent node
-                // (`search.cc:2175-2257`: finalize(v); v = -v).
+                // px0 `EdgeAndNode::GetQ` 读取 child.wl（走子方视角）。先用 child
+                // delta 完成 edge，再为 parent node 翻转（`search.cc:2175-2257`：
+                // `finalize(v); v = -v`）。
                 reservations.next().expect("path reservation").complete(delta.q());
                 delta = delta.for_parent().one_ply_up();
             }
@@ -238,9 +235,9 @@ impl BackpropEvent {
         self.queued_at = Some(Instant::now());
     }
 
-    /// Returns the optional delay since the Backprop queue handoff.
+    /// 返回进入 Backprop 队列后的可选等待时间。
     ///
-    /// Reference: LC3 overview, "Stats Collection".
+    /// 参考：LC3 Overview 的 “Stats Collection”。
     pub(crate) fn take_queue_wait(&mut self) -> Option<std::time::Duration> {
         self.queued_at.take().map(|queued_at| queued_at.elapsed())
     }
@@ -300,8 +297,8 @@ mod tests {
         let edge = &root_node.edges()[0];
         assert_eq!(edge.visits(), 1);
         assert_eq!(edge.completed_visits(), 1);
-        // Mover-perspective leaf value is stored on the child and edge; parent
-        // receives the flipped backup (px0 search.cc:2129,2175-2257).
+        // 走子方视角的叶子价值存于 child 和 edge；parent 接收翻转后的回传
+        // （px0 `search.cc:2129,2175-2257`）。
         assert!((edge.q() - 0.4).abs() < f32::EPSILON);
         assert_eq!(root_node.completed_visits(), 1);
         assert!((root_node.q() + 0.4).abs() < f32::EPSILON);

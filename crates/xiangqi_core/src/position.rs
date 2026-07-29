@@ -100,8 +100,8 @@ impl Position {
     /// px0 free function `PositionToFen` (`position.cc:207-212`).
     pub fn to_fen(&self) -> String {
         let mut result = board_to_fen(&self.board);
-        // `position_test.cc` expects a standard six-field FEN. px0's current
-        // `PositionToFen()` omits these two unused Xiangqi placeholders.
+        // `position_test.cc` 期望标准六字段 FEN。px0 当前的 `PositionToFen()` 省略了
+        // 中国象棋中未使用的这两个占位字段。
         result.push_str(" - - ");
         result.push_str(&self.rule60_ply.to_string());
         result.push(' ');

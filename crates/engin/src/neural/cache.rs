@@ -21,8 +21,8 @@ pub(crate) struct CachedEval {
     pub num_moves: usize,
 }
 
-/// Shared NN result cache. `quick_cache` provides the general concurrent
-/// container; the wrapper retains the px0-specific key and move-count rules.
+/// 共享 NN 结果缓存。`quick_cache` 提供通用并发容器；wrapper 保留 px0 专用的 key 和
+/// 合法着数量规则。
 #[derive(Debug)]
 pub(crate) struct EvalCache {
     values: Cache<u64, CachedEval>,
@@ -36,8 +36,8 @@ impl EvalCache {
     }
 
     /// px0 `MemCache::GetCachedEvaluation` / collision guard
-    /// (`memcache.cc:130-150`). An empty legal move list accepts a cached
-    /// result; otherwise only an equal policy length is safe.
+    /// （`memcache.cc:130-150`）。空合法着列表可接受缓存结果；否则只有相同 policy
+    /// 长度才安全。
     pub(crate) fn get(&self, key: u64, requested_moves: usize) -> Option<Arc<EvalResult>> {
         self.values
             .get(&key)
@@ -45,9 +45,8 @@ impl EvalCache {
             .map(|cached| cached.result)
     }
 
-    /// Preserve the first completed result for a key. `quick_cache` owns the
-    /// S3-FIFO eviction policy; px0 `HashKeyedCache::Insert` is the reference
-    /// only for the no-replacement cache contract (`utils/cache.h:69-105`).
+    /// 保留一个 key 的第一份完整结果。`quick_cache` 负责 S3-FIFO 淘汰策略；px0
+    /// `HashKeyedCache::Insert` 只作为不替换缓存契约的参考（`utils/cache.h:69-105`）。
     pub(crate) fn insert_if_absent(&self, key: u64, value: CachedEval) {
         match self.values.entry(&key, None, |_, _| EntryAction::Retain(())) {
             EntryResult::Vacant(guard) => {

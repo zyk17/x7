@@ -49,10 +49,10 @@ pub trait StringUciResponder: UciResponder {
     }
 }
 
-/// Safe bridge from a search watchdog to the single UCI output owner.
+/// 从搜索 watchdog 到唯一 UCI 输出 owner 的安全桥接。
 ///
-/// Search workers publish structured callbacks; only `UciLoop::flush_output`
-/// borrows the textual responder and formats those callbacks as UCI lines.
+/// 搜索 worker 发布结构化回调；只有 `UciLoop::flush_output` 借用文本 responder，
+/// 并将回调格式化为 UCI 行。
 #[derive(Default)]
 pub struct UciOutputQueue {
     events: Mutex<Vec<UciOutput>>,
@@ -150,8 +150,8 @@ impl<'a> UciLoop<'a> {
             }
             "go" => {
                 let mut go_params = GoParams::default();
-                // px0 only accepts `infinite` (`uciloop.cc:70,209-213`). `infinity`
-                // is a local alias that sets the same `GoParams::infinite` flag.
+                // px0 只接受 `infinite`（`uciloop.cc:70,209-213`）。`infinity` 是本地别名，
+                // 设置相同的 `GoParams::infinite` flag。
                 for flag in ["infinite", "infinity"] {
                     if !contains_key(params, flag) {
                         continue;
@@ -516,7 +516,7 @@ fn parse_setoption(line: &str) -> Result<HashMap<String, String>, EnginError> {
     Ok(params)
 }
 
-/// px0 `ParseCommand` scans `setoption` tokens left-to-right (`uciloop.cc:109-118`).
+/// px0 `ParseCommand` 从左到右扫描 `setoption` token（`uciloop.cc:109-118`）。
 fn token_offset(text: &str, needle: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut start = 0;
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn weights_file_option_matches_px0_name() {
-        let mut options = Options::populate_defaults();
+        let mut options = Options::default();
         options
             .set_uci_option("WeightsFile", "data/x7.onnx")
             .expect("weights option");
@@ -598,6 +598,16 @@ mod tests {
             .list_options_uci()
             .iter()
             .any(|line| line == "option name WeightsFile type string default data/x7.onnx"));
+    }
+
+    #[test]
+    fn virtual_loss_option_uses_centi_units() {
+        let mut options = Options::default();
+        options
+            .set_uci_option("VirtualLoss", "75")
+            .expect("virtual-loss option");
+        assert_eq!(options.virtual_loss, 0.75);
+        assert!(options.set_uci_option("VirtualLoss", "101").is_err());
     }
 
     #[test]

@@ -27,7 +27,7 @@ struct LegacyState {
     time_spared_ms: i64,
 }
 
-/// px0 `LegacyTimeManager` (`legacy.cc:64-174`), the factory default.
+/// px0 `LegacyTimeManager`（`legacy.cc:64-174`），factory 默认实现。
 pub struct LegacyTimeManager {
     move_overhead_ms: i64,
     slowmover: f32,
@@ -112,7 +112,7 @@ impl LegacyTimeManager {
     }
 }
 
-/// px0 internal `LegacyStopper` (`legacy.cc:66-88`).
+/// px0 内部的 `LegacyStopper`（`legacy.cc:66-88`）。
 struct LegacyStopper {
     limit: TimeLimitStopper,
     state: Arc<Mutex<LegacyState>>,

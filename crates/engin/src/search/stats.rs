@@ -1,4 +1,4 @@
-//! Read-only stream root statistics, bestmove, and principal variation.
+//! 只读的 stream root 统计、bestmove 与 principal variation。
 
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use xiangqi_core::Move;
 
 use super::{Edge, ExpansionState, Node, NodeKey, NodeRepository};
 
-/// One root edge snapshot. `started_visits` includes in-flight; Q uses completed only.
+/// 一个 root edge 快照。`started_visits` 包含 in-flight；Q 只使用 completed 值。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RootEdgeStats {
     pub mv: Move,
@@ -16,7 +16,7 @@ pub struct RootEdgeStats {
     pub prior: f32,
 }
 
-/// Root node snapshot (not a globally atomic tree view).
+/// root node 快照（不是全局原子 tree view）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct RootStats {
     pub completed_visits: u32,
@@ -53,12 +53,11 @@ fn orient_move(mv: Move, flip: bool) -> Move {
     }
 }
 
-/// Bestmove outcome bucket (px0 `EdgeRank`, `search.cc:737-756`).
+/// bestmove 结果分组（px0 `EdgeRank`，`search.cc:737-756`）。
 ///
-/// `NonTerminal` means non-decisive: ordinary lines **or terminal draws**
-/// (`wl`/`q == 0`). Draws are not a separate rank so they compete via N→Q→P
-/// (and the terminal-draw `m` tie-break below) instead of always beating
-/// unproven lines. Only proven wins/losses get hard priority.
+/// `NonTerminal` 表示未决：普通变化或终局和棋（`wl`/`q == 0`）。和棋不另设 rank，
+/// 而是通过 N→Q→P（及下方终局和棋的 `m` 决胜）参与竞争，不会总是压过未证明变化。
+/// 只有已证明的胜/负才有硬优先级。
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum BestEdgeRank {
     TerminalLoss,
@@ -159,8 +158,8 @@ fn best_edge_absolute(repository: &NodeRepository, root_key: NodeKey, root_move_
             None
         };
     }
-    // Before any completed visit, the edge list is already generated from
-    // legal moves. Return a verified searchmove, or the first legal edge.
+    // 尚无 completed visit 时，edge list 已从合法着生成。返回已验证的 searchmove，
+    // 或第一条合法 edge。
     if root.completed_visits() == 0 {
         return first_filtered_move(&edges, root_move_filter);
     }
@@ -182,9 +181,9 @@ fn best_edge_absolute(repository: &NodeRepository, root_key: NodeKey, root_move_
         .or_else(|| first_filtered_move(&edges, root_move_filter))
 }
 
-/// Bestmove with optional `go searchmoves` filter (px0 `root_move_filter_`).
+/// 带可选 `go searchmoves` filter 的 bestmove（px0 `root_move_filter_`）。
 ///
-/// `root_is_black` applies UCI orientation for the root ply.
+/// `root_is_black` 在 root ply 应用 UCI 坐标方向。
 pub fn best_move_filtered(
     repository: &NodeRepository,
     root_key: NodeKey,
@@ -198,8 +197,8 @@ pub fn best_move(repository: &NodeRepository, root_key: NodeKey, root_is_black: 
     best_move_filtered(repository, root_key, root_is_black, &[])
 }
 
-/// Proven mate score for the selected root edge. `m` is in plies from that
-/// child, matching px0 `SendUciInfo` (`search.cc:249-336`).
+/// 所选 root edge 的已证明 mate score。`m` 是从该 child 起的 ply 数，对齐 px0
+/// `SendUciInfo`（`search.cc:249-336`）。
 pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_move_filter: &[Move]) -> Option<i32> {
     let root = repository.get(root_key)?;
     if let Some((wl, _, m)) = root.terminal_value() {
@@ -225,10 +224,10 @@ pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_mov
     })
 }
 
-/// Principal variation (UCI `pv` line). Not policy/value.
+/// principal variation（UCI `pv` 行），不是 policy/value。
 ///
-/// Walks like px0 `SendUciInfo` (`search.cc:345-350`): best child while parent
-/// `N > 0`; zero-visit child edges may appear once (dangling), then stop.
+/// 按 px0 `SendUciInfo`（`search.cc:345-350`）遍历：parent `N > 0` 时取最佳 child；
+/// 零访问 child edge 可能出现一次（悬挂），随后停止。
 pub fn principal_variation(repository: &NodeRepository, root_key: NodeKey, root_is_black: bool) -> Vec<Move> {
     principal_variation_filtered(repository, root_key, root_is_black, &[])
 }
@@ -297,7 +296,7 @@ mod tests {
         assert!(!mv.is_null());
         let pv = principal_variation(pipeline.repository(), pipeline.root_key(), root_is_black);
         assert_eq!(pv.first().copied(), Some(mv));
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]
@@ -318,7 +317,7 @@ mod tests {
             Some(Move::NULL)
         );
         assert!(principal_variation(pipeline.repository(), pipeline.root_key(), root_is_black).is_empty());
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//! Position classification before NN / terminal marking.
+//! NN 前的局面分类与终局标记。
 //!
-//! Mirrors px0 `evaluate_extension` (`search.cc:1913-1959`) enough for
-//! X7 stream: checkmate, repetitions, early two-fold, and draw-by-material/rule60.
-//! Plies-left `m` is recorded on terminals for ranking; MultiPV/TB stay out of scope.
+//! 以 px0 `evaluate_extension`（`search.cc:1913-1959`）为参考，实现 X7 stream 所需的
+//! 将死、重复、早期 two-fold、材料和 rule60 和棋。终局保存 plies-left `m` 用于排序；
+//! MultiPV/TB 不在范围内。
 
 use xiangqi_core::{GameResult, PositionHistory};
 
@@ -10,24 +10,23 @@ use super::terminal_wl_for_node;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ExtensionKind {
-    /// NN evaluation + edge publish.
+    /// NN 评估并发布 edge。
     Evaluate,
-    /// Terminal leaf: mover-perspective `wl` / `draw`≡`d` / `plies_left`≡`m`.
+    /// 终局叶子：走子方视角 `wl` / `draw`≡`d` / `plies_left`≡`m`。
     Terminal { wl: f32, draw: f32, plies_left: f32 },
 }
 
-/// Classifies the leaf at `history` for stream Gather/Eval.
+/// 为 stream Gather/Eval 分类 `history` 的叶子。
 ///
-/// `depth` is variation length from the search root (0 = root).
+/// `depth` 是自搜索 root 起的 variation 长度（0 即 root）。
 pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> ExtensionKind {
     let is_root = depth == 0;
     let board = history.last().board();
     let legal_moves = board.generate_legal_moves();
     if legal_moves.is_empty() {
-        // `wl` is stored from the incoming edge / previous mover perspective.
-        // A no-legal-move Xiangqi position therefore always wins for it.
-        // This matches px0's `WHITE_WON` canonical-board shortcut
-        // (`search.cc:1913-1919`, `node.cc:300-317`).
+        // `wl` 按 incoming edge / 上一走子方视角保存。因此无合法着的中国象棋局面对它
+        // 总是胜利。对齐 px0 的 `WHITE_WON` canonical-board 快径
+        // （`search.cc:1913-1919`、`node.cc:300-317`）。
         return ExtensionKind::Terminal {
             wl: 1.0,
             draw: 0.0,
@@ -44,7 +43,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
                 plies_left: 0.0,
             };
         }
-        // px0 `search.cc:1930-1959`: initial repetition may become TwoFold.
+        // px0 `search.cc:1930-1959`：初始重复局面可能成为 TwoFold。
         if history.last().repetitions() == 1
             && depth.saturating_sub(1) >= 4
             && depth.saturating_sub(1) as u32 >= history.last().cycle_length()
@@ -76,7 +75,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
             };
         }
     } else {
-        // Root still uses compute_game_result for checkmate / settled draws.
+        // root 仍通过 compute_game_result 判断将死和已确定的和棋。
         match history.compute_game_result() {
             GameResult::Undecided => {}
             result => {
@@ -92,7 +91,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
     ExtensionKind::Evaluate
 }
 
-/// px0 two-fold chase/check cycle probe (`search.cc:1940-1958`).
+/// px0 的 two-fold chase/check cycle 探测（`search.cc:1940-1958`）。
 fn two_fold_chase_or_check_cycle(history: &PositionHistory) -> bool {
     let mut idx = history.len() - 1;
     let mut idx2 = idx;
@@ -126,8 +125,8 @@ mod tests {
 
     #[test]
     fn checkmated_side_to_move_is_a_terminal_win_for_the_incoming_edge() {
-        // Black is checkmated. This is also used by the stream root terminal
-        // test; here it protects the non-root incoming-edge value contract.
+        // 黑方被将死。stream root terminal 测试也覆盖此局面；这里保护非 root 的
+        // incoming-edge 价值契约。
         let state = GameState::from_fen_moves("4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", &[] as &[&str])
             .expect("checkmate fen");
         let history = PositionHistory::from_positions(state.positions());

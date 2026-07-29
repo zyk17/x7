@@ -1,17 +1,15 @@
-//! Stream selection parameters.
+//! Stream 的选择参数。
 //!
-//! LC3 Policy documents the worker/policy architecture but does not publish a
-//! concrete PUCT formula. Until a stream-native policy is approved, these
-//! defaults intentionally preserve the project's approved X7 policy
-//! (px0 `src/search/classic/search.cc:408-433`).
+//! LC3 Policy 描述 worker/policy 架构，但未公开具体 PUCT 公式。因此在有
+//! stream 原生公式前，默认值保持项目批准的 X7 策略
+//! （px0 `src/search/classic/search.cc:408-433`）。
 
 use crate::utils::fastmath::fast_log;
 
-/// Small, stream-owned selection parameter set.
+/// Stream 自己拥有的最小选择参数集。
 ///
-/// Root-specific variants, absolute FPU, draw score, contempt, and legacy
-/// task-worker controls are deliberately absent. Stream always uses neutral
-/// draw score and reduction FPU.
+/// 不包含 root 专用参数、absolute FPU、draw score、contempt 或旧
+/// task-worker 参数；stream 固定使用中性和棋分数与 reduction FPU。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SearchParams {
     pub cpuct: f32,
@@ -49,7 +47,7 @@ impl SearchParams {
     }
 }
 
-/// Project-approved PUCT alignment, pending a public LC3 formula.
+/// 项目批准的 PUCT 对齐；等待公开的 LC3 公式。
 pub(crate) fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
     if params.cpuct_factor == 0.0 {
         params.cpuct
@@ -58,9 +56,8 @@ pub(crate) fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
     }
 }
 
-// Deferred capabilities intentionally have no fields until their event and
-// lifecycle semantics are defined and measured: OOO evaluation, MultiPV,
-// prefetch, collision control, and DAG reuse.
+// 尚未定义并验证事件/生命周期语义的能力不预留字段：OOO evaluation、MultiPV、
+// prefetch 与 DAG reuse。
 
 #[cfg(test)]
 mod tests {

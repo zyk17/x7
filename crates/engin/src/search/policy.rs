@@ -1,9 +1,8 @@
-//! Stream search policy (px0-referenced selection + WDL deltas).
+//! stream 搜索策略（参考 px0 的选择与 WDL delta）。
 //!
-//! Selection mirrors px0 `ComputeCpuct` / `GetFpu` / PUCT edge scoring
-//! (`src/search/classic/search.cc:408-433`) with
-//! `draw_score` fixed at 0 (Q is raw mover-perspective `wl`). Edge visit counts
-//! include in-flight reservations (LC3 node structure).
+//! 选择参考 px0 `ComputeCpuct` / `GetFpu` / PUCT edge scoring
+//! （`src/search/classic/search.cc:408-433`），`draw_score` 固定为 0（Q 为走子方视角的
+//! 原始 `wl`）。edge visit 计数包含 in-flight reservation（LC3 node structure）。
 
 use std::sync::Arc;
 
@@ -13,10 +12,10 @@ use super::params::compute_cpuct;
 use super::SearchParams;
 use super::{Edge, Node};
 
-/// Compact WDL update used by stream backpropagation.
+/// stream backpropagation 使用的紧凑 WDL 更新。
 ///
-/// - `wl_sum` ↔ px0 `wl_` (mover / incoming-edge perspective, not raw NN STM)
-/// - `draw_sum` ↔ px0 `d_`
+/// - `wl_sum` 对应 px0 `wl_`（走子方 / incoming-edge 视角，非 NN 原始 STM）
+/// - `draw_sum` 对应 px0 `d_`
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ValueDelta {
     pub visits: u32,
@@ -79,7 +78,7 @@ impl ValueDelta {
     }
 }
 
-/// px0 `Node::GetVisitedPolicy` over stream edges.
+/// stream edge 上的 px0 `Node::GetVisitedPolicy`。
 pub fn visited_policy(edges: &[Arc<Edge>]) -> f32 {
     edges
         .iter()
@@ -88,28 +87,39 @@ pub fn visited_policy(edges: &[Arc<Edge>]) -> f32 {
         .sum()
 }
 
-/// px0 `GetFpu` (`search.cc:408-424`) with `draw_score = 0`.
+/// `draw_score = 0` 时的 px0 `GetFpu`（`search.cc:408-424`）。
 pub fn get_fpu(params: &SearchParams, parent_wl: f32, edges: &[Arc<Edge>]) -> f32 {
     -parent_wl - params.fpu_reduction * visited_policy(edges).sqrt()
 }
 
-/// Visited-edge Q, or FPU when the edge has no completed visit.
-pub fn edge_utility(edge: &Edge, fpu: f32) -> f32 {
-    if edge.completed_visits() == 0 {
-        fpu
-    } else {
-        edge.q()
+/// 已访问 edge 返回 Q，未完成访问则返回 FPU。
+///
+/// virtual loss 将每个 reservation 视作临时一次败局，并按 started visits 缩放；
+/// reservation complete 或 cancel 后立即消失。
+/// 参考：KataGo `cpp/search/search.cpp` 管理 playout 下行期间的 `virtualLosses`。
+/// LC3 未公开 virtual-loss 公式；这是最小 tree 形式，不宣称等价于 LC3 或 KataGo。
+pub fn edge_utility(edge: &Edge, fpu: f32, virtual_loss: f32) -> f32 {
+    let completed = edge.completed_visits();
+    let q = if completed == 0 { fpu } else { edge.q() };
+    if virtual_loss == 0.0 {
+        return q;
     }
+    let in_flight = edge.in_flight_visits();
+    if in_flight == 0 {
+        return q;
+    }
+    let total = completed + in_flight;
+    q - virtual_loss * in_flight as f32 / total.max(1) as f32
 }
 
 fn root_filter_allows(is_root: bool, filter: &[Move], mv: Move) -> bool {
     !is_root || filter.is_empty() || filter.contains(&mv)
 }
 
-/// Selects the highest px0-style PUCT edge.
+/// 选择 px0 风格 PUCT 最高的 edge。
 ///
-/// `root_move_filter` mirrors px0 `Search::root_move_filter_` from UCI
-/// `go searchmoves` (`search.cc:53-58,721-724,1668-1739`): empty means no filter.
+/// `root_move_filter` 对应 px0 `Search::root_move_filter_` 与 UCI `go searchmoves`
+/// （`search.cc:53-58,721-724,1668-1739`）；空数组表示不过滤。
 pub fn select_edge(
     edges: &[Arc<Edge>],
     parent_completed_visits: u32,
@@ -117,6 +127,7 @@ pub fn select_edge(
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
+    virtual_loss: f32,
 ) -> Option<usize> {
     if edges.is_empty() {
         return None;
@@ -135,7 +146,7 @@ pub fn select_edge(
         if !root_filter_allows(is_root, root_move_filter, edge.mv()) {
             continue;
         }
-        let q = edge_utility(edge, fpu);
+        let q = edge_utility(edge, fpu, virtual_loss);
         let score = q + u_coeff * edge.prior() / (1 + edge.visits()) as f32;
         if best.is_none_or(|(_, best_score)| score > best_score) {
             best = Some((index, score));
@@ -144,12 +155,13 @@ pub fn select_edge(
     best.map(|(index, _)| index)
 }
 
-/// Convenience for Gather call sites that already hold the parent node.
+/// 供已持有 parent node 的 Gather 调用点使用的便利函数。
 pub fn select_edge_from_node(
     node: &Node,
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
+    virtual_loss: f32,
 ) -> Option<usize> {
     let edges = node.edges();
     select_edge(
@@ -159,6 +171,7 @@ pub fn select_edge_from_node(
         depth,
         params,
         root_move_filter,
+        virtual_loss,
     )
 }
 
@@ -188,10 +201,10 @@ mod tests {
         node.publish_edges(vec![(mv("b2", "b3"), 0.6), (mv("c3", "c4"), 0.4)]);
         let edges = node.edges();
         let params = SearchParams::default();
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]), Some(0));
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[], 0.0), Some(0));
 
         let reservation = node.reserve_edge(0).expect("first edge");
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]), Some(1));
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[], 0.0), Some(1));
         reservation.cancel();
         assert_eq!(edges[0].completed_visits(), 0);
     }
@@ -206,7 +219,7 @@ mod tests {
         let edges = node.edges();
         let params = SearchParams::default();
         let filter = [mv("c3", "c4")];
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &filter), Some(1));
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &filter, 0.0), Some(1));
     }
 
     #[test]
@@ -218,6 +231,22 @@ mod tests {
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();
         node.reserve_edge(0).expect("res").complete(0.5);
-        assert!((edge_utility(&edge, 0.0) - 0.5).abs() < 1e-6);
+        assert!((edge_utility(&edge, 0.0, 0.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn virtual_loss_lowers_only_an_in_flight_edge() {
+        let repo = NodeRepository::default();
+        let key = NodeKey::root(4);
+        let node = repo.get_or_insert(key);
+        assert!(node.try_begin_evaluation());
+        node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
+        let edge = node.edges()[0].clone();
+
+        assert_eq!(edge_utility(&edge, 0.3, 1.0), 0.3);
+        let reservation = node.reserve_edge(0).expect("reservation");
+        assert!((edge_utility(&edge, 0.3, 1.0) + 0.7).abs() < 1e-6);
+        reservation.cancel();
+        assert_eq!(edge_utility(&edge, 0.3, 1.0), 0.3);
     }
 }

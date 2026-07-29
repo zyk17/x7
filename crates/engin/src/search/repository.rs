@@ -1,10 +1,10 @@
-//! Sharded node repository and edge-local reservations for stream search.
+//! stream 搜索的分片 node repository 与 edge-local reservation。
 //!
-//! Reference: LC3 overview, "Node repository" and "Node structure":
+//! 参考：LC3 Overview 的 “Node repository” 与 “Node structure”：
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 //!
-//! x7 deliberately uses tree keys in the first version: a child key combines
-//! its parent key and move, so transpositions are not merged into a DAG yet.
+//! x7 首版刻意使用 tree key：child key 由 parent key 和走法组成，因此暂不把换位合并为
+//! DAG。
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -17,12 +17,11 @@ use xiangqi_core::Move;
 
 use super::ValueDelta;
 
-/// Repository identity. It is a tree key, not a position-only transposition
-/// key: equal positions reached by different paths remain different nodes.
+/// repository 的标识。它是 tree key 而非仅按局面划分的 transposition key：不同路径
+/// 到达的相同局面仍是不同 node。
 ///
-/// The `u64` is already mixed by `hash_cat`. The shard map uses
-/// `nohash_hasher::NoHashHasher` so this value is used as the bucket index
-/// directly (no second hash pass).
+/// `u64` 已由 `hash_cat` 混合。分片 map 使用 `nohash_hasher::NoHashHasher`，直接
+/// 以此值为 bucket index，不再进行第二次 hash。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct NodeKey(u64);
 
@@ -32,7 +31,7 @@ impl Hash for NodeKey {
     }
 }
 
-// Asserts `Hash` only calls `write_u64` once — required by `NoHashHasher`.
+// 断言 `Hash` 只调用一次 `write_u64`，这是 `NoHashHasher` 的要求。
 impl IsEnabled for NodeKey {}
 
 impl NodeKey {
@@ -40,14 +39,14 @@ impl NodeKey {
         Self(position_hash)
     }
 
-    /// Equivalent operation to LC3's documented `HashConcatenate(parentHash,
-    /// Move)`, using the existing px0 `hashcat` mixing primitive.
+    /// 等价于 LC3 文档的 `HashConcatenate(parentHash, Move)`，使用既有 px0
+    /// `hashcat` 混合原语。
     pub const fn child(self, mv: Move) -> Self {
         Self(xiangqi_core::hashcat::hash_cat(self.0, mv.raw() as u64))
     }
 }
 
-/// The immutable expansion lifecycle of a repository node.
+/// repository node 不可逆的展开生命周期。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ExpansionState {
@@ -70,28 +69,28 @@ impl ExpansionState {
     }
 }
 
-/// A child edge. In-flight visits live on the incoming edge, never in the
-/// child node's completed visit count, matching the LC3 node invariant.
+/// child edge。in-flight visit 保存在入边，绝不计入 child node 的 completed visit，
+/// 对齐 LC3 的 node 不变量。
 #[derive(Debug)]
 pub struct Edge {
     mv: Move,
-    /// Policy prior as IEEE-754 `f32` bit pattern (`f32::to_bits` /
-    /// `from_bits`). Stored in `AtomicU32` because std has no `AtomicF32`.
+    /// IEEE-754 `f32` 位模式的 policy prior（`f32::to_bits` / `from_bits`）。
+    /// std 没有 `AtomicF32`，故保存为 `AtomicU32`。
     prior_bits: AtomicU32,
     started: AtomicU32,
-    /// Protected aggregate: Q and completed N must be observed together.
+    /// 受保护的聚合值：必须同时读取 Q 与 completed N。
     completed: Mutex<CompletedStats>,
 }
 
-/// Completed edge aggregate (no draw on edges).
-/// `wl_sum` is mover-perspective totals; Q = wl_sum / visits.
+/// 已完成 edge 聚合值（edge 不保存 draw）。`wl_sum` 是走子方视角总和；
+/// Q = wl_sum / visits。
 #[derive(Debug, Default)]
 struct CompletedStats {
     visits: u32,
     wl_sum: f32,
 }
 
-/// Completed node WDL aggregate (`wl_sum` / `draw_sum` ↔ px0 `wl_` / `d_`).
+/// 已完成 node WDL 聚合值（`wl_sum` / `draw_sum` 对应 px0 `wl_` / `d_`）。
 #[derive(Debug, Default)]
 struct NodeStats {
     visits: u32,
@@ -134,14 +133,24 @@ impl Edge {
         f32::from_bits(self.prior_bits.load(Ordering::Acquire))
     }
 
-    /// LC3 edge N includes in-flight visits. Completed N is separately needed
-    /// to form a stable Q while a GPU evaluation is outstanding.
+    /// LC3 edge N 包含 in-flight visit。GPU 评估未返回时，另存 completed N 才能形成
+    /// 稳定的 Q。
     pub fn visits(&self) -> u32 {
         self.started.load(Ordering::Acquire)
     }
 
     pub fn completed_visits(&self) -> u32 {
         self.completed.lock().visits
+    }
+
+    /// 此 edge 上待完成的 reservation。
+    ///
+    /// 由 `started - completed` 推导而非单独存储，所以 `complete` / `cancel`
+    /// 会自动释放它。参考：LC3 Overview 的 "Node structure"。KataGo 将类似临时
+    /// 计数放在 child node；x7 是 tree，入边是唯一且更简单的 owner。
+    pub fn in_flight_visits(&self) -> u32 {
+        let completed = self.completed.lock().visits;
+        self.started.load(Ordering::Acquire).saturating_sub(completed)
     }
 
     pub fn q(&self) -> f32 {
@@ -182,9 +191,8 @@ impl Edge {
     }
 }
 
-/// One pending visit. It must be consumed exactly once by `complete` or
-/// `cancel`; this is the stream reservation cleanup for pending visits.
-/// cleanup.
+/// 一次待完成访问。它必须恰好被 `complete` 或 `cancel` 消费一次，确保
+/// stream 的 reservation 不泄漏。
 #[derive(Debug)]
 pub struct EdgeReservation {
     edge: Arc<Edge>,
@@ -209,22 +217,22 @@ impl EdgeReservation {
     }
 }
 
-/// A repository value. Expansion publishes its edge vector once; per-edge
-/// statistics can then progress independently without a whole-tree lock.
+/// repository 的 node 值。展开时只发布一次 edge vector；之后各 edge 统计可独立推进，
+/// 不需要整棵 tree 锁。
 #[derive(Debug, Default)]
 pub struct Node {
-    /// Lifecycle: Unexpanded → Evaluating → Expanded|Terminal (`ExpansionState` as u8 for CAS).
+    /// 生命周期：Unexpanded → Evaluating → Expanded|Terminal（`ExpansionState` 以 u8
+    /// 供 CAS 使用）。
     expansion: AtomicU8,
     edges: RwLock<Arc<[Arc<Edge>]>>,
-    /// LC3 nodes retain their completed aggregate. In-flight visits remain
-    /// edge-local and are deliberately excluded from this value.
+    /// LC3 node 保留其 completed 聚合值。in-flight visit 保持在 edge-local，刻意不计入
+    /// 此值。
     stats: Mutex<NodeStats>,
-    /// Terminal WDL + plies: `(wl, draw≡d, plies_left≡m)`.
-    /// `m` is stored in plies (half-moves), same as px0 `MakeTerminal(plies_left)`;
-    /// UCI “moves left” is a separate full-move conversion.
+    /// 终局 WDL 与 plies：`(wl, draw≡d, plies_left≡m)`。`m` 以 ply（半回合）保存，
+    /// 与 px0 `MakeTerminal(plies_left)` 一致；UCI “moves left” 另行换算为完整回合。
     terminal: Mutex<Option<(f32, f32, f32)>>,
-    /// Exact interval in the incoming-edge perspective. This is the stream
-    /// equivalent of px0 `lower_bound_` / `upper_bound_` (`node.h:191-204`).
+    /// incoming-edge 视角的精确区间。相当于 stream 版本的 px0 `lower_bound_` /
+    /// `upper_bound_`（`node.h:191-204`）。
     bounds: Mutex<Bounds>,
 }
 
@@ -272,9 +280,8 @@ impl Node {
         ExpansionState::from_raw(self.expansion.load(Ordering::Acquire))
     }
 
-    /// Exactly one Eval worker claims an unexpanded node. Other workers report
-    /// a collision and backprop/cancel their reservation instead of evaluating
-    /// the same position again.
+    /// 恰好一个 Eval worker 取得未展开 node。其他 worker 报告 collision，并
+    /// backprop/cancel 它们的 reservation，不重复评估同一局面。
     pub fn try_begin_evaluation(&self) -> bool {
         self.expansion
             .compare_exchange(
@@ -292,7 +299,7 @@ impl Node {
             ExpansionState::Evaluating,
             "node must be evaluating"
         );
-        // px0 `Node::SortEdges` after policy init (`node.cc:291-297`).
+        // px0 在 policy 初始化后调用 `Node::SortEdges`（`node.cc:291-297`）。
         let mut edges = edges;
         edges.sort_unstable_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal));
         let edges: Arc<[Arc<Edge>]> = edges
@@ -303,9 +310,8 @@ impl Node {
         self.expansion.store(ExpansionState::Expanded as u8, Ordering::Release);
     }
 
-    /// Restores a node after Eval failed before publishing terminal data or
-    /// policy. This prevents future Gather events from treating a failed NN
-    /// request as a permanent collision.
+    /// Eval 在发布终局数据或 policy 前失败后恢复 node，避免后续 Gather event 将失败的
+    /// NN 请求当作永久 collision。
     pub fn abort_evaluation(&self) {
         self.expansion
             .compare_exchange(
@@ -373,12 +379,12 @@ impl Node {
 
 #[derive(Debug)]
 struct RepositoryShard {
-    /// `NoHashHasher`: `NodeKey` is already `hash_cat`'d; do not hash again.
+    /// `NoHashHasher`：`NodeKey` 已经 `hash_cat`，不得再次 hash。
     nodes: RwLock<HashMap<NodeKey, Arc<Node>, BuildHasherDefault<NoHashHasher<u64>>>>,
 }
 
-/// Sharded key-value repository. A shard lock only protects map lookup and
-/// insertion; node statistics live behind the node/edge objects themselves.
+/// 分片 key-value repository。分片锁只保护 map 查找和插入；node 统计存放在各自的
+/// node/edge 对象之后。
 #[derive(Debug)]
 pub struct NodeRepository {
     shards: Box<[RepositoryShard]>,
@@ -414,10 +420,9 @@ impl NodeRepository {
         shard.nodes.read().get(&key).cloned()
     }
 
-    /// Propagates exact terminal bounds along one owned variation. A parent is
-    /// made terminal only when its child intervals prove one exact outcome;
-    /// an unknown sibling keeps the parent interval open. This is the stream
-    /// counterpart of px0 `MaybeSetBounds` (`search.cc:2229-2289`).
+    /// 沿一条 owned variation 传播精确终局边界。只有 child 区间证明唯一结果时才将
+    /// parent 标记为终局；未知 sibling 会保持 parent 区间开放。对应 stream 版本的
+    /// px0 `MaybeSetBounds`（`search.cc:2229-2289`）。
     pub(crate) fn propagate_proven_bounds(&self, node_path: &[NodeKey], root: NodeKey) {
         for &parent_key in node_path.iter().rev().skip(1) {
             if parent_key == root {
@@ -439,8 +444,8 @@ impl NodeRepository {
                 child_upper = child_upper.max(bounds.upper);
                 children.push((bounds, child.and_then(|node| node.terminal_plies_left())));
             }
-            // Children are measured in the parent side-to-move perspective;
-            // this node is measured from its incoming edge, hence negation.
+            // child 按 parent side-to-move 视角度量；本 node 按 incoming edge 视角度量，
+            // 因此取反。
             parent.update_bounds(Bounds {
                 lower: -child_upper,
                 upper: -child_lower,
@@ -451,7 +456,7 @@ impl NodeRepository {
             }
             let wl = bounds.lower;
             let plies_left = if wl < 0.0 {
-                // The side to move can force a win: choose the shortest win.
+                // 当前行棋方可强制胜：选最短胜利。
                 children
                     .iter()
                     .filter(|(child, _)| child.lower > 0.0)
@@ -460,7 +465,7 @@ impl NodeRepository {
                     .unwrap_or(0.0)
                     + 1.0
             } else if wl > 0.0 {
-                // Every move loses: choose the longest loss.
+                // 每步都输：选最长败局。
                 children.iter().filter_map(|(_, m)| *m).reduce(f32::max).unwrap_or(0.0) + 1.0
             } else {
                 children.iter().filter_map(|(_, m)| *m).reduce(f32::min).unwrap_or(0.0) + 1.0
@@ -474,12 +479,11 @@ impl NodeRepository {
         shard.nodes.write().remove(&key)
     }
 
-    /// Removes one detached tree subtree and returns its node count.
+    /// 删除一棵已脱离的 tree subtree，并返回 node 数。
     ///
-    /// Reference: LC3 overview, "Node repository". LC3 does not define a
-    /// tree-reuse GC policy; x7's tree-only policy follows the sibling release
-    /// shape of px0 `Node::ReleaseChildrenExceptOne` (`node.cc:417-445`).
-    /// The caller must first drain all events and reservations.
+    /// 参考：LC3 Overview 的 “Node repository”。LC3 未定义 tree-reuse GC 策略；x7
+    /// 的 tree-only 策略遵循 px0 `Node::ReleaseChildrenExceptOne`（`node.cc:417-445`）
+    /// 的 sibling 释放方式。调用方必须先 drain 所有 event 和 reservation。
     pub(crate) fn remove_subtree(&self, root: NodeKey) -> usize {
         let mut pending = vec![root];
         let mut removed = 0;
@@ -493,7 +497,7 @@ impl NodeRepository {
         removed
     }
 
-    /// Checks the edge-local reservation invariant below `root`.
+    /// 检查 `root` 以下的 edge-local reservation 不变量。
     pub(crate) fn subtree_is_settled(&self, root: NodeKey) -> bool {
         let mut pending = vec![root];
         let mut seen: HashSet<NodeKey, BuildHasherDefault<NoHashHasher<u64>>> = HashSet::default();

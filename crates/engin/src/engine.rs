@@ -1,4 +1,4 @@
-//! px0 `src/engine.cc:137-250` 的 UCI Engine lifecycle.
+//! 对照 px0 `src/engine.cc:137-250` 的 UCI Engine 生命周期。
 
 use std::sync::Arc;
 
@@ -14,9 +14,8 @@ use crate::Options;
 
 /// px0 `Engine` 的 P3 子集：搜索与 UCI 调度。
 pub struct Engine {
-    // ONNX initialization can fail while the UCI process is already alive;
-    // `None` means no usable stream session. It is deliberately not a
-    // UniformBackend fallback.
+    // UCI 进程已启动时 ONNX 初始化仍可能失败；`None` 表示没有可用的 stream
+    // session，刻意不回退到 UniformBackend。
     search: Option<SearchSession>,
     options: Options,
     position: Option<GameState>,
@@ -52,8 +51,7 @@ impl Engine {
 
     pub fn with_backend(backend: Box<dyn Backend>) -> Self {
         let backend: Arc<dyn Backend> = Arc::from(backend);
-        let mut search = SearchSession::new(Arc::clone(&backend));
-        search.set_responder(None);
+        let search = SearchSession::new(Arc::clone(&backend));
         Self {
             search: Some(search),
             options: Options::default(),
@@ -100,9 +98,8 @@ impl Engine {
         if !self.manages_weights_file {
             return Ok(());
         }
-        // Snapshot the OptionsDict value before stopping/replacing search.
-        // px0's `std::string` option value is likewise stable for the whole
-        // `UpdateBackendConfig` call (`src/engine.cc:153-167`).
+        // 在停止或替换搜索前快照 OptionsDict 值。px0 的 `std::string` option 值同样在
+        // 整个 `UpdateBackendConfig` 调用中稳定（`src/engine.cc:153-167`）。
         let path = self.options.weights_file.trim().to_string();
         if path.is_empty() {
             self.stop_and_drop_search()?;
@@ -119,6 +116,7 @@ impl Engine {
             Ok(backend) => {
                 let backend: Arc<dyn Backend> = Arc::new(CachingBackend::new(Box::new(backend)));
                 let mut search = SearchSession::new(Arc::clone(&backend));
+                search.set_virtual_loss(self.options.virtual_loss);
                 search.set_responder(self.responder.clone());
                 self.search = Some(search);
                 self.loaded_weights_file = Some(path.clone());
@@ -148,7 +146,13 @@ impl Engine {
     }
 
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), EnginError> {
-        self.options.set_uci_option(name, value)
+        self.options.set_uci_option(name, value)?;
+        if name == "VirtualLoss" {
+            if let Some(search) = self.search.as_mut() {
+                search.set_virtual_loss(self.options.virtual_loss);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn ensure_ready(&mut self) -> Result<(), EnginError> {
@@ -163,11 +167,10 @@ impl Engine {
     }
 
     pub(crate) fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), EnginError> {
-        // SearchSession stops and joins before replacing its reusable tree.
-        // px0 `Engine::SetPosition` updates backend configuration after
-        // stopping search and before making the new `GameState`
-        // (`src/engine.cc:187-197`). Retrying here also handles a file that
-        // appeared after an earlier failed `setoption`.
+        // SearchSession 先结束当前 job、drain reservation，再替换可复用树。
+        // px0 `Engine::SetPosition` 在停止搜索后、新建 `GameState` 前更新 backend
+        // 配置（`src/engine.cc:187-197`）。此处重试也处理先前 `setoption` 失败后才出现的
+        // 文件。
         self.update_backend_config()?;
         let state = GameState::from_fen_moves(fen, moves)?;
         if let Some(search) = self.search.as_mut() {
@@ -178,17 +181,15 @@ impl Engine {
     }
 
     pub(crate) fn go(&mut self, params: &GoParams, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
-        // px0 rejects `go ponder` unless the Ponder option enabled its full
-        // position/ponderhit lifecycle (`src/engine.cc:205-215`). This port
-        // has not translated that option or lifecycle, so accepting the token
-        // and silently running a normal search would be a false UCI feature.
+        // px0 只有在 Ponder option 启用完整 position/ponderhit 生命周期时才接受
+        // `go ponder`（`src/engine.cc:205-215`）。本实现尚未翻译该 option 与生命周期，
+        // 因此接受 token 后静默运行普通搜索会构成伪 UCI 功能。
         if params.ponder {
             return Err(EnginError::Uci("Ponder is not enabled.".into()));
         }
-        // px0 `Engine::Go` initializes a missing position through `NewGame`
-        // before calling `StartSearch` (`src/engine.cc:206-219`). NewGame in
-        // turn runs SetPosition and UpdateBackendConfig, so checking the
-        // backend first would incorrectly reject a valid bare `go` command.
+        // px0 `Engine::Go` 调用 `StartSearch` 前会经 `NewGame` 初始化缺失的 position
+        // （`src/engine.cc:206-219`）。NewGame 随后运行 SetPosition 和
+        // UpdateBackendConfig，因此先检查 backend 会错误拒绝合法的裸 `go` 命令。
         if self.position.is_none() {
             self.new_game()?;
         }
@@ -202,8 +203,8 @@ impl Engine {
     }
 
     pub(crate) fn ponder_hit(&mut self) -> Result<(), EnginError> {
-        // px0 `Engine::PonderHit` rejects this outside an active ponder search
-        // (`src/engine.cc:226-235`). Ponder is intentionally unavailable here.
+        // px0 `Engine::PonderHit` 在活跃 ponder 搜索外拒绝此命令（`src/engine.cc:226-235`）。
+        // 此处刻意不提供 Ponder。
         Err(EnginError::Uci("ponderhit while not pondering".into()))
     }
 

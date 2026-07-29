@@ -1,7 +1,6 @@
-//! Search stopper chain and individual stop conditions.
+//! 搜索 stopper 链与各个停止条件。
 //!
-//! Reference: px0 `stoppers/stoppers.h`, `stoppers.cc:39-131`, and
-//! `common.cc:118-165`.
+//! 参考：px0 `stoppers/stoppers.h`、`stoppers.cc:39-131` 与 `common.cc:118-165`。
 
 use super::timemgr::{IterationStats, StoppersHints};
 use crate::uci_loop::GoParams;
@@ -120,9 +119,8 @@ impl TimeLimitStopper {
 impl SearchStopper for TimeLimitStopper {
     fn should_stop(&mut self, stats: &IterationStats, hints: &mut StoppersHints) -> bool {
         hints.update_estimated_remaining_time_ms(self.time_limit_ms - stats.time_since_movestart);
-        // px0 checks only elapsed time here (`stoppers.cc:120-129`). Its
-        // caller already guards an entirely unexpanded root, while a reused
-        // root may legitimately stop without forcing one new playout.
+        // px0 此处只检查已用时间（`stoppers.cc:120-129`）。调用方已保护完全未展开的
+        // root；而复用的 root 可以合法停止，无需强制一个新的 playout。
         stats.time_since_movestart >= self.time_limit_ms
     }
 }
@@ -134,8 +132,8 @@ pub fn build_search_stoppers(
     move_overhead_ms: i64,
     time_manager_stopper: Option<Box<dyn SearchStopper>>,
 ) -> ChainedSearchStopper {
-    // px0 always installs a visit cap, even when UCI did not send `go nodes`,
-    // to bound tree growth at 4_000_000_000 visits (`common.cc:133-145`).
+    // px0 即使 UCI 未发送 `go nodes` 也总会安装 visit cap，将 tree 增长限制在
+    // 4_000_000_000 visit（`common.cc:133-145`）。
     const PX0_MAX_VISITS: i64 = 4_000_000_000;
 
     let mut chain = ChainedSearchStopper::new();
@@ -151,9 +149,8 @@ pub fn build_search_stoppers(
         }
     }
     chain.add(Box::new(VisitsStopper::new(visit_limit, true)));
-    // px0's `infinite` also covers ponder/mate; the Rust port rejects those
-    // untranslated modes before building this chain. `go infinite movetime N`
-    // must therefore keep searching until `stop`, not honor `movetime`.
+    // px0 的 `infinite` 也涵盖 ponder/mate；Rust 实现会在构建此链前拒绝这些尚未翻译的
+    // 模式。因此 `go infinite movetime N` 必须持续搜索至 `stop`，而不理会 `movetime`。
     if !params.infinite {
         if let Some(movetime) = params.movetime {
             chain.add(Box::new(TimeLimitStopper::new(movetime - move_overhead_ms)));

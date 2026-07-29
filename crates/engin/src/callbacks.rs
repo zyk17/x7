@@ -63,12 +63,11 @@ impl Default for ThinkingInfo {
     }
 }
 
-/// Thread-safe output boundary owned by the search session.
+/// 搜索会话持有的线程安全输出边界。
 ///
-/// px0 stores a `UciResponder*` for the full search lifetime
-/// (`src/search/search.h:45-99`), so the watchdog may emit `info` and
-/// `bestmove` independently of the UCI command loop. Rust uses this separate
-/// trait because the UCI loop still owns the concrete mutable responder.
+/// px0 在整个搜索生命周期保存 `UciResponder*`（`src/search/search.h:45-99`），
+/// 因此 watchdog 可以独立于 UCI 命令循环输出 `info` 和 `bestmove`。Rust 用此 trait
+/// 隔开两者，因为 UCI 循环仍独占具体 responder 的可变借用。
 pub trait SearchResponder: Send + Sync {
     fn output_best_move(&self, info: &BestMoveInfo);
     fn output_thinking_info(&self, infos: &[ThinkingInfo]);

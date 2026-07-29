@@ -1,4 +1,4 @@
-//! UCI lifecycle adapter for the stream search.
+//! stream 搜索的 UCI 生命周期适配层。
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -14,10 +14,9 @@ use crate::{EnginError, GoParams};
 
 use super::{SearchControl, SearchLimits, SearchState, WatchdogSnapshot};
 
-/// Engine-owned search session for the LC3-style search.
+/// Engine 持有的 LC3 风格搜索会话。
 ///
-/// UCI only drives `Engine`; the Engine owns this session and its worker
-/// lifecycle.
+/// UCI 只驱动 `Engine`；由 Engine 持有会话和 worker 生命周期。
 pub(crate) struct SearchSession {
     state: SearchState,
     active: Option<ActiveSearch>,
@@ -46,8 +45,8 @@ fn watchdog(
     responder: Option<Arc<dyn SearchResponder>>,
     started: Instant,
 ) {
-    // LC3 overview, "WatchdogWorker": this is deliberately one thread per
-    // search. It owns reporting, while Gather/Eval/NN/Backprop own search.
+    // LC3 Overview 的 "WatchdogWorker"：每次搜索一个 watchdog；它只负责
+    // 输出，Gather/Eval/NN/Backprop 负责搜索。
     loop {
         let mut result = completion.result.lock();
         if result.is_none() {
@@ -97,6 +96,10 @@ impl SearchSession {
 
     pub(crate) fn set_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>) {
         self.responder = responder;
+    }
+
+    pub(crate) fn set_virtual_loss(&mut self, virtual_loss: f32) {
+        self.state.set_virtual_loss(virtual_loss);
     }
 
     pub(crate) fn set_position(&mut self, state: &GameState) -> Result<(), EnginError> {

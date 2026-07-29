@@ -1,9 +1,9 @@
-//! Reusable stream search state.
+//! 可复用的 stream 搜索状态。
 //!
-//! Reference: LC3 overview, "Search" / "WatchdogWorker":
+//! 参考：LC3 Overview 的 "Search" / "WatchdogWorker"：
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>.
-//! Tree replacement follows px0 `NodeTree::ResetToPosition`
-//! (`src/search/classic/node.cc:484-520`).
+//! tree 替换对照 px0 `NodeTree::ResetToPosition`
+//! （`src/search/classic/node.cc:484-520`）。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,10 +16,10 @@ use crate::EnginError;
 
 use super::{
     best_mate, best_move_filtered, principal_variation_filtered, root_stats, GcStats, NodeKey, NodeRepository, Search,
-    SearchConfig, SearchControl, SearchGeneration, SearchLimits, Stats, Tree,
+    SearchConfig, SearchControl, SearchGeneration, SearchLimits, Stats, Tree, WorkerPool,
 };
 
-/// Read-only root view owned by the watchdog, never by a search worker.
+/// watchdog 持有的只读 root view，搜索 worker 不持有它。
 #[derive(Clone)]
 pub(crate) struct WatchdogSnapshot {
     repository: Arc<NodeRepository>,
@@ -50,8 +50,8 @@ impl WatchdogSnapshot {
             };
         };
 
-        // A root node stores the incoming-edge/mover perspective. UCI reports
-        // the side to move, hence the sign flip (LC3 glossary: `v = w - l`).
+        // root node 保存 incoming-edge/走子方视角；UCI 输出当前行棋方视角，故需要翻转
+        // 符号（LC3 glossary：`v = w - l`）。
         let wl = (-root.q).clamp(-1.0, 1.0);
         let draw = root.draw.clamp(0.0, 1.0);
         let win = ((1.0 - draw + wl) * 0.5).clamp(0.0, 1.0);
@@ -82,7 +82,7 @@ impl WatchdogSnapshot {
     }
 }
 
-/// Completed stream result consumed by the outer Engine.
+/// 外层 Engine 消费的已完成 stream 结果。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchResult {
     pub stats: Stats,
@@ -90,14 +90,16 @@ pub struct SearchResult {
     pub principal_variation: Vec<xiangqi_core::Move>,
 }
 
-/// Reusable stream state: backend, retained tree, and search generation.
+/// 可复用 stream 状态：backend、保留 tree、generation 与 worker pool。
 pub(crate) struct SearchState {
     backend: Arc<dyn Backend>,
     tree: Option<Tree>,
     next_generation: u64,
+    virtual_loss: f32,
+    worker_pool: Arc<WorkerPool>,
 }
 
-/// One started stream search; its owner runs and joins all workers.
+/// 一次已启动的 stream job；owner 负责运行、drain，并归还 worker。
 pub(crate) struct RunningSearch {
     search: Search,
     root_is_black: bool,
@@ -132,7 +134,7 @@ impl RunningSearch {
             self.root_is_black,
             &self.root_move_filter,
         );
-        self.search.stop_and_join();
+        self.search.stop_and_finish();
         Ok(SearchResult {
             stats,
             best_move,
@@ -143,11 +145,21 @@ impl RunningSearch {
 
 impl SearchState {
     pub fn new(backend: Arc<dyn Backend>) -> Self {
+        let config = SearchConfig::default();
+        let worker_pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
         Self {
             backend,
             tree: None,
             next_generation: 0,
+            virtual_loss: config.virtual_loss,
+            worker_pool,
         }
+    }
+
+    /// 更新 Engine 生命周期参数；已启动的搜索保留自己的配置快照。
+    /// 参考：LC3 Overview 的 "Search"。
+    pub fn set_virtual_loss(&mut self, virtual_loss: f32) {
+        self.virtual_loss = virtual_loss;
     }
 
     /// Applies a complete UCI position history after any active search has
@@ -162,16 +174,17 @@ impl SearchState {
         }
     }
 
-    /// Starts one owned search. This state keeps the resulting tree
-    /// only after all worker threads joined, which is the reservation boundary
-    /// required before the next `set_position` can prune or rewind it.
+    /// 启动一个独占 job。
+    ///
+    /// 只有当前 job drain 并归还 worker 后，下一次 `set_position` 才能
+    /// prune 或 rewind 保留树；这是 reservation 的边界。
     pub fn begin_search(&mut self, searchmoves: &[String]) -> Result<RunningSearch, EnginError> {
         let tree = self
             .tree
             .as_ref()
             .ok_or(EnginError::Uci("position is not configured".into()))?;
-        // px0 `StringsToMovelist` (`src/search/classic/wrapper.cc:78-100`):
-        // retain legal root requests and reject a non-empty list with none.
+        // px0 `StringsToMovelist`（`src/search/classic/wrapper.cc:78-100`）：保留合法
+        // root 请求；非空列表中没有合法着时拒绝。
         let board = tree.root_history().last().board();
         let legal_moves = board.generate_legal_moves();
         let root_move_filter: Vec<_> = searchmoves
@@ -185,13 +198,15 @@ impl SearchState {
         self.next_generation = self.next_generation.wrapping_add(1);
         let config = SearchConfig {
             root_move_filter: root_move_filter.clone(),
+            virtual_loss: self.virtual_loss,
             ..SearchConfig::default()
         };
-        let search = Search::new_with_tree(
+        let search = Search::new_with_tree_in_pool(
             Arc::clone(&self.backend),
             SearchGeneration(self.next_generation),
             tree,
             config,
+            Arc::clone(&self.worker_pool),
         );
         let root_is_black = tree.root_history().last().is_black_to_move();
         Ok(RunningSearch {
@@ -213,8 +228,9 @@ mod tests {
     use super::{SearchLimits, SearchState};
 
     #[test]
-    fn state_reuses_tree_between_completed_searches() {
+    fn state_reuses_tree_and_worker_pool_between_completed_searches() {
         let mut state = SearchState::new(Arc::new(UniformBackend::default()));
+        let worker_pool = Arc::clone(&state.worker_pool);
         let start = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         state
             .set_position(Arc::new(PositionHistory::from_positions(start.positions())))
@@ -243,5 +259,37 @@ mod tests {
             .expect("second search");
         assert!(second.stats.completed_playouts >= 4);
         assert!(second.best_move.is_some());
+        assert!(Arc::ptr_eq(&worker_pool, &state.worker_pool));
+    }
+
+    #[test]
+    fn virtual_loss_is_snapshotted_per_search_job() {
+        let mut state = SearchState::new(Arc::new(UniformBackend::default()));
+        let start = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        state
+            .set_position(Arc::new(PositionHistory::from_positions(start.positions())))
+            .expect("position");
+
+        state.set_virtual_loss(0.25);
+        let first = state.begin_search(&[]).expect("first search");
+        assert_eq!(first.search.virtual_loss(), 0.25);
+
+        // `setoption` 只更新 Engine 状态；已启动 job 保留自己的不可变配置快照。
+        state.set_virtual_loss(0.75);
+        first
+            .run(SearchLimits {
+                max_playouts: Some(1),
+                deadline: None,
+            })
+            .expect("first result");
+
+        let second = state.begin_search(&[]).expect("second search");
+        assert_eq!(second.search.virtual_loss(), 0.75);
+        second
+            .run(SearchLimits {
+                max_playouts: Some(1),
+                deadline: None,
+            })
+            .expect("second result");
     }
 }

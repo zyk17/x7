@@ -28,7 +28,7 @@
 
 - repository 使用分片 map 和 `parent-key + move` 的 tree key；首版不做 DAG/TT。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
-- worker 拓扑为 Gather×4、Eval×2、NN×1、Backprop×1。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
+- Engine session 常驻 Gather×4、Eval×4、NN×1、Backprop×1；每次 `go` 只下发独占 job（新的 queues、generation、root/tree view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现。
 - tree reuse 会保留已走主线及旧根，并遍历 repository 删除不可达兄弟子树；UCI/Watchdog 已输出最小 info 与一次 bestmove。
 - 当前没有 MultiPV 或 multivisit；NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。

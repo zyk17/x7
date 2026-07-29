@@ -1,7 +1,6 @@
-//! One-shot NN probe: FEN + moves → legal policy / WDL / moves_left + optional latency bench.
+//! 一次性 NN 探针：FEN + moves → 合法着 policy / WDL / moves_left，并可选测量延迟。
 //!
-//! Reuses `PositionHistory` encoding and `OnnxBackend` (same path as search).
-//! Not a UCI path.
+//! 复用 `PositionHistory` 编码与 `OnnxBackend`，即与搜索相同的路径；不属于 UCI 路径。
 //!
 //! ```text
 //! cargo run -p engin --bin nn_eval -- --onnx data/x7.onnx
@@ -92,7 +91,7 @@ fn parse_batches(text: &str) -> Result<Vec<usize>, String> {
 }
 
 fn wdl_from_eval(wl: f32, d: f32) -> (f32, f32, f32) {
-    // value = [W,D,L]; EvalResult stores wl=W-L, d=D.
+    // value = [W,D,L]；EvalResult 保存 wl=W-L、d=D。
     let w = ((1.0 - d + wl) * 0.5).clamp(0.0, 1.0);
     let l = ((1.0 - d - wl) * 0.5).clamp(0.0, 1.0);
     (w, d.clamp(0.0, 1.0), l)

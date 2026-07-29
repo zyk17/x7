@@ -1,4 +1,4 @@
-//! UCI stdin/stdout entry for the stream search.
+//! stream 搜索的 UCI stdin/stdout 入口。
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -6,15 +6,12 @@ use std::time::Duration;
 
 use engin::{Engine, StdoutUciResponder, UciLoop};
 
-/// Resolves the bundled formal ONNX weight before UCI starts.
+/// 在 UCI 启动前定位随程序发布的正式 ONNX 权重。
 ///
-/// px0 exposes the same `WeightsFile` option in
-/// `src/neural/shared_params.cc:43-50` and creates its backend from options in
-/// `src/engine.cc:153-167`.  This port has no px0 weight autodiscovery or
-/// backend registry, so its distributable equivalent is an ONNX file in the
-/// app resource layout: `engin.exe` plus a sibling `x7.onnx`. The current
-/// working directory and compile-time repository location are development
-/// fallbacks; neither is required by the packaged layout.
+/// px0 在 `src/neural/shared_params.cc:43-50` 提供同名 `WeightsFile` option，
+/// 并在 `src/engine.cc:153-167` 从 option 创建 backend。本实现没有权重自动发现或
+/// backend 注册表；发行布局等价为 `engin.exe` 与同目录 `x7.onnx`。当前目录与编译期
+/// 仓库路径仅用于开发期回退，发布布局不依赖它们。
 fn default_weights_file() -> PathBuf {
     let mut candidates = Vec::new();
     if let Ok(executable) = std::env::current_exe() {
@@ -34,14 +31,13 @@ fn default_weights_file() -> PathBuf {
 fn main() {
     let mut responder = StdoutUciResponder::default();
     let mut engine = Engine::new();
-    // The backend is created by the first `position` command.
+    // 首个 `position` 命令创建 backend。
     engine
         .set_option("WeightsFile", &default_weights_file().to_string_lossy())
         .expect("default UCI options must be valid");
     let mut uci = UciLoop::new(&mut responder, &mut engine);
 
-    // Watchdog callbacks must reach stdout even while a GUI is waiting for a
-    // finite `go` result and sends no additional input.
+    // GUI 等待有限 `go` 的结果且不再输入时，watchdog 的回调仍必须输出到 stdout。
     let (input_tx, input_rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines() {

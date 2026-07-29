@@ -21,8 +21,8 @@ pub struct StoppersHints {
 impl Default for StoppersHints {
     fn default() -> Self {
         Self {
-            // px0 `StoppersHints::Reset` (`timemgr.cc:60-66`). Keep these
-            // finite so later arithmetic cannot overflow a u32 node budget.
+            // px0 `StoppersHints::Reset`（`timemgr.cc:60-66`）。保持这些值有限，
+            // 以免后续计算溢出 u32 node budget。
             remaining_time_ms: 100_000_000_000,
             remaining_playouts: 4_000_000_000,
         }

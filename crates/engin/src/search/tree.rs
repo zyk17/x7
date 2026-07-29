@@ -1,9 +1,8 @@
-//! Reusable stream tree with px0-style main-line retention.
+//! 按 px0 主线保留规则复用 stream tree。
 //!
-//! LC3 overview documents a repository, but not tree reuse. This tree-only
-//! policy follows px0 `NodeTree::MakeMove` / `ResetToPosition`
-//! (`src/search/classic/node.cc:465-520`): keep the played line and release
-//! sibling subtrees. It is not a DAG/TT policy.
+//! LC3 Overview 描述 repository，但未描述 tree reuse。此 tree-only 策略对照 px0
+//! `NodeTree::MakeMove` / `ResetToPosition`（`src/search/classic/node.cc:465-520`）：
+//! 保留已走主线，释放 sibling subtree；不是 DAG/TT 策略。
 
 use std::sync::Arc;
 
@@ -13,13 +12,13 @@ use crate::EnginError;
 
 use super::{NodeKey, NodeRepository};
 
-/// Nodes reclaimed when a played move replaces the current root.
+/// 已走着替换当前 root 时回收的 node 数。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcStats {
     pub removed_nodes: usize,
 }
 
-/// Persistent tree state between completed stream searches.
+/// 两次已完成 stream 搜索之间保留的 tree 状态。
 #[derive(Debug)]
 pub struct Tree {
     repository: Arc<NodeRepository>,

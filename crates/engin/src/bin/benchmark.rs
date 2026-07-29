@@ -1,13 +1,12 @@
-//! Sweep Gather × Eval × Backprop for search throughput and collisions.
+//! 用 Gather × Eval × Backprop 组合测量吞吐与 collision。
 //!
-//! Topology: independent NN thread (ONNX only). Eval does terminal/cache/encode;
-//! NN merges queued tensors up to `--eval-batch`. Default workers: 4/2/1.
-//! Not a UCI path.
+//! NN 是独立 ONNX 线程；Eval 负责终局、缓存与编码；NN 合并队列中的 tensor，
+//! 最大 batch 为 `--eval-batch`。默认 worker 为 `4/4/1`。这不是 UCI 路径。
 //!
 //! ```text
-//! cargo run -p engin --release --bin feed_bench -- --cache --playouts 20000
-//! cargo run -p engin --release --bin feed_bench -- --movetime 3000 --repeat 3
-//! cargo run -p engin --release --bin feed_bench -- --gathers 4,8 --evals 1,2 --backprops 1,2 --cache
+//! cargo run -p engin --release --bin benchmark -- --cache --playouts 20000
+//! cargo run -p engin --release --bin benchmark -- --movetime 3000 --repeat 3
+//! cargo run -p engin --release --bin benchmark -- --gathers 4,8 --evals 1,2 --backprops 1,2 --cache
 //! ```
 
 use std::path::PathBuf;
@@ -30,11 +29,12 @@ struct Args {
     backprops: Vec<usize>,
     eval_batch: Option<usize>,
     cache: bool,
+    virtual_loss: f32,
 }
 
 fn usage() -> &'static str {
-    "usage: feed_bench [--onnx data/x7.onnx] [--fen \"...\"] [--playouts 20000 | --movetime 3000] \
-     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache]"
+    "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\"] [--playouts 20000 | --movetime 3000] \
+     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache] [--virtual-loss 0.5]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -43,11 +43,12 @@ fn parse_args() -> Result<Args, String> {
     let mut playouts = Some(20_000);
     let mut movetime = None;
     let mut repeat = 1;
-    let mut gathers = vec![4, 8];
-    let mut evals = vec![1, 2];
-    let mut backprops = vec![1, 2];
+    let mut gathers = vec![2, 4, 8];
+    let mut evals = vec![2, 4, 8];
+    let mut backprops = vec![1]; // 除非遇到显示的back瓶颈, 它暂时很难成为瓶颈
     let mut eval_batch = None;
     let mut cache = false;
+    let mut virtual_loss: f32 = 0.0;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -96,6 +97,13 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--cache" => cache = true,
+            "--virtual-loss" => {
+                virtual_loss = args
+                    .next()
+                    .ok_or("--virtual-loss requires a number in [0, 1]")?
+                    .parse()
+                    .map_err(|_| "--virtual-loss must be a number in [0, 1]")?;
+            }
             "--help" | "-h" => return Err(usage().into()),
             _ => return Err(format!("unknown argument: {argument}\n{}", usage())),
         }
@@ -121,6 +129,9 @@ fn parse_args() -> Result<Args, String> {
     if eval_batch == Some(0) {
         return Err("--eval-batch must be > 0".into());
     }
+    if !virtual_loss.is_finite() || !(0.0..=1.0).contains(&virtual_loss) {
+        return Err("--virtual-loss must be within [0, 1]".into());
+    }
     Ok(Args {
         onnx,
         fen,
@@ -132,12 +143,13 @@ fn parse_args() -> Result<Args, String> {
         backprops,
         eval_batch,
         cache,
+        virtual_loss,
     })
 }
 
-/// Formats one average queue delay from benchmark-only stream telemetry.
+/// 格式化 benchmark 专用 stream 遥测中的一项平均队列延迟。
 ///
-/// Reference: LC3 overview, "Stats Collection".
+/// 参考：LC3 Overview 的 “Stats Collection”。
 fn average_wait_us(queue: QueueStats) -> f64 {
     if queue.samples == 0 {
         0.0
@@ -146,9 +158,9 @@ fn average_wait_us(queue: QueueStats) -> f64 {
     }
 }
 
-/// Formats non-zero collision buckets without widening the result table.
+/// 格式化非零 collision bucket，且不加宽结果表。
 ///
-/// Reference: LC3 overview, "Stats Collection".
+/// 参考：LC3 Overview 的 “Stats Collection”。
 fn collision_depths(stats: &Stats) -> String {
     let buckets: Vec<String> = stats
         .collisions_by_depth
@@ -197,10 +209,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let cells = args.gathers.len() * args.evals.len() * args.backprops.len();
     println!(
-        "onnx={} provider={} cache={} recommended_batch={} target_batch={} budget={} repeat={} matrix={}",
+        "onnx={} provider={} cache={} virtual_loss={:.2} recommended_batch={} target_batch={} budget={} repeat={} matrix={}",
         args.onnx.display(),
         provider,
         args.cache,
+        args.virtual_loss,
         recommended,
         target_batch,
         args.playouts
@@ -235,6 +248,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             eval_workers,
                             backprop_workers,
                             benchmark_telemetry: true,
+                            virtual_loss: args.virtual_loss,
                             ..SearchConfig::default()
                         },
                     );
@@ -289,7 +303,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         stats.submitted_playouts,
                         collision_depths(&stats),
                     );
-                    search.stop_and_join();
+                    search.stop_and_finish();
                 }
             }
         }
@@ -299,7 +313,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("feed_bench: {error}");
+        eprintln!("benchmark: {error}");
         std::process::exit(2);
     }
 }

@@ -31,9 +31,9 @@ pub struct OnnxBackend {
     provider: OnnxProvider,
 }
 
-/// px0 ONNX backend selects a configured provider and reports its real CPU
-/// capability through `NetworkAsBackend` (`src/neural/backends/onnx/
-/// network_onnx.cc:140-176`, `src/neural/wrapper.cc:49-68`).
+/// px0 ONNX backend 选择配置的 provider，并通过 `NetworkAsBackend` 报告实际 CPU
+/// 能力（`src/neural/backends/onnx/network_onnx.cc:140-176`、
+/// `src/neural/wrapper.cc:49-68`）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnnxProvider {
     DirectMl,
@@ -53,11 +53,10 @@ const DML_BATCH_STEP: usize = 16;
 const DML_BATCH_STEPS: usize = 4;
 const DML_MAX_BATCH: usize = DML_BATCH_STEP * DML_BATCH_STEPS;
 
-/// Fixed-shape DirectML sessions, matching px0's ONNX session set.
+/// 固定形状的 DirectML session，对齐 px0 的 ONNX session 集合。
 ///
 /// px0 `src/neural/backends/onnx/network_onnx.cc:629-677,810-838,878-901`
-/// creates one session per `batch_size * step`; DirectML needs a static input
-/// shape to compile an efficient graph.
+/// 为每个 `batch_size * step` 创建一个 session；DirectML 需要静态输入形状来编译高效图。
 struct OnnxSessions {
     provider: OnnxProvider,
     sessions: Vec<(usize, Session)>,
@@ -123,8 +122,8 @@ impl OnnxBackend {
                 has_wdl: true,
                 runs_on_cpu: provider == OnnxProvider::Cpu,
                 suggested_num_search_threads: 1,
-                // px0 DirectML defaults to batch=16 and steps=4, yielding
-                // a 64-position minibatch (`network_onnx.cc:810-838`).
+                // px0 DirectML 默认 batch=16、step=4，得到 64 局面的 minibatch
+                // （`network_onnx.cc:810-838`）。
                 recommended_batch_size: if provider == OnnxProvider::DirectMl {
                     DML_MAX_BATCH
                 } else {
@@ -141,14 +140,12 @@ impl OnnxBackend {
     }
 }
 
-/// Creates DirectML sessions and explicitly falls back to CPU when DirectML
-/// cannot be initialized.
+/// 创建 DirectML session；DirectML 无法初始化时显式回退 CPU。
 ///
-/// px0's ONNX backend receives a provider at construction and derives
-/// `IsCpu`/batch attributes from it (`src/neural/backends/onnx/
-/// network_onnx.cc:140-176`). This Windows build intentionally supports one
-/// GPU execution provider only: DirectML. That keeps the bundled ORT runtime
-/// independent of locally installed CUDA and cuDNN versions.
+/// px0 ONNX backend 在构造时接收 provider，并由其派生 `IsCpu`/batch 属性
+/// （`src/neural/backends/onnx/network_onnx.cc:140-176`）。此 Windows 构建刻意只支持
+/// 一个 GPU execution provider：DirectML，以使随程序发布的 ORT runtime 不依赖本机
+/// CUDA 和 cuDNN 版本。
 fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginError> {
     match create_direct_ml_sessions(path) {
         Ok(sessions) => Ok((OnnxSessions::direct_ml(sessions), OnnxProvider::DirectMl)),
@@ -163,9 +160,8 @@ fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginErr
     }
 }
 
-/// px0 `network_onnx.cc:629-677,810-838,878-901`: create fixed DirectML
-/// sessions for each batch step instead of making DirectML compile a dynamic
-/// batch graph on every search workload.
+/// px0 `network_onnx.cc:629-677,810-838,878-901`：为每个 batch step 创建固定
+/// DirectML session，而不让 DirectML 在每个搜索负载上编译动态 batch 图。
 fn create_direct_ml_sessions(path: &Path) -> Result<Vec<(usize, Session)>, EnginError> {
     let mut sessions = Vec::with_capacity(DML_BATCH_STEPS);
     for step in 1..=DML_BATCH_STEPS {
@@ -325,7 +321,7 @@ pub fn softmax_legal_policy(logits: &[f32], legal_moves: &[xiangqi_core::Move]) 
     Ok(selected)
 }
 
-/// ONNX-only: padded DirectML/CPU session run on pre-encoded planes.
+/// 仅供 ONNX 使用：在预编码 planes 上运行补齐后的 DirectML/CPU session。
 fn infer_encoded_planes(
     sessions: &mut OnnxSessions,
     planes: &[f32],
@@ -349,7 +345,7 @@ fn infer_encoded_planes(
         let end = (chunk_start + chunk_size).min(batch);
         let actual_batch = end - chunk_start;
         let run_batch = sessions.run_batch_size(actual_batch);
-        // px0 zero-pads each DirectML minibatch (`network_onnx.cc:398-447`).
+        // px0 对每个 DirectML minibatch 补零（`network_onnx.cc:398-447`）。
         let mut input = vec![0.0; run_batch * plane_len];
         input[..actual_batch * plane_len].copy_from_slice(&planes[chunk_start * plane_len..end * plane_len]);
         let board = Array4::from_shape_vec((run_batch, INPUT_PLANES, BOARD_ROWS, BOARD_COLS), input)

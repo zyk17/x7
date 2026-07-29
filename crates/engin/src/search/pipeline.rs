@@ -1,10 +1,10 @@
-//! Stream search mainline: Gather / Eval / NN / Backprop workers.
+//! Stream 搜索主线：Gather / Eval / NN / Backprop worker。
 //!
-//! Reference: LC3 overview, "Workers":
+//! 参考：LC3 Overview 的 "Workers"：
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 //!
-//! Eval handles terminal/cache/legal moves and encodes planes; one NN thread only
-//! runs ONNX on queued tensors. Workers exchange owned events only.
+//! Eval 负责终局、缓存、合法着和编码；NN 线程只对队列中的 tensor 执行 ONNX。
+//! worker 之间只传递 owned event。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -28,12 +28,11 @@ use super::{
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
 
-/// Search budget consumed relative to the pipeline's current completed
-/// playout count. A later UCI watchdog maps `go nodes` / `go movetime` onto
-/// this boundary; workers themselves only observe the immutable limit and
-/// the explicit `request_stop()` signal.
+/// 相对当前 completed playout 的搜索预算。
 ///
-/// Reference: LC3 overview, "Stats Collection" and "WatchdogWorker".
+/// UCI watchdog 将 `go nodes` / `go movetime` 映射到这里；worker 只观察不可变
+/// budget 与显式 `request_stop()`。参考：LC3 Overview 的 "Stats Collection" /
+/// "WatchdogWorker"。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SearchLimits {
     pub max_playouts: Option<u64>,
@@ -46,9 +45,8 @@ impl SearchLimits {
     }
 }
 
-/// One queue's optional benchmark timing snapshot.
-///
-/// Reference: LC3 overview, "Stats Collection".
+/// 一条队列的 benchmark 等待时间快照。
+/// 参考：LC3 Overview 的 "Stats Collection"。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueueStats {
     pub samples: u64,
@@ -56,25 +54,24 @@ pub struct QueueStats {
     pub max_wait_ns: u64,
 }
 
-/// Normal search counters plus benchmark-only pipeline telemetry.
-///
-/// Reference: LC3 overview, "Stats Collection".
+/// 正式搜索计数与仅 benchmark 使用的流水线遥测。
+/// 参考：LC3 Overview 的 "Stats Collection"。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Stats {
     pub submitted_playouts: u64,
     pub completed_playouts: u64,
-    /// Mean completed leaf depth, with the root at depth one. This follows
-    /// classic `ThinkingInfo::depth` rather than current PV length.
+    /// 已完成 leaf 的平均深度，root 深度为一；语义对应 px0 `ThinkingInfo::depth`，
+    /// 不是当前 PV 长度。
     pub average_depth: u64,
-    /// Deepest completed leaf depth, matching classic `seldepth`.
+    /// 最深已完成 leaf，语义对应 px0 `seldepth`。
     pub max_depth: u64,
     pub collisions: u64,
     pub network_batches: u64,
     pub network_evaluations: u64,
-    /// Largest `BackendComputation` batch observed this search.
+    /// 本次搜索观察到的最大 `BackendComputation` batch。
     pub network_batch_size_max: u64,
     pub peak_in_flight: u64,
-    /// Collisions indexed by variation depth from the root.
+    /// 按距 root 的 variation 深度统计 collision。
     pub collisions_by_depth: Vec<u64>,
     pub gather_queue: QueueStats,
     pub eval_queue: QueueStats,
@@ -90,9 +87,8 @@ struct QueueMetrics {
 }
 
 impl QueueMetrics {
-    /// Records one event handoff for `feed_bench` only.
-    ///
-    /// Reference: LC3 overview, "Stats Collection".
+    /// 记录一次 event 交接；仅 benchmark 启用。
+    /// 参考：LC3 Overview 的 "Stats Collection"。
     fn record(&self, wait: Duration) {
         let nanos = wait.as_nanos().min(u64::MAX as u128) as u64;
         self.samples.fetch_add(1, Ordering::Relaxed);
@@ -100,9 +96,8 @@ impl QueueMetrics {
         self.max_wait_ns.fetch_max(nanos, Ordering::Relaxed);
     }
 
-    /// Reads a consistent-enough diagnostic snapshot; it is not search state.
-    ///
-    /// Reference: LC3 overview, "Stats Collection".
+    /// 读取足够一致的诊断快照；它不是搜索状态。
+    /// 参考：LC3 Overview 的 "Stats Collection"。
     fn snapshot(&self) -> QueueStats {
         QueueStats {
             samples: self.samples.load(Ordering::Relaxed),
@@ -112,10 +107,10 @@ impl QueueMetrics {
     }
 }
 
-/// Cloneable stop boundary for a running stream search.
+/// 运行中搜索可克隆的 stop 句柄。
 ///
-/// The controller may hold this while the owning thread retains `Search` and
-/// its worker join handles. Reference: LC3 overview, "WatchdogWorker".
+/// controller 可持有它；`Search` owner 负责 drain 当前 job 并归还 worker。
+/// 参考：LC3 Overview 的 "WatchdogWorker"。
 #[derive(Clone)]
 pub struct SearchControl {
     shared: Arc<Shared>,
@@ -134,21 +129,24 @@ impl SearchControl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchConfig {
-    /// Gather/Eval/Backprop/NN queue depth. `0` → `max(4096, 64 * resolved_batch)`.
+    /// Gather/Eval/Backprop/NN 队列深度。`0` 表示 `max(4096, 64 * resolved_batch)`。
     pub queue_capacity: usize,
-    /// NN GPU merge size when several encoded positions are already queued. `0` →
-    /// backend `recommended_batch_size`. Eval does not wait to fill this.
+    /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
+    /// `recommended_batch_size`；Eval 不会等待凑满 batch。
     pub eval_batch_size: usize,
     pub params: SearchParams,
     pub gather_workers: usize,
-    /// LC3 EvalWorker count. Prep/cache/legal moves; NN inference is a separate thread.
+    /// Eval worker 数。它负责准备、缓存、合法着；NN inference 是独立线程。
     pub eval_workers: usize,
     pub backprop_workers: usize,
-    /// px0 `root_move_filter_` from UCI `go searchmoves` (empty = unrestricted).
+    /// UCI `go searchmoves` 对应 px0 `root_move_filter_`（空表示不限制）。
     pub root_move_filter: Vec<Move>,
-    /// Enables timing/distribution counters used only by `feed_bench`.
-    /// Reference: LC3 overview, "Stats Collection".
+    /// 启用仅 benchmark 使用的时间/分布计数。
+    /// 参考：LC3 Overview 的 "Stats Collection"。
     pub benchmark_telemetry: bool,
+    /// edge-local virtual loss。UCI 以百分单位 `VirtualLoss` 暴露它。
+    /// 参考：KataGo `cpp/search/search.cpp` 的 virtual-loss selection。
+    pub virtual_loss: f32,
 }
 
 impl Default for SearchConfig {
@@ -158,10 +156,11 @@ impl Default for SearchConfig {
             eval_batch_size: 0,
             params: SearchParams::default(),
             gather_workers: 4,
-            eval_workers: 2,
+            eval_workers: 4,
             backprop_workers: 1,
             root_move_filter: Vec::new(),
             benchmark_telemetry: false,
+            virtual_loss: 1.0,
         }
     }
 }
@@ -174,6 +173,10 @@ impl SearchConfig {
         assert!(
             self.backprop_workers > 0,
             "stream requires at least one backprop worker"
+        );
+        assert!(
+            self.virtual_loss.is_finite() && (0.0..=1.0).contains(&self.virtual_loss),
+            "virtual loss must be finite and within [0, 1]"
         );
     }
 
@@ -200,7 +203,11 @@ impl SearchConfig {
             queue_capacity,
             eval_batch_size,
             params: self.params,
+            gather_workers: self.gather_workers,
+            eval_workers: self.eval_workers,
+            backprop_workers: self.backprop_workers,
             benchmark_telemetry: self.benchmark_telemetry,
+            virtual_loss: self.virtual_loss,
         }
     }
 }
@@ -210,7 +217,168 @@ struct ResolvedSearchConfig {
     queue_capacity: usize,
     eval_batch_size: usize,
     params: SearchParams,
+    gather_workers: usize,
+    eval_workers: usize,
+    backprop_workers: usize,
     benchmark_telemetry: bool,
+    virtual_loss: f32,
+}
+
+enum GatherCommand {
+    Run(Arc<Shared>, Receiver<NodeEvent>),
+    Shutdown,
+}
+
+enum EvalCommand {
+    Run(Arc<Shared>, Receiver<NodeEvent>, Sender<NnRequest>),
+    Shutdown,
+}
+
+enum NnCommand {
+    Run(Arc<Shared>, Receiver<NnRequest>),
+    Shutdown,
+}
+
+enum BackpropCommand {
+    Run(Arc<Shared>, Receiver<BackpropEvent>),
+    Shutdown,
+}
+
+/// Engine 持有的固定 worker 拓扑。
+///
+/// 每个 job 独占树视图、队列与 generation；线程池只跨 job 保留线程。
+/// 参考：LC3 Overview 的 "Workers" / "Search"。
+pub(crate) struct WorkerPool {
+    gather_commands: Vec<Sender<GatherCommand>>,
+    eval_commands: Vec<Sender<EvalCommand>>,
+    nn_commands: Sender<NnCommand>,
+    backprop_commands: Vec<Sender<BackpropCommand>>,
+    job_done: Receiver<()>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    eval_batch_size: usize,
+}
+
+impl WorkerPool {
+    pub(crate) fn new(backend: &dyn Backend, config: &SearchConfig) -> Self {
+        config.validate();
+        Self::from_resolved(&config.resolve(backend))
+    }
+
+    fn from_resolved(config: &ResolvedSearchConfig) -> Self {
+        let (job_done_tx, job_done) = crossbeam_channel::unbounded();
+        let eval_batch_size = config.eval_batch_size;
+        let mut gather_commands = Vec::with_capacity(config.gather_workers);
+        let mut eval_commands = Vec::with_capacity(config.eval_workers);
+        let mut backprop_commands = Vec::with_capacity(config.backprop_workers);
+        let mut threads = Vec::with_capacity(config.gather_workers + config.eval_workers + config.backprop_workers + 1);
+        for _ in 0..config.gather_workers {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let job_done = job_done_tx.clone();
+            threads.push(thread::spawn(move || persistent_gather_worker(rx, job_done)));
+            gather_commands.push(tx);
+        }
+        let (nn_commands, nn_rx) = crossbeam_channel::unbounded();
+        threads.push(thread::spawn({
+            let job_done = job_done_tx.clone();
+            move || persistent_nn_worker(nn_rx, job_done, eval_batch_size)
+        }));
+        for _ in 0..config.eval_workers {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let job_done = job_done_tx.clone();
+            threads.push(thread::spawn(move || persistent_eval_worker(rx, job_done)));
+            eval_commands.push(tx);
+        }
+        for _ in 0..config.backprop_workers {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let job_done = job_done_tx.clone();
+            threads.push(thread::spawn(move || persistent_backprop_worker(rx, job_done)));
+            backprop_commands.push(tx);
+        }
+        Self {
+            gather_commands,
+            eval_commands,
+            nn_commands,
+            backprop_commands,
+            job_done,
+            threads: Mutex::new(threads),
+            eval_batch_size: config.eval_batch_size,
+        }
+    }
+
+    fn start_job(
+        &self,
+        shared: &Arc<Shared>,
+        gather_rx: &Receiver<NodeEvent>,
+        eval_rx: &Receiver<NodeEvent>,
+        nn_tx: &Sender<NnRequest>,
+        nn_rx: &Receiver<NnRequest>,
+        backprop_rx: &Receiver<BackpropEvent>,
+    ) {
+        for sender in &self.gather_commands {
+            sender
+                .send(GatherCommand::Run(Arc::clone(shared), gather_rx.clone()))
+                .expect("persistent gather worker is alive");
+        }
+        self.nn_commands
+            .send(NnCommand::Run(Arc::clone(shared), nn_rx.clone()))
+            .expect("persistent nn worker is alive");
+        for sender in &self.eval_commands {
+            sender
+                .send(EvalCommand::Run(Arc::clone(shared), eval_rx.clone(), nn_tx.clone()))
+                .expect("persistent eval worker is alive");
+        }
+        for sender in &self.backprop_commands {
+            sender
+                .send(BackpropCommand::Run(Arc::clone(shared), backprop_rx.clone()))
+                .expect("persistent backprop worker is alive");
+        }
+    }
+
+    fn finish_job(&self) {
+        for _ in 0..self.gather_commands.len() + self.eval_commands.len() + self.backprop_commands.len() + 1 {
+            self.job_done.recv().expect("persistent worker completion");
+        }
+    }
+
+    fn assert_compatible(&self, config: &ResolvedSearchConfig) {
+        assert_eq!(
+            self.gather_commands.len(),
+            config.gather_workers,
+            "worker pool gather topology changed"
+        );
+        assert_eq!(
+            self.eval_commands.len(),
+            config.eval_workers,
+            "worker pool eval topology changed"
+        );
+        assert_eq!(
+            self.backprop_commands.len(),
+            config.backprop_workers,
+            "worker pool backprop topology changed"
+        );
+        assert_eq!(
+            self.eval_batch_size, config.eval_batch_size,
+            "worker pool batch size changed"
+        );
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        for sender in &self.gather_commands {
+            let _ = sender.send(GatherCommand::Shutdown);
+        }
+        let _ = self.nn_commands.send(NnCommand::Shutdown);
+        for sender in &self.eval_commands {
+            let _ = sender.send(EvalCommand::Shutdown);
+        }
+        for sender in &self.backprop_commands {
+            let _ = sender.send(BackpropCommand::Shutdown);
+        }
+        for worker in self.threads.get_mut().drain(..) {
+            let _ = worker.join();
+        }
+    }
 }
 
 struct Shared {
@@ -220,6 +388,7 @@ struct Shared {
     generation: SearchGeneration,
     params: SearchParams,
     benchmark_telemetry: bool,
+    virtual_loss: f32,
     root_move_filter: Vec<Move>,
     stopping: AtomicBool,
     outstanding: AtomicUsize,
@@ -252,7 +421,7 @@ impl Shared {
         }
         let previous = self.outstanding.fetch_sub(1, Ordering::AcqRel);
         assert!(previous > 0, "stream outstanding task underflow");
-        // Wake submitters waiting on in-flight caps, not only full idle.
+        // 唤醒等待 in-flight 上限的提交者，而不只是在完全空闲时唤醒。
         let _guard = self.idle_lock.lock();
         self.idle.notify_all();
         let _ = previous;
@@ -404,9 +573,9 @@ impl Shared {
     }
 }
 
-/// LC3-style streaming search: Gather / Eval / NN / Backprop.
-/// Eval: terminal | cache → Backprop; else encode planes → NN queue; on NN
-/// completion → softmax/edges → Backprop. NN: dequeue tensors → GPU → reply.
+/// LC3 风格流式搜索：Gather / Eval / NN / Backprop。
+/// Eval：terminal | cache → Backprop；否则编码 planes → NN queue；NN 返回后
+/// softmax/edges → Backprop。NN：取出 tensor → GPU → 回复。
 pub struct Search {
     shared: Arc<Shared>,
     root_history: Arc<PositionHistory>,
@@ -414,7 +583,8 @@ pub struct Search {
     /// Cap concurrent owned playouts after root expansion. Much smaller than
     /// queue capacity: saturating thousands of in-flight walks explodes collisions.
     max_in_flight: usize,
-    workers: Vec<JoinHandle<()>>,
+    worker_pool: Arc<WorkerPool>,
+    workers_idle: bool,
 }
 
 impl Search {
@@ -428,16 +598,27 @@ impl Search {
         Self::new_with_tree(backend, generation, &tree, config)
     }
 
-    /// Starts workers from a previously retained tree root. The caller must
-    /// stop and join this search before advancing or rewinding `tree`.
+    /// 从保留树创建独立搜索；该搜索自己创建、销毁 worker pool。
     pub fn new_with_tree(
         backend: Arc<dyn Backend>,
         generation: SearchGeneration,
         tree: &Tree,
         config: SearchConfig,
     ) -> Self {
+        let worker_pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
+        Self::new_with_tree_in_pool(backend, generation, tree, config, worker_pool)
+    }
+
+    pub(crate) fn new_with_tree_in_pool(
+        backend: Arc<dyn Backend>,
+        generation: SearchGeneration,
+        tree: &Tree,
+        config: SearchConfig,
+        worker_pool: Arc<WorkerPool>,
+    ) -> Self {
         config.validate();
         let resolved = config.resolve(backend.as_ref());
+        worker_pool.assert_compatible(&resolved);
         let (gather_tx, gather_rx) = bounded(resolved.queue_capacity);
         let (eval_tx, eval_rx) = bounded(resolved.queue_capacity);
         let (backprop_tx, backprop_rx) = bounded(resolved.queue_capacity);
@@ -450,6 +631,7 @@ impl Search {
             generation,
             params: resolved.params,
             benchmark_telemetry: resolved.benchmark_telemetry,
+            virtual_loss: resolved.virtual_loss,
             root_move_filter: config.root_move_filter.clone(),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
@@ -475,40 +657,20 @@ impl Search {
             backprop_tx,
         });
         let (nn_tx, nn_rx) = bounded::<NnRequest>(resolved.queue_capacity);
-        let mut workers = Vec::with_capacity(config.gather_workers + config.eval_workers + config.backprop_workers + 1);
-        for _ in 0..config.gather_workers {
-            let shared = Arc::clone(&shared);
-            let receiver = gather_rx.clone();
-            workers.push(thread::spawn(move || gather_worker(shared, receiver)));
-        }
-        {
-            let shared = Arc::clone(&shared);
-            let batch_size = resolved.eval_batch_size;
-            workers.push(thread::spawn(move || nn_worker(shared, nn_rx, batch_size)));
-        }
-        for _ in 0..config.eval_workers {
-            let shared = Arc::clone(&shared);
-            let receiver = eval_rx.clone();
-            let nn_tx = nn_tx.clone();
-            workers.push(thread::spawn(move || eval_worker(shared, receiver, nn_tx)));
-        }
+        worker_pool.start_job(&shared, &gather_rx, &eval_rx, &nn_tx, &nn_rx, &backprop_rx);
         drop(nn_tx);
-        for _ in 0..config.backprop_workers {
-            let shared = Arc::clone(&shared);
-            let receiver = backprop_rx.clone();
-            workers.push(thread::spawn(move || backprop_worker(shared, receiver)));
-        }
         Self {
             shared,
             root_history,
             root_key,
-            // Keep a few Eval batches worth of leaves in flight, not the full queue depth.
+            // 保持数个 Eval batch 的叶子处于 in-flight，而非占满全部队列深度。
             max_in_flight: resolved
                 .eval_batch_size
                 .saturating_mul(4)
                 .min(resolved.queue_capacity)
                 .max(1),
-            workers,
+            worker_pool,
+            workers_idle: false,
         }
     }
 
@@ -530,11 +692,18 @@ impl Search {
         }
     }
 
+    /// 测试 SearchState 的 option 快照语义；运行中的 job 不读取其后续配置。
+    /// 参考：LC3 Overview 的 “Search”。
+    #[cfg(test)]
+    pub(crate) fn virtual_loss(&self) -> f32 {
+        self.shared.virtual_loss
+    }
+
     /// Requests a normal stream-search stop without tearing down worker
     /// threads. Gather/Eval/Backprop cancel every unfinished event and its
     /// edge reservation before becoming idle. This is the boundary a later
-    /// UCI controller will use for `stop`; `stop_and_join()` remains the
-    /// terminal owner cleanup path.
+    /// UCI controller uses this for `stop`; owner cleanup drains this job and
+    /// returns its workers to the pool.
     ///
     /// Reference: LC3 overview, "Watchdog" and worker stop coordination.
     pub fn request_stop(&self) {
@@ -578,10 +747,8 @@ impl Search {
                 self.shared.cancel_and_finish(event, false);
                 return Err(EnginError::PortIncomplete("stream worker pipeline is stopped"));
             }
-            // LC3 workers communicate through bounded event queues. Queue
-            // capacity is normal backpressure, not a failed search request;
-            // use a short timeout so a concurrent Stop can still interrupt a
-            // producer that is waiting for Gather capacity.
+            // LC3 worker 通过有界 event queue 通信。队列容量耗尽是正常背压，不是搜索请求
+            // 失败；使用短超时，以便并发 Stop 仍能中断等待 Gather 容量的生产者。
             match self.shared.gather_tx.send_timeout(event, RECEIVE_POLL) {
                 Ok(()) => return Ok(()),
                 Err(SendTimeoutError::Timeout(returned)) => event = returned,
@@ -620,7 +787,7 @@ impl Search {
                 break;
             }
             if root_state != Some(ExpansionState::Expanded) {
-                // Bootstrap: one playout at a time until the root is expanded.
+                // 启动阶段：root 展开前一次只提交一个 playout。
                 if let Err(error) = self.submit_playout() {
                     if self.is_stopping() {
                         break;
@@ -636,7 +803,7 @@ impl Search {
                 if outstanding == 0 {
                     break;
                 }
-                // Let in-flight work finish toward the budget; do not overshoot with more submits.
+                // 让已有 in-flight 工作完成至预算；不要继续提交而超出预算。
                 self.wait_until_outstanding_below(outstanding)?;
                 continue;
             }
@@ -651,9 +818,8 @@ impl Search {
                 return Err(error);
             }
         }
-        // A requested stop is a normal search outcome. `wait_for_idle()` has
-        // already ensured every queued event either completed or cancelled its
-        // reservation, so callers can safely snapshot the partial tree.
+        // 请求停止是正常搜索结果。`wait_for_idle()` 已保证每个入队 event 都已完成或取消
+        // reservation，因此调用方可安全快照部分 tree。
         self.wait_for_idle()?;
         Ok(self.stats())
     }
@@ -674,18 +840,21 @@ impl Search {
         Ok(())
     }
 
-    pub fn stop_and_join(&mut self) {
+    /// 结束当前 job；常驻 worker 完成 drain 后回到等待，不在这里退出线程。
+    pub fn stop_and_finish(&mut self) {
+        if self.workers_idle {
+            return;
+        }
         self.request_stop();
         let _ = self.wait_for_idle();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
+        self.worker_pool.finish_job();
+        self.workers_idle = true;
     }
 }
 
 impl Drop for Search {
     fn drop(&mut self) {
-        self.stop_and_join();
+        self.stop_and_finish();
     }
 }
 
@@ -707,6 +876,18 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>) {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn persistent_gather_worker(commands: Receiver<GatherCommand>, job_done: Sender<()>) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            GatherCommand::Run(shared, receiver) => {
+                gather_worker(shared, receiver);
+                let _ = job_done.send(());
+            }
+            GatherCommand::Shutdown => break,
         }
     }
 }
@@ -741,8 +922,14 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
             }
             ExpansionState::Expanded => {
                 let depth = event.variation.moves().len();
-                let edge_index = select_edge_from_node(node.as_ref(), depth, &shared.params, &shared.root_move_filter)
-                    .expect("expanded stream node must have an edge");
+                let edge_index = select_edge_from_node(
+                    node.as_ref(),
+                    depth,
+                    &shared.params,
+                    &shared.root_move_filter,
+                    shared.virtual_loss,
+                )
+                .expect("expanded stream node must have an edge");
                 let reservation = node.reserve_edge(edge_index).expect("selected stream edge");
                 let child_key = event.node_key.child(reservation.mv());
                 event = event.descend(child_key, reservation);
@@ -751,10 +938,10 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
     }
 }
 
-/// Raw logits[POLICY], WDL[3] and moves-left[1] returned by the NN worker.
+/// NN worker 返回的原始 logits[POLICY]、WDL[3] 与 moves-left[1]。
 type NnReply = Result<(Vec<f32>, Vec<f32>, f32), EnginError>;
 
-/// One encoded position for the NN thread. Reply owns all three model heads.
+/// 交给 NN 线程的一个已编码局面。回复拥有三个 model head 的全部结果。
 struct NnRequest {
     planes: Vec<f32>,
     reply: Sender<NnReply>,
@@ -777,7 +964,7 @@ impl NnRequest {
     }
 }
 
-/// Eval is waiting on NN for this node (LC3: after NN completes → Backprop).
+/// Eval 正在等待此 node 的 NN（LC3：NN 完成后 → Backprop）。
 struct WaitingNn {
     event: NodeEvent,
     node: Arc<Node>,
@@ -786,11 +973,9 @@ struct WaitingNn {
     reply: Receiver<NnReply>,
 }
 
-/// LC3 EvalWorker:
-/// terminal | cache → Backprop; else legal moves + encode → NN queue;
-/// when NN replies → softmax/edges → Backprop.
-/// Does not block the whole worker on one GPU call: poll completions interleaved
-/// with new NodeEvents.
+/// LC3 EvalWorker：terminal | cache → Backprop；否则合法着 + 编码 → NN queue；
+/// NN 回复后 → softmax/edges → Backprop。它不会因一次 GPU 调用阻塞整个 worker，
+/// 而是在新 NodeEvent 之间轮询已完成结果。
 fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender<NnRequest>) {
     let mut waiting: Vec<WaitingNn> = Vec::new();
     loop {
@@ -821,10 +1006,22 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender
                 if waiting.is_empty() {
                     continue;
                 }
-                // No new leaves: wait briefly for at least one NN reply.
+                // 没有新叶子：短暂等待至少一个 NN 回复。
                 wait_one_nn_completion(&shared, &mut waiting);
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn persistent_eval_worker(commands: Receiver<EvalCommand>, job_done: Sender<()>) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            EvalCommand::Run(shared, receiver, nn_tx) => {
+                eval_worker(shared, receiver, nn_tx);
+                let _ = job_done.send(());
+            }
+            EvalCommand::Shutdown => break,
         }
     }
 }
@@ -1008,11 +1205,10 @@ fn complete_nn_item(
     publish_eval(shared, item.event, item.node, item.legal_moves, eval)
 }
 
-/// Validates a completed backend result before it reaches the tree.
+/// 在 backend 完成结果写入 tree 前校验它。
 ///
-/// Reference: the fixed `WDL + moves-left` backend contract in ARCHITECTURE;
-/// worker failures must return through LC3's cancellation path, never panic
-/// after retaining an owned event.
+/// 参考：ARCHITECTURE 固定的 `WDL + moves-left` backend 契约。worker 失败必须通过
+/// LC3 取消路径返回；持有 owned event 后不得 panic。
 fn publish_eval(
     shared: &Shared,
     event: NodeEvent,
@@ -1049,19 +1245,18 @@ fn cancel_waiting_item(shared: &Shared, item: WaitingNn) {
     cancel_evaluation(shared, item.event, item.node);
 }
 
-/// Releases a claimed evaluation event that will not publish a result.
+/// 释放已 claim 但不会发布结果的 evaluation event。
 ///
-/// Reference: LC3 overview's EvalWorker ownership model: each owned event
-/// must finish through backpropagation or explicit cancellation.
+/// 参考：LC3 Overview 的 EvalWorker 所有权模型：每个 owned event 必须经 backpropagation
+/// 完成，或显式取消。
 fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>) {
     event.cancel();
     node.abort_evaluation();
     shared.finish(false);
 }
 
-/// NN worker: pull encoded planes from the queue, run ONNX, reply. Merges whatever
-/// is already queued (up to `batch_size`) so the GPU stays busy; Eval never waits
-/// to fill that size.
+/// NN worker：从队列取已编码 planes，运行 ONNX 后回复。合并当前已排队的项目（最多
+/// `batch_size`）以保持 GPU 忙碌；Eval 从不等待队列凑满该数量。
 fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usize) {
     let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
     loop {
@@ -1131,6 +1326,18 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
     }
 }
 
+fn persistent_nn_worker(commands: Receiver<NnCommand>, job_done: Sender<()>, batch_size: usize) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            NnCommand::Run(shared, receiver) => {
+                nn_worker(shared, receiver, batch_size);
+                let _ = job_done.send(());
+            }
+            NnCommand::Shutdown => break,
+        }
+    }
+}
+
 fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
@@ -1173,6 +1380,18 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn persistent_backprop_worker(commands: Receiver<BackpropCommand>, job_done: Sender<()>) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            BackpropCommand::Run(shared, receiver) => {
+                backprop_worker(shared, receiver);
+                let _ = job_done.send(());
+            }
+            BackpropCommand::Shutdown => break,
         }
     }
 }
@@ -1245,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_workers_complete_batched_playouts_and_join() {
+    fn search_completes_batched_playouts_and_returns_workers() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
             SearchGeneration(21),
@@ -1262,14 +1481,14 @@ mod tests {
         let stats = pipeline.run_playouts(32).expect("playouts");
         assert_eq!(stats.completed_playouts, 32);
         assert!(stats.network_batches > 0);
-        // A very fast stop may win the race before Gather expands the root.
-        // If it did expand, every reservation must still be released.
+        // 很快的 stop 可能在 Gather 展开 root 前竞争获胜；如果已展开，仍必须释放每个
+        // reservation。
         if let Some(root) = pipeline.repository().get(pipeline.root_key()) {
             for edge in root.edges().iter() {
                 assert_eq!(edge.visits(), edge.completed_visits());
             }
         }
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]
@@ -1291,11 +1510,11 @@ mod tests {
         assert!(stats.gather_queue.samples >= stats.completed_playouts);
         assert!(stats.eval_queue.samples > 0);
         assert!(stats.backprop_queue.samples > 0);
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]
-    fn stop_join_drains_in_flight_reservations() {
+    fn stop_and_finish_drains_in_flight_reservations() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
             SearchGeneration(22),
@@ -1313,10 +1532,9 @@ mod tests {
         for _ in 0..16 {
             pipeline.submit_playout().expect("queued root event");
         }
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
 
-        // Stop may arrive before Gather expands the root. If it did expand,
-        // every reservation still has to be released.
+        // Stop 可能在 Gather 展开 root 前到达；如果已展开，仍必须释放每个 reservation。
         if let Some(root) = pipeline.repository().get(pipeline.root_key()) {
             for edge in root.edges().iter() {
                 assert_eq!(edge.visits(), edge.completed_visits());
@@ -1344,7 +1562,7 @@ mod tests {
             pipeline.submit_playout().expect("bounded queue waits for gather");
         }
         pipeline.wait_for_idle().expect("all submitted work drains");
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]
@@ -1373,14 +1591,13 @@ mod tests {
             assert!(stats.completed_playouts < 1_000_000);
         });
 
-        // Stop may win the race before Gather creates the root. If it did
-        // create it, every reservation still has to be released.
+        // Stop 可能在 Gather 创建 root 前竞争获胜；如果已创建，仍必须释放每个 reservation。
         if let Some(root) = pipeline.repository().get(pipeline.root_key()) {
             for edge in root.edges().iter() {
                 assert_eq!(edge.visits(), edge.completed_visits());
             }
         }
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]
@@ -1399,7 +1616,7 @@ mod tests {
             .expect("expired deadline is a normal result");
         assert_eq!(stats.completed_playouts, 0);
         assert!(pipeline.repository().get(pipeline.root_key()).is_none());
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]
@@ -1424,7 +1641,7 @@ mod tests {
                 .expansion_state(),
             super::ExpansionState::Terminal
         );
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]
@@ -1456,7 +1673,7 @@ mod tests {
             .all(|edge| edge.started_visits == edge.completed_visits));
         assert!(!worker_root.edges.is_empty());
 
-        workers.stop_and_join();
+        workers.stop_and_finish();
     }
 
     #[test]
@@ -1471,7 +1688,7 @@ mod tests {
         assert_eq!(error, EnginError::Onnx("test computation failure".to_owned()));
         pipeline.wait_for_idle().expect_err("pipeline retains the worker error");
         assert_eq!(pipeline.stats().completed_playouts, 0);
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]
@@ -1487,7 +1704,7 @@ mod tests {
 
         assert_eq!(error, EnginError::Onnx("stream nn values are invalid".into()));
         assert_eq!(pipeline.stats().completed_playouts, 0);
-        pipeline.stop_and_join();
+        pipeline.stop_and_finish();
     }
 
     #[test]
@@ -1508,6 +1725,7 @@ mod tests {
             generation: SearchGeneration(30),
             params: SearchParams::default(),
             benchmark_telemetry: false,
+            virtual_loss: 0.0,
             root_move_filter: Vec::new(),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(1),
@@ -1555,7 +1773,7 @@ mod tests {
         first.run_playouts(16).expect("first search");
         let old_root = tree.root_key();
         let played = best_move(first.repository(), first.root_key(), false).expect("best move");
-        first.stop_and_join();
+        first.stop_and_finish();
 
         tree.advance(played).expect("advance retained tree");
         assert!(tree.repository().get(old_root).is_some());
@@ -1564,6 +1782,6 @@ mod tests {
         second.run_playouts(8).expect("reused search");
         let root = second.repository().get(second.root_key()).expect("reused root");
         assert!(root.edges().iter().all(|edge| edge.visits() == edge.completed_visits()));
-        second.stop_and_join();
+        second.stop_and_finish();
     }
 }

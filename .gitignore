@@ -38,6 +38,9 @@ venv/
 # --- 数据集、棋谱、训练权重（体积大 / 本机生成）---
 # 原有脚本产出与 checkpoint 等放在 data/，统一不入库；若在仓库根外另有目录可同名忽略
 data/
+!data/
+data/*
+!data/benchmark_positions.txt
 datasets/
 checkpoints/
 pgns/
