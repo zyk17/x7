@@ -134,12 +134,8 @@ class ValMetricTotals:
 @dataclass
 class ValMetricsState:
     overall: ValMetricTotals = field(default_factory=ValMetricTotals)
-    by_ply_bin: dict[int, ValMetricTotals] = field(
-        default_factory=lambda: defaultdict(ValMetricTotals)
-    )
-    by_source_id: dict[int, ValMetricTotals] = field(
-        default_factory=lambda: defaultdict(ValMetricTotals)
-    )
+    by_ply_bin: dict[int, ValMetricTotals] = field(default_factory=lambda: defaultdict(ValMetricTotals))
+    by_source_id: dict[int, ValMetricTotals] = field(default_factory=lambda: defaultdict(ValMetricTotals))
 
     def update_batch(
         self,
@@ -169,15 +165,11 @@ class ValMetricsState:
             mask = ply_bins == pb
             if not mask.any():
                 continue
-            self.by_ply_bin[pb].update(
-                nll_cpu[mask], ent_cpu[mask], t1_cpu[mask], t3_cpu[mask], t5_cpu[mask]
-            )
+            self.by_ply_bin[pb].update(nll_cpu[mask], ent_cpu[mask], t1_cpu[mask], t3_cpu[mask], t5_cpu[mask])
 
         for sid in src_cpu.unique(sorted=True).tolist():
             mask = src_cpu == sid
-            self.by_source_id[int(sid)].update(
-                nll_cpu[mask], ent_cpu[mask], t1_cpu[mask], t3_cpu[mask], t5_cpu[mask]
-            )
+            self.by_source_id[int(sid)].update(nll_cpu[mask], ent_cpu[mask], t1_cpu[mask], t3_cpu[mask], t5_cpu[mask])
 
 
 def format_val_metrics_report(
@@ -195,7 +187,7 @@ def format_val_metrics_report(
     lines.append(
         f"val human_NLL mean={mn:.4f} std={sd:.4f} | "
         f"entropy(nat) mean={ent_m:.4f} | "
-        f"top1={o.sum_top1/o.n:.4f} top3={o.sum_top3/o.n:.4f} top5={o.sum_top5/o.n:.4f}"
+        f"top1={o.sum_top1 / o.n:.4f} top3={o.sum_top3 / o.n:.4f} top5={o.sum_top5 / o.n:.4f}"
     )
     lines.append("val by ply bin:")
     for bi, label in enumerate(PLY_BIN_LABELS):
@@ -205,7 +197,7 @@ def format_val_metrics_report(
         mn_b, sd_b = t.mean_std_nll()
         lines.append(
             f"  {label} n={t.n} NLL={mn_b:.4f}+-{sd_b:.4f} "
-            f"H={t.sum_entropy/t.n:.4f} top1={t.sum_top1/t.n:.4f} top3={t.sum_top3/t.n:.4f}"
+            f"H={t.sum_entropy / t.n:.4f} top1={t.sum_top1 / t.n:.4f} top3={t.sum_top3 / t.n:.4f}"
         )
     lines.append("val by pgn_source:")
     for sid in sorted(state.by_source_id.keys()):
@@ -216,6 +208,6 @@ def format_val_metrics_report(
         mn_b, sd_b = t.mean_std_nll()
         lines.append(
             f"  {name} n={t.n} NLL={mn_b:.4f}+-{sd_b:.4f} "
-            f"H={t.sum_entropy/t.n:.4f} top1={t.sum_top1/t.n:.4f} top3={t.sum_top3/t.n:.4f}"
+            f"H={t.sum_entropy / t.n:.4f} top1={t.sum_top1 / t.n:.4f} top3={t.sum_top3 / t.n:.4f}"
         )
     return "\n".join(lines)

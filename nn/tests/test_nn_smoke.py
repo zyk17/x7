@@ -12,13 +12,12 @@ sys.path.insert(0, str(ROOT / "scripts" / "export"))
 from nn import (
     PolicyResNet,
     soft_policy_cross_entropy,
-    mix_wdl_targets,
     moves_left_loss,
     value_q_mse_from_wdl,
     value_wdl_cross_entropy,
     wdl_logits_to_q,
 )
-from nn.model import GlobalBroadcast, PreActBottleneck, ValueAuxHead, _load_move_vocab
+from nn.model import GlobalBroadcast, PreActBottleneck, ValueAuxHead, _load_move_vocab, soften_policy_targets
 from export_onnx import PolicyOnnxExport
 
 
@@ -38,6 +37,11 @@ def test_policy_forward_shape():
     x = torch.zeros((1, 124, 10, 9), dtype=torch.float32)
     logits = m(x)
     assert logits.shape == (1, 2062)
+
+
+def test_model_defaults_to_b15c384bt192():
+    model = PolicyResNet()
+    assert (model.num_blocks, model.stem.out_channels, model.bottleneck_channels) == (15, 384, 192)
 
 
 def test_value_wdl_forward_and_loss():
@@ -72,6 +76,36 @@ def test_onnx_export_wrapper_keeps_moves_left_output():
     assert torch.allclose(value.sum(dim=1), torch.ones(1))
 
 
+def test_auxiliary_heads_are_separate_from_formal_heads():
+    model = PolicyResNet(width=32, num_blocks=12, value_head=True, moves_left_head=True, auxiliary_heads=True)
+    outputs = model(torch.zeros((1, 124, 10, 9)))
+    assert isinstance(outputs, tuple) and len(outputs) == 5
+    logits, value, moves_left = PolicyOnnxExport(model)(torch.zeros((1, 124, 10, 9)))
+    assert logits.shape == (1, 2062) and value.shape == (1, 3) and moves_left.shape == (1, 1)
+
+
+def test_auxiliary_heads_require_formal_value_heads():
+    with pytest.raises(ValueError, match="auxiliary_heads"):
+        PolicyResNet(width=32, num_blocks=12, auxiliary_heads=True)
+
+
+def test_onnx_export_omits_auxiliary_head_weights(tmp_path: Path):
+    onnx = pytest.importorskip("onnx")
+    model = PolicyResNet(width=32, num_blocks=12, value_head=True, moves_left_head=True, auxiliary_heads=True).eval()
+    out = tmp_path / "x7.onnx"
+    torch.onnx.export(
+        PolicyOnnxExport(model, mixed_fp16=True).eval(),
+        torch.zeros((1, 124, 10, 9)),
+        str(out),
+        input_names=["board"],
+        output_names=["logits", "value", "moves_left"],
+        opset_version=17,
+        dynamo=False,
+    )
+    names = {initializer.name for initializer in onnx.load(str(out)).graph.initializer}
+    assert not any("soft_policy_head" in name or "root_value_out" in name for name in names)
+
+
 def test_pure_cnn_policy_head_forward_shape():
     m = PolicyResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
     x = torch.zeros((2, 124, 10, 9), dtype=torch.float32)
@@ -90,7 +124,7 @@ def test_x7_v2_uses_three_stages_and_two_global_broadcasts():
     assert model.stage1[0].conv2.kernel_size == (3, 3)
     assert model.stage1[0].conv3.kernel_size == (3, 3)
     assert model.stage1[0].conv4.kernel_size == (1, 1)
-    assert model.stage1[0].conv1.out_channels == 14
+    assert model.stage1[0].conv1.out_channels == 16
     assert model.broadcast4.gpool_conv.kernel_size == (3, 3)
     assert model.broadcast4.gpool_to_bias.in_features == 32
 
@@ -128,7 +162,7 @@ def test_policy_and_shared_value_aux_head_features():
     assert torch.all(moves_left >= 0)
 
 
-def test_x7_v2_256x12_parameter_count_is_stable():
+def test_x7_v2_256x12bt128_parameter_count_is_stable():
     model = PolicyResNet(
         in_planes=124,
         width=256,
@@ -137,7 +171,7 @@ def test_x7_v2_256x12_parameter_count_is_stable():
         value_head=True,
         moves_left_head=True,
     )
-    assert sum(param.numel() for param in model.parameters()) == 5_690_808
+    assert sum(param.numel() for param in model.parameters()) == 6_619_704
 
 
 def test_soft_policy_cross_entropy_masks_px0_illegal_minus_one_targets():
@@ -148,11 +182,12 @@ def test_soft_policy_cross_entropy_masks_px0_illegal_minus_one_targets():
     assert loss.ndim == 0 and torch.isfinite(loss)
 
 
-def test_mix_wdl_targets_uses_fixed_q_ratio_semantics():
-    winner = torch.tensor([[0.2, 0.3, 0.5]], dtype=torch.float32)
-    search = torch.tensor([[0.7, 0.1, 0.2]], dtype=torch.float32)
-    assert torch.equal(mix_wdl_targets(winner, search, q_ratio=0.0), winner)
-    assert torch.equal(mix_wdl_targets(winner, search, q_ratio=1.0), search)
+def test_soft_policy_target_stays_on_legal_moves():
+    target = torch.tensor([[-1.0, 0.01, -1.0, 0.99]], dtype=torch.float32)
+    legal = target >= 0
+    softened = soften_policy_targets(target.clamp_min(0.0), legal, temperature=4.0)
+    assert torch.equal(softened[~legal], torch.zeros(2))
+    assert torch.allclose(softened.sum(dim=1), torch.ones(1))
 
 
 def test_wdl_q_metric_is_finite():

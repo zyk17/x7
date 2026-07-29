@@ -348,9 +348,7 @@ def load_prepared_px0_training_data(
     )
     required_paths = (train_manifest, val_manifest, validation_manifest, ready_path)
     if any(not path.is_file() for path in required_paths):
-        raise FileNotFoundError(
-            f"PX0 {version} 尚未准备完成；先运行 scripts/data/prepare_px0.py --config <YAML>"
-        )
+        raise FileNotFoundError(f"PX0 {version} 尚未准备完成；先运行 scripts/data/prepare_px0.py --config <YAML>")
     ready = read_px0_manifest(ready_path)
     if (
         ready.get("format") != "px0_training_ready_v1"

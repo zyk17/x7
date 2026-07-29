@@ -27,13 +27,8 @@ def _sample_with_pieces(pieces: int) -> Px0Sample:
     return Px0Sample(
         planes=planes,
         policy=np.zeros(2062, dtype=np.float32),
-        winner_q=np.zeros(1, dtype=np.float32),
         winner_wdl=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
         root_wdl=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
-        search_q=np.zeros(1, dtype=np.float32),
-        search_wdl=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
-        search_visits=np.ones(1, dtype=np.float32),
-        policy_kld=np.zeros(1, dtype=np.float32),
         plies_left=np.ones(1, dtype=np.float32),
     )
 

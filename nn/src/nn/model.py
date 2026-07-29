@@ -190,7 +190,7 @@ class ValueAuxHead(nn.Module):
     Reference: KataGo `python/katago/train/model_pytorch.py:2544-2673`.
     """
 
-    def __init__(self, channels: int, *, hidden_dim: int) -> None:
+    def __init__(self, channels: int, *, hidden_dim: int, root_value_head: bool = False) -> None:
         super().__init__()
         self.pre_bn = nn.BatchNorm2d(channels)
         self.conv = nn.Conv2d(channels, hidden_dim, kernel_size=1, bias=False)
@@ -198,27 +198,47 @@ class ValueAuxHead(nn.Module):
         self.fc = nn.Linear(hidden_dim * 2, hidden_dim)
         self.value_out = nn.Linear(hidden_dim, 3)
         self.moves_left_out = nn.Linear(hidden_dim, 1)
+        # Training-only root-search WDL target. It is intentionally a second final
+        # projection over the same value readout: the main head remains the
+        # final-game WDL contract exported to ONNX.
+        self.root_value_out = nn.Linear(hidden_dim, 3) if root_value_head else None
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        include_root_value: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         trunk = F.silu(self.pre_bn(x), inplace=True)
         features = F.silu(self.conv_bn(self.conv(trunk)), inplace=True)
         global_features = F.silu(self.fc(_mean_max_pool(features)), inplace=True)
-        return self.value_out(global_features), F.relu(self.moves_left_out(global_features), inplace=True)
+        value = self.value_out(global_features)
+        moves_left = F.relu(self.moves_left_out(global_features), inplace=True)
+        if self.root_value_out is None or not include_root_value:
+            return value, moves_left
+        return value, moves_left, self.root_value_out(global_features)
 
 
 class PolicyResNet(nn.Module):
-    """输入 `[B,124,10,9]`，输出 policy，或 `(policy, value[, moves_left])`。"""
+    """输入 `[B,124,10,9]`，输出正式 head，训练时可附加辅助 head。
+
+    Reference: KataGoMethods.md, "Auxiliary Soft Policy Target" and
+    "Short-term Value and Score Targets". Auxiliary heads are training-only:
+    they and the shared features receive gradients, but the ONNX wrapper omits
+    them entirely.
+    """
 
     def __init__(
         self,
         in_planes: int = 124,
-        width: int = 256,
-        num_blocks: int = 12,
+        width: int = 384,
+        num_blocks: int = 15,
         num_moves: int = 2062,
         *,
         bottleneck_channels: int | None = None,
         value_head: bool = False,
         moves_left_head: bool = False,
+        auxiliary_heads: bool = False,
         trunk_kind: str = "x7_v2_bottleneck_gbroadcast",
     ) -> None:
         super().__init__()
@@ -230,10 +250,13 @@ class PolicyResNet(nn.Module):
         self.num_moves = int(num_moves)
         self.value_head = bool(value_head)
         self.moves_left_head = bool(moves_left_head)
+        self.auxiliary_heads = bool(auxiliary_heads)
+        if self.auxiliary_heads and (not self.value_head or not self.moves_left_head):
+            raise ValueError("auxiliary_heads 须与 value_head、moves_left_head 一起启用")
         self.trunk_kind = str(trunk_kind)
 
         self.stem = nn.Conv2d(in_planes, width, kernel_size=3, padding=1, bias=False)
-        bottleneck_channels = width * 7 // 16 if bottleneck_channels is None else int(bottleneck_channels)
+        bottleneck_channels = width // 2 if bottleneck_channels is None else int(bottleneck_channels)
         if bottleneck_channels < 1:
             raise ValueError(f"bottleneck_channels={bottleneck_channels} 须为正整数")
         if int(num_blocks) < 3:
@@ -251,9 +274,8 @@ class PolicyResNet(nn.Module):
         self.stage1 = nn.Sequential(
             *(PreActBottleneck(width, bottleneck_channels=bottleneck_channels) for _ in range(stage1_blocks))
         )
-        # Preserve the baseline state-dict names so existing 256x12 v2
-        # checkpoints remain exportable. For another depth they mean the first
-        # and second stage boundary, not literally block 4 and block 8.
+        # Names describe the first and second stage boundary, not a literal
+        # block index when the depth differs from twelve.
         self.broadcast4 = GlobalBroadcast(width, gpool_channels=width // 2)
         self.stage2 = nn.Sequential(
             *(PreActBottleneck(width, bottleneck_channels=bottleneck_channels) for _ in range(stage2_blocks))
@@ -265,30 +287,58 @@ class PolicyResNet(nn.Module):
         self.trunk_bn = nn.BatchNorm2d(width)
 
         self.policy_head = PolicyHead(width)
+        self.soft_policy_head = PolicyHead(width) if self.auxiliary_heads else None
         if self.value_head or self.moves_left_head:
-            self.value_aux_head_module = ValueAuxHead(width, hidden_dim=max(64, width))
+            self.value_aux_head_module = ValueAuxHead(
+                width,
+                hidden_dim=max(64, width),
+                root_value_head=self.auxiliary_heads,
+            )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward_trunk(self, x: torch.Tensor) -> torch.Tensor:
         trunk = self.stem(x)
         trunk = self.broadcast4(self.stage1(trunk))
         trunk = self.broadcast8(self.stage2(trunk))
         trunk = self.stage3(trunk)
-        trunk = F.silu(self.trunk_bn(trunk), inplace=True)
-        logits = self.policy_head(trunk)
+        return F.silu(self.trunk_bn(trunk), inplace=True)
 
+    def forward_heads(
+        self,
+        trunk: torch.Tensor,
+        *,
+        include_auxiliary: bool = True,
+    ) -> tuple[torch.Tensor, ...]:
+        logits = self.policy_head(trunk)
         outputs: list[torch.Tensor] = [logits]
-        value = moves_left = None
         if self.value_head or self.moves_left_head:
-            value, moves_left = self.value_aux_head_module(trunk)
-        if self.value_head:
-            assert value is not None
-            outputs.append(value)
-        if self.moves_left_head:
-            assert moves_left is not None
-            outputs.append(moves_left)
+            value_outputs = self.value_aux_head_module(
+                trunk,
+                include_root_value=include_auxiliary,
+            )
+            value, moves_left = value_outputs[:2]
+            if self.value_head:
+                outputs.append(value)
+            if self.moves_left_head:
+                outputs.append(moves_left)
+            if self.auxiliary_heads and include_auxiliary:
+                assert self.soft_policy_head is not None
+                assert len(value_outputs) == 3
+                outputs.extend((self.soft_policy_head(trunk), value_outputs[2]))
+        return tuple(outputs)
+
+    def forward_formal_heads(self, trunk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return only the fixed engine contract, without tracing auxiliary heads."""
+        if not self.value_head or not self.moves_left_head:
+            raise RuntimeError("formal ONNX export requires WDL and moves-left heads")
+        logits = self.policy_head(trunk)
+        value, moves_left = self.value_aux_head_module(trunk, include_root_value=False)
+        return logits, value, moves_left
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        outputs = self.forward_heads(self.forward_trunk(x))
         if len(outputs) == 1:
             return outputs[0]
         return tuple(outputs)  # type: ignore[return-value]
@@ -297,6 +347,20 @@ class PolicyResNet(nn.Module):
 def masked_log_softmax(logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
     logits = logits.masked_fill(~legal_mask, float("-inf"))
     return F.log_softmax(logits, dim=1)
+
+
+def soften_policy_targets(
+    target_probs: torch.Tensor, legal_mask: torch.Tensor, *, temperature: float = 4.0
+) -> torch.Tensor:
+    """Raise the legal PX0 policy target to `1 / temperature` and renormalize.
+
+    Reference: KataGoMethods.md, "Auxiliary Soft Policy Target" (T=4).
+    """
+    if temperature <= 0.0:
+        raise ValueError("temperature 须为正数")
+    target = torch.where(legal_mask, target_probs.clamp_min(0.0), torch.zeros_like(target_probs))
+    softened = target.pow(1.0 / float(temperature))
+    return softened / softened.sum(dim=1, keepdim=True).clamp(min=1e-8)
 
 
 def soft_policy_cross_entropy(
@@ -318,28 +382,6 @@ def soft_policy_cross_entropy(
     if reduction == "mean":
         return loss.mean()
     return loss
-
-
-def mix_wdl_targets(
-    winner_wdl: torch.Tensor,
-    search_wdl: torch.Tensor,
-    *,
-    q_ratio: float | torch.Tensor,
-) -> torch.Tensor:
-    if isinstance(q_ratio, torch.Tensor):
-        ratio = q_ratio.to(device=winner_wdl.device, dtype=winner_wdl.dtype)
-        if ratio.ndim == 0:
-            ratio = ratio.reshape(1)
-        if ratio.ndim == 1:
-            ratio = ratio.unsqueeze(1)
-        return ratio * search_wdl + (1.0 - ratio) * winner_wdl
-
-    q_ratio = float(q_ratio)
-    if q_ratio <= 0.0:
-        return winner_wdl
-    if q_ratio >= 1.0:
-        return search_wdl
-    return q_ratio * search_wdl + (1.0 - q_ratio) * winner_wdl
 
 
 def wdl_probs_to_q(wdl_probs: torch.Tensor) -> torch.Tensor:

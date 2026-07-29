@@ -4,8 +4,8 @@ from nn.dataset_px0 import Px0ChunkDataset, Px0DatasetConfig
 from nn.fen_tensor import fen_to_planes
 from nn.model import (
     PolicyResNet,
-    mix_wdl_targets,
     moves_left_loss,
+    soften_policy_targets,
     soft_policy_cross_entropy,
     value_q_mse_from_wdl,
     value_wdl_cross_entropy,
@@ -18,8 +18,8 @@ __all__ = [
     "Px0ChunkDataset",
     "Px0DatasetConfig",
     "fen_to_planes",
-    "mix_wdl_targets",
     "moves_left_loss",
+    "soften_policy_targets",
     "soft_policy_cross_entropy",
     "value_q_mse_from_wdl",
     "value_wdl_cross_entropy",

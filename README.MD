@@ -1,7 +1,8 @@
 # 77xiangqi_engine
 
 一个新的中国象棋 Rust 引擎：规则层参考 px0，正式搜索只有 stream MCTS。模型输入输出固定为
-`124 × 10 × 9 → 2062 policy + WDL + moves-left`；搜索值使用 `win - loss`。
+`124 × 10 × 9 → 2062 policy + WDL + moves-left`；搜索值使用 `win - loss`。当前 NN
+训练基线为 b15c384bt192；训练期辅助头不进入 ONNX 正式契约。
 
 ## 快速运行
 

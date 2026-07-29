@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""将 checkpoint 导出为 ONNX（动态 batch）。"""
+"""将 checkpoint 导出为正式 ONNX：FP16 trunk，FP32 input/heads/outputs。"""
 
 from __future__ import annotations
 
@@ -20,14 +20,31 @@ TRUNK_KIND = "x7_v2_bottleneck_gbroadcast"
 
 
 class PolicyOnnxExport(nn.Module):
-    """导出 logits、WDL 概率和 moves-left，与引擎模型契约一致。"""
+    """Fixed `124x10x9 -> 2062 + WDL + moves-left` ONNX wrapper.
 
-    def __init__(self, inner: PolicyResNet) -> None:
+    Auxiliary policy/search-value heads are intentionally never called here,
+    therefore they are absent from the ONNX graph and have no inference cost.
+    """
+
+    def __init__(self, inner: PolicyResNet, *, mixed_fp16: bool = False) -> None:
         super().__init__()
         self.inner = inner
+        self.mixed_fp16 = mixed_fp16
+        if mixed_fp16:
+            for module in (
+                inner.stem,
+                inner.stage1,
+                inner.broadcast4,
+                inner.stage2,
+                inner.broadcast8,
+                inner.stage3,
+                inner.trunk_bn,
+            ):
+                module.half()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, value, moves_left = self.inner(x)
+        trunk = self.inner.forward_trunk(x.half() if self.mixed_fp16 else x)
+        logits, value, moves_left = self.inner.forward_formal_heads(trunk.float() if self.mixed_fp16 else trunk)
         return logits, torch.softmax(value, dim=1), moves_left
 
 
@@ -35,41 +52,33 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="checkpoint → ONNX")
     ap.add_argument("--checkpoint", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True, help="例如 data/x7.onnx")
+    ap.add_argument("--precision", choices=("fp32", "mixed-fp16"), default="mixed-fp16")
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     if str(ckpt.get("trunk_kind")) != TRUNK_KIND:
         raise SystemExit(f"checkpoint 不是当前 {TRUNK_KIND} 架构，不能导出")
-    in_planes = int(ckpt.get("in_planes", 124))
     width = int(ckpt["width"])
-    blocks = int(ckpt["blocks"])
-    bottleneck_channels = int(ckpt.get("bottleneck_channels", width * 7 // 16))
-    n_moves = int(ckpt["n_moves"])
-    sd = ckpt["model"]
-    value_head = bool(ckpt.get("value_head", False))
-    moves_left_head = bool(ckpt.get("moves_left_head", False))
-    if not value_head and "fc_value.weight" in sd:
-        value_head = True
-    if not value_head or not moves_left_head:
-        raise SystemExit("当前 ONNX 契约要求 checkpoint 同时包含 WDL 与 moves-left head")
     model = PolicyResNet(
-        in_planes=in_planes,
+        in_planes=int(ckpt.get("in_planes", 124)),
         width=width,
-        num_blocks=blocks,
-        num_moves=n_moves,
-        bottleneck_channels=bottleneck_channels,
-        value_head=value_head,
-        moves_left_head=moves_left_head,
+        num_blocks=int(ckpt["blocks"]),
+        num_moves=int(ckpt["n_moves"]),
+        bottleneck_channels=int(ckpt["bottleneck_channels"]),
+        value_head=bool(ckpt.get("value_head")),
+        moves_left_head=bool(ckpt.get("moves_left_head")),
+        auxiliary_heads=bool(ckpt.get("auxiliary_heads")),
         trunk_kind=TRUNK_KIND,
     )
-    model.load_state_dict(sd, strict=True)
+    if not model.value_head or not model.moves_left_head:
+        raise SystemExit("当前 ONNX 契约要求 checkpoint 同时包含 WDL 与 moves-left head")
+    model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
-    export_mod = PolicyOnnxExport(model)
+    export_mod = PolicyOnnxExport(model, mixed_fp16=args.precision == "mixed-fp16").eval()
 
-    dummy = torch.zeros(1, in_planes, 10, 9)
+    dummy = torch.zeros(1, model.in_planes, 10, 9)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     out_names = ["logits", "value", "moves_left"]
-    # dynamo=False：使用 TorchScript 导出路径，无需 onnxscript（PyTorch 2.x 默认 dynamo=True）
     torch.onnx.export(
         export_mod,
         dummy,
@@ -77,17 +86,12 @@ def main() -> None:
         input_names=["board"],
         output_names=out_names,
         opset_version=17,
-        dynamic_axes={
-            "board": {0: "batch"},
-            "logits": {0: "batch"},
-            "value": {0: "batch"},
-            "moves_left": {0: "batch"},
-        },
+        dynamic_axes={"board": {0: "batch"}, "logits": {0: "batch"}, "value": {0: "batch"}, "moves_left": {0: "batch"}},
         dynamo=False,
     )
     print(
-        f"exported -> {args.out} moves={n_moves} width={width} blocks={blocks} bt={bottleneck_channels} "
-        f"in_planes={in_planes} outputs={out_names}（value 已为 WDL 概率）"
+        f"exported -> {args.out} precision={args.precision} "
+        f"b{model.num_blocks}c{width}bt{model.bottleneck_channels} outputs={out_names}"
     )
 
 

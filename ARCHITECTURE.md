@@ -37,7 +37,10 @@ stream 的 selection 使用项目批准的 X7 参数与 px0 PUCT/N-Q-P 语义，
 
 ## 模型
 
-正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。x7 v2 基准为 `width=256`、`blocks=12`、`bottleneck_channels=112`，带两次 Global Broadcast；训练、续训和导出严格校验 checkpoint 元数据，避免模型尺寸漂移。
+正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。当前训练基准为
+`width=384`、`blocks=15`、`bottleneck_channels=192`，带两次 Global Broadcast。训练期另有
+Auxiliary Soft Policy 与 root-WDL 辅助头；二者不进入 ONNX。CUDA 训练和导出均为 FP16 trunk、
+FP32 heads/outputs；训练、续训和导出校验 checkpoint 的关键架构元数据，避免模型尺寸漂移。
 
 ## 纪律
 
