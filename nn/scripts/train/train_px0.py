@@ -305,7 +305,8 @@ def main() -> None:
     print(
         f"px0: train_files={len(train_ds.files)} val_files={len(val_ds.files)} "
         f"batch={args.batch_size} steps={args.steps} b{args.blocks}c{args.width}bt{args.bottleneck_channels} "
-        f"soft_policy=T{args.soft_policy_temperature}/w{args.soft_policy_weight}"
+        f"loss_weights=(final={args.final_value_loss_weight}, root={args.root_wdl_loss_weight}, "
+        f"moves={args.moves_left_loss_weight}, soft=T{args.soft_policy_temperature}/w{args.soft_policy_weight})"
     )
     train_iter = iter(train_loader)
     for step in range(start_step + 1, int(args.steps) + 1):
@@ -359,12 +360,17 @@ def main() -> None:
                 root_wdl_loss_weight=float(args.root_wdl_loss_weight),
                 amp_enabled=amp_enabled,
             )
+            print(f"step {step:,}/{int(args.steps):,} | lr={opt.param_groups[0]['lr']:.2e}")
             print(
-                f"step {step}/{args.steps} train={loss.item():.4f} policy={terms['policy'].item():.4f} "
-                f"final={terms['final_value_ce'].item():.4f} root={terms['root_value_ce'].item():.4f} "
-                f"soft={terms['soft_policy'].item():.4f} "
-                f"val_formal={val['formal']:.4f} val_total={val['total']:.4f} "
-                f"lr={opt.param_groups[0]['lr']:.2e} root_wdl={args.root_wdl_loss_weight:.3f}"
+                f"  train total={terms['total'].item():.4f} formal={terms['formal'].item():.4f} "
+                f"policy={terms['policy'].item():.4f} final_wdl={terms['final_value_ce'].item():.4f} "
+                f"root_wdl={terms['root_value_ce'].item():.4f} moves={terms['moves_left'].item():.4f} "
+                f"soft_policy={terms['soft_policy'].item():.4f}"
+            )
+            print(
+                f"  val   total={val['total']:.4f} formal={val['formal']:.4f} policy={val['policy']:.4f} "
+                f"final_wdl={val['final_value_ce']:.4f} root_wdl={val['root_value_ce']:.4f} "
+                f"moves={val['moves_left']:.4f} soft_policy={val['soft_policy']:.4f}"
             )
             payload = {
                 "model": model.state_dict(),
