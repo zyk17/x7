@@ -97,8 +97,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test
 
 ## 9. 当前引擎 UCI 冒烟
 
-当前引擎只提供正式 UCI stdin/stdout 入口；没有独立 ONNX evaluator、bench CLI 或 px0 trace
-对拍脚本。权重由 `WeightsFile` 在下一条 `position` 前加载。
+当前引擎提供正式 UCI stdin/stdout 入口；另有 `nn_eval`、`benchmark` 和 Pikafish 对照脚本用于本地诊断。权重由 `WeightsFile` 在下一条 `position` 前加载。
 
 ```powershell
 @'
@@ -130,13 +129,11 @@ quit
 cargo run --release -p engin
 ```
 
-当前已翻译的 UCI options 是：`WeightsFile`、`MultiPV`、`PerPVCounters`、
-`ScoreType`、`UCI_ShowWDL`、`UCI_ShowEPS`、`UCI_ShowMovesLeft`、`NNCacheSize`。其余搜索参数仍
-是 Rust 内部 `SearchParams`，在对应 px0 option 层完整翻译前不伪造公开 UCI 选项。
+当前 UCI options 是：`WeightsFile`、`VirtualLoss`、`UCI_ShowWDL`、`UCI_ShowEPS`。
+`VirtualLoss` 使用 `0.0..5.0` 的小数，默认 `3.0`；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留启动时快照。
 
-当前已实现的 `go` 预算只有 `nodes`、`movetime`、`infinite`。`depth`、`mate`、`ponder` 与
-`wtime/btime/winc/binc/movestogo` 会明确报错，直到 px0 对应 stopper、ponder 生命周期和
-`SimpleTimeManager` 被逐函数翻译；不要把它们与 `nodes` 混用。
+当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
+`movetime` 不可与时钟字段混用；`infinite` 不可与其他预算混用。`depth`、`mate`、`ponder` 仍会明确报错。
 
 连续命令生命周期冒烟。按 px0 语义，前一条无限搜索被静默回收，只有最后一条 `go` 返回
 `bestmove`：
@@ -160,7 +157,7 @@ quit
 ```powershell
 @'
 uci
-setoption name MultiPV value 2
+setoption name VirtualLoss value 3.0
 setoption name WeightsFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos
@@ -169,27 +166,34 @@ quit
 '@ | C:\projects\77xiangqi_engine\target\release\engin.exe
 ```
 
-## 10. Stream ONNX 生命周期诊断
+## 10. 搜索与 ONNX 诊断
 
-`stream` 仍未接入正式 UCI。下面的诊断二进制会以同一 ONNX/FEN 运行 classic、串行 stream 与常驻 worker；
-默认固定 playout 对比，额外 `--movetime-ms` 则只验证 stream worker 持续推进、deadline 收敛及 root 无 in-flight。
-
-```powershell
-cargo run --release -p engin --bin stream_compare -- `
-  --onnx data\x7.onnx `
-  --playouts 128
-```
+`stream` 已是正式 UCI 搜索。`benchmark` 从 fresh tree 运行，用于观察吞吐、NN batch 和 collision：
 
 ```powershell
-target\release\stream_compare.exe `
-  --onnx data\x7.onnx `
-  --playouts 64 `
-  --movetime-ms 30000
+cargo run --release -p engin --bin benchmark -- `
+  --movetime 3000 --repeat 3 `
+  --gathers 4 --evals 4 --backprops 1 --virtual-loss 3
 ```
 
-固定 playout 下 classic 允许在已提交 minibatch 的边界超过请求节点数；工具会按 classic 的实际 root completed N
-运行 stream。并发 stream 不要求和 serial/classic 得到逐边相同 `N/Q`，但必须完成既定预算或 deadline，且每条 edge
-都满足 `started == completed`。
+使用完整历史诊断评分拐点：
+
+```powershell
+cargo run --release -p engin --bin benchmark -- `
+  --moves "c3c4 g6g5 ..." --movetime 3000 --repeat 3 --root-top 12
+```
+
+`benchmark` 输出根候选的 `P / completed-N / in-flight / Q`；它不模拟实战 tree reuse。`nn_eval` 可单独检查 ONNX：
+
+```powershell
+cargo run --release -p engin --bin nn_eval -- --onnx data\x7.onnx --bench 20
+```
+
+以本地 Pikafish 对照候选排序：
+
+```powershell
+python scripts\pikafish_compare.py --moves "c3c4 g6g5 ..." --movetime 3000 --multipv 3
+```
 
 ## 11. 质量检查
 
@@ -230,10 +234,18 @@ DirectML provider DLL，并确认 bundle 内的 UCI 搜索没有回退 CPU：
 powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1
 ```
 
-默认读取 `data\x7.onnx`，输出到 `bundle\`。可指定其他模型或输出目录：
+默认读取 `data\x7.onnx`，输出到 `bundle-directml\`。可指定其他模型或输出目录：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1 `
   -ModelPath C:\models\x7.onnx `
   -BundleDir C:\dist\x7-directml
 ```
+
+CUDA 是 NVIDIA 专用备用包，需要 CUDA 13、cuDNN 9 和脚本中配置的 ONNX Runtime 目录：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-cuda.ps1
+```
+
+它输出到 `bundle-cuda\`；CUDA 与 DirectML 是两份互斥包，不构成运行时回退链。

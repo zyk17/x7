@@ -235,6 +235,8 @@ impl Drop for UciLoop<'_> {
 
 /// px0 `ParseCommand` (`uciloop.cc:81-135`)。
 pub fn parse_command(line: &str) -> Result<(String, HashMap<String, String>), EnginError> {
+    // PowerShell 管道会在第一行附带 UTF-8 BOM；把它视为传输层前缀而非 UCI token。
+    let line = line.trim_start_matches('\u{feff}');
     let mut params = HashMap::new();
     let mut value: Option<&mut String> = None;
 

@@ -15,7 +15,13 @@ position startpos
 go nodes 1000
 ```
 
-Windows 发行构建优先使用 DirectML；DirectML 初始化失败时会使用 CPU ONNX Runtime。
+本机开发默认构建 DirectML。CUDA 保留为 NVIDIA 专用备用构建：`scripts/build-cuda.ps1` 默认从
+`C:\projects\onnxruntime-cuda13\windows\runtimes\win-x64\native` 读取官方 ONNX Runtime 1.28 的 CUDA
+DLL，复制到 `target/debug`、`target/release` 与 CUDA bundle；要换目录直接修改脚本中的路径。
+本机仍需提供 CUDA 13 / cuDNN 9。
+发行时显式选择两种互斥包：`build-directml.ps1` 构建通用 DirectML 包，`build-cuda.ps1` 构建 NVIDIA
+CUDA 包。两者不是同一二进制的运行时回退链；CUDA 使用 ORT 的 `prefer_nhwc=1`，但当前端到端
+吞吐仍不及 DirectML。
 
 ## UCI 范围
 
@@ -88,4 +94,5 @@ cargo fmt --check
 cargo test -p engin --lib
 cargo clippy -p engin --all-targets -- -D warnings
 powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build-cuda.ps1
 ```

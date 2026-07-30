@@ -12,7 +12,7 @@ if ($env:OS -ne "Windows_NT") {
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $ModelPath = if ($ModelPath) { $ModelPath } else { Join-Path $repoRoot "data\x7.onnx" }
-$BundleDir = if ($BundleDir) { $BundleDir } else { Join-Path $repoRoot "bundle" }
+$BundleDir = if ($BundleDir) { $BundleDir } else { Join-Path $repoRoot "bundle-directml" }
 $model = (Resolve-Path -LiteralPath $ModelPath).Path
 $bundle = [System.IO.Path]::GetFullPath($BundleDir)
 
@@ -39,7 +39,10 @@ try {
     }
 
     cargo clean
-    cargo build --release -p engin
+    cargo build --release -p engin --no-default-features --features directml
+    if ($LASTEXITCODE -ne 0) {
+        throw "DirectML engine build failed."
+    }
 
     $releaseDir = Join-Path $repoRoot "target\release"
     New-Item -ItemType Directory -Path $bundle -Force | Out-Null
