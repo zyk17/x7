@@ -130,20 +130,22 @@ def compute_loss_terms(
     legal_mask = raw_policy >= 0
     target_policy = raw_policy.clamp_min(0.0)
     policy = soft_policy_cross_entropy(policy_logits, target_policy, legal_mask)
-    soft_policy = soft_policy_cross_entropy(
-        soft_logits,
-        soften_policy_targets(target_policy, legal_mask, temperature=soft_policy_temperature),
-        legal_mask,
-    )
+    soft_target = soften_policy_targets(target_policy, legal_mask, temperature=soft_policy_temperature)
+    soft_policy_ce = soft_policy_cross_entropy(soft_logits, soft_target, legal_mask)
+    soft_target_entropy = -torch.where(
+        soft_target > 0,
+        soft_target * soft_target.log(),
+        torch.zeros_like(soft_target),
+    ).sum(dim=1).mean()
     final_ce = value_wdl_cross_entropy(final_value, winner_wdl)
     root_ce = value_wdl_cross_entropy(root_value, root_wdl)
     moves = moves_left_loss(pred_moves_left, plies_left)
     model_loss = policy + final_value_loss_weight * final_ce + moves_left_loss_weight * moves
     return {
-        "total": model_loss + soft_policy_weight * soft_policy + root_wdl_loss_weight * root_ce,
+        "total": model_loss + soft_policy_weight * soft_policy_ce + root_wdl_loss_weight * root_ce,
         "formal": model_loss,
         "policy": policy,
-        "soft_policy": soft_policy,
+        "soft_policy_kl": (soft_policy_ce - soft_target_entropy).clamp_min(0.0),
         "final_value_ce": final_ce,
         "final_value_q_mse": value_q_mse_from_wdl(final_value, winner_wdl[:, 0] - winner_wdl[:, 2]),
         "root_value_ce": root_ce,
@@ -188,7 +190,7 @@ def run_val(
             "total",
             "formal",
             "policy",
-            "soft_policy",
+            "soft_policy_kl",
             "final_value_ce",
             "final_value_q_mse",
             "root_value_ce",
@@ -365,12 +367,12 @@ def main() -> None:
                 f"  train total={terms['total'].item():.4f} formal={terms['formal'].item():.4f} "
                 f"policy={terms['policy'].item():.4f} final_wdl={terms['final_value_ce'].item():.4f} "
                 f"root_wdl={terms['root_value_ce'].item():.4f} moves={terms['moves_left'].item():.4f} "
-                f"soft_policy={terms['soft_policy'].item():.4f}"
+                f"soft_kl={terms['soft_policy_kl'].item():.4f}"
             )
             print(
                 f"  val   total={val['total']:.4f} formal={val['formal']:.4f} policy={val['policy']:.4f} "
                 f"final_wdl={val['final_value_ce']:.4f} root_wdl={val['root_value_ce']:.4f} "
-                f"moves={val['moves_left']:.4f} soft_policy={val['soft_policy']:.4f}"
+                f"moves={val['moves_left']:.4f} soft_kl={val['soft_policy_kl']:.4f}"
             )
             payload = {
                 "model": model.state_dict(),

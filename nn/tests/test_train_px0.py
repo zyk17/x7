@@ -13,6 +13,7 @@ from train_px0 import (
     OPTIMIZER_KIND,
     build_optimizer,
     build_dataset_configs,
+    compute_loss_terms,
     resolve_device,
     validate_args,
     validate_existing_output_checkpoint,
@@ -93,6 +94,33 @@ def test_cosine_learning_rate_has_warmup_and_floor() -> None:
     assert learning_rate_at_step(250, total_steps=1_000, lr=1e-3, warmup_steps=250, min_lr_scale=0.1) == 1e-3
     assert learning_rate_at_step(1_000, total_steps=1_000, lr=1e-3, warmup_steps=250, min_lr_scale=0.1) == 1e-4
     assert learning_rate_at_step(2_000, total_steps=1_000, lr=1e-3, warmup_steps=250, min_lr_scale=0.1) == 1e-4
+
+
+def test_soft_policy_kl_is_zero_for_its_own_target() -> None:
+    import torch
+
+    raw_policy = torch.tensor([[-1.0, 0.2, 0.8]], dtype=torch.float32)
+    soft_target = raw_policy.clamp_min(0.0).pow(0.25)
+    soft_target /= soft_target.sum(dim=1, keepdim=True)
+    terms = compute_loss_terms(
+        (
+            torch.zeros_like(raw_policy),
+            torch.zeros((1, 3)),
+            torch.zeros((1, 1)),
+            soft_target.log(),
+            torch.zeros((1, 3)),
+        ),
+        raw_policy=raw_policy,
+        winner_wdl=torch.tensor([[0.0, 1.0, 0.0]]),
+        root_wdl=torch.tensor([[0.0, 1.0, 0.0]]),
+        plies_left=torch.zeros((1, 1)),
+        final_value_loss_weight=0.6,
+        moves_left_loss_weight=0.5,
+        soft_policy_weight=8.0,
+        soft_policy_temperature=4.0,
+        root_wdl_loss_weight=0.6,
+    )
+    assert terms["soft_policy_kl"].item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_validate_args_rejects_invalid_adamw_schedule() -> None:

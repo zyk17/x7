@@ -63,7 +63,8 @@ python scripts/train/train_px0.py --config configs/x7_v3_01.yaml
 - `training.shuffle_size`：训练 record 的有界 replacement shuffle 总大小，按 DataLoader worker 均分。
   这对应 pxzero 的 shuffle buffer，避免顺序读取同一对局的相邻局面；默认 `4096`，约占 200 MB 主存。
 - `training.final_value_loss_weight + root_wdl_loss_weight + moves_left_loss_weight`：三项都服务 value 表示。前两项分别监督最终 WDL 与 PX0 当前 root WDL；moves-left 是间接辅助。当前小网络对照的暂定基线为 `0.6 / 0.6 / 0.5`，它们不是可按 loss 数值直接比较的比例。root WDL 不是 KataGo 的未来时间平均 target。
-- `training.soft_policy_weight + soft_policy_temperature`：训练期 Soft Policy 辅助头，默认 `8.0` / `4.0`。
+- `training.soft_policy_weight + soft_policy_temperature`：训练期 Soft Policy 辅助头，默认 `8.0` / `4.0`。日志中的
+  `soft_kl` 是该 soft target 相对预测分布的 KL（最优为 `0`）；训练 total 仍使用交叉熵，因而不受日志表示变化影响。
 - `training.lr + warmup_steps + min_lr_scale`：线性 warmup 后 cosine decay。首次训练会把 cosine horizon 写入 checkpoint；后续仅延长 `steps` 时保持该 horizon，并在 floor LR 继续。优化器固定为 AdamW；Conv/Linear 权重做 decoupled decay，BatchNorm 与 bias 不 decay。
 
 ## 当前验证与下一步
