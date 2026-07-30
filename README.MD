@@ -26,7 +26,8 @@ Windows 发行构建优先使用 DirectML；DirectML 初始化失败时会使用
 - `stop`、`ucinewgame`、`quit`
 - `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`VirtualLoss`
 
-`VirtualLoss` 的范围是 `0..100`，对应搜索参数 `V=0.00..1.00`，默认 `100`。它是引擎
+`VirtualLoss` 直接使用搜索参数 `V`，范围 `0.0..5.0`，默认 `3.0`，例如
+`setoption name VirtualLoss value 2.5`。它是引擎
 生命周期配置：一次 `setoption` 会影响之后启动的每次 `go`；正在运行的搜索保持启动时的参数快照。
 
 时钟使用固定中性的 px0 分配，固定 `MoveOverhead=200ms`，不额外暴露 UCI 调参项。`go movetime`
@@ -41,6 +42,31 @@ Windows 发行构建优先使用 DirectML；DirectML 初始化失败时会使用
 ```powershell
 cargo run -p engin --release --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1 --virtual-loss 1
 ```
+
+要诊断实战中的评分突变，优先保留完整历史而不是只复制最终 FEN：
+
+```powershell
+cargo run -p engin --release --bin benchmark -- --moves "c3c4 g6g5 ..." --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1 --virtual-loss 1 --root-top 12
+```
+
+`--moves` 从 startpos（或指定的 `--fen`）依次应用 ICCS 着法；它保留重复与规则历史，
+但每次 benchmark 仍从 fresh tree 开始，不模拟前几回合的 tree reuse。
+
+诊断评分拐点时，可用本地 Pikafish 作为外部对照。`scripts/pikafish_compare.py` 只走标准
+UCI 生命周期并打印最终 MultiPV；默认使用本机的 Pikafish 路径，也可用 `--engine` 覆盖：
+
+```powershell
+python scripts/pikafish_compare.py --moves "c3c4 g6g5 ..." --movetime 3000 --multipv 3
+```
+
+要比较指定根着的独立价值，可重复传入 `--searchmove`：
+
+```powershell
+python scripts/pikafish_compare.py --moves "c3c4 g6g5 ..." --searchmove c3c4 --movetime 3000
+```
+
+Pikafish 的 `score cp` 是对照分数；stream 的 `Q` 是未校准的网络搜索值，二者只比较候选
+排序和趋势，不能直接作数值换算。
 
 吞吐、EPS 和 collision 只能说明流水线利用率；棋力需要用固定局面或对局测试另行验证。
 

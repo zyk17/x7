@@ -9,7 +9,7 @@ pub struct Options {
     pub weights_file: String,
     pub show_wdl: bool,
     pub show_eps: bool,
-    /// UCI `VirtualLoss` 使用百分单位：`100` 表示搜索值 `1.0`。
+    /// UCI `VirtualLoss` 直接使用搜索参数 V，例如 `3.0`。
     pub virtual_loss: f32,
 }
 
@@ -19,7 +19,7 @@ impl Default for Options {
             weights_file: String::new(),
             show_wdl: false,
             show_eps: false,
-            virtual_loss: 1.0,
+            virtual_loss: 3.0,
         }
     }
 }
@@ -30,10 +30,7 @@ impl Options {
             format!("option name UCI_ShowWDL type check default {}", self.show_wdl),
             format!("option name UCI_ShowEPS type check default {}", self.show_eps),
             format!("option name WeightsFile type string default {}", self.weights_file),
-            format!(
-                "option name VirtualLoss type spin default {} min 0 max 100",
-                (self.virtual_loss * 100.0) as u32
-            ),
+            format!("option name VirtualLoss type string default {:.1}", self.virtual_loss),
         ]
     }
 
@@ -51,12 +48,12 @@ impl Options {
             "WeightsFile" => self.weights_file = value.to_owned(),
             "VirtualLoss" => {
                 let value = value
-                    .parse::<u32>()
-                    .map_err(|_| crate::EnginError::Uci("VirtualLoss must be an integer within [0, 100]".into()))?;
-                if value > 100 {
-                    return Err(crate::EnginError::Uci("VirtualLoss must be within [0, 100]".into()));
+                    .parse::<f32>()
+                    .map_err(|_| crate::EnginError::Uci("VirtualLoss must be a decimal within [0, 5]".into()))?;
+                if !value.is_finite() || !(0.0..=5.0).contains(&value) {
+                    return Err(crate::EnginError::Uci("VirtualLoss must be within [0, 5]".into()));
                 }
-                self.virtual_loss = value as f32 / 100.0;
+                self.virtual_loss = value;
             }
             _ => return Err(crate::EnginError::Uci(format!("Unknown option: {name}"))),
         }

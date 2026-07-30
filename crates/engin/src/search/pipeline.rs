@@ -144,7 +144,7 @@ pub struct SearchConfig {
     /// 启用仅 benchmark 使用的时间/分布计数。
     /// 参考：LC3 Overview 的 "Stats Collection"。
     pub benchmark_telemetry: bool,
-    /// edge-local virtual loss。UCI 以百分单位 `VirtualLoss` 暴露它。
+    /// edge-local virtual loss。UCI 直接以小数 `VirtualLoss` 暴露它。
     /// 参考：KataGo `cpp/search/search.cpp` 的 virtual-loss selection。
     pub virtual_loss: f32,
 }
@@ -160,7 +160,7 @@ impl Default for SearchConfig {
             backprop_workers: 1,
             root_move_filter: Vec::new(),
             benchmark_telemetry: false,
-            virtual_loss: 1.0,
+            virtual_loss: 3.0,
         }
     }
 }
@@ -174,9 +174,10 @@ impl SearchConfig {
             self.backprop_workers > 0,
             "stream requires at least one backprop worker"
         );
+        // UCI 与 benchmark 都允许同一实验范围；默认值由 `Options` 和此处固定为 V=3。
         assert!(
-            self.virtual_loss.is_finite() && (0.0..=1.0).contains(&self.virtual_loss),
-            "virtual loss must be finite and within [0, 1]"
+            self.virtual_loss.is_finite() && (0.0..=5.0).contains(&self.virtual_loss),
+            "virtual loss must be finite and within [0, 5]"
         );
     }
 

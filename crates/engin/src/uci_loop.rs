@@ -604,13 +604,13 @@ mod tests {
     }
 
     #[test]
-    fn virtual_loss_option_uses_centi_units() {
+    fn virtual_loss_option_uses_decimal_units() {
         let mut options = Options::default();
         options
-            .set_uci_option("VirtualLoss", "75")
+            .set_uci_option("VirtualLoss", "2.5")
             .expect("virtual-loss option");
-        assert_eq!(options.virtual_loss, 0.75);
-        assert!(options.set_uci_option("VirtualLoss", "101").is_err());
+        assert_eq!(options.virtual_loss, 2.5);
+        assert!(options.set_uci_option("VirtualLoss", "5.1").is_err());
     }
 
     #[test]
