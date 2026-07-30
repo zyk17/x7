@@ -28,6 +28,8 @@
 - 不预设人类数据混入
 - 正式 value head 只学习最终 WDL；独立 root-WDL 辅助 head 学当前 root search target，不再 qMix
 - Auxiliary Soft Policy 使用 `T=4`，两个辅助 head 均不导出 ONNX
+- 当前不做棋盘镜像增强：KataGo 的 8 种方形棋盘对称不能直接用于 `10x9` 象棋。若以后加入水平镜像，必须同时严格变换
+  `124` 个输入平面和 `2062` 个 policy target，不能只改 FEN 或 UCI 字符串。
 - x7 v2 trunk 为 PreAct bottleneck + 两次 mean/max Global Broadcast；当前基准是
   `stem 124->384 + 15x(384->192->192->384)`
 - CUDA 训练为 FP16 trunk autocast、FP32 heads/loss；ONNX 默认是 FP16 trunk、FP32 input/heads/outputs
