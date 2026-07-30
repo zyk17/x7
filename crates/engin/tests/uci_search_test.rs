@@ -68,6 +68,21 @@ fn searchmoves_restricts_the_selected_move() {
 }
 
 #[test]
+fn clock_go_uses_the_side_to_move_budget() {
+    ensure_init();
+    let mut engine = Engine::uniform();
+    let mut responder = VecUciResponder::default();
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
+    uci.process_line("position startpos", "test").expect("position");
+    uci.process_line("go wtime 1000 btime 1000 winc 0 binc 0 movestogo 20", "test")
+        .expect("clock go");
+    uci.process_line("wait", "test").expect("wait");
+    drop(uci);
+
+    assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
+}
+
+#[test]
 fn proven_terminal_child_reports_uci_mate() {
     ensure_init();
     let mut engine = Engine::uniform();
@@ -125,7 +140,13 @@ fn unsupported_go_limits_are_rejected_without_stopping_the_current_search() {
     uci.process_line("position startpos", "test").expect("position");
     uci.process_line("go infinite", "test").expect("infinite go");
 
-    for command in ["go depth 1", "go mate 1", "go wtime 1000", "go nodes 0"] {
+    for command in [
+        "go depth 1",
+        "go mate 1",
+        "go btime 1000",
+        "go movetime 1000 wtime 1000 btime 1000",
+        "go nodes 0",
+    ] {
         assert!(uci.process_line(command, "test").is_err(), "{command}");
     }
 

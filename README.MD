@@ -22,14 +22,16 @@ Windows 发行构建优先使用 DirectML；DirectML 初始化失败时会使用
 目前支持：
 
 - `position startpos|fen ... [moves ...]`
-- `go nodes`、`go movetime`、`go infinite`、`go searchmoves`
+- `go nodes`、`go movetime`、`go wtime/btime/winc/binc/movestogo`、`go infinite`、`go searchmoves`
 - `stop`、`ucinewgame`、`quit`
 - `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`VirtualLoss`
 
 `VirtualLoss` 的范围是 `0..100`，对应搜索参数 `V=0.00..1.00`，默认 `100`。它是引擎
 生命周期配置：一次 `setoption` 会影响之后启动的每次 `go`；正在运行的搜索保持启动时的参数快照。
 
-`go depth`、`go mate`、时钟字段、`go ponder` 与 `ponderhit` 尚无完整语义，会明确拒绝。
+时钟使用固定中性的 px0 分配，固定 `MoveOverhead=200ms`，不额外暴露 UCI 调参项。`go movetime`
+不可与时钟字段混用；`go depth`、`go mate`、`go ponder` 与 `ponderhit`
+尚无完整语义，会明确拒绝。
 
 ## 基准测试
 
@@ -47,7 +49,7 @@ cargo run -p engin --release --bin benchmark -- --fen "<FEN>" --movetime 3000 --
 | 目录 | 职责 |
 | --- | --- |
 | `crates/xiangqi_core` | 唯一的规则真相：棋盘、合法着、FEN、历史与裁判。 |
-| `crates/engin` | UCI、ONNX 外围、stream 搜索、watchdog 与 stopper。 |
+| `crates/engin` | UCI、ONNX 外围、stream 搜索、watchdog 与时钟管理。 |
 | `nn` | 训练、权重处理与 ONNX 导出；不进入搜索热路径。 |
 
 架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。当前工作与待办只记录在本地的

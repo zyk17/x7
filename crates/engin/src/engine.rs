@@ -162,6 +162,7 @@ impl Engine {
     pub(crate) fn new_game(&mut self) -> Result<(), EnginError> {
         if let Some(search) = self.search.as_mut() {
             search.abort()?;
+            search.reset_clock();
         }
         self.set_position(STARTPOS_FEN, &[])
     }

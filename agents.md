@@ -15,7 +15,7 @@
 ## 模块边界
 
 - `crates/xiangqi_core`：唯一规则真相，翻译 px0 `src/chess`。
-- `crates/engin`：UCI、网络外围、stream 搜索与独立 stoppers。
+- `crates/engin`：UCI、网络外围、stream 搜索与固定中性时钟管理。
 - `crates/engin/src/search`：独立的 LC3-style streaming MCTS；事件必须 owned 并携带完整 root history 与 variation。首版只做 tree，不做 DAG/TT。
 - `nn/`：独立训练与 ONNX 导出，不进入规则或搜索热路径。
 

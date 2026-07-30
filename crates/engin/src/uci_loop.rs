@@ -400,6 +400,9 @@ impl StringUciResponder for StdoutUciResponder {
         for response in responses {
             let _ = writeln!(lock, "{response}");
         }
+        // UCI GUI 通常经 pipe 读取 stdout；换行不会像终端一样自动刷新。必须在本次
+        // responder 调用结束前送出 `bestmove`，否则搜索已结束却会被外层误认为超时。
+        let _ = lock.flush();
     }
 
     fn set_options(&mut self, options: Options) {

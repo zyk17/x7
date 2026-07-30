@@ -30,11 +30,12 @@ struct Args {
     eval_batch: Option<usize>,
     cache: bool,
     virtual_loss: f32,
+    root_top: usize,
 }
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\"] [--playouts 20000 | --movetime 3000] \
-     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache] [--virtual-loss 0.5]"
+     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache] [--virtual-loss 0.5] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -49,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
     let mut eval_batch = None;
     let mut cache = false;
     let mut virtual_loss: f32 = 0.0;
+    let mut root_top = 8;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -104,6 +106,13 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--virtual-loss must be a number in [0, 1]")?;
             }
+            "--root-top" => {
+                root_top = args
+                    .next()
+                    .ok_or("--root-top requires an integer")?
+                    .parse()
+                    .map_err(|_| "--root-top must be an unsigned integer")?;
+            }
             "--help" | "-h" => return Err(usage().into()),
             _ => return Err(format!("unknown argument: {argument}\n{}", usage())),
         }
@@ -129,6 +138,9 @@ fn parse_args() -> Result<Args, String> {
     if eval_batch == Some(0) {
         return Err("--eval-batch must be > 0".into());
     }
+    if root_top == 0 {
+        return Err("--root-top must be > 0".into());
+    }
     if !virtual_loss.is_finite() || !(0.0..=1.0).contains(&virtual_loss) {
         return Err("--virtual-loss must be within [0, 1]".into());
     }
@@ -144,6 +156,7 @@ fn parse_args() -> Result<Args, String> {
         eval_batch,
         cache,
         virtual_loss,
+        root_top,
     })
 }
 
@@ -173,6 +186,39 @@ fn collision_depths(stats: &Stats) -> String {
         "-".into()
     } else {
         buckets.join(",")
+    }
+}
+
+/// 打印 root 候选，诊断关键应手是否因低 P、低 completed N 或错误 Q 被忽略。
+/// `RootEdgeStats` 的 Q 是走该 root 着一方视角；started - completed 是 edge-local
+/// reservation/in-flight。两者来自 stream 的只读 root snapshot，不影响正式 UCI。
+fn print_root_candidates(search: &Search, root_is_black: bool, top: usize) {
+    let Some(root) = root_stats(search.repository(), search.root_key()) else {
+        return;
+    };
+    let mut edges = root.edges;
+    edges.sort_unstable_by(|left, right| {
+        right
+            .completed_visits
+            .cmp(&left.completed_visits)
+            .then_with(|| right.started_visits.cmp(&left.started_visits))
+            .then_with(|| right.prior.total_cmp(&left.prior))
+    });
+    let shown = edges.len().min(top);
+    println!(
+        "    root candidates top {shown}/{}: move       P    done flight       Q",
+        edges.len()
+    );
+    for edge in edges.into_iter().take(top) {
+        let mv = if root_is_black { edge.mv.flip() } else { edge.mv };
+        println!(
+            "                       {:<6} {:>7.4} {:>7} {:>6} {:>7.4}",
+            mv.to_uci(),
+            edge.prior,
+            edge.completed_visits,
+            edge.started_visits.saturating_sub(edge.completed_visits),
+            edge.q,
+        );
     }
 }
 
@@ -230,6 +276,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = GameState::from_fen_moves(&args.fen, &[] as &[&str])?;
     let history = Arc::new(PositionHistory::from_positions(state.positions()));
+    let root_is_black = history.is_black_to_move();
     let mut generation = 0u64;
 
     for &gather_workers in &args.gathers {
@@ -303,6 +350,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         stats.submitted_playouts,
                         collision_depths(&stats),
                     );
+                    print_root_candidates(&search, root_is_black, args.root_top);
                     search.stop_and_finish();
                 }
             }

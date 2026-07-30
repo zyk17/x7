@@ -162,11 +162,12 @@ impl SearchState {
         self.virtual_loss = virtual_loss;
     }
 
-    /// Applies a complete UCI position history after any active search has
-    /// stopped. Retained prefixes reuse the tree; unrelated lines rebuild it.
+    /// 在 session stop/drain 后写入完整 UCI history。保留前缀复用 tree；无关线路
+    /// 重建 repository。参考 px0 `NodeTree::ResetToPosition`
+    /// （`src/search/classic/node.cc:484-520`）。
     pub fn set_position(&mut self, history: Arc<PositionHistory>) -> Result<GcStats, EnginError> {
         match self.tree.as_mut() {
-            Some(tree) => tree.reset_to_history(history),
+            Some(tree) => tree.reset_to_history_after_drain(history),
             None => {
                 self.tree = Some(Tree::new(history));
                 Ok(GcStats::default())

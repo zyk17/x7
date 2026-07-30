@@ -13,8 +13,8 @@
 | 模块 | 职责 | 当前状态 |
 | --- | --- | --- |
 | `crates/xiangqi_core` | 唯一规则真相：棋盘、合法着、FEN、Position、history、RuleJudge | 已完成 |
-| `crates/engin/src/search` | 唯一的 LC3-style tree MCTS 与正式 UCI 主线 | 已接入 UCI，持续验证 |
-| `crates/engin/src/search/stoppers` | 独立 stopper 与正式时钟管理基础 | 保留，尚未接入 stream |
+| `crates/engin/src/search` | 唯一的 LC3-style tree MCTS 与正式 UCI 主线；`tree.rs` 直接包含 node、edge、repository 与 tree reuse | 已接入 UCI，持续验证 |
+| `crates/engin/src/search/time.rs` | 单一 stream 的固定中性时钟分配 | 已接入 UCI |
 | `crates/engin/src/neural` | 124-plane 编码、policy 映射、ONNX、缓存 | stream 使用的 backend 契约 |
 | `nn/` | px0 record、训练、checkpoint、ONNX 导出 | 独立 Python 子项目 |
 
@@ -22,14 +22,16 @@
 
 仓库只维护 stream 搜索。`Engine` 直接拥有其搜索会话，不保留 `SearchBase`、`SearchFactory` 或 classic 对照实现。`UniformBackend` 仅用于 stream 测试；正式 UCI 必须加载 ONNX。
 
-`search/stoppers` 保持独立于 tree/worker，供后续正式时钟管理接入；它不是第二套搜索实现。
+`search/time.rs` 独立于 tree/worker：只在 session 启动时计算 deadline、在 drain 后归还未用时间；
+它不是第二套搜索实现，也不提供策略化调参。
 
 ## Stream
 
-- repository 使用分片 map 和 `parent-key + move` 的 tree key；首版不做 DAG/TT。
+- repository 是一个 64 分片的 key-value map，使用 `parent-key + move` 的 tree key；首版不做 DAG/TT。跨回合只保留已走主线及其子树，GC 先收集不可达 sibling subtree 的 key，再按分片批量删除；不为每个 root 创建独立 map。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
 - Engine session 常驻 Gather×4、Eval×4、NN×1、Backprop×1；每次 `go` 只下发独占 job（新的 queues、generation、root/tree view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
-- `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现。
+- `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
+  session 启动时按固定中性的 px0 预算转换为不可变 deadline，job drain 后才归还剩余时间。
 - tree reuse 会保留已走主线及旧根，并遍历 repository 删除不可达兄弟子树；UCI/Watchdog 已输出最小 info 与一次 bestmove。
 - 当前没有 MultiPV 或 multivisit；NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
@@ -47,4 +49,4 @@ FP32 heads/outputs；训练、续训和导出校验 checkpoint 的关键架构�
 - px0 路径的新 Rust 函数必须记录连续 px0 参考区间；stream 新函数记录 LC3 URL 与对应标题。
 - 找不到参考语义时记录缺口，不自行添加搜索启发式。
 - `position ... moves ...` 必须保留完整历史。
-- stream UCI 持续验证 `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏且恰好一次 `bestmove`；时钟分配与未实现 stopper 必须保持明确边界。
+- stream UCI 持续验证 `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏且恰好一次 `bestmove`；真实 ONNX 回归仅在本地 `data/x7.onnx` 存在时运行。

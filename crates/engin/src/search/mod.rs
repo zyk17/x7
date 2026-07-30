@@ -10,25 +10,20 @@
 
 use xiangqi_core::GameResult;
 
-pub mod stoppers;
-
 mod event;
 mod extension;
-mod params;
 mod pipeline;
 mod policy;
-mod repository;
 mod session;
 mod state;
 mod stats;
+mod time;
 mod tree;
 
 pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
-pub use params::SearchParams;
 pub(crate) use pipeline::WorkerPool;
 pub use pipeline::{QueueStats, Search, SearchConfig, SearchControl, SearchLimits, Stats};
-pub use policy::{select_edge, select_edge_from_node, ValueDelta};
-pub use repository::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository};
+pub use policy::{select_edge, select_edge_from_node, SearchParams, ValueDelta};
 pub(crate) use session::SearchSession;
 pub use state::SearchResult;
 pub(crate) use state::{SearchState, WatchdogSnapshot};
@@ -37,7 +32,7 @@ pub use stats::{
     best_move, best_move_filtered, principal_variation, principal_variation_filtered, root_stats, RootEdgeStats,
     RootStats,
 };
-pub use tree::{GcStats, Tree};
+pub use tree::{Edge, EdgeReservation, ExpansionState, GcStats, Node, NodeKey, NodeRepository, Tree};
 
 /// px0 `FetchSingleNodeResult`：`eval->q = -eval->q`（`search.cc:2129`）。NN WDL
 /// 按 side-to-move 表示；node 统计按 incoming-edge / 走子方视角表示，对齐 px0 `Node::wl_`。
