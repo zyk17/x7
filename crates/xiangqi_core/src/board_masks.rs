@@ -74,7 +74,6 @@ pub fn distance(a: Square, b: Square) -> i32 {
     }
 }
 
-/// px0 `board.cc:382-386`。
 pub fn safe_destination(s: Square, step: Direction) -> BitBoard {
     let to = s.offset_by(step);
     if to.is_valid() && distance(s, to) <= 2 {

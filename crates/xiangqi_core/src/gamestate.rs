@@ -14,7 +14,6 @@ impl GameState {
         Self { startpos, moves }
     }
 
-    /// px0 `MakeGameState` (`engine.cc:65-78`)。
     pub fn from_fen_moves(fen: &str, move_strs: &[impl AsRef<str>]) -> Result<Self, CoreError> {
         let startpos = Position::from_fen(fen)?;
         let mut board = startpos.board().clone();
@@ -28,14 +27,12 @@ impl GameState {
         Ok(Self { startpos, moves })
     }
 
-    /// px0 `GameState::CurrentPosition` (`gamestate.cc:35-39`)。
     pub fn current_position(&self) -> Position {
         self.moves
             .iter()
             .fold(self.startpos.clone(), |pos, &mv| Position::after(&pos, mv))
     }
 
-    /// px0 `GameState::GetPositions` (`gamestate.cc:41-55`)。
     pub fn positions(&self) -> Vec<Position> {
         let mut positions = Vec::with_capacity(self.moves.len() + 1);
         positions.push(self.startpos.clone());

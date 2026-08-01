@@ -346,7 +346,6 @@ pub fn initialize_magic_bitboards() {
 
 /// px0 `board.cc:563-615`。
 pub fn get_attacks(pt: PieceType, square: Square, pieces: BitBoard) -> BitBoard {
-    let _ = tables();
     let s = square.index() as usize;
     let t = tables();
     match pt {

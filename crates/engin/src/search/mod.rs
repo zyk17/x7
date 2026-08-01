@@ -40,10 +40,13 @@ pub(crate) fn network_wl_to_node(stm_wl: f32) -> f32 {
     -stm_wl
 }
 
-/// 将绝对 game result 转换为终局叶子的走子方视角 `(wl, d)`。
+/// 将**绝对** game result（`compute_game_result`）转为终局叶子 incoming-edge `(wl, d)`。
 ///
-/// 等价于先转为 STM，再应用与 NN fetch 相同的取反；这对齐 px0 为被将死叶子写入
-/// `WHITE_WON`（+1）的方式（`search.cc:1913-1919`、`node.cc:300-317`）。
+/// 先换成 STM 视角，再取反，对齐 NN fetch 与将死快径 `WHITE_WON`→`+1`
+///（`search.cc:1913-1919`、`node.cc:300-317`）。
+///
+/// 注意：`rule_judge()` 的返回值**不是**绝对胜负，不能走这里；应使用
+/// [`rule_judge_wl_for_node`]。
 pub(crate) fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (f32, f32) {
     let (stm_wl, draw) = match result {
         GameResult::WhiteWon => (if black_to_move { -1.0 } else { 1.0 }, 0.0),
@@ -52,4 +55,18 @@ pub(crate) fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (
         GameResult::Undecided => unreachable!("terminal search evaluation requires a result"),
     };
     (-stm_wl, draw)
+}
+
+/// px0 `Node::MakeTerminal(RuleJudge())`：`WHITE_WON`→`+1`，`BLACK_WON`→`-1`。
+///
+/// `rule_judge` 的胜负枚举已是 node / incoming-edge 视角（与 `checkThem`/`checkUs`
+/// 绑定），**不要**再按 `is_black_to_move` 当绝对颜色转换，否则白方行棋时的长将/长捉
+/// 符号会反转。
+pub(crate) fn rule_judge_wl_for_node(result: GameResult) -> (f32, f32) {
+    match result {
+        GameResult::WhiteWon => (1.0, 0.0),
+        GameResult::BlackWon => (-1.0, 0.0),
+        GameResult::Draw => (0.0, 1.0),
+        GameResult::Undecided => unreachable!("rule-judge terminal requires a decided result"),
+    }
 }

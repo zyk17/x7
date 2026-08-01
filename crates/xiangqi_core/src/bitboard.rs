@@ -17,14 +17,6 @@ pub fn mirror_board(bits: u128) -> u128 {
     v | fixed
 }
 
-fn lowest_bit(value: u128) -> u32 {
-    if value as u64 != 0 {
-        (value as u64).trailing_zeros()
-    } else {
-        (value >> 64).trailing_zeros() + 64
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct BitBoard(u128);
 
@@ -32,7 +24,7 @@ impl BitBoard {
     pub const EMPTY: Self = Self(0);
 
     pub const fn from_square(square: Square) -> Self {
-        if square.index() < 90 {
+        if square.is_valid() {
             Self(1u128 << square.index())
         } else {
             Self::EMPTY
@@ -55,36 +47,24 @@ impl BitBoard {
         self.0.count_ones()
     }
 
-    /// px0 `bitboard.h:76-88`（NO_POPCNT 稀疏路径）。
-    pub fn count_few(self) -> u32 {
-        let mut x = self.0;
-        let mut count = 0u32;
-        while x != 0 {
-            count += 1;
-            x &= x - 1;
-        }
-        count
-    }
-
     pub const fn contains(self, square: Square) -> bool {
-        square.index() < 90 && (self.0 & (1u128 << square.index())) != 0
+        square.is_valid() && (self.0 & (1u128 << square.index())) != 0
     }
 
     pub fn set(&mut self, square: Square) {
-        if square.index() < 90 {
+        if square.is_valid() {
             self.0 |= 1u128 << square.index();
         }
     }
 
     pub fn reset(&mut self, square: Square) {
-        if square.index() < 90 {
+        if square.is_valid() {
             self.0 &= !(1u128 << square.index());
         }
     }
 
-    /// px0 `bitboard.h:92-94`。
     pub fn set_if(&mut self, square: Square, cond: bool) {
-        if cond && square.index() < 90 {
+        if cond && square.is_valid() {
             self.0 |= 1u128 << square.index();
         }
     }
@@ -93,7 +73,6 @@ impl BitBoard {
         self.0 = 0;
     }
 
-    /// px0 `bitboard.h:111`。
     pub fn mirror(&mut self) {
         self.0 = mirror_board(self.0);
     }
@@ -115,7 +94,7 @@ impl BitBoard {
     }
 
     pub fn subtract_square(self, square: Square) -> Self {
-        if square.index() < 90 {
+        if square.is_valid() {
             Self(self.0 & !(1u128 << square.index()))
         } else {
             self
@@ -178,9 +157,9 @@ impl Iterator for BitBoardIter {
         if self.value == 0 {
             return None;
         }
-        let bit = lowest_bit(self.value);
+        let bit = self.value.trailing_zeros() as u8;
         self.value &= self.value - 1;
-        Square::from_idx(bit as u8)
+        Square::from_idx(bit)
     }
 }
 

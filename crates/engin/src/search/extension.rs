@@ -6,13 +6,13 @@
 
 use xiangqi_core::{GameResult, PositionHistory};
 
-use super::terminal_wl_for_node;
+use super::{rule_judge_wl_for_node, terminal_wl_for_node};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ExtensionKind {
     /// NN 评估并发布 edge。
     Evaluate,
-    /// 终局叶子：走子方视角 `wl` / `draw`≡`d` / `plies_left`≡`m`。
+    /// 终局叶子：incoming-edge 视角 `wl` / `draw`≡`d` / `plies_left`≡`m`。
     Terminal { wl: f32, draw: f32, plies_left: f32 },
 }
 
@@ -35,8 +35,8 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
     }
     if !is_root {
         if history.last().repetitions() >= 2 {
-            let result = history.rule_judge();
-            let (wl, draw) = terminal_wl_for_node(result, history.last().is_black_to_move());
+            // 对齐 px0 `MakeTerminal(history->RuleJudge())`，勿经绝对颜色转换。
+            let (wl, draw) = rule_judge_wl_for_node(history.rule_judge());
             return ExtensionKind::Terminal {
                 wl,
                 draw,
@@ -51,7 +51,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
             let cycle_length = history.last().cycle_length() as f32;
             let result = history.rule_judge();
             if result == GameResult::Draw {
-                let (wl, draw) = terminal_wl_for_node(result, history.last().is_black_to_move());
+                let (wl, draw) = rule_judge_wl_for_node(result);
                 return ExtensionKind::Terminal {
                     wl,
                     draw,
@@ -59,7 +59,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
                 };
             }
             if two_fold_chase_or_check_cycle(history) && history.last().rule60_ply() < 120 {
-                let (wl, draw) = terminal_wl_for_node(result, history.last().is_black_to_move());
+                let (wl, draw) = rule_judge_wl_for_node(result);
                 return ExtensionKind::Terminal {
                     wl,
                     draw,
@@ -119,9 +119,10 @@ fn two_fold_chase_or_check_cycle(history: &PositionHistory) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use xiangqi_core::{GameState, PositionHistory};
+    use xiangqi_core::{ChessBoard, GameResult, GameState, PositionHistory};
 
     use super::{classify_extension, ExtensionKind};
+    use crate::search::{rule_judge_wl_for_node, terminal_wl_for_node};
 
     #[test]
     fn checkmated_side_to_move_is_a_terminal_win_for_the_incoming_edge() {
@@ -139,5 +140,40 @@ mod tests {
                 plies_left: 0.0,
             }
         );
+    }
+
+    /// 白方长将、终局落在**白方行棋**时：`rule_judge` 不能再经绝对颜色转换，
+    /// 否则长将方会被标成胜利（对方先变招）。
+    #[test]
+    fn white_perpetual_check_at_white_to_move_is_loss_for_checker() {
+        let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
+        let mut history = PositionHistory::default();
+        history.reset(board, 2, 30);
+        // 两轮半循环，停在与首个白方行棋局面相同的位置（rep >= 1，白走）。
+        for mv in ["d9e9", "d2e2", "e9d9", "e2d2", "d9e9"] {
+            let parsed = history.last().board().parse_move(mv).expect(mv);
+            history.append(parsed);
+        }
+        assert!(!history.last().is_black_to_move());
+        assert!(history.last().repetitions() >= 1);
+
+        let judged = history.rule_judge();
+        // 仅对方被将 → RuleJudge::WHITE_WON；px0 MakeTerminal → node wl = +1
+        //（incoming 是黑方逃将，长将方白应负）。
+        assert_eq!(judged, GameResult::WhiteWon);
+        assert_eq!(rule_judge_wl_for_node(judged), (1.0, 0.0));
+
+        // 错误路径（把 rule_judge 当绝对胜负）会得到 -1，回传后长将方变“赢”。
+        let wrong = terminal_wl_for_node(judged, history.last().is_black_to_move());
+        assert_eq!(wrong, (-1.0, 0.0));
+
+        let depth = history.len().saturating_sub(1).max(1);
+        match classify_extension(&history, depth) {
+            ExtensionKind::Terminal { wl, draw, .. } => {
+                assert_eq!(draw, 0.0);
+                assert_eq!(wl, 1.0, "escape from perpetual check must be winning for escaper");
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
     }
 }

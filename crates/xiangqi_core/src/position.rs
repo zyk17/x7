@@ -39,7 +39,6 @@ pub struct Position {
 }
 
 impl Position {
-    /// px0 `Position(const ChessBoard&, int, int)`。
     pub fn new(board: ChessBoard, rule60_ply: u32, game_ply: u32) -> Self {
         Self {
             board,
@@ -52,7 +51,6 @@ impl Position {
         }
     }
 
-    /// px0 `Position::FromFen`。
     pub fn from_fen(fen: &str) -> Result<Self, CoreError> {
         let (board, state) = ChessBoard::from_fen(fen)?;
         Ok(Self::new(board, state.rule60_ply, state.game_ply))
@@ -259,7 +257,9 @@ impl PositionHistory {
 
     /// px0 `PositionHistory::RuleJudge` (`position.cc:126-169`)。
     ///
-    /// 结果保持 px0 约定：从黑方视角返回。
+    /// 返回值按 px0 `MakeTerminal` 约定解释：`WhiteWon`→node `wl=+1`，
+    /// `BlackWon`→`wl=-1`（incoming-edge 视角），**不是**绝对红黑胜负。
+    /// 绝对结果见 [`Self::compute_game_result`]（白走时会取反）。
     pub fn rule_judge(&self) -> GameResult {
         let last = self.last();
         if last.rule60_ply < 4 {
