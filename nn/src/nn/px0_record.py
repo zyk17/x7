@@ -4,8 +4,8 @@
 
 - 124 x 10 x 9 输入平面
 - 2062 维 policy 概率
-- winner WDL
-- root WDL
+- winner WDL（最终结果锚点）
+- root WDL（已完成搜索的 target）
 - plies_left
 
 这里不试图兼容 lc0/px0 全部历史版本，也不引入 proto 依赖。

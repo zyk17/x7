@@ -66,7 +66,7 @@ training: {out: data/x7.pt, legacy_resume: true}
         load_train_config(path)
 
 
-def test_load_train_config_defaults_to_b15c384bt192(tmp_path: Path) -> None:
+def test_load_train_config_defaults_to_v3_attentionbody(tmp_path: Path) -> None:
     path = tmp_path / "default.yaml"
     path.write_text(
         """
@@ -77,7 +77,33 @@ training: {out: data/x7.pt}
         encoding="utf-8",
     )
     args = load_train_config(path)
-    assert (args.blocks, args.width, args.bottleneck_channels) == (15, 384, 192)
+    assert (args.model_kind, args.blocks, args.width, args.bottleneck_channels) == (
+        "x7_v3_attentionbody",
+        12,
+        512,
+        256,
+    )
+
+
+def test_load_transformer_v3_config(tmp_path: Path) -> None:
+    path = tmp_path / "transformer.yaml"
+    path.write_text(
+        """
+name: v3
+dataset: {px0_version: "677"}
+model: {kind: x7_v3_attentionbody, width: 32, blocks: 2, heads: 4, ffn_channels: 96}
+training: {out: data/v3.pt}
+""",
+        encoding="utf-8",
+    )
+    args = load_train_config(path)
+    assert (args.model_kind, args.width, args.blocks, args.heads, args.ffn_channels) == (
+        "x7_v3_attentionbody",
+        32,
+        2,
+        4,
+        96,
+    )
 
 
 def test_load_train_config_accepts_adamw_weight_decay(tmp_path: Path) -> None:

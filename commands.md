@@ -30,15 +30,15 @@ validation manifest 的局面扫描都在这里完成。
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\prepare_px0.py `
-  --config nn\configs\x7_v2_01.yaml
+  --config nn\configs\x7_v3_01.yaml
 ```
 
 ## 3. 用 YAML 训练
 
 ```powershell
-Copy-Item nn\configs\example.yaml nn\configs\x7_v2_01.yaml
+Copy-Item nn\configs\example.yaml nn\configs\x7_v3_01.yaml
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --config nn\configs\x7_v2_01.yaml
+  --config nn\configs\x7_v3_01.yaml
 ```
 
 配置分为 `dataset`、`model`、`training` 三段，格式参考
@@ -64,7 +64,7 @@ width、blocks、bottleneck_channels 必须与来源 checkpoint 一致。
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --config nn\configs\x7_v2_01.yaml
+  --config nn\configs\x7_v3_01.yaml
 ```
 
 ## 6. 强制重下并重建某个版本

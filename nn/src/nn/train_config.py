@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+
+from .model_common import CNN_TRUNK_KIND, TRANSFORMER_TRUNK_KIND
 from typing import Any
 
 import yaml
@@ -64,7 +66,11 @@ def load_train_config(path: Path | str) -> argparse.Namespace:
             "force_download",
         },
     )
-    _reject_unknown(model, name="model", allowed={"width", "blocks", "bottleneck_channels"})
+    _reject_unknown(
+        model,
+        name="model",
+        allowed={"kind", "width", "blocks", "bottleneck_channels", "heads", "ffn_channels"},
+    )
     _reject_unknown(
         training,
         name="training",
@@ -90,7 +96,10 @@ def load_train_config(path: Path | str) -> argparse.Namespace:
         },
     )
 
-    width = int(model.get("width", 384))
+    model_kind = str(model.get("kind", TRANSFORMER_TRUNK_KIND))
+    if model_kind not in (CNN_TRUNK_KIND, TRANSFORMER_TRUNK_KIND):
+        raise ValueError(f"model.kind 只支持 {CNN_TRUNK_KIND} 或 {TRANSFORMER_TRUNK_KIND}")
+    width = int(model.get("width", 512 if model_kind == TRANSFORMER_TRUNK_KIND else 384))
     return argparse.Namespace(
         config_path=config_path.resolve(),
         name=str(config.get("name", config_path.stem)),
@@ -104,8 +113,11 @@ def load_train_config(path: Path | str) -> argparse.Namespace:
         out=Path(_required(training, "out", name="training")),
         init_from=Path(training["init_from"]) if training.get("init_from") else None,
         width=width,
-        blocks=int(model.get("blocks", 15)),
+        blocks=int(model.get("blocks", 12 if model_kind == TRANSFORMER_TRUNK_KIND else 15)),
         bottleneck_channels=int(model.get("bottleneck_channels", width // 2)),
+        model_kind=model_kind,
+        heads=int(model.get("heads", 16)),
+        ffn_channels=int(model.get("ffn_channels", width * 3 // 2)),
         in_planes=124,
         num_moves=2062,
         batch_size=int(training.get("batch_size", 256)),

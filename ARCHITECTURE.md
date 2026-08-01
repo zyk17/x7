@@ -35,6 +35,12 @@ GPU evaluation 昂贵；象棋的 NN cache 重用有限，因此单次 evaluatio
 
 更强 Knowledge 是否通常比更高吞吐更能提高象棋固定时间 Elo；困难局面是否主要是 Knowledge 不足且短时间内 Proof 也不足的局面；Knowledge/Proof 的占比是否由局面的可证明性而非开中残局阶段决定，均仍是待验证假设，而不是设计前提。
 
+NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-left Prediction，不模拟搜索、
+不承担 Proof。网络应跟进 Lc0、KataGo 已验证有效的实践，而非把发明网络结构作为项目研究；训练期
+辅助 target 可以帮助共享表示，但不以增加正式推理 head 为目标。项目的研究重点是 Knowledge 与 Proof
+如何协同。网络结构、loss、吞吐和参数量均是诊断或实现选择；网络是否保留只以它对固定时间 Elo 与
+搜索可用 Evidence 的实际贡献判断。
+
 ### 开放问题与准入
 
 后续研究只围绕四个开放问题：Knowledge 与 Proof 的最佳比例；何种局面应由谁主导；Proof 相对网络到底能提供多少新增信息；二者如何共同决定固定时间 Elo。每个新想法都必须回答：它增强 Knowledge 还是 Proof、是否制造了新的 Evidence、是否能提高固定时间 Elo。回答不了的工作只能作为工程优化，不进入长期主线。
@@ -70,10 +76,13 @@ stream 的 selection 使用项目批准的 X7 参数与 px0 PUCT/N-Q-P 语义，
 
 ## 模型
 
-正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。当前训练基准为
-`width=384`、`blocks=15`、`bottleneck_channels=192`，带两次 Global Broadcast。训练期另有
-Auxiliary Soft Policy 与 root-WDL 辅助头；二者不进入 ONNX。CUDA 训练和导出均为 FP16 trunk、
-FP32 heads/outputs；训练、续训和导出校验 checkpoint 的关键架构元数据，避免模型尺寸漂移。
+正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。CNN 对照基线为
+`width=384`、`blocks=15`、`bottleneck_channels=192`，带两次 Global Broadcast。v3 开始试验
+PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residual scale、LayerNorm、FFN 与 from-to policy，
+默认 `width=512`、`blocks=12`、`heads=16`、`ffn=768`。v3 使用 PX0/Lc0 AttentionBody
+（MHA + Smolgen + LayerNorm + FFN）。训练期另有 Auxiliary Soft Policy 与 root-WDL
+辅助头；二者不进入 ONNX。CUDA 训练和导出均为 FP16 trunk、FP32 heads/outputs；训练、续训和导出
+校验 checkpoint 的关键架构元数据，避免模型尺寸漂移。
 
 ## 纪律
 

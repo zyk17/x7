@@ -20,7 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nn.dataset_px0 import Px0ChunkDataset, Px0DatasetConfig
 from nn.model import (
-    PolicyResNet,
+    CNN_TRUNK_KIND,
+    KnowledgeResNet,
+    KnowledgeTransformer,
+    build_model,
     moves_left_loss,
     soften_policy_targets,
     soft_policy_cross_entropy,
@@ -38,6 +41,7 @@ from train_common import TRAIN_SEED, default_num_workers
 
 
 OPTIMIZER_KIND = "adamw"
+KnowledgeModel = KnowledgeResNet | KnowledgeTransformer
 
 
 def build_optimizer(model: torch.nn.Module, *, learning_rate: float, weight_decay: float) -> AdamW:
@@ -57,8 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if int(args.width) < 4 or int(args.width) % 2 != 0 or int(args.blocks) < 3 or int(args.bottleneck_channels) < 1:
-        raise SystemExit("model.width/blocks/bottleneck_channels 非法")
+    model_kind = getattr(args, "model_kind", CNN_TRUNK_KIND)
+    if model_kind == CNN_TRUNK_KIND:
+        if int(args.width) < 4 or int(args.width) % 2 != 0 or int(args.blocks) < 3 or int(args.bottleneck_channels) < 1:
+            raise SystemExit("CNN model.width/blocks/bottleneck_channels 非法")
+    elif (
+        int(args.width) < 4
+        or int(args.blocks) < 1
+        or int(getattr(args, "heads", 16)) < 1
+        or int(getattr(args, "ffn_channels", int(args.width) * 3 // 2)) < int(args.width)
+        or int(args.width) % int(getattr(args, "heads", 16)) != 0
+    ):
+        raise SystemExit("Transformer model.width/blocks/heads/ffn_channels 非法")
     if not str(args.px0_version).strip() or not (0.0 < float(args.px0_val_ratio) < 1.0):
         raise SystemExit("dataset.px0_version 或 dataset.val_ratio 非法")
     if int(args.validation_samples) < 3 or int(args.validation_source_files) < 0 or int(args.shuffle_size) < 0:
@@ -97,7 +111,7 @@ def take_training_outputs(
 
 
 def forward_training(
-    model: PolicyResNet, boards: torch.Tensor, *, amp_enabled: bool
+    model: KnowledgeModel, boards: torch.Tensor, *, amp_enabled: bool
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Use FP16 for the spatial trunk and explicit FP32 heads/losses.
 
@@ -132,11 +146,15 @@ def compute_loss_terms(
     policy = soft_policy_cross_entropy(policy_logits, target_policy, legal_mask)
     soft_target = soften_policy_targets(target_policy, legal_mask, temperature=soft_policy_temperature)
     soft_policy_ce = soft_policy_cross_entropy(soft_logits, soft_target, legal_mask)
-    soft_target_entropy = -torch.where(
-        soft_target > 0,
-        soft_target * soft_target.log(),
-        torch.zeros_like(soft_target),
-    ).sum(dim=1).mean()
+    soft_target_entropy = (
+        -torch.where(
+            soft_target > 0,
+            soft_target * soft_target.log(),
+            torch.zeros_like(soft_target),
+        )
+        .sum(dim=1)
+        .mean()
+    )
     final_ce = value_wdl_cross_entropy(final_value, winner_wdl)
     root_ce = value_wdl_cross_entropy(root_value, root_wdl)
     moves = moves_left_loss(pred_moves_left, plies_left)
@@ -153,15 +171,36 @@ def compute_loss_terms(
     }
 
 
-def validate_existing_output_checkpoint(ckpt: dict, *, width: int, blocks: int, bottleneck_channels: int) -> None:
-    if str(ckpt.get("trunk_kind")) != "x7_v2_bottleneck_gbroadcast":
-        raise SystemExit("--out 已存在，但不是当前 x7 v2 架构；请换新输出文件")
-    if (int(ckpt.get("width", 0)), int(ckpt.get("blocks", 0)), int(ckpt.get("bottleneck_channels", 0))) != (
-        width,
-        blocks,
-        bottleneck_channels,
-    ):
-        raise SystemExit("checkpoint 的 width/blocks/bottleneck_channels 与当前 YAML 不一致")
+def validate_existing_output_checkpoint(
+    ckpt: dict,
+    *,
+    width: int,
+    blocks: int,
+    bottleneck_channels: int,
+    trunk_kind: str = CNN_TRUNK_KIND,
+    heads: int = 16,
+    ffn_channels: int = 0,
+) -> None:
+    if str(ckpt.get("trunk_kind")) != trunk_kind:
+        raise SystemExit("--out 已存在，但模型架构与当前 YAML 不一致；请换新输出文件")
+    keys = (
+        ("width", "blocks", "bottleneck_channels")
+        if trunk_kind == CNN_TRUNK_KIND
+        else (
+            "width",
+            "blocks",
+            "heads",
+            "ffn_channels",
+        )
+    )
+    expected = (
+        (width, blocks, bottleneck_channels) if trunk_kind == CNN_TRUNK_KIND else (width, blocks, heads, ffn_channels)
+    )
+    actual = tuple(int(ckpt.get(key, 0)) for key in keys)
+    if actual != expected:
+        if trunk_kind == CNN_TRUNK_KIND:
+            raise SystemExit("checkpoint 的 width/blocks/bottleneck_channels 与当前 YAML 不一致")
+        raise SystemExit("checkpoint 的 Transformer 模型尺寸与当前 YAML 不一致")
     if not bool(ckpt.get("moves_left_head")) or not bool(ckpt.get("auxiliary_heads")):
         raise SystemExit("--out 已存在，但不含当前训练辅助头；请换新输出文件")
 
@@ -172,7 +211,7 @@ def validate_existing_optimizer_checkpoint(ckpt: dict) -> None:
 
 
 def run_val(
-    model: PolicyResNet,
+    model: KnowledgeModel,
     loader: DataLoader,
     *,
     device: torch.device,
@@ -270,12 +309,16 @@ def main() -> None:
         val_ds, batch_size=int(args.batch_size), num_workers=max(0, min(2, workers)), pin_memory=device.type == "cuda"
     )
 
-    model = PolicyResNet(
+    trunk_kind = str(args.model_kind)
+    model = build_model(
+        trunk_kind=trunk_kind,
         in_planes=int(args.in_planes),
         width=int(args.width),
-        num_blocks=int(args.blocks),
+        blocks=int(args.blocks),
         num_moves=int(args.num_moves),
         bottleneck_channels=int(args.bottleneck_channels),
+        heads=int(args.heads),
+        ffn_channels=int(args.ffn_channels),
         value_head=True,
         moves_left_head=True,
         auxiliary_heads=True,
@@ -291,7 +334,13 @@ def main() -> None:
         assert source is not None
         ckpt = torch.load(source, map_location=device)
         validate_existing_output_checkpoint(
-            ckpt, width=int(args.width), blocks=int(args.blocks), bottleneck_channels=int(args.bottleneck_channels)
+            ckpt,
+            trunk_kind=trunk_kind,
+            width=int(args.width),
+            blocks=int(args.blocks),
+            bottleneck_channels=int(args.bottleneck_channels),
+            heads=int(args.heads),
+            ffn_channels=int(args.ffn_channels),
         )
         model.load_state_dict(ckpt["model"], strict=True)
         if source == args.out:
@@ -306,7 +355,8 @@ def main() -> None:
 
     print(
         f"px0: train_files={len(train_ds.files)} val_files={len(val_ds.files)} "
-        f"batch={args.batch_size} steps={args.steps} b{args.blocks}c{args.width}bt{args.bottleneck_channels} "
+        f"batch={args.batch_size} steps={args.steps} {args.model_kind} b{args.blocks}c{args.width} "
+        f"h{args.heads}ffn{args.ffn_channels} "
         f"loss_weights=(final={args.final_value_loss_weight}, root={args.root_wdl_loss_weight}, "
         f"moves={args.moves_left_loss_weight}, soft=T{args.soft_policy_temperature}/w{args.soft_policy_weight})"
     )
@@ -381,6 +431,8 @@ def main() -> None:
                 "width": int(args.width),
                 "blocks": int(args.blocks),
                 "bottleneck_channels": int(args.bottleneck_channels),
+                "heads": int(args.heads),
+                "ffn_channels": int(args.ffn_channels),
                 "in_planes": int(args.in_planes),
                 "n_moves": int(args.num_moves),
                 "format": "px0_v7",

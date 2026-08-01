@@ -1,4 +1,4 @@
-# X7 PX0 训练配置模板。
+# X7 v3 Transformer PX0 训练配置模板。
 # 训练入口只接受：python scripts/train/train_px0.py --config <this-file>
 # 路径相对于启动命令所在目录解析；仓库根目录启动时，data/... 即为仓库 data/。
 
@@ -7,7 +7,7 @@ name: example
 
 dataset:
   # Kaggle pikacat/px0data 的版本号；本地目录为 C:/work/px0data/{version}/。
-  px0_version: "710"
+  px0_version: "677"
   # 本地版本缓存根目录。目录已有完整 manifest/chunk 时不访问 Kaggle。
   px0_root: "C:/work/px0data"
   # 固定文件级 train/validation 切分中 validation 的比例，必须在 (0, 1)。
@@ -24,18 +24,24 @@ dataset:
   force_download: false
 
 model:
-  # 当前基准为 b15c384bt192：3x3 stem 124->384，15 个 384->192->192->384
-  # PreAct bottleneck。可为实验调整；两次 mean/max Global Broadcast 始终均匀插入三个 trunk stage 之间。
-  # bottleneck_channels 控制每个 block 的中间表示；两个 3x3 层使其参数量近似二次增长。
-  # 同一个 checkpoint 续训或 init_from 时，这三个数必须精确一致。
-  width: 384
-  blocks: 15
-  bottleneck_channels: 192
+  # v3：90 个棋盘 token 的 PX0/Lc0 AttentionBody。每层是 MHA + Smolgen + LayerNorm + FFN。
+  # policy 由起点-终点 token pair score 收集回固定 2062 PX0 着法顺序；正式输出契约不变。
+  # 只接受本实现名：x7_v3_attentionbody 或 x7_v2_bottleneck_gbroadcast。
+  # 两者 checkpoint 不兼容，不能互相 init_from 或续训。
+  kind: x7_v3_attentionbody
+  width: 512
+  blocks: 12
+  # 32 channels/head 与 Lc0 默认 AttentionBody 保持同一量级。
+  heads: 16
+  # Lc0 的 dff=1.5*d_model；这里保持同一比例。
+  ffn_channels: 768
 
 training:
   # 一个 YAML 对应一个模型 checkpoint。文件存在时自动续训。
   out: "data/checkpoints/example.pt"
-  # init_from: "data/checkpoints/x7_v3_b15c384bt192.best.pt"
+  # init_from 只载入模型权重，并从 step 0 创建新的优化器和学习率日程；需要完整续训时，先复制
+  # 原 checkpoint 到新的 out 路径。
+  # init_from: "data/checkpoints/x7_v3_transformer.best.pt"
   # 全局总 step，不是本次增加的 step。续训时必须大于 checkpoint 的 completed_steps。
   steps: 2000
   # 每个 optimizer step 的样本数。
@@ -51,13 +57,14 @@ training:
   min_lr_scale: 0.1
   # Conv/Linear weights decay；BatchNorm 与 bias 不 decay。
   weight_decay: 0.0001
-  # KataGo-inspired fixed multi-target supervision. Unlike KataGo's future
-  # time-average targets, root WDL here is PX0's current root search target.
+  # PX0 self-play/search targets 的离线训练。`policy` 是 root-child visit
+  # distribution，`root_wdl` 是完成搜索后的 root_q/root_d；final result 和
+  # plies-left 是结果锚点。未来以本网络生成新数据后，才构成完整 RL 闭环。
   final_value_loss_weight: 0.6
   root_wdl_loss_weight: 0.6
   # 剩余 ply 是 value 的间接辅助；v677 小网络对照中 0.5 优于 1.0。
   moves_left_loss_weight: 0.5
-  # KataGo Auxiliary Soft Policy Target: T=4；该头只参与训练。
+  # 第二 policy head 使用同一搜索分布的 T=4 软化目标，仅训练期使用。
   soft_policy_weight: 8.0
   soft_policy_temperature: 4.0
   # CUDA trunk FP16 autocast，heads/loss FP32。

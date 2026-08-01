@@ -2,7 +2,11 @@
 
 from nn.dataset_px0 import Px0ChunkDataset, Px0DatasetConfig
 from nn.model import (
-    PolicyResNet,
+    CNN_TRUNK_KIND,
+    TRANSFORMER_TRUNK_KIND,
+    KnowledgeResNet,
+    KnowledgeTransformer,
+    build_model,
     moves_left_loss,
     soften_policy_targets,
     soft_policy_cross_entropy,
@@ -13,7 +17,11 @@ from nn.model import (
 )
 
 __all__ = [
-    "PolicyResNet",
+    "KnowledgeResNet",
+    "KnowledgeTransformer",
+    "build_model",
+    "CNN_TRUNK_KIND",
+    "TRANSFORMER_TRUNK_KIND",
     "Px0ChunkDataset",
     "Px0DatasetConfig",
     "moves_left_loss",

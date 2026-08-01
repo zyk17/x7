@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 from pathlib import Path
 
@@ -13,34 +14,39 @@ import torch.nn as nn
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from nn import PolicyResNet
+from nn import CNN_TRUNK_KIND, TRANSFORMER_TRUNK_KIND, KnowledgeResNet, KnowledgeTransformer, build_model
 
 
-TRUNK_KIND = "x7_v2_bottleneck_gbroadcast"
-
-
-class PolicyOnnxExport(nn.Module):
+class KnowledgeOnnxExport(nn.Module):
     """Fixed `124x10x9 -> 2062 + WDL + moves-left` ONNX wrapper.
 
     Auxiliary policy/search-value heads are intentionally never called here,
     therefore they are absent from the ONNX graph and have no inference cost.
     """
 
-    def __init__(self, inner: PolicyResNet, *, mixed_fp16: bool = False) -> None:
+    def __init__(self, inner: KnowledgeResNet | KnowledgeTransformer, *, mixed_fp16: bool = False) -> None:
         super().__init__()
-        self.inner = inner
+        # Export precision must not mutate a caller's in-memory training model.
+        self.inner = copy.deepcopy(inner)
         self.mixed_fp16 = mixed_fp16
         if mixed_fp16:
-            for module in (
-                inner.stem,
-                inner.stage1,
-                inner.broadcast4,
-                inner.stage2,
-                inner.broadcast8,
-                inner.stage3,
-                inner.trunk_bn,
-            ):
+            modules = (
+                (
+                    self.inner.stem,
+                    self.inner.stage1,
+                    self.inner.broadcast4,
+                    self.inner.stage2,
+                    self.inner.broadcast8,
+                    self.inner.stage3,
+                    self.inner.trunk_bn,
+                )
+                if self.inner.trunk_kind == CNN_TRUNK_KIND
+                else (self.inner.input_embedding, self.inner.blocks)
+            )
+            for module in modules:
                 module.half()
+            if self.inner.trunk_kind == TRANSFORMER_TRUNK_KIND:
+                self.inner.smolgen_weight.data = self.inner.smolgen_weight.data.half()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         trunk = self.inner.forward_trunk(x.half() if self.mixed_fp16 else x)
@@ -56,25 +62,28 @@ def main() -> None:
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
-    if str(ckpt.get("trunk_kind")) != TRUNK_KIND:
-        raise SystemExit(f"checkpoint 不是当前 {TRUNK_KIND} 架构，不能导出")
+    trunk_kind = str(ckpt.get("trunk_kind"))
+    if trunk_kind not in (CNN_TRUNK_KIND, TRANSFORMER_TRUNK_KIND):
+        raise SystemExit(f"checkpoint 的 trunk_kind 不受支持: {trunk_kind}")
     width = int(ckpt["width"])
-    model = PolicyResNet(
+    model = build_model(
+        trunk_kind=trunk_kind,
         in_planes=int(ckpt.get("in_planes", 124)),
         width=width,
-        num_blocks=int(ckpt["blocks"]),
+        blocks=int(ckpt["blocks"]),
         num_moves=int(ckpt["n_moves"]),
-        bottleneck_channels=int(ckpt["bottleneck_channels"]),
+        bottleneck_channels=int(ckpt.get("bottleneck_channels", width // 2)),
+        heads=int(ckpt.get("heads", 16)),
+        ffn_channels=int(ckpt.get("ffn_channels", width * 3 // 2)),
         value_head=bool(ckpt.get("value_head")),
         moves_left_head=bool(ckpt.get("moves_left_head")),
         auxiliary_heads=bool(ckpt.get("auxiliary_heads")),
-        trunk_kind=TRUNK_KIND,
     )
     if not model.value_head or not model.moves_left_head:
         raise SystemExit("当前 ONNX 契约要求 checkpoint 同时包含 WDL 与 moves-left head")
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
-    export_mod = PolicyOnnxExport(model, mixed_fp16=args.precision == "mixed-fp16").eval()
+    export_mod = KnowledgeOnnxExport(model, mixed_fp16=args.precision == "mixed-fp16").eval()
 
     dummy = torch.zeros(1, model.in_planes, 10, 9)
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -91,7 +100,7 @@ def main() -> None:
     )
     print(
         f"exported -> {args.out} precision={args.precision} "
-        f"b{model.num_blocks}c{width}bt{model.bottleneck_channels} outputs={out_names}"
+        f"{trunk_kind} b{model.num_blocks}c{width} outputs={out_names}"
     )
 
 
