@@ -1,8 +1,10 @@
 # 77xiangqi_engine
 
-一个新的中国象棋 Rust 引擎：规则层参考 px0，正式搜索只有 stream MCTS。模型输入输出固定为
-`124 × 10 × 9 → 2062 policy + WDL + moves-left`；搜索值使用 `win - loss`。当前 NN
-训练基线为 b15c384bt192；训练期辅助头不进入 ONNX 正式契约。
+> 棋力不是来自网络，也不是来自搜索。棋力来自 Prediction 与 Evidence 的协同；Knowledge 负责产生 Prediction，Proof 负责产生新的 Evidence，Decision 在固定时间预算下融合二者，形成最终行动。
+
+这是一个新的中国象棋研究引擎。项目目标是在有限计算资源、固定思考时间下研究上述协同，并只以固定时间 Elo 评估成果；网络架构、搜索算法和硬件分工都是实现选择，不是项目目标。
+
+当前正式主线只有 stream tree MCTS；规则层参考 px0，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 快速运行
 

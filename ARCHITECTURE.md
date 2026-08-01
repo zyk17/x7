@@ -1,12 +1,43 @@
 # ARCHITECTURE
 
-## 目标与参考
+## 项目目标
 
-这是 px0 的 Rust 重写，不是兼容层。规则与网络外围按 px0 逐函数对照；stream 按 LC3 的公开架构文档实现等价设计，在 LC3 未公开公式时参考对应 px0 语义，不能标称为源码翻译。
+> 棋力不是来自网络，也不是来自搜索。棋力来自 Prediction 与 Evidence 的协同；Knowledge 负责产生 Prediction，Proof 负责产生新的 Evidence，Decision 在固定时间预算下融合二者，形成最终行动。
 
-- px0：`C:\Users\Administrator\projects\px0`
-- 训练参考：`C:\Users\Administrator\projects\pxzero-training`
-- stream 参考：[LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/)
+项目目标是在有限计算资源、固定思考时间下，研究 Knowledge（Recognition）与 Proof（Calculation）如何协同，获得最高的固定时间 Elo。ResNet、Transformer、MCTS、Alpha-Beta、CPU/GPU 分工和辅助 head 都是实现选择，不是独立目标。
+
+项目不复制人、Lc0 或 Stockfish 中的任一种实现；它研究象棋在现代硬件约束下的成本模型：GPU 主要生产 Prediction，CPU 主要生产 Evidence，两种资源不应被简单视为零和。
+
+## 研究坐标
+
+- **Knowledge**：从数据学习的预测能力，包括 pattern、局面、战略、value 与 policy。
+- **Proof**：计算得到新增证据的过程，不限于 MCTS、Alpha-Beta 或 proof search。
+- **Evidence**：Proof 的产物。终局、将杀和强制线是强证据；有限搜索的 Q、访问统计和 PV 是较弱证据，不等同于逻辑证明。
+- **Decision**：在固定时间内结合预测与证据选择着法；Proof 不把网络知识“改写”为另一套知识。
+
+这一坐标系同样适用于人、Lc0 与 Stockfish：三者都有 Knowledge 与 Proof，差别只在于二者的来源、实现与成本。人以长期学习和心算协同；Lc0 以 NN 和 MCTS 协同；Stockfish 以 NNUE/启发式和 Alpha-Beta 协同。
+
+## 参考边界
+
+当前阶段是 px0 的 Rust 重写。参考用于约束实现语义，不能替代项目目标：
+
+- 规则与网络外围按 px0 逐函数对照：`C:\Users\Administrator\projects\px0`。
+- 训练格式与导出参考 pxzero-training：`C:\Users\Administrator\projects\pxzero-training`。
+- stream 按 [LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/) 的公开架构文档实现等价设计；LC3 未公开公式时参考对应 px0 语义，不能标称为源码翻译。
+
+## 当前认识
+
+### 当前事实
+
+GPU evaluation 昂贵；象棋的 NN cache 重用有限，因此单次 evaluation 珍贵；开中局的有限预算通常只能获得有限新增信息；网络已学习大量棋型、局面和局部战术，CPU 不应重复实现人类 HCE。最终目标只能是固定时间 Elo，EPS、NPS、参数量和 collision 都只是诊断指标。
+
+### 待验证假设
+
+更强 Knowledge 是否通常比更高吞吐更能提高象棋固定时间 Elo；困难局面是否主要是 Knowledge 不足且短时间内 Proof 也不足的局面；Knowledge/Proof 的占比是否由局面的可证明性而非开中残局阶段决定，均仍是待验证假设，而不是设计前提。
+
+### 开放问题与准入
+
+后续研究只围绕四个开放问题：Knowledge 与 Proof 的最佳比例；何种局面应由谁主导；Proof 相对网络到底能提供多少新增信息；二者如何共同决定固定时间 Elo。每个新想法都必须回答：它增强 Knowledge 还是 Proof、是否制造了新的 Evidence、是否能提高固定时间 Elo。回答不了的工作只能作为工程优化，不进入长期主线。
 
 ## 模块
 
