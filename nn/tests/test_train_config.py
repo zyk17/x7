@@ -47,7 +47,6 @@ training:
     assert args.blocks == 12
     assert args.bottleneck_channels == 160
     assert args.min_lr_scale == 0.1
-    assert args.validation_samples == 8192
     assert args.shuffle_size == 4096
 
 

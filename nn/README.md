@@ -77,11 +77,10 @@ python scripts/train/train_px0.py --config configs/x7_v3_01.yaml
 - `model.kind`：`x7_v3_attentionbody`（默认）或对照用的 `x7_v2_bottleneck_gbroadcast`。两者 checkpoint 不兼容。
 - v3 的 `model.width`、`blocks`、`heads`、`ffn_channels` 当前默认 `512/12/16/768`；`width / heads`
   的 head dimension 必须为整数；默认每个 head 为 32 channels。
-- v3 value 与 moves-left 共享 token mean/max global readout；CNN 继续使用其 `1x1 conv -> mean/max pool -> FC`
-  readout。两者均不使用展平棋盘的大型全连接 head。
-- `dataset.validation_samples`：固定验证局面数。首次运行会按确定性随机 chunk 顺序建立 record-level
-  manifest，并按当前盘面子力分为开局/中局/残局三档平衡抽样；`validation_source_files: 0` 会在达到三档
-  配额后停止扫描，正数则限制扫描文件数。它不是不可获得的真实对局 ply 阶段，但能避免只读验证文件固定前缀。
+- v3 逐结构对齐 PX0/Lc0 AttentionBody：90 个 token、attention-policy-map positional encoding、input MA gate、
+  MHA + Smolgen + DeepNorm + LayerNorm + ReLU FFN；policy/value/moves-left 均使用 PX0 attention-body head。
+- `dataset.val_ratio`：以固定 seed 在 chunk 级别切出完整 held-out 验证流；不再建立固定 record-level 子集。
+- `training.validation_batches`：PX0-style 常规验证从 held-out 流 shuffle 后读取的 batch 数；完整验证集不在每次 eval 扫完。
 - `training.shuffle_size`：训练 record 的有界 replacement shuffle 总大小，按 DataLoader worker 均分。
   这对应 pxzero 的 shuffle buffer，避免顺序读取同一对局的相邻局面；默认 `4096`，约占 200 MB 主存。
 - `training.final_value_loss_weight + root_wdl_loss_weight + moves_left_loss_weight`：三项都服务 value 表示。前两项分别监督最终 WDL 与 PX0 当前 root WDL；moves-left 是间接辅助。当前小网络对照的暂定基线为 `0.6 / 0.6 / 0.5`，它们不是可按 loss 数值直接比较的比例。root WDL 不是 KataGo 的未来时间平均 target。

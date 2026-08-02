@@ -25,8 +25,8 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install -e "nn[t
 
 ## 2. 准备数据
 
-每个 `px0_version + val_ratio + seed + validation_*` 组合只需要准备一次。此步骤可能较慢：首次下载、解压和
-validation manifest 的局面扫描都在这里完成。
+每个 `px0_version + val_ratio + seed` 组合只需要准备一次。此步骤可能较慢：首次下载、解压和固定
+train/validation chunk split 都在这里完成。
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\prepare_px0.py `

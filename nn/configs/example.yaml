@@ -12,19 +12,15 @@ dataset:
   px0_root: "C:/work/px0data"
   # 固定文件级 train/validation 切分中 validation 的比例，必须在 (0, 1)。
   val_ratio: 0.05
-  # 每次 validation 使用的固定局面数。首次训练会生成并持久化 record-level manifest；
-  # 此后所有 validation 读取同一批局面，曲线可以横向比较。
-  validation_samples: 16384
-  # 首次构建 manifest 时允许扫描的 validation chunk 上限。0 表示按固定随机顺序扫描，
-  # 达到三档配额即停止；正数用于限制初始化成本。
-  validation_source_files: 0
+  # validation 读取该固定文件切分的完整 5%，不再二次随机抽样固定局面数。
   # 文件切分随机种子。改变它会生成另一份 train/validation manifest。
   seed: 42
   # 仅 prepare_px0.py 使用：true 会删除此版本已准备的 chunk/archive/manifest 后重新下载；通常保持 false。
   force_download: false
 
 model:
-  # v3：90 个棋盘 token 的 PX0/Lc0 AttentionBody。每层是 MHA + Smolgen + LayerNorm + FFN。
+  # v3：逐结构复刻 PX0/Lc0 AttentionBody：attention-policy-map positional encoding、
+  # input MA gate、MHA + Smolgen + DeepNorm + LayerNorm + ReLU FFN，以及原版三正式 head。
   # policy 由起点-终点 token pair score 收集回固定 2062 PX0 着法顺序；正式输出契约不变。
   # 只接受本实现名：x7_v3_attentionbody 或 x7_v2_bottleneck_gbroadcast。
   # 两者 checkpoint 不兼容，不能互相 init_from 或续训。
@@ -46,8 +42,10 @@ training:
   steps: 2000
   # 每个 optimizer step 的样本数。
   batch_size: 256
-  # 每隔多少 step 跑一次 validation 并写 checkpoint。
+  # 每隔多少 step 跑一次 PX0 test 验证并写 checkpoint。
   eval_every: 100
+  # PX0-style low-frequency sequential full validation; `.best.pt` only updates from this result.
+  full_validation_every: 200000
   # pxzero-style record shuffle buffer 的总大小；会按 DataLoader worker 均分，避免顺序读取
   # 同一对局相邻局面。4096 个解码样本约占 200 MB 主存。
   shuffle_size: 4096

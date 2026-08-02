@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the PX0 download, file split, and fixed validation manifest once."""
+"""Prepare the PX0 download and fixed train/validation file split once."""
 
 from __future__ import annotations
 
@@ -26,8 +26,6 @@ def main() -> None:
             val_ratio=float(args.px0_val_ratio),
             seed=int(args.px0_seed),
             force_download=bool(args.px0_force_download),
-            validation_samples=int(args.validation_samples),
-            validation_source_files=int(args.validation_source_files),
         )
     except (FileNotFoundError, ImportError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

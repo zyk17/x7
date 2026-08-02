@@ -140,6 +140,8 @@ def test_validate_args_rejects_invalid_adamw_schedule() -> None:
         steps = 1_000
         warmup_steps = 250
         shuffle_size = 4096
+        validation_batches = 256
+        full_validation_every = 200_000
         lr = 0.0
         min_lr_scale = 0.1
         weight_decay = 1e-4
@@ -166,6 +168,8 @@ def test_validate_args_allows_non_baseline_v2_dimensions() -> None:
         steps = 1_000
         warmup_steps = 250
         shuffle_size = 4096
+        validation_batches = 256
+        full_validation_every = 200_000
         lr = 3e-4
         min_lr_scale = 0.1
         weight_decay = 1e-4
@@ -200,13 +204,12 @@ def test_build_dataset_configs_uses_prepared_data_loader(monkeypatch, tmp_path: 
         px0_root = tmp_path
         px0_val_ratio = 0.1
         px0_seed = 42
-        validation_samples = 8192
-        validation_source_files = 0
         shuffle_size = 4096
 
-    train_cfg, val_cfg, manifest = build_dataset_configs(Args())
+    train_cfg, val_cfg, full_val_cfg, manifest = build_dataset_configs(Args())
     assert captured["version"] == "710"
-    assert captured["validation_samples"] == 8192
     assert train_cfg.file_list_path == prepared.train_manifest
-    assert val_cfg.sample_list_path == validation_manifest
+    assert val_cfg.file_list_path == validation_manifest
+    assert full_val_cfg.file_list_path == validation_manifest
+    assert (train_cfg.sample_rate, val_cfg.sample_rate, full_val_cfg.sample_rate) == (32, 32, 1)
     assert manifest == validation_manifest

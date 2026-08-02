@@ -75,8 +75,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("Transformer model.width/blocks/heads/ffn_channels 非法")
     if not str(args.px0_version).strip() or not (0.0 < float(args.px0_val_ratio) < 1.0):
         raise SystemExit("dataset.px0_version 或 dataset.val_ratio 非法")
-    if int(args.validation_samples) < 3 or int(args.validation_source_files) < 0 or int(args.shuffle_size) < 0:
-        raise SystemExit("dataset/training 样本或 shuffle 配置非法")
+    if int(args.shuffle_size) < 0 or int(args.full_validation_every) < 1:
+        raise SystemExit("training shuffle/validation 配置非法")
     if (
         float(args.final_value_loss_weight) < 0.0
         or float(args.root_wdl_loss_weight) < 0.0
@@ -183,6 +183,8 @@ def validate_existing_output_checkpoint(
 ) -> None:
     if str(ckpt.get("trunk_kind")) != trunk_kind:
         raise SystemExit("--out 已存在，但模型架构与当前 YAML 不一致；请换新输出文件")
+    if trunk_kind != CNN_TRUNK_KIND and ckpt.get("model_format") != "px0_attentionbody_v1":
+        raise SystemExit("--out 是旧 v3 AttentionBody checkpoint；请换新输出文件")
     keys = (
         ("width", "blocks", "bottleneck_channels")
         if trunk_kind == CNN_TRUNK_KIND
@@ -221,6 +223,7 @@ def run_val(
     soft_policy_temperature: float,
     root_wdl_loss_weight: float,
     amp_enabled: bool,
+    max_batches: int | None,
 ) -> dict[str, float]:
     model.eval()
     sums = {
@@ -259,26 +262,36 @@ def run_val(
             for name, value in terms.items():
                 sums[name] += float(value.item())
             batches += 1
+            if max_batches is not None and batches >= max_batches:
+                break
     return {name: total / batches if batches else float("nan") for name, total in sums.items()}
 
 
-def build_dataset_configs(args: argparse.Namespace) -> tuple[Px0DatasetConfig, Px0DatasetConfig, Path]:
+def build_dataset_configs(
+    args: argparse.Namespace,
+) -> tuple[Px0DatasetConfig, Px0DatasetConfig, Px0DatasetConfig, Path]:
     prepared, validation_manifest = load_prepared_px0_training_data(
         args.px0_version,
         root=args.px0_root,
         val_ratio=float(args.px0_val_ratio),
         seed=int(args.px0_seed),
-        validation_samples=int(args.validation_samples),
-        validation_source_files=int(args.validation_source_files),
     )
     return (
         Px0DatasetConfig(
             file_list_path=prepared.train_manifest,
             shuffle_files=True,
             shuffle_size=int(args.shuffle_size),
+            sample_rate=32,
             verify_files=False,
         ),
-        Px0DatasetConfig(sample_list_path=validation_manifest, shuffle_files=False),
+        Px0DatasetConfig(
+            file_list_path=validation_manifest,
+            shuffle_files=True,
+            shuffle_size=max(1, int(args.shuffle_size * args.px0_val_ratio)),
+            sample_rate=32,
+            verify_files=False,
+        ),
+        Px0DatasetConfig(file_list_path=validation_manifest, verify_files=False),
         validation_manifest,
     )
 
@@ -297,16 +310,24 @@ def main() -> None:
     print(f"torch {torch.__version__} | device={device} | trunk_amp={amp_enabled}")
 
     try:
-        train_cfg, val_cfg, validation_manifest = build_dataset_configs(args)
+        train_cfg, val_cfg, full_val_cfg, validation_manifest = build_dataset_configs(args)
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
-    train_ds, val_ds = Px0ChunkDataset(train_cfg), Px0ChunkDataset(val_cfg)
+    train_ds = Px0ChunkDataset(train_cfg)
+    val_ds = Px0ChunkDataset(val_cfg)
+    full_val_ds = Px0ChunkDataset(full_val_cfg)
     workers = default_num_workers() if args.num_workers is None else int(args.num_workers)
     train_loader = DataLoader(
         train_ds, batch_size=int(args.batch_size), num_workers=workers, pin_memory=device.type == "cuda"
     )
     val_loader = DataLoader(
         val_ds, batch_size=int(args.batch_size), num_workers=max(0, min(2, workers)), pin_memory=device.type == "cuda"
+    )
+    full_val_loader = DataLoader(
+        full_val_ds,
+        batch_size=int(args.batch_size),
+        num_workers=0,
+        pin_memory=device.type == "cuda",
     )
 
     trunk_kind = str(args.model_kind)
@@ -325,7 +346,7 @@ def main() -> None:
     ).to(device)
     opt = build_optimizer(model, learning_rate=float(args.lr), weight_decay=float(args.weight_decay))
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    start_step, best_formal = 0, float("inf")
+    start_step, best_full_formal = 0, float("inf")
     lr_decay_steps = int(args.steps)
     if args.out.is_file() and args.init_from is not None:
         raise SystemExit("--out 已存在时不要再传 --init-from")
@@ -347,20 +368,23 @@ def main() -> None:
             validate_existing_optimizer_checkpoint(ckpt)
             opt.load_state_dict(ckpt["optimizer"])
             start_step = int(ckpt.get("completed_steps", 0))
-            best_formal = float(ckpt.get("best_formal_loss", float("inf")))
+            best_full_formal = float(ckpt.get("best_full_formal_loss", float("inf")))
             lr_decay_steps = int(ckpt.get("lr_decay_steps", int(args.steps)))
         print(f"{'resume' if source == args.out else 'init'} from {source}")
     if start_step >= int(args.steps):
         raise SystemExit("--steps 必须大于 checkpoint 的 completed_steps")
 
+    regular_validation_batches = max(1, len(val_ds.files) * 10 // int(args.batch_size))
     print(
         f"px0: train_files={len(train_ds.files)} val_files={len(val_ds.files)} "
         f"batch={args.batch_size} steps={args.steps} {args.model_kind} b{args.blocks}c{args.width} "
-        f"h{args.heads}ffn{args.ffn_channels} "
+        f"h{args.heads}ffn{args.ffn_channels} val_batches={regular_validation_batches} "
         f"loss_weights=(final={args.final_value_loss_weight}, root={args.root_wdl_loss_weight}, "
         f"moves={args.moves_left_loss_weight}, soft=T{args.soft_policy_temperature}/w{args.soft_policy_weight})"
     )
     train_iter = iter(train_loader)
+    train_sums: dict[str, float] = {}
+    train_batches = 0
     for step in range(start_step + 1, int(args.steps) + 1):
         try:
             batch = next(train_iter)
@@ -400,10 +424,14 @@ def main() -> None:
         scaler.scale(loss).backward()
         scaler.step(opt)
         scaler.update()
-        if step == 1 or step % max(1, int(args.eval_every)) == 0 or step == int(args.steps):
+        for name, value in terms.items():
+            train_sums[name] = train_sums.get(name, 0.0) + float(value.item())
+        train_batches += 1
+        full_validation = step % int(args.full_validation_every) == 0 or step == int(args.steps)
+        if step % max(1, int(args.eval_every)) == 0 or full_validation:
             val = run_val(
                 model,
-                val_loader,
+                full_val_loader if full_validation else val_loader,
                 device=device,
                 final_value_loss_weight=float(args.final_value_loss_weight),
                 moves_left_loss_weight=float(args.moves_left_loss_weight),
@@ -411,16 +439,19 @@ def main() -> None:
                 soft_policy_temperature=float(args.soft_policy_temperature),
                 root_wdl_loss_weight=float(args.root_wdl_loss_weight),
                 amp_enabled=amp_enabled,
+                max_batches=None if full_validation else regular_validation_batches,
             )
+            train = {name: total / train_batches for name, total in train_sums.items()}
             print(f"step {step:,}/{int(args.steps):,} | lr={opt.param_groups[0]['lr']:.2e}")
             print(
-                f"  train total={terms['total'].item():.4f} formal={terms['formal'].item():.4f} "
-                f"policy={terms['policy'].item():.4f} final_wdl={terms['final_value_ce'].item():.4f} "
-                f"root_wdl={terms['root_value_ce'].item():.4f} moves={terms['moves_left'].item():.4f} "
-                f"soft_kl={terms['soft_policy_kl'].item():.4f}"
+                f"  train[{train_batches:>4}] total={train['total']:.4f} formal={train['formal']:.4f} "
+                f"policy={train['policy']:.4f} final_wdl={train['final_value_ce']:.4f} "
+                f"root_wdl={train['root_value_ce']:.4f} moves={train['moves_left']:.4f} "
+                f"soft_kl={train['soft_policy_kl']:.4f}"
             )
             print(
-                f"  val   total={val['total']:.4f} formal={val['formal']:.4f} policy={val['policy']:.4f} "
+                f"  {'full_val' if full_validation else 'val':<7} total={val['total']:.4f} "
+                f"formal={val['formal']:.4f} policy={val['policy']:.4f} "
                 f"final_wdl={val['final_value_ce']:.4f} root_wdl={val['root_value_ce']:.4f} "
                 f"moves={val['moves_left']:.4f} soft_kl={val['soft_policy_kl']:.4f}"
             )
@@ -440,6 +471,7 @@ def main() -> None:
                 "moves_left_head": True,
                 "auxiliary_heads": True,
                 "trunk_kind": model.trunk_kind,
+                "model_format": "px0_attentionbody_v1" if trunk_kind != CNN_TRUNK_KIND else "x7_v2",
                 "value_head_format": "wdl",
                 "value_target_kind": "final_wdl_plus_root_wdl",
                 "soft_policy_temperature": float(args.soft_policy_temperature),
@@ -448,7 +480,7 @@ def main() -> None:
                 "root_wdl_loss_weight": float(args.root_wdl_loss_weight),
                 "amp": amp_enabled,
                 "completed_steps": step,
-                "best_formal_loss": min(best_formal, val["formal"]),
+                "best_full_formal_loss": min(best_full_formal, val["formal"]) if full_validation else best_full_formal,
                 "lr_decay_steps": lr_decay_steps,
                 "config_path": str(args.config_path),
                 "run_name": str(args.name),
@@ -456,17 +488,23 @@ def main() -> None:
                 "px0_root": str(args.px0_root.resolve()),
                 "validation_manifest": str(validation_manifest),
                 "batch_size": int(args.batch_size),
+                "validation_batches": regular_validation_batches,
+                "full_validation_every": int(args.full_validation_every),
+                "last_validation_is_full": full_validation,
                 "warmup_steps": int(args.warmup_steps),
                 "lr": float(args.lr),
                 "min_lr_scale": float(args.min_lr_scale),
                 "weight_decay": float(args.weight_decay),
                 "last_val": val,
+                "last_train": train,
                 "created_utc": datetime.now(timezone.utc).isoformat(),
             }
             save_checkpoint(payload, args.out)
-            if math.isfinite(val["formal"]) and val["formal"] < best_formal:
-                best_formal = val["formal"]
+            if full_validation and math.isfinite(val["formal"]) and val["formal"] < best_full_formal:
+                best_full_formal = val["formal"]
                 save_checkpoint(payload, args.out.with_name(args.out.stem + ".best" + args.out.suffix))
+            train_sums.clear()
+            train_batches = 0
 
 
 if __name__ == "__main__":

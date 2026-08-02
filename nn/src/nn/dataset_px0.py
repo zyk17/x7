@@ -18,9 +18,9 @@ from nn.px0_record import Px0Sample, expand_chunk_globs, iter_px0_chunk_file
 class Px0DatasetConfig:
     patterns: tuple[str, ...] = ()
     file_list_path: Path | None = None
-    sample_list_path: Path | None = None
     shuffle_files: bool = False
     shuffle_size: int = 0
+    sample_rate: int = 1
     max_files: int = 0
     limit_samples: int = 0
     verify_files: bool = True
@@ -52,24 +52,6 @@ def resolve_px0_files(config: Px0DatasetConfig) -> list[Path]:
     return files
 
 
-def load_px0_sample_list(path: Path | str) -> dict[Path, list[int]]:
-    src = Path(path)
-    data = json.loads(src.read_text(encoding="utf-8"))
-    entries = data.get("samples")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError(f"px0 sample list 缺少非空 samples: {src}")
-    grouped: dict[Path, list[int]] = {}
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError(f"px0 sample list 包含非法 sample: {src}")
-        path = Path(str(entry.get("file", ""))).resolve()
-        record_index = entry.get("record_index")
-        if not path.is_file() or not isinstance(record_index, int) or record_index < 0:
-            raise ValueError(f"px0 sample list 包含非法引用: {src}")
-        grouped.setdefault(path, []).append(record_index)
-    return {path: sorted(indices) for path, indices in sorted(grouped.items())}
-
-
 T = TypeVar("T")
 
 
@@ -99,8 +81,7 @@ class Px0ChunkDataset(IterableDataset[dict[str, torch.Tensor]]):
     def __init__(self, config: Px0DatasetConfig) -> None:
         super().__init__()
         self.config = config
-        self.sample_indices = load_px0_sample_list(config.sample_list_path) if config.sample_list_path else None
-        self.files = list(self.sample_indices) if self.sample_indices is not None else resolve_px0_files(config)
+        self.files = resolve_px0_files(config)
         if not self.files:
             raise FileNotFoundError("no px0 chunk files matched")
 
@@ -128,18 +109,9 @@ class Px0ChunkDataset(IterableDataset[dict[str, torch.Tensor]]):
 
         def samples() -> Iterator[Px0Sample]:
             for path in files:
-                wanted = self.sample_indices.get(path) if self.sample_indices is not None else None
-                wanted_pos = 0
-                for record_index, sample in enumerate(iter_px0_chunk_file(path)):
-                    if wanted is not None:
-                        while wanted_pos < len(wanted) and wanted[wanted_pos] < record_index:
-                            wanted_pos += 1
-                        if wanted_pos >= len(wanted):
-                            break
-                        if wanted[wanted_pos] != record_index:
-                            continue
-                        wanted_pos += 1
-                    yield sample
+                for sample in iter_px0_chunk_file(path):
+                    if self.config.sample_rate <= 1 or random.randrange(self.config.sample_rate) == 0:
+                        yield sample
 
         # DataLoader workers own disjoint file streams. Divide the configured
         # total buffer across them to bound aggregate host-memory use.
