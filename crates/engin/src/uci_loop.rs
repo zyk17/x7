@@ -1,6 +1,6 @@
 //! px0 `src/chess/uciloop.h:42-127` 与 `uciloop.cc:45-337`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use xiangqi_core::STARTPOS_FEN;
@@ -135,7 +135,7 @@ impl<'a> UciLoop<'a> {
                     return Err(EnginError::Uci("setoption requires name".into()));
                 }
                 self.engine
-                    .set_option(&get_or_empty(params, "name"), &get_or_empty(params, "value"))?;
+                    .set_option(get_or_empty(params, "name"), get_or_empty(params, "value"))?;
                 self.responder.set_options(self.engine.options().clone());
             }
             "ucinewgame" => self.engine.new_game()?,
@@ -143,10 +143,10 @@ impl<'a> UciLoop<'a> {
                 if contains_key(params, "fen") == contains_key(params, "startpos") {
                     return Err(EnginError::Uci("Position requires either fen or startpos".into()));
                 }
-                let moves = split_at_whitespace(&get_or_empty(params, "moves"));
+                let moves = split_at_whitespace(get_or_empty(params, "moves"));
                 let fen = get_or_empty(params, "fen");
                 self.engine
-                    .set_position(if fen.is_empty() { STARTPOS_FEN } else { &fen }, &moves)?;
+                    .set_position(if fen.is_empty() { STARTPOS_FEN } else { fen }, &moves)?;
             }
             "go" => {
                 let mut go_params = GoParams::default();
@@ -156,23 +156,19 @@ impl<'a> UciLoop<'a> {
                     if !contains_key(params, flag) {
                         continue;
                     }
-                    if !get_or_empty(params, flag).is_empty() {
-                        return Err(EnginError::Uci(format!(
-                            "Unexpected token {}",
-                            get_or_empty(params, flag)
-                        )));
+                    let value = get_or_empty(params, flag);
+                    if !value.is_empty() {
+                        return Err(EnginError::Uci(format!("Unexpected token {value}")));
                     }
                     go_params.infinite = true;
                 }
                 if contains_key(params, "searchmoves") {
-                    go_params.searchmoves = split_at_whitespace(&get_or_empty(params, "searchmoves"));
+                    go_params.searchmoves = split_at_whitespace(get_or_empty(params, "searchmoves"));
                 }
                 if contains_key(params, "ponder") {
-                    if !get_or_empty(params, "ponder").is_empty() {
-                        return Err(EnginError::Uci(format!(
-                            "Unexpected token {}",
-                            get_or_empty(params, "ponder")
-                        )));
+                    let value = get_or_empty(params, "ponder");
+                    if !value.is_empty() {
+                        return Err(EnginError::Uci(format!("Unexpected token {value}")));
                     }
                     go_params.ponder = true;
                 }
@@ -252,7 +248,7 @@ pub fn parse_command(line: &str) -> Result<(String, HashMap<String, String>), En
         chars = line.chars().peekable();
     }
 
-    if !known_commands().contains(command_token.as_str()) {
+    if !is_known_command(&command_token) {
         return Err(EnginError::Uci(format!("Unknown command: {line}")));
     }
 
@@ -263,14 +259,9 @@ pub fn parse_command(line: &str) -> Result<(String, HashMap<String, String>), En
     let mut whitespace = "";
     while let Some(token) = {
         let t = read_token(&mut chars);
-        if t.is_empty() {
-            None
-        } else {
-            Some(t)
-        }
+        if t.is_empty() { None } else { Some(t) }
     } {
-        let command_keys = known_command_keys(command_token.as_str());
-        if !command_keys.contains(token.as_str()) {
+        if !is_command_key(&command_token, &token) {
             let Some(current) = value.as_mut() else {
                 return Err(EnginError::Uci(format!("Unexpected token: {token}")));
             };
@@ -287,9 +278,9 @@ pub fn parse_command(line: &str) -> Result<(String, HashMap<String, String>), En
     Ok((command_token, params))
 }
 
-/// px0 `GetOrEmpty` (`uciloop.cc:137-143`)。
-pub fn get_or_empty(params: &HashMap<String, String>, key: &str) -> String {
-    params.get(key).cloned().unwrap_or_default()
+/// px0 `GetOrEmpty`（`uciloop.cc:137-143`）：缺 key 时返回空串借用，避免无谓 `String` 拷贝。
+pub fn get_or_empty<'a>(params: &'a HashMap<String, String>, key: &str) -> &'a str {
+    params.get(key).map(String::as_str).unwrap_or("")
 }
 
 /// px0 `GetNumeric` (`uciloop.cc:145-162`)。
@@ -436,42 +427,44 @@ impl StringUciResponder for VecUciResponder {
     }
 }
 
-fn known_commands() -> HashSet<&'static str> {
-    HashSet::from([
-        "uci",
-        "isready",
-        "setoption",
-        "ucinewgame",
-        "position",
-        "go",
-        "stop",
-        "ponderhit",
-        "quit",
-        "fen",
-        "wait",
-    ])
+fn is_known_command(command: &str) -> bool {
+    matches!(
+        command,
+        "uci"
+            | "isready"
+            | "setoption"
+            | "ucinewgame"
+            | "position"
+            | "go"
+            | "stop"
+            | "ponderhit"
+            | "quit"
+            | "fen"
+            | "wait"
+    )
 }
 
-fn known_command_keys(command: &str) -> HashSet<&'static str> {
+fn is_command_key(command: &str, key: &str) -> bool {
     match command {
-        "setoption" => HashSet::from(["name", "value"]),
-        "position" => HashSet::from(["fen", "startpos", "moves"]),
-        "go" => HashSet::from([
-            "infinite",
-            "infinity",
-            "wtime",
-            "btime",
-            "winc",
-            "binc",
-            "movestogo",
-            "depth",
-            "mate",
-            "nodes",
-            "movetime",
-            "searchmoves",
-            "ponder",
-        ]),
-        _ => HashSet::new(),
+        "setoption" => matches!(key, "name" | "value"),
+        "position" => matches!(key, "fen" | "startpos" | "moves"),
+        "go" => matches!(
+            key,
+            "infinite"
+                | "infinity"
+                | "wtime"
+                | "btime"
+                | "winc"
+                | "binc"
+                | "movestogo"
+                | "depth"
+                | "mate"
+                | "nodes"
+                | "movetime"
+                | "searchmoves"
+                | "ponder"
+        ),
+        _ => false,
     }
 }
 
@@ -546,7 +539,7 @@ mod tests {
     use super::*;
     use crate::callbacks::Wdl;
     use std::sync::Once;
-    use xiangqi_core::{initialize_magic_bitboards, Move, Square};
+    use xiangqi_core::{Move, Square, initialize_magic_bitboards};
 
     static INIT: Once = Once::new();
 
@@ -599,10 +592,12 @@ mod tests {
             .set_uci_option("WeightsFile", "data/x7.onnx")
             .expect("weights option");
         assert_eq!(options.weights_file, "data/x7.onnx");
-        assert!(options
-            .list_options_uci()
-            .iter()
-            .any(|line| line == "option name WeightsFile type string default data/x7.onnx"));
+        assert!(
+            options
+                .list_options_uci()
+                .iter()
+                .any(|line| line == "option name WeightsFile type string default data/x7.onnx")
+        );
     }
 
     #[test]
@@ -623,9 +618,10 @@ mod tests {
         let mut uci = UciLoop::new(&mut responder, &mut engine);
         assert!(uci.process_line("uci", "1.2.3").expect("uci"));
         assert!(uci.process_line("isready", "1.2.3").expect("isready"));
-        assert!(uci
-            .process_line("position startpos moves h2h4", "1.2.3")
-            .expect("position"));
+        assert!(
+            uci.process_line("position startpos moves h2h4", "1.2.3")
+                .expect("position")
+        );
         drop(uci);
         assert_eq!(responder.responses[0], "id name x7 v1.2.3");
         assert_eq!(responder.responses.last().unwrap(), "readyok");
