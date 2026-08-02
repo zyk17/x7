@@ -1,7 +1,7 @@
 //! px0 `board.cc:96-121, 368-386` 几何 mask 与距离辅助。
 
 use crate::bitboard::BitBoard;
-use crate::types::{file_distance, rank_distance, Direction, Square, EAST, NORTH, SOUTH, WEST};
+use crate::types::{Direction, EAST, NORTH, SOUTH, Square, WEST, file_distance, rank_distance};
 
 pub const PALACE: u128 = (0x0000_0000_0070_381Cu128 << 64) | 0x0000_0000_00E0_7038u128;
 pub const FILE_A_BB: u128 = (0x0000_0000_0002_0100u128 << 64) | 0x8040_2010_0804_0201u128;

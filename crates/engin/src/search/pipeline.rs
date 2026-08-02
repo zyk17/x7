@@ -6,24 +6,24 @@
 //! Eval 负责终局、缓存、合法着和编码；NN 线程只对队列中的 tensor 执行 ONNX。
 //! worker 之间只传递 owned event。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, SendTimeoutError, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use parking_lot::{Condvar, Mutex};
 use xiangqi_core::{Move, PositionHistory};
 
+use crate::EnginError;
 use crate::neural::backend::{Backend, EvalPosition, EvalResult};
 use crate::neural::onnx::softmax_legal_policy;
-use crate::neural::{encode_position_for_nn, FillEmptyHistory, BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE};
-use crate::EnginError;
+use crate::neural::{BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLICY_SIZE, encode_position_for_nn};
 
-use super::extension::{classify_extension, ExtensionKind};
+use super::extension::{ExtensionKind, classify_extension};
 use super::{
-    network_wl_to_node, select_edge_from_node, BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository,
-    SearchGeneration, SearchParams, Tree,
+    BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGeneration, SearchParams, Tree,
+    network_wl_to_node, select_edge_from_node,
 };
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
@@ -863,10 +863,10 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(mut event) => {
-                if shared.benchmark_telemetry {
-                    if let Some(wait) = event.take_queue_wait() {
-                        shared.gather_queue.record(wait);
-                    }
+                if shared.benchmark_telemetry
+                    && let Some(wait) = event.take_queue_wait()
+                {
+                    shared.gather_queue.record(wait);
                 }
                 if shared.stopping.load(Ordering::Acquire) {
                     shared.cancel_and_finish(event, false);
@@ -994,10 +994,10 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender
 
         match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(mut event) => {
-                if shared.benchmark_telemetry {
-                    if let Some(wait) = event.take_queue_wait() {
-                        shared.eval_queue.record(wait);
-                    }
+                if shared.benchmark_telemetry
+                    && let Some(wait) = event.take_queue_wait()
+                {
+                    shared.eval_queue.record(wait);
                 }
                 if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
                     shared.fail(error);
@@ -1267,19 +1267,19 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
-        if shared.benchmark_telemetry {
-            if let Some(wait) = first.take_queue_wait() {
-                shared.nn_queue.record(wait);
-            }
+        if shared.benchmark_telemetry
+            && let Some(wait) = first.take_queue_wait()
+        {
+            shared.nn_queue.record(wait);
         }
         let mut requests = vec![first];
         while requests.len() < batch_size {
             match receiver.try_recv() {
                 Ok(mut request) => {
-                    if shared.benchmark_telemetry {
-                        if let Some(wait) = request.take_queue_wait() {
-                            shared.nn_queue.record(wait);
-                        }
+                    if shared.benchmark_telemetry
+                        && let Some(wait) = request.take_queue_wait()
+                    {
+                        shared.nn_queue.record(wait);
                     }
                     requests.push(request);
                 }
@@ -1343,17 +1343,17 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(mut first) => {
-                if shared.benchmark_telemetry {
-                    if let Some(wait) = first.take_queue_wait() {
-                        shared.backprop_queue.record(wait);
-                    }
+                if shared.benchmark_telemetry
+                    && let Some(wait) = first.take_queue_wait()
+                {
+                    shared.backprop_queue.record(wait);
                 }
                 let mut events = vec![first];
                 for mut event in receiver.try_iter() {
-                    if shared.benchmark_telemetry {
-                        if let Some(wait) = event.take_queue_wait() {
-                            shared.backprop_queue.record(wait);
-                        }
+                    if shared.benchmark_telemetry
+                        && let Some(wait) = event.take_queue_wait()
+                    {
+                        shared.backprop_queue.record(wait);
                     }
                     events.push(event);
                 }
@@ -1399,8 +1399,8 @@ fn persistent_backprop_worker(commands: Receiver<BackpropCommand>, job_done: Sen
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1409,11 +1409,11 @@ mod tests {
     use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
     use super::{NodeEvent, Search, SearchConfig, SearchLimits, Shared};
+    use crate::EnginError;
     use crate::neural::backend::{
         Backend, BackendAttributes, BackendComputation, EncodedInference, EvalResult, UniformBackend,
     };
-    use crate::search::{best_move, root_stats, ExpansionState, NodeRepository, SearchGeneration, SearchParams};
-    use crate::EnginError;
+    use crate::search::{ExpansionState, NodeRepository, SearchGeneration, SearchParams, best_move, root_stats};
 
     struct FailingComputationBackend;
 
@@ -1668,10 +1668,12 @@ mod tests {
         assert!(worker_stats.average_depth >= 1);
         assert!(worker_stats.max_depth >= worker_stats.average_depth);
         assert_eq!(worker_root.completed_visits, count as u32);
-        assert!(worker_root
-            .edges
-            .iter()
-            .all(|edge| edge.started_visits == edge.completed_visits));
+        assert!(
+            worker_root
+                .edges
+                .iter()
+                .all(|edge| edge.started_visits == edge.completed_visits)
+        );
         assert!(!worker_root.edges.is_empty());
 
         workers.stop_and_finish();

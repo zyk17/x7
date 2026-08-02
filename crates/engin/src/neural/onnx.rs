@@ -13,20 +13,20 @@ use std::sync::{Arc, Mutex};
 
 use ndarray::Array4;
 #[cfg(feature = "cuda")]
-use ort::ep::{cuda::ConvAlgorithmSearch, CUDA};
+use ort::ep::{CUDA, cuda::ConvAlgorithmSearch};
 #[cfg(feature = "directml")]
-use ort::ep::{directml::PerformancePreference, DirectML};
+use ort::ep::{DirectML, directml::PerformancePreference};
 use ort::session::Session;
 use ort::value::TensorRef;
 
+use crate::EnginError;
 use crate::neural::backend::{
     AddInputResult, Backend, BackendAttributes, BackendComputation, EncodedInference, EvalPosition, EvalResult,
     EvalTicket,
 };
-use crate::EnginError;
 
 use super::{
-    encode_position_for_nn, move_to_nn_index, FillEmptyHistory, BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE,
+    BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLICY_SIZE, encode_position_for_nn, move_to_nn_index,
 };
 
 /// px0 `NetworkAsBackend` (`wrapper.cc:49-98`) 的最小 Rust 对应物。
@@ -525,10 +525,9 @@ mod tests {
             return;
         }
         let backend = OnnxBackend::from_file(&path).expect("load local x7.onnx");
-        let history = xiangqi_core::PositionHistory::from_positions(vec![xiangqi_core::Position::from_fen(
-            xiangqi_core::STARTPOS_FEN,
-        )
-        .unwrap()]);
+        let history = xiangqi_core::PositionHistory::from_positions(vec![
+            xiangqi_core::Position::from_fen(xiangqi_core::STARTPOS_FEN).unwrap(),
+        ]);
         let legal = history.last().board().generate_legal_moves();
         let eval = backend.evaluate(&history, &legal);
         assert_eq!(eval.policies.len(), legal.len());

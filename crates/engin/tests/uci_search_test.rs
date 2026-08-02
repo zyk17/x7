@@ -23,10 +23,12 @@ fn go_nodes_reports_info_and_bestmove() {
     drop(uci);
 
     assert!(responder.responses.iter().any(|line| line.starts_with("info ")));
-    assert!(responder
-        .responses
-        .iter()
-        .any(|line| line.contains(" depth ") && line.contains(" seldepth ")));
+    assert!(
+        responder
+            .responses
+            .iter()
+            .any(|line| line.contains(" depth ") && line.contains(" seldepth "))
+    );
     assert!(responder.responses.iter().any(|line| line.contains(" score cp ")));
     assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
 }
@@ -124,10 +126,12 @@ fn missing_weights_never_falls_back_to_uniform_search() {
     uci.process_line("go nodes 8", "test").expect("go");
     drop(uci);
 
-    assert!(responder
-        .responses
-        .iter()
-        .any(|line| line.starts_with("info string cannot search:")));
+    assert!(
+        responder
+            .responses
+            .iter()
+            .any(|line| line.starts_with("info string cannot search:"))
+    );
     assert!(!responder.responses.iter().any(|line| line.starts_with("bestmove ")));
 }
 

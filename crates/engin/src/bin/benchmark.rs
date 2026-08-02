@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use engin::neural::backend::{Backend, CachingBackend};
 use engin::neural::onnx::OnnxBackend;
-use engin::search::{root_stats, QueueStats, Search, SearchConfig, SearchGeneration, SearchLimits, Stats};
+use engin::search::{QueueStats, Search, SearchConfig, SearchGeneration, SearchLimits, Stats, root_stats};
 use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
 struct Args {
@@ -390,11 +390,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .map(|(best, total)| best as f64 * 100.0 / total.max(1) as f64)
                             .unwrap_or(0.0);
                         println!(
-                        "{:>3} {:>3} {:>3} {:>3} {:>8.1} {:>8.0} {:>8.0} {:>7} {:>6.1} {:>7} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
-                        gather_workers, eval_workers, backprop_workers, run_index, ms, nps, eps,
-                        stats.completed_playouts, collision_rate, stats.peak_in_flight, root_share,
-                        average_wait_us(stats.gather_queue), average_wait_us(stats.eval_queue), average_wait_us(stats.nn_queue),
-                    );
+                            "{:>3} {:>3} {:>3} {:>3} {:>8.1} {:>8.0} {:>8.0} {:>7} {:>6.1} {:>7} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
+                            gather_workers,
+                            eval_workers,
+                            backprop_workers,
+                            run_index,
+                            ms,
+                            nps,
+                            eps,
+                            stats.completed_playouts,
+                            collision_rate,
+                            stats.peak_in_flight,
+                            root_share,
+                            average_wait_us(stats.gather_queue),
+                            average_wait_us(stats.eval_queue),
+                            average_wait_us(stats.nn_queue),
+                        );
                         println!(
                             "    batch avg={:.2} max={} q_backprop={:.1}us submitted={} collision_depths={}",
                             if stats.network_batches > 0 {

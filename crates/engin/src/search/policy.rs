@@ -236,7 +236,7 @@ pub fn select_edge_from_node(
 mod tests {
     use xiangqi_core::{Move, Square};
 
-    use super::{compute_cpuct, edge_utility, select_edge, SearchParams, ValueDelta};
+    use super::{SearchParams, ValueDelta, compute_cpuct, edge_utility, select_edge};
     use crate::search::{NodeKey, NodeRepository};
 
     fn mv(from: &str, to: &str) -> Move {

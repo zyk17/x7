@@ -14,10 +14,10 @@ use engin::{Engine, StdoutUciResponder, UciLoop};
 /// 仓库路径仅用于开发期回退，发布布局不依赖它们。
 fn default_weights_file() -> PathBuf {
     let mut candidates = Vec::new();
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            candidates.push(directory.join("x7.onnx"));
-        }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        candidates.push(directory.join("x7.onnx"));
     }
     candidates.push(PathBuf::from("x7.onnx"));
     let mut dev_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

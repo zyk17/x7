@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use crate::bitboard::BitBoard;
 use crate::board_attacks::get_attacks;
-use crate::board_masks::{bishop_bb, pawn_bb, PALACE};
+use crate::board_masks::{PALACE, bishop_bb, pawn_bb};
 use crate::hashcat::hash_cat_u128s;
 use crate::{CoreError, File, Move, MoveList, PieceType, Rank, Square};
 
@@ -82,10 +82,11 @@ impl ChessBoard {
             where_at: Option<&str>,
             fen: &str,
         ) -> Result<bool, CoreError> {
-            if let Some(where_at) = where_at {
-                if *pos < bytes.len() && bytes[*pos] != b' ' {
-                    return Err(CoreError::InvalidFen(format!("space expected {where_at}: {fen}")));
-                }
+            if let Some(where_at) = where_at
+                && *pos < bytes.len()
+                && bytes[*pos] != b' '
+            {
+                return Err(CoreError::InvalidFen(format!("space expected {where_at}: {fen}")));
             }
             while *pos < bytes.len() && bytes[*pos] == b' ' {
                 *pos += 1;

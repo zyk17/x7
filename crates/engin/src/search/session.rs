@@ -284,11 +284,11 @@ impl SearchSession {
 mod tests {
     use std::sync::{Arc, Mutex, Once};
 
-    use xiangqi_core::{initialize_magic_bitboards, GameState, STARTPOS_FEN};
+    use xiangqi_core::{GameState, STARTPOS_FEN, initialize_magic_bitboards};
 
+    use crate::GoParams;
     use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo};
     use crate::neural::backend::UniformBackend;
-    use crate::GoParams;
 
     use super::SearchSession;
 

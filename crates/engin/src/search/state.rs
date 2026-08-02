@@ -10,13 +10,13 @@ use std::time::Instant;
 
 use xiangqi_core::PositionHistory;
 
+use crate::EnginError;
 use crate::callbacks::{ThinkingInfo, Wdl};
 use crate::neural::backend::Backend;
-use crate::EnginError;
 
 use super::{
-    best_mate, best_move_filtered, principal_variation_filtered, root_stats, GcStats, NodeKey, NodeRepository, Search,
-    SearchConfig, SearchControl, SearchGeneration, SearchLimits, Stats, Tree, WorkerPool,
+    GcStats, NodeKey, NodeRepository, Search, SearchConfig, SearchControl, SearchGeneration, SearchLimits, Stats, Tree,
+    WorkerPool, best_mate, best_move_filtered, principal_variation_filtered, root_stats,
 };
 
 /// watchdog 持有的只读 root view，搜索 worker 不持有它。

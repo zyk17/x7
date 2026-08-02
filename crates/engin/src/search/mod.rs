@@ -23,14 +23,14 @@ mod tree;
 pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
 pub(crate) use pipeline::WorkerPool;
 pub use pipeline::{QueueStats, Search, SearchConfig, SearchControl, SearchLimits, Stats};
-pub use policy::{select_edge, select_edge_from_node, SearchParams, ValueDelta};
+pub use policy::{SearchParams, ValueDelta, select_edge, select_edge_from_node};
 pub(crate) use session::SearchSession;
 pub use state::SearchResult;
 pub(crate) use state::{SearchState, WatchdogSnapshot};
 pub(crate) use stats::best_mate;
 pub use stats::{
-    best_move, best_move_filtered, principal_variation, principal_variation_filtered, root_stats, RootEdgeStats,
-    RootStats,
+    RootEdgeStats, RootStats, best_move, best_move_filtered, principal_variation, principal_variation_filtered,
+    root_stats,
 };
 pub use tree::{Edge, EdgeReservation, ExpansionState, GcStats, Node, NodeKey, NodeRepository, Tree};
 

@@ -65,11 +65,7 @@ impl PieceType {
             Self::King => 'k',
             Self::KnightTo | Self::PawnToOurs | Self::PawnToTheirs => '?',
         };
-        if uppercase {
-            ch.to_ascii_uppercase()
-        } else {
-            ch
-        }
+        if uppercase { ch.to_ascii_uppercase() } else { ch }
     }
 
     pub fn to_string(self, uppercase: bool) -> String {
@@ -97,11 +93,7 @@ impl File {
     pub const INVALID: Self = Self(0x80);
 
     pub const fn from_idx(idx: u8) -> Option<Self> {
-        if idx < FILE_NB {
-            Some(Self(idx))
-        } else {
-            None
-        }
+        if idx < FILE_NB { Some(Self(idx)) } else { None }
     }
 
     pub const fn index(self) -> u8 {
@@ -167,11 +159,7 @@ impl Rank {
     pub const INVALID: Self = Self(0x80);
 
     pub const fn from_idx(idx: u8) -> Option<Self> {
-        if idx < RANK_NB {
-            Some(Self(idx))
-        } else {
-            None
-        }
+        if idx < RANK_NB { Some(Self(idx)) } else { None }
     }
 
     pub const fn index(self) -> u8 {
@@ -231,11 +219,7 @@ impl Square {
     }
 
     pub const fn from_idx(idx: u8) -> Option<Self> {
-        if idx < SQUARE_NB {
-            Some(Self(idx))
-        } else {
-            None
-        }
+        if idx < SQUARE_NB { Some(Self(idx)) } else { None }
     }
 
     pub fn parse(text: &str) -> Option<Self> {

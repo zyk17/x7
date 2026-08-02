@@ -7,7 +7,7 @@ use xiangqi_core::{Move, MoveList, Position, PositionHistory};
 
 use crate::EnginError;
 
-use super::cache::{CachedEval, EvalCache, DEFAULT_NN_CACHE_SIZE};
+use super::cache::{CachedEval, DEFAULT_NN_CACHE_SIZE, EvalCache};
 use super::{BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE};
 
 /// px0 `BackendAttributes` (`src/neural/backend.h:45-52`)。

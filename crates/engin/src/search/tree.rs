@@ -8,8 +8,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use nohash_hasher::{IsEnabled, NoHashHasher};
 use parking_lot::{Mutex, RwLock};
@@ -730,7 +730,7 @@ impl Tree {
 mod tree_tests {
     use std::sync::Arc;
 
-    use xiangqi_core::{GameState, Move, PositionHistory, Square, STARTPOS_FEN};
+    use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN, Square};
 
     use super::{NodeKey, Tree};
 

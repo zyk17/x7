@@ -340,10 +340,10 @@ pub fn format_thinking_info(info: &ThinkingInfo, options: &Options) -> String {
     if let Some(score) = info.score {
         res.push_str(&format!(" score cp {score}"));
     }
-    if let Some(wdl) = info.wdl {
-        if options.show_wdl {
-            res.push_str(&format!(" wdl {} {} {}", wdl.w, wdl.d, wdl.l));
-        }
+    if options.show_wdl
+        && let Some(wdl) = info.wdl
+    {
+        res.push_str(&format!(" wdl {} {} {}", wdl.w, wdl.d, wdl.l));
     }
     if info.nps >= 0 {
         res.push_str(&format!(" nps {}", info.nps));

@@ -119,7 +119,7 @@ mod tests {
 
     use xiangqi_core::{Position, STARTPOS_FEN};
 
-    use super::{estimated_moves_to_go, TimeManager};
+    use super::{TimeManager, estimated_moves_to_go};
     use crate::uci_loop::GoParams;
 
     #[test]

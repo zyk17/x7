@@ -46,11 +46,7 @@ pub fn root_stats(repository: &NodeRepository, root_key: NodeKey) -> Option<Root
 }
 
 fn orient_move(mv: Move, flip: bool) -> Move {
-    if flip && !mv.is_null() {
-        mv.flip()
-    } else {
-        mv
-    }
+    if flip && !mv.is_null() { mv.flip() } else { mv }
 }
 
 /// bestmove 结果分组（px0 `EdgeRank`，`search.cc:737-756`）。
@@ -83,11 +79,7 @@ fn best_edge_rank(edge: &Edge, child: Option<&Node>) -> BestEdgeRank {
 }
 
 fn edge_q_for_ranking(edge: &Edge) -> f32 {
-    if edge.completed_visits() > 0 {
-        edge.q()
-    } else {
-        0.0
-    }
+    if edge.completed_visits() > 0 { edge.q() } else { 0.0 }
 }
 
 fn terminal_plies(child: &Node) -> f32 {
@@ -204,11 +196,7 @@ pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_mov
     if let Some((wl, _, m)) = root.terminal_value() {
         return (wl != 0.0).then(|| {
             let distance = m.round() as i32 / 2 + 1;
-            if wl < 0.0 {
-                distance
-            } else {
-                -distance
-            }
+            if wl < 0.0 { distance } else { -distance }
         });
     }
     let mv = best_edge_absolute(repository, root_key, root_move_filter)?;
@@ -216,11 +204,7 @@ pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_mov
     let (wl, _, m) = child.terminal_value()?;
     (wl != 0.0).then(|| {
         let distance = m.round() as i32 / 2 + 1;
-        if wl > 0.0 {
-            distance
-        } else {
-            -distance
-        }
+        if wl > 0.0 { distance } else { -distance }
     })
 }
 
@@ -266,7 +250,7 @@ pub fn principal_variation_filtered(
 mod tests {
     use std::sync::Arc;
 
-    use xiangqi_core::{GameState, Move, PositionHistory, Square, STARTPOS_FEN};
+    use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN, Square};
 
     use super::{best_mate, best_move, best_move_filtered, principal_variation, root_stats};
     use crate::neural::backend::UniformBackend;
@@ -288,10 +272,12 @@ mod tests {
         let stats = root_stats(pipeline.repository(), pipeline.root_key()).expect("root snapshot");
         assert_eq!(stats.completed_visits, 16);
         assert!(stats.edges.iter().any(|edge| edge.completed_visits > 0));
-        assert!(stats
-            .edges
-            .iter()
-            .all(|edge| edge.started_visits == edge.completed_visits));
+        assert!(
+            stats
+                .edges
+                .iter()
+                .all(|edge| edge.started_visits == edge.completed_visits)
+        );
         let mv = best_move(pipeline.repository(), pipeline.root_key(), root_is_black).expect("bestmove");
         assert!(!mv.is_null());
         let pv = principal_variation(pipeline.repository(), pipeline.root_key(), root_is_black);

@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use xiangqi_core::{GameState, STARTPOS_FEN};
 
+use crate::EnginError;
+use crate::Options;
 use crate::callbacks::SearchResponder;
 use crate::neural::backend::{Backend, CachingBackend, UniformBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::SearchSession;
 use crate::uci_loop::{GoParams, StringUciResponder};
-use crate::EnginError;
-use crate::Options;
 
 /// px0 `Engine` 的 P3 子集：搜索与 UCI 调度。
 pub struct Engine {
@@ -147,10 +147,10 @@ impl Engine {
 
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), EnginError> {
         self.options.set_uci_option(name, value)?;
-        if name == "VirtualLoss" {
-            if let Some(search) = self.search.as_mut() {
-                search.set_virtual_loss(self.options.virtual_loss);
-            }
+        if name == "VirtualLoss"
+            && let Some(search) = self.search.as_mut()
+        {
+            search.set_virtual_loss(self.options.virtual_loss);
         }
         Ok(())
     }

@@ -121,7 +121,7 @@ fn two_fold_chase_or_check_cycle(history: &PositionHistory) -> bool {
 mod tests {
     use xiangqi_core::{ChessBoard, GameResult, GameState, PositionHistory};
 
-    use super::{classify_extension, ExtensionKind};
+    use super::{ExtensionKind, classify_extension};
     use crate::search::{rule_judge_wl_for_node, terminal_wl_for_node};
 
     #[test]
