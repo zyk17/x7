@@ -13,7 +13,7 @@ pub mod position;
 pub mod types;
 
 pub use bitboard::BitBoard;
-pub use board::{board_to_fen, startpos_board, ChessBoard, FenState, STARTPOS_FEN};
+pub use board::{ChessBoard, FenState, STARTPOS_FEN, board_to_fen, startpos_board};
 pub use board_attacks::initialize_magic_bitboards;
 pub use gamestate::GameState;
 pub use position::{GameResult, Position, PositionHistory};

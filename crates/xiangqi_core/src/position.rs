@@ -39,7 +39,6 @@ pub struct Position {
 }
 
 impl Position {
-    /// px0 `Position(const ChessBoard&, int, int)`。
     pub fn new(board: ChessBoard, rule60_ply: u32, game_ply: u32) -> Self {
         Self {
             board,
@@ -52,7 +51,6 @@ impl Position {
         }
     }
 
-    /// px0 `Position::FromFen`。
     pub fn from_fen(fen: &str) -> Result<Self, CoreError> {
         let (board, state) = ChessBoard::from_fen(fen)?;
         Ok(Self::new(board, state.rule60_ply, state.game_ply))
@@ -100,8 +98,8 @@ impl Position {
     /// px0 free function `PositionToFen` (`position.cc:207-212`).
     pub fn to_fen(&self) -> String {
         let mut result = board_to_fen(&self.board);
-        // `position_test.cc` expects a standard six-field FEN. px0's current
-        // `PositionToFen()` omits these two unused Xiangqi placeholders.
+        // `position_test.cc` 期望标准六字段 FEN。px0 当前的 `PositionToFen()` 省略了
+        // 中国象棋中未使用的这两个占位字段。
         result.push_str(" - - ");
         result.push_str(&self.rule60_ply.to_string());
         result.push(' ');
@@ -259,7 +257,9 @@ impl PositionHistory {
 
     /// px0 `PositionHistory::RuleJudge` (`position.cc:126-169`)。
     ///
-    /// 结果保持 px0 约定：从黑方视角返回。
+    /// 返回值按 px0 `MakeTerminal` 约定解释：`WhiteWon`→node `wl=+1`，
+    /// `BlackWon`→`wl=-1`（incoming-edge 视角），**不是**绝对红黑胜负。
+    /// 绝对结果见 [`Self::compute_game_result`]（白走时会取反）。
     pub fn rule_judge(&self) -> GameResult {
         let last = self.last();
         if last.rule60_ply < 4 {

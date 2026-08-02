@@ -2,7 +2,7 @@
 
 use std::sync::Once;
 
-use xiangqi_core::{initialize_magic_bitboards, ChessBoard, GameResult, Position, PositionHistory};
+use xiangqi_core::{ChessBoard, GameResult, Position, PositionHistory, initialize_magic_bitboards};
 
 static INIT: Once = Once::new();
 

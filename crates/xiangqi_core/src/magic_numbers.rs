@@ -1,4 +1,4 @@
-//! px0 oard.cc:156-346 magic numbers (NO_PEXT path).
+//! px0 `board.cc:156-346` 的 magic number（`NO_PEXT` 路径）。
 
 #[inline]
 const fn magic_u128(hi: u64, lo: u64) -> u128 {

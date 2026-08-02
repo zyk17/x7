@@ -1,57 +1,15 @@
 # 77xiangqi_engine
 
-中国象棋 `policy + WDL` 网络与 MCTS 引擎项目。
+> 棋力不是来自网络，也不是来自搜索。棋力来自 Prediction 与 Evidence 的协同；Knowledge 负责产生 Prediction，Proof 负责产生新的 Evidence，Decision 在固定时间预算下融合二者，形成最终行动。
 
-## 当前状态
+这是一个新的中国象棋研究引擎。项目目标是在有限计算资源、固定思考时间下研究上述协同，并只以固定时间 Elo 评估成果；网络架构、搜索算法和硬件分工都是实现选择，不是项目目标。
 
-旧 Rust 规则核心与 MCTS 已删除。项目当前唯一目标是将 px0 的规则、history、搜索、UCI 与网络调用主线逐函数翻译为 Rust。
+当前正式主线只有 stream tree MCTS；规则层参考 px0，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-当前工程参考：
+## 快速运行
 
-- `C:\Users\Administrator\projects\px0`
-- `C:\Users\Administrator\projects\pxzero-training`
-
-P4 的单 worker 主线已接通真实 `124x10x9` ONNX backend、minibatch、prefetch、collision、
-shared-tree、`MakeSolid`、watchdog UCI info 和 WDL/contempt display。正式 ONNX 已由
-px0 `MemCache` 风格的 `CachingBackend` 包裹：按局面 hash 查找、以合法着数量防碰撞、batch 完成后写入、
-`ucinewgame` 清空；默认 `NNCacheSize=2000000`。缓存容器使用 `quick_cache` 分片 S3-FIFO，缓存命中以
-`Arc<EvalResult>` 共享 policy 向量；这替代了 px0 的严格 FIFO 容器，但不改变 NN cache 的 key、collision
-guard 或 completed-only 回填语义。
-P4 已有 px0 风格的 task 生命周期、owned processing 输入和 owner tree phase 边界；旧 scoped raw-pointer
-bridge 已删除。当前队列仍由 owner 同步 drain，**不是**常驻并行 task-worker；下一项长任务将逐段翻译
-px0 `RunTasks/WaitForTasks`，先打通 processing，再在 owned selection delta 可证明后处理 gathering。task 不会
-借用 `NodeTree`、minibatch 或 backend computation。
-
-`search::stream` 是独立于 classic 的下一代搜索骨架（LC3 文档形态：repository + owned event 流水线），
-不是 LC3 源码翻译，也不接正式 UCI。当前已有库内 worker/ONNX 与对拍工具；**无 tree reuse、无 UCI
-会话**，正式对局仍走 classic。细节以 `temp.md` / `temp_stream_x7_policy.md` 为准。
-
-主 UCI 使用 px0 名称 `WeightsFile` 配置 ONNX 权重，并会在下一条 `position` 前加载它。正式
-`ClassicEngine` 在权重成功加载前没有 `ClassicSearch`，不会以 `UniformBackend` 代替模型搜索。
-启动时依次查找 `engin.exe` 同目录的 `x7.onnx`、当前工作目录的 `x7.onnx`、开发目录
-`data/x7.onnx`。Windows 发行构建只启用 DirectML；DirectML 初始化失败时明确回退 CPU，不依赖本机 CUDA 或 cuDNN。
-
-`info` 输出 px0 语义的平均/选择深度、NPS/EPS、WDL、PV、MultiPV、`ScoreType/WDL_mu` 与
-可配置的 `ContemptMode`/WDL calibration。`go nodes N` 是 px0 的 completed-iteration 下限，
-不承诺 root visits 严格等于 `N`。和 px0 一样，未先发送 `position` 的 `go` 会从 `startpos`
-初始化并加载默认权重；若权重不存在，返回明确的 `info string cannot search`。
-
-同一 UCI 会话的每次新 `go`、`position` 或 `ucinewgame` 都会先静默 `Abort + Wait` 上一次
-搜索，再启动或重置下一状态；因此 GUI 可以发送 `position -> go -> position -> go`，最后只会收到
-新搜索的 `bestmove`。这一生命周期对照 px0 `src/engine.cc:148-151,187-224` 与
-`src/search/classic/wrapper.cc:100-140`。
-
-当前开放 `go nodes`、`go movetime`、`go infinite` 与 px0 默认 legacy 时钟预算
-`wtime/btime/winc/binc/movestogo`；对应 UCI 选项是 `MoveOverheadMs` 和 `Slowmover`。`go depth`、
-`go mate`、`go ponder`、`ponderhit` 仍会明确拒绝，不能静默变成普通搜索。只翻译并暴露 px0 factory 的
-默认 `legacy` time manager，不暴露尚未翻译的 `simple/smooth/alphazero` 变体。
-
-```text
-position startpos
-go nodes 1000
-```
-
-如需切换模型，仍可在下一条 `position` 前覆盖默认值：
+正式 UCI 必须成功加载 ONNX 权重，不会回退到测试用的均匀网络。启动时依次查找可执行文件同目录、
+当前目录和 `data/x7.onnx`；也可以明确指定权重：
 
 ```text
 setoption name WeightsFile value C:/models/x7.onnx
@@ -59,23 +17,84 @@ position startpos
 go nodes 1000
 ```
 
-## 正式模型契约
+本机开发默认构建 DirectML。CUDA 保留为 NVIDIA 专用备用构建：`scripts/build-cuda.ps1` 默认从
+`C:\projects\onnxruntime-cuda13\windows\runtimes\win-x64\native` 读取官方 ONNX Runtime 1.28 的 CUDA
+DLL，复制到 `target/debug`、`target/release` 与 CUDA bundle；要换目录直接修改脚本中的路径。
+本机仍需提供 CUDA 13 / cuDNN 9。
+发行时显式选择两种互斥包：`build-directml.ps1` 构建通用 DirectML 包，`build-cuda.ps1` 构建 NVIDIA
+CUDA 包。两者不是同一二进制的运行时回退链；CUDA 使用 ORT 的 `prefer_nhwc=1`，但当前端到端
+吞吐仍不及 DirectML。
 
-- 输入：`124 x 10 x 9`
-- policy：`2062` logits
-- value：`WDL[win, draw, loss]`
-- 引擎 value：`q = win - loss`
+## UCI 范围
 
-px0 翻译顺序与参考位置见 [NextStep.md](/C:/projects/77xiangqi_engine/NextStep.md) 与 [TODO.md](/C:/projects/77xiangqi_engine/TODO.md)。
+目前支持：
 
-## Windows DirectML 打包
+- `position startpos|fen ... [moves ...]`
+- `go nodes`、`go movetime`、`go wtime/btime/winc/binc/movestogo`、`go infinite`、`go searchmoves`
+- `stop`、`ucinewgame`、`quit`
+- `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`VirtualLoss`
+
+`VirtualLoss` 直接使用搜索参数 `V`，范围 `0.0..5.0`，默认 `3.0`，例如
+`setoption name VirtualLoss value 2.5`。它是引擎
+生命周期配置：一次 `setoption` 会影响之后启动的每次 `go`；正在运行的搜索保持启动时的参数快照。
+
+时钟使用固定中性的 px0 分配，固定 `MoveOverhead=200ms`，不额外暴露 UCI 调参项。`go movetime`
+不可与时钟字段混用；`go depth`、`go mate`、`go ponder` 与 `ponderhit`
+尚无完整语义，会明确拒绝。
+
+## 基准测试
+
+`benchmark` 用于比较 stream 流水线吞吐、batch 和 collision，不经过 UCI。代表局面保存在
+`data/benchmark_positions.txt`；每行是“名称 | FEN”，使用时只复制 `|` 后的完整 FEN：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1
+cargo run -p engin --release --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1 --virtual-loss 1
 ```
 
-脚本清理并重新编译 `engin`，然后生成 `bundle\`。当前 `ort` 静态链接 ONNX Runtime，因此 bundle 包含
-`engin.exe`、`x7.onnx` 和 `DirectML.dll`，不应混入其他版本的 `onnxruntime.dll`。
+要诊断实战中的评分突变，优先保留完整历史而不是只复制最终 FEN：
 
-Python 训练独立位于 `nn/`：固定纯 CNN、`124x10x9 -> 2062 + WDL`，从单一 YAML 配置启动；见
-[nn README](C:/projects/77xiangqi_engine/nn/README.md)。
+```powershell
+cargo run -p engin --release --bin benchmark -- --moves "c3c4 g6g5 ..." --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1 --virtual-loss 1 --root-top 12
+```
+
+`--moves` 从 startpos（或指定的 `--fen`）依次应用 ICCS 着法；它保留重复与规则历史，
+但每次 benchmark 仍从 fresh tree 开始，不模拟前几回合的 tree reuse。
+
+诊断评分拐点时，可用本地 Pikafish 作为外部对照。`scripts/pikafish_compare.py` 只走标准
+UCI 生命周期并打印最终 MultiPV；默认使用本机的 Pikafish 路径，也可用 `--engine` 覆盖：
+
+```powershell
+python scripts/pikafish_compare.py --moves "c3c4 g6g5 ..." --movetime 3000 --multipv 3
+```
+
+要比较指定根着的独立价值，可重复传入 `--searchmove`：
+
+```powershell
+python scripts/pikafish_compare.py --moves "c3c4 g6g5 ..." --searchmove c3c4 --movetime 3000
+```
+
+Pikafish 的 `score cp` 是对照分数；stream 的 `Q` 是未校准的网络搜索值，二者只比较候选
+排序和趋势，不能直接作数值换算。
+
+吞吐、EPS 和 collision 只能说明流水线利用率；棋力需要用固定局面或对局测试另行验证。
+
+## 目录
+
+| 目录 | 职责 |
+| --- | --- |
+| `crates/xiangqi_core` | 唯一的规则真相：棋盘、合法着、FEN、历史与裁判。 |
+| `crates/engin` | UCI、ONNX 外围、stream 搜索、watchdog 与时钟管理。 |
+| `nn` | 训练、权重处理与 ONNX 导出；不进入搜索热路径。 |
+
+架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。当前工作与待办只记录在本地的
+[NextStep.md](NextStep.md) 和 [TODO.md](TODO.md)。训练说明见 [nn/README.md](nn/README.md)。
+
+## 开发验证
+
+```powershell
+cargo fmt --check
+cargo test -p engin --lib
+cargo clippy -p engin --all-targets -- -D warnings
+powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build-cuda.ps1
+```

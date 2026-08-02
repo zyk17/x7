@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use xiangqi_core::{startpos_board, ChessBoard, Move, Position, PositionHistory};
+use xiangqi_core::{ChessBoard, Move, Position, PositionHistory, startpos_board};
 
 /// px0 classical 输入平面数。
 pub const INPUT_PLANES: usize = 124;

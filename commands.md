@@ -25,26 +25,28 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install -e "nn[t
 
 ## 2. 准备数据
 
-每个 `px0_version + val_ratio + seed + validation_*` 组合只需要准备一次。此步骤可能较慢：首次下载、解压和
-validation manifest 的局面扫描都在这里完成。
+每个 `px0_version + val_ratio + seed` 组合只需要准备一次。此步骤可能较慢：首次下载、解压和固定
+train/validation chunk split 都在这里完成。
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\prepare_px0.py `
-  --config nn\configs\x7_v2_01.yaml
+  --config nn\configs\x7_v3_01.yaml
 ```
 
 ## 3. 用 YAML 训练
 
 ```powershell
-Copy-Item nn\configs\example.yaml nn\configs\x7_v2_01.yaml
+Copy-Item nn\configs\example.yaml nn\configs\x7_v3_01.yaml
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --config nn\configs\x7_v2_01.yaml
+  --config nn\configs\x7_v3_01.yaml
 ```
 
 配置分为 `dataset`、`model`、`training` 三段，格式参考
 `C:\Users\Administrator\projects\pxzero-training\tf\configs\example.yaml`，但只保留当前 PyTorch/PX0
-主线需要的字段。`124x10x9 -> 2062 + WDL`、纯 CNN trunk 与 loss 语义固定，不能通过配置切换。
-优化器固定为 pxzero-training 的 `SGD(momentum=0.9, nesterov=true)`。
+主线需要的字段。正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`；x7 v2 的纯 CNN trunk、
+正式 head 和 loss 语义不能通过配置切换。训练期 Auxiliary Soft Policy 与 root-WDL head 不进入 ONNX。
+优化器固定为 AdamW：Conv/Linear weights 使用 decoupled weight decay，BatchNorm 与 bias 不 decay；学习率为
+线性 warmup 后 cosine decay。
 所有可配置字段、默认值与注释见 [nn/configs/example.yaml](C:/projects/77xiangqi_engine/nn/configs/example.yaml)。
 `example.yaml` 是唯一提交到 Git 的配置文件；复制出的实验 YAML 被忽略。
 
@@ -55,14 +57,14 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 再次运行同一条 YAML 命令即可。`training.out` 已存在时自动恢复；只需把 YAML 中的
 `training.steps` 调大。
 
-## 5. 开启新阶段训练（从旧权重起步）
+## 5. 从旧权重初始化新实验
 
-复制 YAML，修改 `name`、`training.out`、`training.init_from`、`training.q_ratio` 和 `training.steps`。
-例如先用 `q_ratio=0.0` 训出第一阶段，再切到新的 `q_ratio`：
+复制 YAML，修改 `name`、`training.out`、`training.init_from` 和 `training.steps`。`init_from` 只加载模型权重；
+width、blocks、bottleneck_channels 必须与来源 checkpoint 一致。
 
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
-  --config nn\configs\x7_v2_01.yaml
+  --config nn\configs\x7_v3_01.yaml
 ```
 
 ## 6. 强制重下并重建某个版本
@@ -74,18 +76,18 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 ```powershell
 C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
   --checkpoint data\checkpoints\x7_v2_01.best.pt `
-  --out data\x7.onnx
+  --out data\x7.onnx `
+  --precision mixed-fp16
 ```
 
 说明：
 
 - `value` 输出是 `WDL` 概率
 - 引擎侧按 `q = W - L` 消费 value
-- 当前 trunk：`pre-activation residual + global-pooling residual`
+- 当前 trunk：`pre-activation bottleneck residual + two Global Broadcast`
 - 当前 policy：`pure CNN conv head`
-- 当前引擎正式只消费：`policy + WDL`
-- `q_ratio=0.0` 表示纯最终结果监督
-- `q_ratio=1.0` 表示纯搜索监督
+- 当前引擎正式消费：`policy + WDL + moves-left`
+- Auxiliary Soft Policy 与 root-WDL 是训练期 head，不在 ONNX 中
 
 ## 8. 检查 ONNX 合约
 
@@ -95,8 +97,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test
 
 ## 9. 当前引擎 UCI 冒烟
 
-当前引擎只提供正式 UCI stdin/stdout 入口；没有独立 ONNX evaluator、bench CLI 或 px0 trace
-对拍脚本。权重由 `WeightsFile` 在下一条 `position` 前加载。
+当前引擎提供正式 UCI stdin/stdout 入口；另有 `nn_eval`、`benchmark` 和 Pikafish 对照脚本用于本地诊断。权重由 `WeightsFile` 在下一条 `position` 前加载。
 
 ```powershell
 @'
@@ -128,13 +129,11 @@ quit
 cargo run --release -p engin
 ```
 
-当前已翻译的 UCI options 是：`WeightsFile`、`MultiPV`、`PerPVCounters`、
-`ScoreType`、`UCI_ShowWDL`、`UCI_ShowEPS`、`UCI_ShowMovesLeft`、`NNCacheSize`。其余搜索参数仍
-是 Rust 内部 `SearchParams`，在对应 px0 option 层完整翻译前不伪造公开 UCI 选项。
+当前 UCI options 是：`WeightsFile`、`VirtualLoss`、`UCI_ShowWDL`、`UCI_ShowEPS`。
+`VirtualLoss` 使用 `0.0..5.0` 的小数，默认 `3.0`；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留启动时快照。
 
-当前已实现的 `go` 预算只有 `nodes`、`movetime`、`infinite`。`depth`、`mate`、`ponder` 与
-`wtime/btime/winc/binc/movestogo` 会明确报错，直到 px0 对应 stopper、ponder 生命周期和
-`SimpleTimeManager` 被逐函数翻译；不要把它们与 `nodes` 混用。
+当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
+`movetime` 不可与时钟字段混用；`infinite` 不可与其他预算混用。`depth`、`mate`、`ponder` 仍会明确报错。
 
 连续命令生命周期冒烟。按 px0 语义，前一条无限搜索被静默回收，只有最后一条 `go` 返回
 `bestmove`：
@@ -158,7 +157,7 @@ quit
 ```powershell
 @'
 uci
-setoption name MultiPV value 2
+setoption name VirtualLoss value 3.0
 setoption name WeightsFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos
@@ -167,29 +166,64 @@ quit
 '@ | C:\projects\77xiangqi_engine\target\release\engin.exe
 ```
 
-## 10. Stream ONNX 生命周期诊断
+## 10. 搜索与 ONNX 诊断
 
-`stream` 仍未接入正式 UCI。下面的诊断二进制会以同一 ONNX/FEN 运行 classic、串行 stream 与常驻 worker；
-默认固定 playout 对比，额外 `--movetime-ms` 则只验证 stream worker 持续推进、deadline 收敛及 root 无 in-flight。
-
-```powershell
-cargo run --release -p engin --bin stream_compare -- `
-  --onnx data\x7.onnx `
-  --playouts 128
-```
+`stream` 已是正式 UCI 搜索。`benchmark` 从 fresh tree 运行，用于观察吞吐、NN batch 和 collision：
 
 ```powershell
-target\release\stream_compare.exe `
-  --onnx data\x7.onnx `
-  --playouts 64 `
-  --movetime-ms 30000
+cargo run --release -p engin --bin benchmark -- `
+  --movetime 3000 --repeat 3 `
+  --gathers 4 --evals 4 --backprops 1 --virtual-loss 3
 ```
 
-固定 playout 下 classic 允许在已提交 minibatch 的边界超过请求节点数；工具会按 classic 的实际 root completed N
-运行 stream。并发 stream 不要求和 serial/classic 得到逐边相同 `N/Q`，但必须完成既定预算或 deadline，且每条 edge
-都满足 `started == completed`。
+使用完整历史诊断评分拐点：
+
+```powershell
+cargo run --release -p engin --bin benchmark -- `
+  --moves "c3c4 g6g5 ..." --movetime 3000 --repeat 3 --root-top 12
+```
+
+`benchmark` 输出根候选的 `P / completed-N / in-flight / Q`；它不模拟实战 tree reuse。`nn_eval` 可单独检查 ONNX：
+
+```powershell
+cargo run --release -p engin --bin nn_eval -- --onnx data\x7.onnx --bench 20
+```
+
+以本地 Pikafish 对照候选排序：
+
+```powershell
+python scripts\pikafish_compare.py --moves "c3c4 g6g5 ..." --movetime 3000 --multipv 3
+```
 
 ## 11. 质量检查
+
+在仓库根目录执行：
+
+```powershell
+cargo fmt --check
+cargo test -p engin --lib
+cargo test -p engin --test uci_search_test
+cargo clippy -p engin --all-targets -- -D warnings
+```
+
+规则层的 release perft 对拍较慢，按需单独运行：
+
+```powershell
+cargo test --release -p xiangqi_core
+```
+
+NN 检查使用项目自己的虚拟环境：
+
+```powershell
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m ruff check nn\src nn\scripts nn\tests
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests -q
+```
+
+需要检查格式而非修正格式时：
+
+```powershell
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m ruff format --check nn\src nn\scripts nn\tests
+```
 
 ## 12. Windows DirectML 打包
 
@@ -200,7 +234,7 @@ DirectML provider DLL，并确认 bundle 内的 UCI 搜索没有回退 CPU：
 powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1
 ```
 
-默认读取 `data\x7.onnx`，输出到 `bundle\`。可指定其他模型或输出目录：
+默认读取 `data\x7.onnx`，输出到 `bundle-directml\`。可指定其他模型或输出目录：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1 `
@@ -208,24 +242,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1 `
   -BundleDir C:\dist\x7-directml
 ```
 
-```powershell
-cargo check
-```
+CUDA 是 NVIDIA 专用备用包，需要 CUDA 13、cuDNN 9 和脚本中配置的 ONNX Runtime 目录：
 
 ```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m ruff check nn
+powershell -ExecutionPolicy Bypass -File .\scripts\build-cuda.ps1
 ```
 
-```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests
-```
-
-```powershell
-cargo test -p engin --lib
-```
-
-P1 px0 规则对拍包含 depth-5 perft，建议只在 release 运行：
-
-```powershell
-cargo test --release -p xiangqi_core
-```
+它输出到 `bundle-cuda\`；CUDA 与 DirectML 是两份互斥包，不构成运行时回退链。

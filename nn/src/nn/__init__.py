@@ -1,12 +1,14 @@
 """网络基础设施入口。"""
 
 from nn.dataset_px0 import Px0ChunkDataset, Px0DatasetConfig
-from nn.fen_tensor import fen_to_planes
 from nn.model import (
-    PolicyResNet,
-    mix_wdl_targets,
+    CNN_TRUNK_KIND,
+    TRANSFORMER_TRUNK_KIND,
+    KnowledgeResNet,
+    KnowledgeTransformer,
+    build_model,
     moves_left_loss,
-    policy_cross_entropy,
+    soften_policy_targets,
     soft_policy_cross_entropy,
     value_q_mse_from_wdl,
     value_wdl_cross_entropy,
@@ -15,13 +17,15 @@ from nn.model import (
 )
 
 __all__ = [
-    "PolicyResNet",
+    "KnowledgeResNet",
+    "KnowledgeTransformer",
+    "build_model",
+    "CNN_TRUNK_KIND",
+    "TRANSFORMER_TRUNK_KIND",
     "Px0ChunkDataset",
     "Px0DatasetConfig",
-    "fen_to_planes",
-    "mix_wdl_targets",
     "moves_left_loss",
-    "policy_cross_entropy",
+    "soften_policy_targets",
     "soft_policy_cross_entropy",
     "value_q_mse_from_wdl",
     "value_wdl_cross_entropy",

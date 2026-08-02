@@ -7,9 +7,6 @@ use xiangqi_core::Move;
 pub struct BestMoveInfo {
     pub bestmove: Move,
     pub ponder: Move,
-    pub player: i32,
-    pub game_id: i32,
-    pub is_black: Option<bool>,
 }
 
 impl BestMoveInfo {
@@ -17,9 +14,6 @@ impl BestMoveInfo {
         Self {
             bestmove,
             ponder: Move::NULL,
-            player: -1,
-            game_id: -1,
-            is_black: None,
         }
     }
 }
@@ -41,18 +35,12 @@ pub struct ThinkingInfo {
     pub nodes: i64,
     pub nps: i32,
     pub eps: i32,
-    pub hashfull: i32,
     pub mate: Option<i32>,
     pub score: Option<i32>,
     pub wdl: Option<Wdl>,
-    pub tb_hits: i32,
     pub pv: Vec<Move>,
     pub multipv: i32,
     pub comment: String,
-    pub player: i32,
-    pub game_id: i32,
-    pub is_black: Option<bool>,
-    pub moves_left: Option<i32>,
 }
 
 impl Default for ThinkingInfo {
@@ -65,28 +53,21 @@ impl Default for ThinkingInfo {
             nodes: -1,
             nps: -1,
             eps: -1,
-            hashfull: -1,
             mate: None,
             score: None,
             wdl: None,
-            tb_hits: -1,
             pv: Vec::new(),
             multipv: -1,
             comment: String::new(),
-            player: -1,
-            game_id: -1,
-            is_black: None,
-            moves_left: None,
         }
     }
 }
 
-/// Thread-safe output boundary owned by classic search.
+/// 搜索会话持有的线程安全输出边界。
 ///
-/// px0 `SearchBase` stores a `UciResponder*` for the full search lifetime
-/// (`src/search/search.h:45-99`), so the watchdog may emit `info` and
-/// `bestmove` independently of the UCI command loop. Rust uses this separate
-/// trait because the UCI loop still owns the concrete mutable responder.
+/// px0 在整个搜索生命周期保存 `UciResponder*`（`src/search/search.h:45-99`），
+/// 因此 watchdog 可以独立于 UCI 命令循环输出 `info` 和 `bestmove`。Rust 用此 trait
+/// 隔开两者，因为 UCI 循环仍独占具体 responder 的可变借用。
 pub trait SearchResponder: Send + Sync {
     fn output_best_move(&self, info: &BestMoveInfo);
     fn output_thinking_info(&self, infos: &[ThinkingInfo]);

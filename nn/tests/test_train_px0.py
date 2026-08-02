@@ -13,7 +13,7 @@ from train_px0 import (
     OPTIMIZER_KIND,
     build_optimizer,
     build_dataset_configs,
-    next_qmix_phase,
+    compute_loss_terms,
     resolve_device,
     validate_args,
     validate_existing_output_checkpoint,
@@ -29,6 +29,7 @@ def test_validate_existing_output_checkpoint_accepts_matching_v2_dimensions() ->
             "blocks": 10,
             "bottleneck_channels": 64,
             "moves_left_head": True,
+            "auxiliary_heads": True,
         },
         width=96,
         blocks=10,
@@ -36,18 +37,20 @@ def test_validate_existing_output_checkpoint_accepts_matching_v2_dimensions() ->
     )
 
 
-def test_validate_existing_output_checkpoint_derives_legacy_bottleneck_width() -> None:
-    validate_existing_output_checkpoint(
-        {
-            "trunk_kind": "x7_v2_bottleneck_gbroadcast",
-            "width": 96,
-            "blocks": 10,
-            "moves_left_head": True,
-        },
-        width=96,
-        blocks=10,
-        bottleneck_channels=42,
-    )
+def test_validate_existing_output_checkpoint_rejects_missing_bottleneck_width() -> None:
+    with pytest.raises(SystemExit, match="width/blocks/bottleneck_channels"):
+        validate_existing_output_checkpoint(
+            {
+                "trunk_kind": "x7_v2_bottleneck_gbroadcast",
+                "width": 96,
+                "blocks": 10,
+                "moves_left_head": True,
+                "auxiliary_heads": True,
+            },
+            width=96,
+            blocks=10,
+            bottleneck_channels=42,
+        )
 
 
 def test_validate_existing_output_checkpoint_rejects_mismatched_dimensions() -> None:
@@ -59,6 +62,7 @@ def test_validate_existing_output_checkpoint_rejects_mismatched_dimensions() -> 
                 "blocks": 10,
                 "bottleneck_channels": 64,
                 "moves_left_head": True,
+                "auxiliary_heads": True,
             },
             width=96,
             blocks=10,
@@ -70,46 +74,56 @@ def test_resolve_device_accepts_explicit_cpu() -> None:
     assert resolve_device("cpu").type == "cpu"
 
 
-def test_optimizer_matches_pxzero_sgd_nesterov() -> None:
+def test_optimizer_uses_adamw_and_excludes_bias_from_weight_decay() -> None:
     import torch
 
     model = torch.nn.Linear(2, 1)
-    optimizer = build_optimizer(model, learning_rate=0.001)
-    assert optimizer.defaults["momentum"] == 0.9
-    assert optimizer.defaults["nesterov"] is True
-    assert optimizer.defaults["weight_decay"] == 0
-    assert OPTIMIZER_KIND == "sgd_nesterov"
+    optimizer = build_optimizer(model, learning_rate=0.001, weight_decay=0.0001)
+    assert optimizer.defaults["weight_decay"] == 0.01
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.0001, 0.0]
+    assert OPTIMIZER_KIND == "adamw"
 
 
-def test_resume_rejects_adamw_checkpoint_state() -> None:
-    with pytest.raises(SystemExit, match=r"SGD\+Nesterov"):
-        validate_existing_optimizer_checkpoint({"optimizer_kind": "adamw"})
+def test_resume_rejects_sgd_checkpoint_state() -> None:
+    with pytest.raises(SystemExit, match="AdamW"):
+        validate_existing_optimizer_checkpoint({"optimizer_kind": "sgd_nesterov"})
 
 
-def test_qmix_change_starts_a_new_phase() -> None:
-    changed, phase_start, history = next_qmix_phase(
-        {"q_ratio": 0.0, "completed_steps": 200_000},
-        q_ratio=0.75,
-        completed_steps=200_000,
+def test_cosine_learning_rate_has_warmup_and_floor() -> None:
+    assert learning_rate_at_step(1, total_steps=1_000, lr=1e-3, warmup_steps=250, min_lr_scale=0.1) == 4e-6
+    assert learning_rate_at_step(250, total_steps=1_000, lr=1e-3, warmup_steps=250, min_lr_scale=0.1) == 1e-3
+    assert learning_rate_at_step(1_000, total_steps=1_000, lr=1e-3, warmup_steps=250, min_lr_scale=0.1) == 1e-4
+    assert learning_rate_at_step(2_000, total_steps=1_000, lr=1e-3, warmup_steps=250, min_lr_scale=0.1) == 1e-4
+
+
+def test_soft_policy_kl_is_zero_for_its_own_target() -> None:
+    import torch
+
+    raw_policy = torch.tensor([[-1.0, 0.2, 0.8]], dtype=torch.float32)
+    soft_target = raw_policy.clamp_min(0.0).pow(0.25)
+    soft_target /= soft_target.sum(dim=1, keepdim=True)
+    terms = compute_loss_terms(
+        (
+            torch.zeros_like(raw_policy),
+            torch.zeros((1, 3)),
+            torch.zeros((1, 1)),
+            soft_target.log(),
+            torch.zeros((1, 3)),
+        ),
+        raw_policy=raw_policy,
+        winner_wdl=torch.tensor([[0.0, 1.0, 0.0]]),
+        root_wdl=torch.tensor([[0.0, 1.0, 0.0]]),
+        plies_left=torch.zeros((1, 1)),
+        final_value_loss_weight=0.6,
+        moves_left_loss_weight=0.5,
+        soft_policy_weight=8.0,
+        soft_policy_temperature=4.0,
+        root_wdl_loss_weight=0.6,
     )
-    assert changed
-    assert phase_start == 200_000
-    assert history == [
-        {"start_step": 0, "q_ratio": 0.0},
-        {"start_step": 200_000, "q_ratio": 0.75},
-    ]
+    assert terms["soft_policy_kl"].item() == pytest.approx(0.0, abs=1e-6)
 
 
-def test_piecewise_learning_rate_has_phase_local_warmup() -> None:
-    values = (1e-3, 3e-4, 1e-4)
-    boundaries = (140_000, 180_000)
-    assert learning_rate_at_step(1, values=values, boundaries=boundaries, warmup_steps=250) == 4e-6
-    assert learning_rate_at_step(250, values=values, boundaries=boundaries, warmup_steps=250) == 1e-3
-    assert learning_rate_at_step(140_001, values=values, boundaries=boundaries, warmup_steps=250) == 3e-4
-    assert learning_rate_at_step(180_001, values=values, boundaries=boundaries, warmup_steps=250) == 1e-4
-
-
-def test_validate_args_rejects_invalid_lr_schedule() -> None:
+def test_validate_args_rejects_invalid_adamw_schedule() -> None:
     class Args:
         width = 256
         blocks = 12
@@ -118,15 +132,22 @@ def test_validate_args_rejects_invalid_lr_schedule() -> None:
         px0_val_ratio = 0.1
         validation_samples = 8192
         validation_source_files = 64
-        q_ratio = 0.0
+        soft_policy_weight = 8.0
+        soft_policy_temperature = 4.0
+        final_value_loss_weight = 0.6
+        root_wdl_loss_weight = 0.6
         moves_left_loss_weight = 1.0
+        steps = 1_000
         warmup_steps = 250
         shuffle_size = 4096
-        lr_values = (1e-3,)
-        lr_boundaries = (100,)
+        validation_batches = 256
+        full_validation_every = 200_000
+        lr = 0.0
+        min_lr_scale = 0.1
+        weight_decay = 1e-4
         init_from = None
 
-    with pytest.raises(SystemExit, match="lr_values"):
+    with pytest.raises(SystemExit, match="AdamW"):
         validate_args(Args())
 
 
@@ -139,12 +160,19 @@ def test_validate_args_allows_non_baseline_v2_dimensions() -> None:
         px0_val_ratio = 0.1
         validation_samples = 8192
         validation_source_files = 64
-        q_ratio = 0.0
+        soft_policy_weight = 8.0
+        soft_policy_temperature = 4.0
+        final_value_loss_weight = 0.6
+        root_wdl_loss_weight = 0.6
         moves_left_loss_weight = 1.0
+        steps = 1_000
         warmup_steps = 250
         shuffle_size = 4096
-        lr_values = (1e-3,)
-        lr_boundaries = ()
+        validation_batches = 256
+        full_validation_every = 200_000
+        lr = 3e-4
+        min_lr_scale = 0.1
+        weight_decay = 1e-4
         init_from = None
 
     validate_args(Args())
@@ -176,13 +204,12 @@ def test_build_dataset_configs_uses_prepared_data_loader(monkeypatch, tmp_path: 
         px0_root = tmp_path
         px0_val_ratio = 0.1
         px0_seed = 42
-        validation_samples = 8192
-        validation_source_files = 0
         shuffle_size = 4096
 
-    train_cfg, val_cfg, manifest = build_dataset_configs(Args())
+    train_cfg, val_cfg, full_val_cfg, manifest = build_dataset_configs(Args())
     assert captured["version"] == "710"
-    assert captured["validation_samples"] == 8192
     assert train_cfg.file_list_path == prepared.train_manifest
-    assert val_cfg.sample_list_path == validation_manifest
+    assert val_cfg.file_list_path == validation_manifest
+    assert full_val_cfg.file_list_path == validation_manifest
+    assert (train_cfg.sample_rate, val_cfg.sample_rate, full_val_cfg.sample_rate) == (32, 32, 1)
     assert manifest == validation_manifest

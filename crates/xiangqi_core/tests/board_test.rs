@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Once;
 
-use xiangqi_core::{initialize_magic_bitboards, startpos_board, ChessBoard, CoreError, STARTPOS_FEN};
+use xiangqi_core::{ChessBoard, CoreError, STARTPOS_FEN, initialize_magic_bitboards, startpos_board};
 
 static INIT: Once = Once::new();
 

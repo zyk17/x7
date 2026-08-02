@@ -15,7 +15,7 @@ from onnx import TensorProto, shape_inference
 REPO_ROOT = Path(__file__).resolve().parents[2]
 POLICY_ONNX = REPO_ROOT / "data" / "x7.onnx"
 
-_ALLOWED_SUFFIXES = ((), ("value",))
+EXPECTED_OUTPUTS = ("logits", "value", "moves_left")
 
 
 def _tensor_elem_type_and_shape(vi) -> tuple[int, list[int | str | None]]:
@@ -54,12 +54,7 @@ def test_policy_onnx_contract_matches_export_script() -> None:
 
     out_list = list(model.graph.output)
     names = [o.name for o in out_list]
-    if not names or names[0] != "logits":
-        raise AssertionError(f"first output must be logits, got {names}")
-    suffix = tuple(names[1:])
-    assert suffix in _ALLOWED_SUFFIXES, (
-        f"output names must be logits + one of {_ALLOWED_SUFFIXES}, got {names}"
-    )
+    assert tuple(names) == EXPECTED_OUTPUTS, f"output names must be {EXPECTED_OUTPUTS}, got {names}"
 
     logits_info = out_list[0]
     elem, dims = _tensor_elem_type_and_shape(logits_info)
@@ -70,12 +65,12 @@ def test_policy_onnx_contract_matches_export_script() -> None:
     assert isinstance(dims[1], int), f"logits second dim must be static vocab size, got {dims!r}"
     assert dims[1] >= 2
 
-    for o in out_list[1:]:
-        elem, dims = _tensor_elem_type_and_shape(o)
-        assert elem == TensorProto.FLOAT
-        if dims == [1]:
-            pytest.skip("stale scalar data/x7.onnx; re-export WDL onnx via scripts/export/export_onnx.py")
-        assert dims in ([1, 3], ["batch", 3]), f"{o.name} expected float32[B,3] WDL probabilities, got {dims}"
+    elem, dims = _tensor_elem_type_and_shape(out_list[1])
+    assert elem == TensorProto.FLOAT
+    assert dims in ([1, 3], ["batch", 3]), f"value expected float32[B,3] WDL probabilities, got {dims}"
+    elem, dims = _tensor_elem_type_and_shape(out_list[2])
+    assert elem == TensorProto.FLOAT
+    assert dims in ([1, 1], ["batch", 1]), f"moves_left expected float32[B,1], got {dims}"
 
 
 @pytest.mark.skipif(
@@ -95,9 +90,8 @@ def test_policy_onnx_optional_runtime_inference_smoke() -> None:
     inputs = {in_name: np.zeros((1, channels, 10, 9), dtype=np.float32)}
     out = sess.run(None, inputs)
     n_out = len(sess.get_outputs())
+    assert n_out == len(EXPECTED_OUTPUTS)
     assert len(out) == n_out
     assert out[0].shape[0] == 1 and out[0].ndim == 2
-    for i in range(1, len(out)):
-        if out[i].shape == (1,):
-            pytest.skip("stale scalar data/x7.onnx; re-export WDL onnx via scripts/export/export_onnx.py")
-        assert out[i].shape == (1, 3)
+    assert out[1].shape == (1, 3)
+    assert out[2].shape == (1, 1)

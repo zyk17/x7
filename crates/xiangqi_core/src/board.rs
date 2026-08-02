@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use crate::bitboard::BitBoard;
 use crate::board_attacks::get_attacks;
-use crate::board_masks::{bishop_bb, pawn_bb, PALACE};
+use crate::board_masks::{PALACE, bishop_bb, pawn_bb};
 use crate::hashcat::hash_cat_u128s;
 use crate::{CoreError, File, Move, MoveList, PieceType, Rank, Square};
 
@@ -14,7 +14,6 @@ pub const STARTPOS_FEN: &str = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/
 
 static STARTPOS_BOARD: OnceLock<ChessBoard> = OnceLock::new();
 
-/// px0 `ChessBoard::kStartposBoard`（`board.cc:58`）。
 pub fn startpos_board() -> &'static ChessBoard {
     STARTPOS_BOARD.get_or_init(|| ChessBoard::from_fen(STARTPOS_FEN).expect("valid startpos FEN").0)
 }
@@ -62,7 +61,6 @@ impl Default for ChessBoard {
 }
 
 impl ChessBoard {
-    /// px0 `board.cc:971-1070`。
     pub fn from_fen(fen: &str) -> Result<(Self, FenState), CoreError> {
         initialize_magic_bitboards();
         let mut board = Self::default();
@@ -84,10 +82,11 @@ impl ChessBoard {
             where_at: Option<&str>,
             fen: &str,
         ) -> Result<bool, CoreError> {
-            if let Some(where_at) = where_at {
-                if *pos < bytes.len() && bytes[*pos] != b' ' {
-                    return Err(CoreError::InvalidFen(format!("space expected {where_at}: {fen}")));
-                }
+            if let Some(where_at) = where_at
+                && *pos < bytes.len()
+                && bytes[*pos] != b' '
+            {
+                return Err(CoreError::InvalidFen(format!("space expected {where_at}: {fen}")));
             }
             while *pos < bytes.len() && bytes[*pos] == b' ' {
                 *pos += 1;
@@ -120,7 +119,7 @@ impl ChessBoard {
                 continue;
             }
             let piece = PieceType::from_fen_char(c)
-                .filter(|p| (*p as u8) < PieceType::PIECE_TYPE_NB)
+                .filter(|p| p.is_valid())
                 .ok_or_else(|| complain("invalid character as piece"))?;
             let file = File::from_idx(file_idx as u8);
             if file.is_none() || !rank.is_valid() {
@@ -229,12 +228,10 @@ impl ChessBoard {
         Ok((board, state))
     }
 
-    /// px0 `ChessBoard::Clear` / `board.cc:60`。
     pub fn clear(&mut self) {
         *self = Self::default();
     }
 
-    /// px0 `board.cc:62-76`。
     pub fn mirror(&mut self) {
         self.ours.mirror();
         self.theirs.mirror();
@@ -251,7 +248,6 @@ impl ChessBoard {
         self.flipped = !self.flipped;
     }
 
-    /// px0 `board.cc:674-735`。
     pub fn generate_pseudolegal_moves(&self) -> MoveList {
         initialize_magic_bitboards();
         let occupied = self.ours.union(self.theirs);
@@ -325,7 +321,6 @@ impl ChessBoard {
         result
     }
 
-    /// px0 `board.cc:769-809`。
     pub fn apply_move(&mut self, mv: Move) -> bool {
         let from = mv.from();
         let to = mv.to();
@@ -333,14 +328,14 @@ impl ChessBoard {
         self.ours.reset(from);
         self.ours.set(to);
 
-        let reset_50_moves = self.theirs.contains(to);
-        if reset_50_moves {
+        let reset_60_moves = self.theirs.contains(to);
+        if reset_60_moves {
             self.reset_captured_piece(to);
         }
 
         if from == self.our_king {
             self.our_king = to;
-            return reset_50_moves;
+            return reset_60_moves;
         }
 
         self.move_piece_marker(from, to);
@@ -355,10 +350,9 @@ impl ChessBoard {
         self.rule_id[to_id.index() as usize] = self.rule_id[from_id.index() as usize];
         self.rule_id[from_id.index() as usize] = 0;
 
-        reset_50_moves
+        reset_60_moves
     }
 
-    /// px0 `board.cc:845-871`。
     pub fn is_legal_move(&self, mv: Move) -> bool {
         self.is_legal_move_for::<true>(mv)
     }
@@ -388,7 +382,6 @@ impl ChessBoard {
         checkers.is_empty()
     }
 
-    /// px0 `board.cc:950-957`。
     pub fn generate_legal_moves(&self) -> MoveList {
         self.generate_pseudolegal_moves()
             .into_iter()
@@ -396,7 +389,6 @@ impl ChessBoard {
             .collect()
     }
 
-    /// px0 `board.cc:811-823`。
     pub fn is_under_check(&self) -> bool {
         !self
             .checkers_to::<true>(self.our_king, self.ours.union(self.theirs))
@@ -416,7 +408,6 @@ impl ChessBoard {
         checkers.intersection(if OUR { self.theirs } else { self.ours })
     }
 
-    /// px0 `board.cc:825-843`。
     pub fn recaptures_to(&self, sq: Square) -> BitBoard {
         let occupied = self.ours.union(self.theirs);
         let mut attackers = get_attacks(PieceType::Rook, sq, occupied).intersection(self.rooks);
@@ -431,9 +422,8 @@ impl ChessBoard {
         attackers.intersection(self.theirs)
     }
 
-    /// px0 `board.cc:1072-1141`。
     pub fn has_mating_material(&self) -> bool {
-        if self.pawns.count() == 0 && self.rooks.count_few() == 0 && self.knights.count_few() == 0 {
+        if self.pawns.count() == 0 && self.rooks.count() == 0 && self.knights.count() == 0 {
             let level = mating_draw_level(self);
             if level != DrawLevel::No {
                 if level == DrawLevel::Mate {
@@ -452,7 +442,6 @@ impl ChessBoard {
         true
     }
 
-    /// px0 `board.cc:873-948`。
     pub fn us_chased(&self) -> u16 {
         let mut chase = 0u16;
 
@@ -519,7 +508,6 @@ impl ChessBoard {
         chase
     }
 
-    /// px0 `board.cc:944-948`。
     pub fn them_chased(&self) -> u16 {
         let mut board = self.clone();
         board.mirror();
@@ -533,7 +521,6 @@ impl ChessBoard {
         1u16 << self.rule_id[to.index() as usize]
     }
 
-    /// px0 `board.cc:1148-1170`。
     pub fn parse_move(&self, move_str: &str) -> Result<Move, CoreError> {
         if move_str.len() != 4 {
             return Err(CoreError::InvalidFen(format!("invalid move: {move_str}")));
@@ -602,8 +589,6 @@ impl ChessBoard {
     pub const fn flipped(&self) -> bool {
         self.flipped
     }
-
-    /// px0 `board.h:105-110`。
     pub fn hash(&self) -> u64 {
         let meta =
             ((self.our_king.index() as u128) << 16) | ((self.their_king.index() as u128) << 8) | (self.flipped as u128);
@@ -620,7 +605,6 @@ impl ChessBoard {
         ])
     }
 
-    /// px0 `board.cc:959-968`。
     fn put_piece(&mut self, square: Square, piece: PieceType, is_theirs: bool) {
         if is_theirs {
             self.theirs.set(square);
@@ -645,13 +629,11 @@ impl ChessBoard {
         }
     }
 
-    /// px0 `ResetSquare` (`board.cc:759-762`).
     fn reset_captured_piece(&mut self, square: Square) {
         self.theirs.reset(square);
         self.clear_piece_marker(square);
     }
 
-    /// px0 `SetIfSquare` (`board.cc:764-767`).
     fn move_piece_marker(&mut self, from: Square, to: Square) {
         self.rooks.set_if(to, self.rooks.contains(from));
         self.advisors.set_if(to, self.advisors.contains(from));
@@ -670,7 +652,6 @@ impl ChessBoard {
         self.bishops.reset(square);
     }
 
-    /// px0 `board.cc:737-757`。
     fn is_valid(&self) -> bool {
         let all = self.ours().union(self.theirs());
         let bbs = [
@@ -705,10 +686,10 @@ enum DrawLevel {
 }
 
 fn mating_draw_level(board: &ChessBoard) -> DrawLevel {
-    if board.cannons().count_few() == 0 {
+    if board.cannons().count() == 0 {
         return DrawLevel::Direct;
     }
-    if board.cannons().count_few() == 1 {
+    if board.cannons().count() == 1 {
         let mut cannon_side_occ = board.ours();
         let mut non_cannon_side_occ = board.theirs();
         if cannon_side_occ.intersection(board.cannons()).is_empty() {
@@ -718,7 +699,7 @@ fn mating_draw_level(board: &ChessBoard) -> DrawLevel {
             if board.advisors().intersection(non_cannon_side_occ).is_empty() {
                 return DrawLevel::Direct;
             }
-            if board.advisors().intersection(non_cannon_side_occ).count_few() == 1 {
+            if board.advisors().intersection(non_cannon_side_occ).count() == 1 {
                 return if board.bishops().intersection(cannon_side_occ).is_empty() {
                     DrawLevel::Direct
                 } else {
@@ -730,11 +711,11 @@ fn mating_draw_level(board: &ChessBoard) -> DrawLevel {
             }
         }
     }
-    if board.cannons().intersection(board.ours()).count_few() == 1
-        && board.cannons().intersection(board.theirs()).count_few() == 1
-        && board.advisors().count_few() == 0
+    if board.cannons().intersection(board.ours()).count() == 1
+        && board.cannons().intersection(board.theirs()).count() == 1
+        && board.advisors().count() == 0
     {
-        return if board.bishops().count_few() == 0 {
+        return if board.bishops().count() == 0 {
             DrawLevel::Direct
         } else {
             DrawLevel::Mate
@@ -743,7 +724,6 @@ fn mating_draw_level(board: &ChessBoard) -> DrawLevel {
     DrawLevel::No
 }
 
-/// px0 `board.cc:1200-1223`。
 pub fn board_to_fen(board: &ChessBoard) -> String {
     let mut board = board.clone();
     let black_to_move = board.flipped();

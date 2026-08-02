@@ -65,19 +65,13 @@ impl PieceType {
             Self::King => 'k',
             Self::KnightTo | Self::PawnToOurs | Self::PawnToTheirs => '?',
         };
-        if uppercase {
-            ch.to_ascii_uppercase()
-        } else {
-            ch
-        }
+        if uppercase { ch.to_ascii_uppercase() } else { ch }
     }
 
-    /// px0 `PieceType::ToString` (`types.h:38-40`).
     pub fn to_string(self, uppercase: bool) -> String {
         self.fen_char(uppercase).to_string()
     }
 
-    /// px0 `PieceType::IsValid` (`types.h:41`).
     pub const fn is_valid(self) -> bool {
         (self as u8) < Self::PIECE_TYPE_NB
     }
@@ -99,11 +93,7 @@ impl File {
     pub const INVALID: Self = Self(0x80);
 
     pub const fn from_idx(idx: u8) -> Option<Self> {
-        if idx < FILE_NB {
-            Some(Self(idx))
-        } else {
-            None
-        }
+        if idx < FILE_NB { Some(Self(idx)) } else { None }
     }
 
     pub const fn index(self) -> u8 {
@@ -135,13 +125,11 @@ impl File {
         Self(8 - self.0)
     }
 
-    /// px0 `File::ToString` (`types.h:71-73`).
     pub fn to_string(self, uppercase: bool) -> String {
         let base = if uppercase { b'A' } else { b'a' };
         char::from(base.wrapping_add(self.0)).to_string()
     }
 
-    /// px0 `File::Flop` (`types.h:74`).
     pub fn flop_in_place(&mut self) {
         *self = self.flip();
     }
@@ -171,11 +159,7 @@ impl Rank {
     pub const INVALID: Self = Self(0x80);
 
     pub const fn from_idx(idx: u8) -> Option<Self> {
-        if idx < RANK_NB {
-            Some(Self(idx))
-        } else {
-            None
-        }
+        if idx < RANK_NB { Some(Self(idx)) } else { None }
     }
 
     pub const fn index(self) -> u8 {
@@ -206,12 +190,10 @@ impl Rank {
         Self(9 - self.0)
     }
 
-    /// px0 `Rank::ToString` (`types.h:106`).
     pub fn as_text(self) -> String {
         char::from(b'0'.wrapping_add(self.0)).to_string()
     }
 
-    /// px0 `Rank::Flip` (`types.h:105`).
     pub fn flip_in_place(&mut self) {
         *self = self.flip();
     }
@@ -237,11 +219,7 @@ impl Square {
     }
 
     pub const fn from_idx(idx: u8) -> Option<Self> {
-        if idx < SQUARE_NB {
-            Some(Self(idx))
-        } else {
-            None
-        }
+        if idx < SQUARE_NB { Some(Self(idx)) } else { None }
     }
 
     pub fn parse(text: &str) -> Option<Self> {
@@ -277,7 +255,6 @@ impl Square {
         *self = self.flip();
     }
 
-    /// px0 `Square::ToString` (`types.h:126-128`).
     pub fn to_string(self, uppercase: bool) -> String {
         match (self.file(), self.rank()) {
             (Some(file), Some(rank)) => format!("{}{}", file.to_string(uppercase), rank.as_text()),
@@ -285,11 +262,10 @@ impl Square {
         }
     }
 
-    pub fn is_valid(self) -> bool {
+    pub const fn is_valid(self) -> bool {
         self.index() < SQUARE_NB
     }
 
-    /// px0 `types.h:135-143`：`(rank_delta, file_delta)`。
     pub fn offset(self, rank_delta: i32, file_delta: i32) -> Self {
         match (self.file(), self.rank()) {
             (Some(file), Some(rank)) => {
@@ -351,7 +327,6 @@ impl Move {
         Self(((from.index() as u16) << 7) | to.index() as u16)
     }
 
-    /// px0 `Move::White` (`types.h:158-160`).
     pub const fn white(from: Square, to: Square) -> Self {
         Self::new(from, to)
     }
@@ -374,11 +349,6 @@ impl Move {
         self.0
     }
 
-    /// px0 `Move::raw_data` (`types.h:178`).
-    pub const fn raw_data(self) -> u16 {
-        self.raw()
-    }
-
     pub const fn is_null(self) -> bool {
         self.0 == 0
     }
@@ -387,12 +357,10 @@ impl Move {
         Self::new(self.from().flip(), self.to().flip())
     }
 
-    /// px0 `Move::Flip` (`types.h:166-171`).
     pub fn flip_in_place(&mut self) {
         *self = self.flip();
     }
 
-    /// px0 `Move::ToString` (`types.h:210-212`).
     pub fn to_uci(self) -> String {
         format!("{}{}", self.from().to_string(false), self.to().to_string(false))
     }

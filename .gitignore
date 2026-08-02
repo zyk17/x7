@@ -9,7 +9,7 @@
 
 # --- Rust ---
 /target/
-/bundle/
+/bundle*/
 **/*.rs.bk
 
 # --- Python 打包与构建产物 ---
@@ -38,6 +38,9 @@ venv/
 # --- 数据集、棋谱、训练权重（体积大 / 本机生成）---
 # 原有脚本产出与 checkpoint 等放在 data/，统一不入库；若在仓库根外另有目录可同名忽略
 data/
+!data/
+data/*
+!data/benchmark_positions.txt
 datasets/
 checkpoints/
 pgns/
@@ -58,6 +61,11 @@ pgns/
 *.log
 *.tmp
 *.temp
+# 本地工作记录；不作为远端协作契约。
+/NextStep.md
+/TODO.md
+/temp.md
+/temp_stream_x7_policy.md
 .DS_Store
 Thumbs.db
 /.cursorrules

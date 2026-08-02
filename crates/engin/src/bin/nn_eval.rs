@@ -1,7 +1,6 @@
-//! One-shot NN probe: FEN + moves → legal policy / WDL / moves_left + optional latency bench.
+//! 一次性 NN 探针：FEN + moves → 合法着 policy / WDL / moves_left，并可选测量延迟。
 //!
-//! Reuses `PositionHistory` encoding and `OnnxBackend` (same path as search).
-//! Not a UCI path.
+//! 复用 `PositionHistory` 编码与 `OnnxBackend`，即与搜索相同的路径；不属于 UCI 路径。
 //!
 //! ```text
 //! cargo run -p engin --bin nn_eval -- --onnx data/x7.onnx
@@ -61,7 +60,7 @@ fn parse_args() -> Result<Args, String> {
     if top == 0 {
         return Err("--top must be > 0".into());
     }
-    if batches.iter().any(|&b| b == 0) {
+    if batches.contains(&0) {
         return Err("--batch sizes must be > 0".into());
     }
     Ok(Args {
@@ -92,7 +91,7 @@ fn parse_batches(text: &str) -> Result<Vec<usize>, String> {
 }
 
 fn wdl_from_eval(wl: f32, d: f32) -> (f32, f32, f32) {
-    // value = [W,D,L]; EvalResult stores wl=W-L, d=D.
+    // value = [W,D,L]；EvalResult 保存 wl=W-L、d=D。
     let w = ((1.0 - d + wl) * 0.5).clamp(0.0, 1.0);
     let l = ((1.0 - d - wl) * 0.5).clamp(0.0, 1.0);
     (w, d.clamp(0.0, 1.0), l)
@@ -112,9 +111,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         backend.attributes().has_wdl,
         backend.attributes().has_mlh
     );
-    println!(
-        "note: current export keeps logits+value only; EvalResult.m is 0 unless ONNX gains moves_left"
-    );
 
     let move_refs: Vec<&str> = args.moves.iter().map(String::as_str).collect();
     let state = GameState::from_fen_moves(&args.fen, &move_refs)?;
@@ -128,11 +124,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             args.moves.join(" ")
         },
-        if history.is_black_to_move() {
-            "black"
-        } else {
-            "red"
-        },
+        if history.is_black_to_move() { "black" } else { "red" },
         legal.len()
     );
 
@@ -141,15 +133,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let eval_ms = t0.elapsed().as_secs_f64() * 1e3;
     let (w, d, l) = wdl_from_eval(eval.wl, eval.d);
     println!(
-        "eval_ms={eval_ms:.3} wdl W={w:.6} D={d:.6} L={l:.6} Q(wl)={:.6} moves_left(m)={:.6}",
-        eval.wl, eval.m
+        "eval_ms={eval_ms:.3} wdl W={w:.6} D={d:.6} L={l:.6} Q(wl)={:.6} plies_left={:.6}",
+        eval.wl, eval.plies_left
     );
 
-    let mut ranked: Vec<(Move, f32)> = legal
-        .iter()
-        .copied()
-        .zip(eval.policies.iter().copied())
-        .collect();
+    let mut ranked: Vec<(Move, f32)> = legal.iter().copied().zip(eval.policies.iter().copied()).collect();
     ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let show = ranked.len().min(args.top);
     println!("policy top {show}/{} (legal softmax):", ranked.len());
@@ -188,9 +176,7 @@ fn run_bench(
         let p50 = samples[samples.len() / 2];
         let p95 = samples[((samples.len() as f64 * 0.95) as usize).min(samples.len() - 1)];
         let pos_per_s = (batch as f64) / (avg / 1e3);
-        println!(
-            "  batch={batch:>3}  avg_ms={avg:.3}  p50_ms={p50:.3}  p95_ms={p95:.3}  pos/s={pos_per_s:.0}"
-        );
+        println!("  batch={batch:>3}  avg_ms={avg:.3}  p50_ms={p50:.3}  p95_ms={p95:.3}  pos/s={pos_per_s:.0}");
     }
     Ok(())
 }

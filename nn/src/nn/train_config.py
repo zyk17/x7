@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+
+from .model_common import CNN_TRUNK_KIND, TRANSFORMER_TRUNK_KIND
 from typing import Any
 
 import yaml
@@ -58,13 +60,15 @@ def load_train_config(path: Path | str) -> argparse.Namespace:
             "px0_version",
             "px0_root",
             "val_ratio",
-            "validation_samples",
-            "validation_source_files",
             "seed",
             "force_download",
         },
     )
-    _reject_unknown(model, name="model", allowed={"width", "blocks", "bottleneck_channels"})
+    _reject_unknown(
+        model,
+        name="model",
+        allowed={"kind", "width", "blocks", "bottleneck_channels", "heads", "ffn_channels"},
+    )
     _reject_unknown(
         training,
         name="training",
@@ -74,46 +78,60 @@ def load_train_config(path: Path | str) -> argparse.Namespace:
             "batch_size",
             "steps",
             "eval_every",
+            "full_validation_every",
             "shuffle_size",
             "warmup_steps",
-            "lr_values",
-            "lr_boundaries",
-            "value_loss_weight",
+            "lr",
+            "min_lr_scale",
+            "weight_decay",
+            "final_value_loss_weight",
+            "root_wdl_loss_weight",
             "moves_left_loss_weight",
-            "q_ratio",
+            "soft_policy_weight",
+            "soft_policy_temperature",
+            "amp",
             "device",
             "num_workers",
         },
     )
 
-    width = int(model.get("width", 256))
+    model_kind = str(model.get("kind", TRANSFORMER_TRUNK_KIND))
+    if model_kind not in (CNN_TRUNK_KIND, TRANSFORMER_TRUNK_KIND):
+        raise ValueError(f"model.kind 只支持 {CNN_TRUNK_KIND} 或 {TRANSFORMER_TRUNK_KIND}")
+    width = int(model.get("width", 512 if model_kind == TRANSFORMER_TRUNK_KIND else 384))
     return argparse.Namespace(
         config_path=config_path.resolve(),
         name=str(config.get("name", config_path.stem)),
         px0_version=str(_required(dataset, "px0_version", name="dataset")),
         px0_root=Path(dataset.get("px0_root", DEFAULT_PX0_ROOT)),
         px0_val_ratio=float(dataset.get("val_ratio", 0.1)),
-        validation_samples=int(dataset.get("validation_samples", 8192)),
-        validation_source_files=int(dataset.get("validation_source_files", 0)),
         px0_seed=int(dataset.get("seed", 42)),
         px0_force_download=bool(dataset.get("force_download", False)),
         out=Path(_required(training, "out", name="training")),
         init_from=Path(training["init_from"]) if training.get("init_from") else None,
         width=width,
-        blocks=int(model.get("blocks", 12)),
-        bottleneck_channels=int(model.get("bottleneck_channels", width * 7 // 16)),
+        blocks=int(model.get("blocks", 12 if model_kind == TRANSFORMER_TRUNK_KIND else 15)),
+        bottleneck_channels=int(model.get("bottleneck_channels", width // 2)),
+        model_kind=model_kind,
+        heads=int(model.get("heads", 16)),
+        ffn_channels=int(model.get("ffn_channels", width * 3 // 2)),
         in_planes=124,
         num_moves=2062,
         batch_size=int(training.get("batch_size", 256)),
         steps=int(training.get("steps", 200_000)),
         eval_every=int(training.get("eval_every", 1_000)),
+        full_validation_every=int(training.get("full_validation_every", 200_000)),
         shuffle_size=int(training.get("shuffle_size", 4_096)),
         warmup_steps=int(training.get("warmup_steps", 250)),
-        lr_values=tuple(float(value) for value in training.get("lr_values", [1e-3])),
-        lr_boundaries=tuple(int(value) for value in training.get("lr_boundaries", [])),
-        value_loss_weight=float(training.get("value_loss_weight", 1.0)),
-        moves_left_loss_weight=float(training.get("moves_left_loss_weight", 1.0)),
-        q_ratio=float(training.get("q_ratio", 0.0)),
+        lr=float(training.get("lr", 3e-4)),
+        min_lr_scale=float(training.get("min_lr_scale", 0.1)),
+        weight_decay=float(training.get("weight_decay", 1e-4)),
+        final_value_loss_weight=float(training.get("final_value_loss_weight", 0.6)),
+        root_wdl_loss_weight=float(training.get("root_wdl_loss_weight", 0.6)),
+        moves_left_loss_weight=float(training.get("moves_left_loss_weight", 0.5)),
+        soft_policy_weight=float(training.get("soft_policy_weight", 8.0)),
+        soft_policy_temperature=float(training.get("soft_policy_temperature", 4.0)),
+        amp=bool(training.get("amp", True)),
         device=str(training.get("device", "cuda")),
         num_workers=training.get("num_workers"),
     )

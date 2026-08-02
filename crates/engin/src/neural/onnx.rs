@@ -4,22 +4,29 @@
 //! 合法着 softmax。cache 是 px0 `neural/memcache.cc` 的独立包装层，不能在此
 //! 偷偷实现。
 
+#[cfg(all(feature = "cuda", feature = "directml"))]
+compile_error!("ONNX runtime build must select either `cuda` or `directml`, not both");
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ndarray::Array4;
-use ort::ep::{directml::PerformancePreference, DirectML};
+#[cfg(feature = "cuda")]
+use ort::ep::{CUDA, cuda::ConvAlgorithmSearch};
+#[cfg(feature = "directml")]
+use ort::ep::{DirectML, directml::PerformancePreference};
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::neural::backend::{
-    AddInputResult, Backend, BackendAttributes, BackendComputation, EvalPosition, EvalResult, EvalTicket,
-};
 use crate::EnginError;
+use crate::neural::backend::{
+    AddInputResult, Backend, BackendAttributes, BackendComputation, EncodedInference, EvalPosition, EvalResult,
+    EvalTicket,
+};
 
 use super::{
-    encode_position_for_nn, move_to_nn_index, FillEmptyHistory, BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE,
+    BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLICY_SIZE, encode_position_for_nn, move_to_nn_index,
 };
 
 /// px0 `NetworkAsBackend` (`wrapper.cc:49-98`) 的最小 Rust 对应物。
@@ -30,11 +37,14 @@ pub struct OnnxBackend {
     provider: OnnxProvider,
 }
 
-/// px0 ONNX backend selects a configured provider and reports its real CPU
-/// capability through `NetworkAsBackend` (`src/neural/backends/onnx/
-/// network_onnx.cc:140-176`, `src/neural/wrapper.cc:49-68`).
+/// px0 ONNX backend 选择配置的 provider，并通过 `NetworkAsBackend` 报告实际 CPU
+/// 能力（`src/neural/backends/onnx/network_onnx.cc:140-176`、
+/// `src/neural/wrapper.cc:49-68`）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnnxProvider {
+    #[cfg(feature = "cuda")]
+    Cuda,
+    #[cfg(feature = "directml")]
     DirectMl,
     Cpu,
 }
@@ -42,34 +52,41 @@ pub enum OnnxProvider {
 impl OnnxProvider {
     pub const fn name(self) -> &'static str {
         match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda => "CUDAExecutionProvider",
+            #[cfg(feature = "directml")]
             Self::DirectMl => "DmlExecutionProvider",
             Self::Cpu => "CPUExecutionProvider",
         }
     }
 }
 
+#[cfg(feature = "cuda")]
+const CUDA_RECOMMENDED_BATCH: usize = 256;
+#[cfg(feature = "directml")]
 const DML_BATCH_STEP: usize = 16;
+#[cfg(feature = "directml")]
 const DML_BATCH_STEPS: usize = 4;
+#[cfg(feature = "directml")]
 const DML_MAX_BATCH: usize = DML_BATCH_STEP * DML_BATCH_STEPS;
 
-/// Fixed-shape DirectML sessions, matching px0's ONNX session set.
-///
-/// px0 `src/neural/backends/onnx/network_onnx.cc:629-677,810-838,878-901`
-/// creates one session per `batch_size * step`; DirectML needs a static input
-/// shape to compile an efficient graph.
+/// CUDA 使用一个动态 batch session；DirectML 使用 px0 风格的固定形状 session 集合。
 struct OnnxSessions {
+    #[cfg(feature = "directml")]
     provider: OnnxProvider,
     sessions: Vec<(usize, Session)>,
 }
 
 impl OnnxSessions {
-    fn single(provider: OnnxProvider, session: Session) -> Self {
+    fn single(session: Session) -> Self {
         Self {
-            provider,
+            #[cfg(feature = "directml")]
+            provider: OnnxProvider::Cpu,
             sessions: vec![(usize::MAX, session)],
         }
     }
 
+    #[cfg(feature = "directml")]
     fn direct_ml(sessions: Vec<(usize, Session)>) -> Self {
         Self {
             provider: OnnxProvider::DirectMl,
@@ -82,22 +99,39 @@ impl OnnxSessions {
     }
 
     fn chunk_size(&self) -> usize {
-        if self.provider == OnnxProvider::DirectMl {
-            DML_MAX_BATCH
-        } else {
+        #[cfg(feature = "cuda")]
+        {
             usize::MAX
+        }
+        #[cfg(feature = "directml")]
+        {
+            if self.provider == OnnxProvider::DirectMl {
+                DML_MAX_BATCH
+            } else {
+                usize::MAX
+            }
         }
     }
 
     fn run_batch_size(&self, entries: usize) -> usize {
-        if self.provider == OnnxProvider::DirectMl {
-            entries.div_ceil(DML_BATCH_STEP).min(DML_BATCH_STEPS) * DML_BATCH_STEP
-        } else {
+        #[cfg(feature = "cuda")]
+        {
             entries
+        }
+        #[cfg(feature = "directml")]
+        {
+            if self.provider == OnnxProvider::DirectMl {
+                entries.div_ceil(DML_BATCH_STEP).min(DML_BATCH_STEPS) * DML_BATCH_STEP
+            } else {
+                entries
+            }
         }
     }
 
     fn session_for(&mut self, batch_size: usize) -> Result<&mut Session, EnginError> {
+        #[cfg(feature = "cuda")]
+        let expected = usize::MAX;
+        #[cfg(feature = "directml")]
         let expected = if self.provider == OnnxProvider::DirectMl {
             batch_size
         } else {
@@ -118,17 +152,11 @@ impl OnnxBackend {
         Ok(Self {
             sessions: Arc::new(Mutex::new(sessions)),
             attributes: BackendAttributes {
-                has_mlh: false,
+                has_mlh: true,
                 has_wdl: true,
                 runs_on_cpu: provider == OnnxProvider::Cpu,
                 suggested_num_search_threads: 1,
-                // px0 DirectML defaults to batch=16 and steps=4, yielding
-                // a 64-position minibatch (`network_onnx.cc:810-838`).
-                recommended_batch_size: if provider == OnnxProvider::DirectMl {
-                    DML_MAX_BATCH
-                } else {
-                    256
-                },
+                recommended_batch_size: recommended_batch_size(provider),
                 maximum_batch_size: 1024,
             },
             provider,
@@ -140,14 +168,25 @@ impl OnnxBackend {
     }
 }
 
-/// Creates DirectML sessions and explicitly falls back to CPU when DirectML
-/// cannot be initialized.
-///
-/// px0's ONNX backend receives a provider at construction and derives
-/// `IsCpu`/batch attributes from it (`src/neural/backends/onnx/
-/// network_onnx.cc:140-176`). This Windows build intentionally supports one
-/// GPU execution provider only: DirectML. That keeps the bundled ORT runtime
-/// independent of locally installed CUDA and cuDNN versions.
+#[cfg(feature = "cuda")]
+fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginError> {
+    match create_cuda_session(path).and_then(|mut session| {
+        validate_cuda_session(&mut session)?;
+        Ok(session)
+    }) {
+        Ok(session) => Ok((OnnxSessions::single(session), OnnxProvider::Cuda)),
+        Err(cuda_error) => {
+            let session = Session::builder()
+                .map_err(onnx_error)?
+                .commit_from_file(path)
+                .map_err(onnx_error)?;
+            eprintln!("ONNX CUDA unavailable; using CPUExecutionProvider: {cuda_error}");
+            Ok((OnnxSessions::single(session), OnnxProvider::Cpu))
+        }
+    }
+}
+
+#[cfg(feature = "directml")]
 fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginError> {
     match create_direct_ml_sessions(path) {
         Ok(sessions) => Ok((OnnxSessions::direct_ml(sessions), OnnxProvider::DirectMl)),
@@ -157,14 +196,60 @@ fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginErr
                 .commit_from_file(path)
                 .map_err(onnx_error)?;
             eprintln!("ONNX DirectML unavailable; using CPUExecutionProvider: {direct_ml_error}");
-            Ok((OnnxSessions::single(OnnxProvider::Cpu, session), OnnxProvider::Cpu))
+            Ok((OnnxSessions::single(session), OnnxProvider::Cpu))
         }
     }
 }
 
-/// px0 `network_onnx.cc:629-677,810-838,878-901`: create fixed DirectML
-/// sessions for each batch step instead of making DirectML compile a dynamic
-/// batch graph on every search workload.
+#[cfg(feature = "cuda")]
+fn recommended_batch_size(provider: OnnxProvider) -> usize {
+    if provider == OnnxProvider::Cuda {
+        CUDA_RECOMMENDED_BATCH
+    } else {
+        256
+    }
+}
+
+#[cfg(feature = "directml")]
+fn recommended_batch_size(provider: OnnxProvider) -> usize {
+    if provider == OnnxProvider::DirectMl {
+        DML_MAX_BATCH
+    } else {
+        256
+    }
+}
+
+/// ORT CUDA EP 使用动态输入形状；heuristic 避免首次加载为卷积算法做完整穷举。
+/// 参考：ORT CUDA EP `cudnn_conv_algo_search` 文档。
+#[cfg(feature = "cuda")]
+fn create_cuda_session(path: &Path) -> Result<Session, EnginError> {
+    Session::builder()
+        .map_err(onnx_error)?
+        .with_execution_providers([CUDA::default()
+            .with_device_id(0)
+            .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
+            // ORT CUDA EP：卷积网络在 Tensor Core GPU 上优先 NHWC；本机 A/B 有收益。
+            // https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#prefer_nhwc
+            .with_prefer_nhwc(true)
+            .build()
+            .error_on_failure()])
+        .map_err(onnx_error)?
+        .commit_from_file(path)
+        .map_err(onnx_error)
+}
+
+/// CUDA EP 注册成功不代表首个 kernel 能在当前 GPU 架构执行。启动时以一个最小输入
+/// 提前验证，避免搜索线程在第一批推理时崩溃；参考 ORT CUDA EP 的运行时兼容要求。
+#[cfg(feature = "cuda")]
+fn validate_cuda_session(session: &mut Session) -> Result<(), EnginError> {
+    let board = Array4::<f32>::zeros((1, INPUT_PLANES, BOARD_ROWS, BOARD_COLS));
+    let tensor = TensorRef::from_array_view(&board).map_err(onnx_error)?;
+    session.run(ort::inputs!["board" => tensor]).map_err(onnx_error)?;
+    Ok(())
+}
+
+/// px0 `network_onnx.cc:629-677,810-838,878-901`：固定形状 DirectML session。
+#[cfg(feature = "directml")]
 fn create_direct_ml_sessions(path: &Path) -> Result<Vec<(usize, Session)>, EnginError> {
     let mut sessions = Vec::with_capacity(DML_BATCH_STEPS);
     for step in 1..=DML_BATCH_STEPS {
@@ -206,7 +291,7 @@ impl Backend for OnnxBackend {
         Ok(Box::new(OnnxBackendComputation::new(self.sessions.clone())))
     }
 
-    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<EncodedInference, EnginError> {
         let mut sessions = self.sessions.lock().expect("ONNX session lock");
         infer_encoded_planes(&mut sessions, planes, batch)
     }
@@ -263,7 +348,7 @@ impl BackendComputation for OnnxBackendComputation {
             packed[index * plane_len..(index + 1) * plane_len].copy_from_slice(&planes);
         }
         let mut sessions = self.sessions.lock().expect("ONNX session lock");
-        let (logits, wdl) = infer_encoded_planes(&mut sessions, &packed, entries.len())?;
+        let (logits, wdl, moves_left) = infer_encoded_planes(&mut sessions, &packed, entries.len())?;
         let mut results = HashMap::with_capacity(entries.len());
         for (index, (ticket, entry)) in entries.iter().enumerate() {
             let values = &logits[index * POLICY_SIZE..(index + 1) * POLICY_SIZE];
@@ -274,7 +359,7 @@ impl BackendComputation for OnnxBackendComputation {
                 Arc::new(EvalResult {
                     wl: value[0] - value[2],
                     d: value[1],
-                    m: 0.0,
+                    plies_left: moves_left[index],
                     policies,
                 }),
             );
@@ -324,13 +409,12 @@ pub fn softmax_legal_policy(logits: &[f32], legal_moves: &[xiangqi_core::Move]) 
     Ok(selected)
 }
 
-
-/// ONNX-only: padded DirectML/CPU session run on pre-encoded planes.
+/// 仅供 ONNX 使用：在预编码 planes 上运行当前发行包的 ONNX session。
 fn infer_encoded_planes(
     sessions: &mut OnnxSessions,
     planes: &[f32],
     batch: usize,
-) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+) -> Result<EncodedInference, EnginError> {
     let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
     if planes.len() != batch * plane_len {
         return Err(EnginError::Onnx(format!(
@@ -339,19 +423,24 @@ fn infer_encoded_planes(
         )));
     }
     if batch == 0 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     let mut all_logits = Vec::with_capacity(batch * POLICY_SIZE);
     let mut all_wdl = Vec::with_capacity(batch * 3);
+    let mut all_moves_left = Vec::with_capacity(batch);
     let chunk_size = sessions.chunk_size();
     for chunk_start in (0..batch).step_by(chunk_size.min(batch).max(1)) {
         let end = (chunk_start + chunk_size).min(batch);
         let actual_batch = end - chunk_start;
         let run_batch = sessions.run_batch_size(actual_batch);
-        // px0 zero-pads each DirectML minibatch (`network_onnx.cc:398-447`).
-        let mut input = vec![0.0; run_batch * plane_len];
-        input[..actual_batch * plane_len]
-            .copy_from_slice(&planes[chunk_start * plane_len..end * plane_len]);
+        #[cfg(feature = "cuda")]
+        let input = planes[chunk_start * plane_len..end * plane_len].to_vec();
+        #[cfg(feature = "directml")]
+        let input = {
+            let mut input = vec![0.0; run_batch * plane_len];
+            input[..actual_batch * plane_len].copy_from_slice(&planes[chunk_start * plane_len..end * plane_len]);
+            input
+        };
         let board = Array4::from_shape_vec((run_batch, INPUT_PLANES, BOARD_ROWS, BOARD_COLS), input)
             .map_err(|error| EnginError::Onnx(format!("invalid batch input: {error}")))?;
         let tensor = TensorRef::from_array_view(&board).map_err(onnx_error)?;
@@ -361,10 +450,12 @@ fn infer_encoded_planes(
             .map_err(onnx_error)?;
         let logits = tensor_output(&outputs, "logits", run_batch, POLICY_SIZE)?;
         let wdl = tensor_output(&outputs, "value", run_batch, 3)?;
+        let moves_left = tensor_output(&outputs, "moves_left", run_batch, 1)?;
         all_logits.extend_from_slice(&logits[..actual_batch * POLICY_SIZE]);
         all_wdl.extend_from_slice(&wdl[..actual_batch * 3]);
+        all_moves_left.extend(moves_left[..actual_batch].iter().copied());
     }
-    Ok((all_logits, all_wdl))
+    Ok((all_logits, all_wdl, all_moves_left))
 }
 
 fn validate_model_io(session: &Session) -> Result<(), EnginError> {
@@ -373,8 +464,10 @@ fn validate_model_io(session: &Session) -> Result<(), EnginError> {
         return Err(EnginError::Onnx("expected one ONNX input named board".into()));
     }
     let output_names: Vec<_> = session.outputs().iter().map(|output| output.name()).collect();
-    if !output_names.contains(&"logits") || !output_names.contains(&"value") {
-        return Err(EnginError::Onnx("expected ONNX outputs logits and value".into()));
+    if output_names != ["logits", "value", "moves_left"] {
+        return Err(EnginError::Onnx(
+            "expected ONNX outputs logits, value, and moves_left".into(),
+        ));
     }
     Ok(())
 }
@@ -432,14 +525,13 @@ mod tests {
             return;
         }
         let backend = OnnxBackend::from_file(&path).expect("load local x7.onnx");
-        let history = xiangqi_core::PositionHistory::from_positions(vec![xiangqi_core::Position::from_fen(
-            xiangqi_core::STARTPOS_FEN,
-        )
-        .unwrap()]);
+        let history = xiangqi_core::PositionHistory::from_positions(vec![
+            xiangqi_core::Position::from_fen(xiangqi_core::STARTPOS_FEN).unwrap(),
+        ]);
         let legal = history.last().board().generate_legal_moves();
         let eval = backend.evaluate(&history, &legal);
         assert_eq!(eval.policies.len(), legal.len());
         assert!((eval.policies.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        assert!(eval.wl.is_finite() && eval.d.is_finite());
+        assert!(eval.wl.is_finite() && eval.d.is_finite() && eval.plies_left.is_finite());
     }
 }

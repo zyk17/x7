@@ -7,7 +7,7 @@ use xiangqi_core::{Move, MoveList, Position, PositionHistory};
 
 use crate::EnginError;
 
-use super::cache::{CachedEval, EvalCache, DEFAULT_NN_CACHE_SIZE};
+use super::cache::{CachedEval, DEFAULT_NN_CACHE_SIZE, EvalCache};
 use super::{BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE};
 
 /// px0 `BackendAttributes` (`src/neural/backend.h:45-52`)。
@@ -37,11 +37,20 @@ impl Default for BackendAttributes {
 /// px0 `EvalResult` / backend 评估输出子集。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EvalResult {
+    /// 当前行棋方的胜率减负率。
     pub wl: f32,
+    /// 当前行棋方的和棋概率。
     pub d: f32,
-    pub m: f32,
+    /// 预测到结果的距离，单位为 ply（半回合）。
+    ///
+    /// ONNX 输出名为 `moves_left`，但训练记录与搜索回传均以 ply 而非完整回合度量此值。
+    pub plies_left: f32,
+    /// 与传入合法着列表对齐的概率。
     pub policies: Vec<f32>,
 }
+
+/// 批量原始网络输出：policy logits、WDL 概率、moves-left。
+pub type EncodedInference = (Vec<f32>, Vec<f32>, Vec<f32>);
 
 /// px0 `EvalPosition` (`src/neural/backend.h:62-65`) 的所有权版本。
 ///
@@ -69,9 +78,9 @@ pub struct EvalTicket(pub usize);
 
 /// px0 `BackendComputation` (`src/neural/backend.h:75-87`)。
 ///
-/// `SearchWorker::ProcessPickedTask` may call `AddInput` from several px0 task
-/// workers (`search.cc:1423-1462`). Rust implementations therefore own their
-/// mutable batch state behind an internal lock instead of requiring `&mut self`.
+/// `SearchWorker::ProcessPickedTask` 可由多个 px0 task worker 调用 `AddInput`
+/// （`search.cc:1423-1462`）。因此 Rust 实现将可变 batch state 置于内部锁之后，
+/// 而不要求 `&mut self`。
 pub trait BackendComputation: Send + Sync {
     fn used_batch_size(&self) -> usize;
     fn add_input(&self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError>;
@@ -94,26 +103,26 @@ pub trait Backend: Send + Sync {
         None
     }
 
-    /// Stream NN worker: inference on already-encoded NCHW planes only.
-    /// Returns `logits[batch * POLICY_SIZE]` and WDL `value[batch * 3]`.
-    fn infer_encoded(&self, _planes: &[f32], _batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+    /// stream NN worker：只对已编码 NCHW planes 推理。依次返回 logits、WDL 概率、
+    /// moves-left，形状为 `[batch * POLICY_SIZE]`、`[batch * 3]`、`[batch]`。
+    fn infer_encoded(&self, _planes: &[f32], _batch: usize) -> Result<EncodedInference, EnginError> {
         Err(EnginError::PortIncomplete("backend has no encoded inference"))
     }
 
-    /// Optional MemCache insert after Eval builds a completed `EvalResult`.
+    /// Eval 构造完整 `EvalResult` 后可选地写入 MemCache。
     fn store_evaluation(&self, _position: &EvalPosition, _result: Arc<EvalResult>) {}
 
     /// px0 `CachingBackend::ClearCache` (`src/neural/memcache.h:34-38`).
-    /// Non-caching backends deliberately keep the no-op default.
+    /// 非缓存 backend 刻意保留此空实现。
     fn clear_cache(&self) {}
 
     /// px0 `CachingBackend::SetCacheSize` (`src/neural/memcache.h:36-38`).
     fn set_cache_size(&self, _size: usize) {}
 }
 
-/// px0 `CachingBackend` / `MemCache` (`src/neural/memcache.h:34-45`,
-/// `memcache.cc:58-190`). This wrapper, rather than the ONNX implementation,
-/// owns cache lookup, batch miss forwarding and post-compute insertion.
+/// px0 `CachingBackend` / `MemCache`（`src/neural/memcache.h:34-45`、
+/// `memcache.cc:58-190`）。缓存查找、batch miss 转发和计算后的插入由此 wrapper 而非
+/// ONNX 实现负责。
 pub struct CachingBackend {
     wrapped: Arc<dyn Backend>,
     cache: Arc<EvalCache>,
@@ -128,8 +137,8 @@ impl CachingBackend {
     }
 
     fn cache_key(position: &EvalPosition) -> u64 {
-        // px0 `ComputeEvalPositionHash` (`memcache.cc:38-45`). History and
-        // repetitions are intentionally not in this cache key yet.
+        // px0 `ComputeEvalPositionHash`（`memcache.cc:38-45`）。暂不将 history 和
+        // repetition 放入此 cache key。
         position.positions.last().map_or(0, Position::hash)
     }
 
@@ -171,7 +180,7 @@ impl Backend for CachingBackend {
         self.cached(position)
     }
 
-    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<EncodedInference, EnginError> {
         self.wrapped.infer_encoded(planes, batch)
     }
 
@@ -196,7 +205,7 @@ impl Backend for CachingBackend {
     }
 }
 
-/// One px0 `MemCacheComputation::Entry` (`memcache.cc:109-120`).
+/// 一个 px0 `MemCacheComputation::Entry`（`memcache.cc:109-120`）。
 struct CacheEntry {
     outer_ticket: EvalTicket,
     inner_ticket: EvalTicket,
@@ -361,7 +370,7 @@ impl BackendComputation for UniformBackendComputation {
 pub struct UniformBackend {
     pub wl: f32,
     pub d: f32,
-    pub m: f32,
+    pub plies_left: f32,
     cache: Arc<EvalCache>,
 }
 
@@ -370,7 +379,7 @@ impl Default for UniformBackend {
         Self {
             wl: 0.0,
             d: 0.0,
-            m: 0.0,
+            plies_left: 0.0,
             cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
         }
     }
@@ -381,11 +390,11 @@ impl UniformBackend {
         position.positions.last().map(|p| p.hash()).unwrap_or(0)
     }
 
-    pub fn with_wdl(wl: f32, d: f32, m: f32) -> Self {
+    pub fn with_wdl(wl: f32, d: f32, plies_left: f32) -> Self {
         Self {
             wl,
             d,
-            m,
+            plies_left,
             cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
         }
     }
@@ -398,7 +407,7 @@ impl Backend for UniformBackend {
         Arc::new(EvalResult {
             wl: self.wl,
             d: self.d,
-            m: self.m,
+            plies_left: self.plies_left,
             policies: vec![p; legal_moves.len()],
         })
     }
@@ -417,18 +426,18 @@ impl Backend for UniformBackend {
         Ok(Box::new(UniformBackendComputation::new(self.clone())))
     }
 
-    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<(Vec<f32>, Vec<f32>), EnginError> {
+    fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<EncodedInference, EnginError> {
         let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
         if planes.len() != batch * plane_len {
             return Err(EnginError::PortIncomplete("uniform encoded planes length"));
         }
-        // Equal logits → Eval softmax is uniform over legal moves.
+        // 相等 logits → Eval softmax 在合法着上均匀分布。
         let logits = vec![0.0; batch * POLICY_SIZE];
         let mut wdl = Vec::with_capacity(batch * 3);
         for _ in 0..batch {
             wdl.extend_from_slice(&[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
         }
-        Ok((logits, wdl))
+        Ok((logits, wdl, vec![self.plies_left; batch]))
     }
 
     fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {
@@ -500,9 +509,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn encoded_uniform_inference_keeps_moves_left_per_position() {
+        let backend = UniformBackend::with_wdl(0.0, 0.0, 17.0);
+        let planes = vec![0.0; 2 * INPUT_PLANES * BOARD_ROWS * BOARD_COLS];
+        let (_, _, moves_left) = backend.infer_encoded(&planes, 2).expect("infer");
+        assert_eq!(moves_left, vec![17.0, 17.0]);
+    }
+
     /// px0 `MemCacheComputation::AddInput/ComputeBlocking`
-    /// (`memcache.cc:101-129`): cache hits skip the wrapped batch, while a
-    /// different legal move count is a collision-safe miss.
+    /// （`memcache.cc:101-129`）：cache hit 跳过被包装的 batch；不同合法着数量是
+    /// collision-safe miss。
     #[test]
     fn caching_backend_returns_hits_only_after_completed_batch_and_checks_move_count() {
         let backend = CachingBackend::new(Box::new(UniformBackend::default()));

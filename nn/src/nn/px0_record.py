@@ -4,11 +4,8 @@
 
 - 124 x 10 x 9 输入平面
 - 2062 维 policy 概率
-- winner WDL
-- root WDL
-- search q WDL（来自 best_q / best_d）
-- search visits
-- policy_kld
+- winner WDL（最终结果锚点）
+- root WDL（已完成搜索的 target）
 - plies_left
 
 这里不试图兼容 lc0/px0 全部历史版本，也不引入 proto 依赖。
@@ -39,26 +36,15 @@ PX0_POLICY_SIZE = 2062
 class Px0Sample:
     planes: np.ndarray
     policy: np.ndarray
-    winner_q: np.ndarray
     winner_wdl: np.ndarray
     root_wdl: np.ndarray
-    search_q: np.ndarray
-    search_wdl: np.ndarray
-    search_visits: np.ndarray
-    policy_kld: np.ndarray
     plies_left: np.ndarray
 
 
-def _winner_wdl(result_q: float, result_d: float) -> np.ndarray:
-    win = 0.5 * (1.0 - result_d + result_q)
-    loss = 0.5 * (1.0 - result_d - result_q)
-    return np.asarray([win, result_d, loss], dtype=np.float32)
-
-
-def _search_wdl(best_q: float, best_d: float) -> np.ndarray:
-    win = 0.5 * (1.0 - best_d + best_q)
-    loss = 0.5 * (1.0 - best_d - best_q)
-    return np.asarray([win, best_d, loss], dtype=np.float32)
+def _wdl_from_qd(q: float, draw: float) -> np.ndarray:
+    win = 0.5 * (1.0 - draw + q)
+    loss = 0.5 * (1.0 - draw - q)
+    return np.asarray([win, draw, loss], dtype=np.float32)
 
 
 def _decode_planes(
@@ -88,9 +74,7 @@ def _decode_planes(
     edge_plane = np.ones((1, PX0_ROWS, PX0_COLS), dtype=np.float32)
 
     if input_format != CLASSICAL_INPUT:
-        raise ValueError(
-            f"当前仅支持 px0 classical input_format=1, got input_format={input_format}"
-        )
+        raise ValueError(f"当前仅支持 px0 classical input_format=1, got input_format={input_format}")
     stm_planes = np.full((1, PX0_ROWS, PX0_COLS), float(stm), dtype=np.float32)
 
     out = np.concatenate([planes, stm_planes, rule50_plane, aux_plane, edge_plane], axis=0)
@@ -113,9 +97,9 @@ def parse_v6_record(record: bytes) -> Px0Sample:
         invariance_info,
         _dep_result,
         root_q,
-        best_q,
+        _best_q,
         root_d,
-        best_d,
+        _best_d,
         _root_m,
         _best_m,
         plies_left,
@@ -127,10 +111,10 @@ def parse_v6_record(record: bytes) -> Px0Sample:
         _orig_q,
         _orig_d,
         _orig_m,
-        visits,
+        _visits,
         _played_idx,
         _best_idx,
-        policy_kld,
+        _policy_kld,
         _reserved,
     ) = V6_STRUCT.unpack(record)
 
@@ -148,20 +132,14 @@ def parse_v6_record(record: bytes) -> Px0Sample:
         invariance_info=int(invariance_info),
         input_format=int(input_format),
     )
-    winner = _winner_wdl(float(result_q), float(result_d))
-    root = _search_wdl(float(root_q), float(root_d))
-    search = _search_wdl(float(best_q), float(best_d))
+    winner = _wdl_from_qd(float(result_q), float(result_d))
+    root = _wdl_from_qd(float(root_q), float(root_d))
     plies = np.asarray([float(plies_left)], dtype=np.float32)
     return Px0Sample(
         planes=planes,
         policy=policy,
-        winner_q=np.asarray([float(result_q)], dtype=np.float32),
         winner_wdl=winner,
         root_wdl=root,
-        search_q=np.asarray([float(best_q)], dtype=np.float32),
-        search_wdl=search,
-        search_visits=np.asarray([float(visits)], dtype=np.float32),
-        policy_kld=np.asarray([float(policy_kld)], dtype=np.float32),
         plies_left=plies,
     )
 

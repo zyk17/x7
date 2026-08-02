@@ -4,13 +4,13 @@ use std::sync::OnceLock;
 
 use crate::bitboard::BitBoard;
 use crate::board_masks::{
-    distance, file_bb, rank_bb, safe_destination, shift, BISHOP_DIRECTIONS, FILE_A_BB, FILE_I_BB, HALF_BB,
-    KNIGHT_DIRECTIONS, PALACE, RANK0_BB, RANK9_BB,
+    BISHOP_DIRECTIONS, FILE_A_BB, FILE_I_BB, HALF_BB, KNIGHT_DIRECTIONS, PALACE, RANK0_BB, RANK9_BB, distance, file_bb,
+    rank_bb, safe_destination, shift,
 };
 use crate::magic_numbers::{KBISHOPMAGICNUMBERS, KKNIGHTMAGICNUMBERS, KKNIGHTTOMAGICNUMBERS, KROOKMAGICNUMBERS};
 use crate::types::{
-    file_distance, rank_distance, Direction, PieceType, Rank, Square, EAST, NORTH, NORTH_EAST, NORTH_WEST, SOUTH,
-    SOUTH_EAST, SOUTH_WEST, WEST,
+    Direction, EAST, NORTH, NORTH_EAST, NORTH_WEST, PieceType, Rank, SOUTH, SOUTH_EAST, SOUTH_WEST, Square, WEST,
+    file_distance, rank_distance,
 };
 
 const PSEUDO_ATTACK_TYPES: usize = 10;
@@ -346,7 +346,6 @@ pub fn initialize_magic_bitboards() {
 
 /// px0 `board.cc:563-615`。
 pub fn get_attacks(pt: PieceType, square: Square, pieces: BitBoard) -> BitBoard {
-    let _ = tables();
     let s = square.index() as usize;
     let t = tables();
     match pt {

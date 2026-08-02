@@ -1,12 +1,13 @@
-//! Owned event payloads for LC3-style streaming workers.
+//! LC3 风格流水线 worker 之间传递的 owned event。
 //!
-//! Reference: LC3 overview, "Workers" and glossary "Variation":
+//! 参考：LC3 Overview 的 “Workers” 与 Glossary 的 “Variation”：
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 //! <https://lczero.org/dev/lc0/search/lc3/glossary/>
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
+use std::time::Instant;
 
 use nohash_hasher::NoHashHasher;
 use xiangqi_core::{Move, PositionHistory};
@@ -15,18 +16,17 @@ use super::{EdgeReservation, NodeKey, ValueDelta};
 
 type NodeDeltaMap = HashMap<NodeKey, ValueDelta, BuildHasherDefault<NoHashHasher<u64>>>;
 
-/// Rejects stale events after `position`, `ucinewgame`, or a replacement `go`.
+/// 拒绝 `position`、`ucinewgame` 或替换 `go` 之后残留的旧 event。
 ///
-/// LC3 events belong to one streaming search. x7 gives every UCI search a
-/// monotonic generation instead of allowing an old event to update a new root.
+/// 一个 LC3 event 只属于一次流式搜索。x7 为每次 UCI 搜索分配单调递增 generation，
+/// 不让旧 event 更新新的 root。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct SearchGeneration(pub u64);
 
-/// A root history plus the moves from that root to a repository node.
+/// root history 加上从 root 到 repository node 的走法。
 ///
-/// Repetition and rule60 are history-sensitive in Xiangqi, so an event cannot
-/// contain only a board hash. The root history is shared immutably; the
-/// move path is owned and grown in place as Gather descends.
+/// 中国象棋重复局面和 rule60 依赖历史，因此 event 不能只保存棋盘 hash。root history
+/// 以不可变方式共享；Gather 下行时在本 event 内扩展其 owned 走法路径。
 #[derive(Clone, Debug)]
 pub struct Variation {
     root_history: Arc<PositionHistory>,
@@ -53,7 +53,7 @@ impl Variation {
         &self.moves
     }
 
-    /// Rebuilds the exact leaf history in a worker-local workspace.
+    /// 在 worker 私有工作区重建准确的叶子 history。
     pub fn replay_history(&self) -> PositionHistory {
         let mut history = self.root_history.as_ref().clone();
         for &mv in self.moves.iter() {
@@ -63,10 +63,10 @@ impl Variation {
     }
 }
 
-/// Work item passed between Gather, Eval, and Backprop workers.
+/// Gather、Eval 与 Backprop worker 间传递的工作项。
 ///
-/// The event owns all search-specific data. It holds no `&mut` tree/backend
-/// references and is therefore safe to send through a bounded worker queue.
+/// event 拥有全部搜索专用数据，不持有 tree/backend 的 `&mut` 引用，因此可安全地通过
+/// 有界 worker 队列发送。
 #[derive(Debug)]
 pub struct NodeEvent {
     pub generation: SearchGeneration,
@@ -74,17 +74,22 @@ pub struct NodeEvent {
     node_path: Vec<NodeKey>,
     pub variation: Variation,
     pub reservations: Vec<EdgeReservation>,
+    queued_at: Option<Instant>,
 }
 
 impl NodeEvent {
     pub fn root(generation: SearchGeneration, root_history: Arc<PositionHistory>) -> Self {
-        let node_key = NodeKey::root(root_history.last().hash());
+        Self::at_root(generation, NodeKey::root(root_history.last().hash()), root_history)
+    }
+
+    pub fn at_root(generation: SearchGeneration, root_key: NodeKey, root_history: Arc<PositionHistory>) -> Self {
         Self {
             generation,
-            node_key,
-            node_path: vec![node_key],
+            node_key: root_key,
+            node_path: vec![root_key],
             variation: Variation::root(root_history),
             reservations: Vec::new(),
+            queued_at: None,
         }
     }
 
@@ -96,9 +101,8 @@ impl NodeEvent {
         self
     }
 
-    /// Releases every edge-local in-flight visit after a collision, stop, or
-    /// failed evaluation. Consuming `self` makes leaving reservations behind
-    /// an explicit bug at the caller.
+    /// collision、停止或评估失败后释放全部 edge-local in-flight visit。消费 `self`
+    /// 让调用方遗漏 reservation 成为显式错误。
     pub fn cancel(self) {
         for reservation in self.reservations.into_iter().rev() {
             reservation.cancel();
@@ -108,36 +112,55 @@ impl NodeEvent {
     pub fn node_path(&self) -> &[NodeKey] {
         &self.node_path
     }
+
+    /// 标记一次 worker 队列交接，供可选 benchmark 遥测使用。
+    ///
+    /// 参考：LC3 Overview 的 “Stats Collection”。普通 UCI 搜索不设置它，因此计时
+    /// 不在其热路径上。
+    pub(crate) fn mark_queued(&mut self) {
+        self.queued_at = Some(Instant::now());
+    }
+
+    pub(crate) fn take_queue_wait(&mut self) -> Option<std::time::Duration> {
+        self.queued_at.take().map(|queued_at| queued_at.elapsed())
+    }
 }
 
-/// A Gather/Eval outcome routed to Backprop.
+/// 由 Gather/Eval 路由给 Backprop 的结果。
 ///
-/// Reference: LC3 Overview, "GatherWorker" and "BackpropWorker":
-/// <https://lczero.org/dev/lc0/search/lc3/overview/>. A collision must reach
-/// Backprop so the same terminal stage releases its edge-local in-flight visit.
+/// 参考：LC3 Overview 的 “GatherWorker” 和 “BackpropWorker”：
+/// <https://lczero.org/dev/lc0/search/lc3/overview/>。collision 必须到达 Backprop，
+/// 让相同的收尾阶段释放 edge-local in-flight visit。
 #[derive(Debug)]
 pub struct BackpropEvent {
     node: NodeEvent,
     outcome: BackpropOutcome,
+    queued_at: Option<Instant>,
 }
 
 #[derive(Debug)]
 enum BackpropOutcome {
-    Evaluation { wl: f32, draw: f32 },
+    Evaluation { wl: f32, draw: f32, plies_left: f32 },
     Collision,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackpropResult {
     pub completed_playouts: u32,
     pub collisions: u32,
+    pub collision_depths: Vec<usize>,
+    /// 已完成叶子深度之和，root 记为深度一。对齐 px0 `cum_depth_` 的计数方式
+    /// （`search.cc:2157-2167`）。
+    pub completed_depth: u64,
+    pub max_depth: u64,
 }
 
 impl BackpropEvent {
-    pub(crate) fn evaluation(node: NodeEvent, wl: f32, draw: f32) -> Self {
+    pub(crate) fn evaluation(node: NodeEvent, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
             node,
-            outcome: BackpropOutcome::Evaluation { wl, draw },
+            outcome: BackpropOutcome::Evaluation { wl, draw, plies_left },
+            queued_at: None,
         }
     }
 
@@ -145,12 +168,12 @@ impl BackpropEvent {
         Self {
             node,
             outcome: BackpropOutcome::Collision,
+            queued_at: None,
         }
     }
 
-    /// Completes events through the aggregate path used by Backprop workers.
-    /// Edge reservations remain per-event because each owns exactly one
-    /// in-flight visit.
+    /// 经 Backprop worker 使用的聚合路径完成 event。edge reservation 保持为每 event
+    /// 一份，因为每份恰好拥有一个 in-flight visit。
     ///
     /// LC3 Overview, "BackpropWorker":
     /// <https://lczero.org/dev/lc0/search/lc3/overview/>.
@@ -158,21 +181,28 @@ impl BackpropEvent {
         events: impl IntoIterator<Item = Self>,
         repository: &super::NodeRepository,
     ) -> BackpropResult {
-        // `NodeKey` is already mixed; same identity hasher as the repository.
+        // `NodeKey` 已混合；与 repository 使用相同的 identity hasher。
         let mut node_deltas = NodeDeltaMap::default();
         let mut result = BackpropResult::default();
 
         for event in events {
-            let Self { node, outcome } = event;
-            let BackpropOutcome::Evaluation { wl, draw } = outcome else {
+            let Self { node, outcome, .. } = event;
+            let BackpropOutcome::Evaluation { wl, draw, plies_left } = outcome else {
+                result.collision_depths.push(node.variation.moves().len());
                 node.cancel();
                 result.collisions += 1;
                 continue;
             };
             debug_assert_eq!(node.node_path.len(), node.reservations.len() + 1);
-            let mut delta = ValueDelta::one(wl, draw);
+            let depth = node.node_path.len() as u64;
+            let mut delta = ValueDelta::with_plies_left(wl, draw, plies_left);
             let mut reservations = node.reservations.into_iter().rev();
             for (node_index, node_key) in node.node_path.into_iter().enumerate().rev() {
+                if let Some((terminal_wl, terminal_draw, terminal_m)) =
+                    repository.get(node_key).and_then(|node| node.terminal_value())
+                {
+                    delta = ValueDelta::with_plies_left(terminal_wl, terminal_draw, terminal_m);
+                }
                 node_deltas
                     .entry(node_key)
                     .and_modify(|aggregate| *aggregate = aggregate.merge(delta))
@@ -180,13 +210,15 @@ impl BackpropEvent {
                 if node_index == 0 {
                     break;
                 }
-                // px0 `EdgeAndNode::GetQ` reads child.wl (mover view). Complete
-                // the edge with the child delta, then flip for the parent node
-                // (`search.cc:2175-2257`: finalize(v); v = -v).
+                // px0 `EdgeAndNode::GetQ` 读取 child.wl（走子方视角）。先用 child
+                // delta 完成 edge，再为 parent node 翻转（`search.cc:2175-2257`：
+                // `finalize(v); v = -v`）。
                 reservations.next().expect("path reservation").complete(delta.q());
-                delta = delta.for_parent();
+                delta = delta.for_parent().one_ply_up();
             }
             result.completed_playouts += 1;
+            result.completed_depth += depth;
+            result.max_depth = result.max_depth.max(depth);
         }
 
         for (node_key, delta) in node_deltas {
@@ -198,6 +230,17 @@ impl BackpropEvent {
     pub fn cancel(self) {
         self.node.cancel();
     }
+
+    pub(crate) fn mark_queued(&mut self) {
+        self.queued_at = Some(Instant::now());
+    }
+
+    /// 返回进入 Backprop 队列后的可选等待时间。
+    ///
+    /// 参考：LC3 Overview 的 “Stats Collection”。
+    pub(crate) fn take_queue_wait(&mut self) -> Option<std::time::Duration> {
+        self.queued_at.take().map(|queued_at| queued_at.elapsed())
+    }
 }
 
 #[cfg(test)]
@@ -207,7 +250,7 @@ mod tests {
     use xiangqi_core::{GameState, Move, STARTPOS_FEN};
 
     use super::{BackpropEvent, NodeEvent, SearchGeneration};
-    use crate::search::stream::{NodeKey, NodeRepository};
+    use crate::search::{NodeKey, NodeRepository};
 
     #[test]
     fn variation_keeps_root_history_and_owns_its_path() {
@@ -222,7 +265,7 @@ mod tests {
         );
         let child_key = root.node_key.child(mv);
         let root_history_len = root.variation.root_history().len();
-        let next = root.descend(child_key, crate::search::stream::EdgeReservation::test_only(mv));
+        let next = root.descend(child_key, crate::search::EdgeReservation::test_only(mv));
 
         assert_eq!(next.variation.moves(), &[mv]);
         assert_eq!(next.variation.root_history().len(), root_history_len);
@@ -249,22 +292,21 @@ mod tests {
         root_node.publish_edges(vec![(mv, 1.0)]);
         let child = root.descend(NodeKey::root(42), root_node.reserve_edge(0).expect("edge"));
 
-        BackpropEvent::complete_batch(
-            [BackpropEvent::evaluation(child, 0.4, 0.2)],
-            &repository,
-        );
+        BackpropEvent::complete_batch([BackpropEvent::evaluation(child, 0.4, 0.2, 2.0)], &repository);
 
         let edge = &root_node.edges()[0];
         assert_eq!(edge.visits(), 1);
         assert_eq!(edge.completed_visits(), 1);
-        // Mover-perspective leaf value is stored on the child and edge; parent
-        // receives the flipped backup (px0 search.cc:2129,2175-2257).
+        // 走子方视角的叶子价值存于 child 和 edge；parent 接收翻转后的回传
+        // （px0 `search.cc:2129,2175-2257`）。
         assert!((edge.q() - 0.4).abs() < f32::EPSILON);
         assert_eq!(root_node.completed_visits(), 1);
         assert!((root_node.q() + 0.4).abs() < f32::EPSILON);
+        assert!((root_node.m() - 3.0).abs() < f32::EPSILON);
         let child_node = repository.get(NodeKey::root(42)).expect("child node");
         assert_eq!(child_node.completed_visits(), 1);
         assert!((child_node.q() - 0.4).abs() < f32::EPSILON);
+        assert!((child_node.m() - 2.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -284,10 +326,7 @@ mod tests {
         root_node.publish_edges(vec![(mv, 1.0)]);
         let child = root.descend(NodeKey::root(42), root_node.reserve_edge(0).expect("edge"));
 
-        let result = BackpropEvent::complete_batch(
-            [BackpropEvent::collision(child)],
-            &repository,
-        );
+        let result = BackpropEvent::complete_batch([BackpropEvent::collision(child)], &repository);
 
         let edge = &root_node.edges()[0];
         assert_eq!(result.completed_playouts, 0);
@@ -318,8 +357,8 @@ mod tests {
 
         let result = BackpropEvent::complete_batch(
             [
-                BackpropEvent::evaluation(first, 0.4, 0.2),
-                BackpropEvent::evaluation(second, 0.2, 0.4),
+                BackpropEvent::evaluation(first, 0.4, 0.2, 0.0),
+                BackpropEvent::evaluation(second, 0.2, 0.4, 0.0),
             ],
             &repository,
         );
@@ -328,6 +367,8 @@ mod tests {
         let child_node = repository.get(child_key).expect("child node");
         assert_eq!(result.completed_playouts, 2);
         assert_eq!(result.collisions, 0);
+        assert_eq!(result.completed_depth, 4);
+        assert_eq!(result.max_depth, 2);
         assert_eq!(edge.visits(), 2);
         assert_eq!(edge.completed_visits(), 2);
         assert!((edge.q() - 0.3).abs() < f32::EPSILON);

@@ -1,61 +1,92 @@
 # ARCHITECTURE
 
-## 当前目标
+## 项目目标
 
-这是一次 Rust 版 px0 的逐函数翻译，不是对旧实现做兼容或修补。
+> 棋力不是来自网络，也不是来自搜索。棋力来自 Prediction 与 Evidence 的协同；Knowledge 负责产生 Prediction，Proof 负责产生新的 Evidence，Decision 在固定时间预算下融合二者，形成最终行动。
 
-翻译顺序固定为：
+项目目标是在有限计算资源、固定思考时间下，研究 Knowledge（Recognition）与 Proof（Calculation）如何协同，获得最高的固定时间 Elo。ResNet、Transformer、MCTS、Alpha-Beta、CPU/GPU 分工和辅助 head 都是实现选择，不是独立目标。
 
-1. `xiangqi_core`：px0 `src/chess` 的棋盘、合法着、FEN、Position、PositionHistory、RuleJudge。
-2. `engin` 外围：`GameState`、UCI controller/loop、`SearchBase` 与 px0
-   `NetworkAsBackendComputation`。P4 的真实 history、124-plane 编码、policy 映射、ONNX batch 和
-   `WeightsFile -> OnnxBackend` 子集已接入。
-3. `engin/mcts`：px0 `src/search` 的 classic worker 主线；minibatch、collision、prefetch、tree reuse 与
-   watchdog 已接线。task 已有 owned leaf path/history/workspace/result 的安全边界，owner 在
-   `WaitForTasks` 后独占写 tree 和提交 backend；当前 task queue 仍由 owner 同步 drain，常驻并行
-   task-worker 是 P4 的下一项逐段翻译任务。旧 scoped raw-pointer bridge 已删除。
-4. prefetch、tree reuse、并发与真实 ONNX 的 px0 `MemCache` wrapper 已接线。缓存通用容器采用
-   `quick_cache` 分片 S3-FIFO，value 以 `Arc<EvalResult>` 共享；px0 的 key/collision guard/completed-only
-   回填时序不变，但淘汰策略不是严格 FIFO。后续改动只能在明确引用的 px0 语义上继续。
-5. `pxzero-training`：数据、训练与 ONNX 导出契约。
+项目不复制人、Lc0 或 Stockfish 中的任一种实现；它研究象棋在现代硬件约束下的成本模型：GPU 主要生产 Prediction，CPU 主要生产 Evidence，两种资源不应被简单视为零和。
 
-## Stream 搜索（进行中）
+## 研究坐标
 
-`crates/engin/src/search/stream` 是独立于 `classic` 的新搜索实现。主线入口是
-`search/stream/search.rs` 的 `Search`（常驻 Gather/Eval/Backprop）。它采用 LC3 文档描述的
-streaming MCTS **形态**：sharded node repository、edge-local in-flight、owned `NodeEvent`。
-第一版只使用 parent-key + move 的**树 key**，不合并成 DAG。协作式单线程 `pipeline` 已删除。
+- **Knowledge**：从数据学习的预测能力，包括 pattern、局面、战略、value 与 policy。
+- **Proof**：计算得到新增证据的过程，不限于 MCTS、Alpha-Beta 或 proof search。
+- **Evidence**：Proof 的产物。终局、将杀和强制线是强证据；有限搜索的 Q、访问统计和 PV 是较弱证据，不等同于逻辑证明。
+- **Decision**：在固定时间内结合预测与证据选择着法；Proof 不把网络知识“改写”为另一套知识。
 
-**现状边界**：库内可搜、可对拍；selection/bestmove 走项目批准的 X7↔classic 对照，不是正式 LC3
-policy。每次搜索新建空 repository，**无 tree reuse / 无剪枝**；正式 UCI 仍只接 classic。
+这一坐标系同样适用于人、Lc0 与 Stockfish：三者都有 Knowledge 与 Proof，差别只在于二者的来源、实现与成本。人以长期学习和心算协同；Lc0 以 NN 和 MCTS 协同；Stockfish 以 NNUE/启发式和 Alpha-Beta 协同。
 
-参考只限 LC3 官方设计文档（无本地 LC3 源码，禁止标称逐行翻译）：
+## 参考边界
 
-- <https://lczero.org/dev/lc0/search/lc3/overview/>
-- <https://lczero.org/dev/lc0/search/lc3/policy/>
-- <https://lczero.org/dev/lc0/search/lc3/glossary/>
+当前阶段是 px0 的 Rust 重写。参考用于约束实现语义，不能替代项目目标：
 
-只有 px0 主线翻译完成并有对拍测试后，才允许比较 lc0 或 KataGo，并将明确记录的差异作为独立优化事项。
+- 规则与网络外围按 px0 逐函数对照：`C:\Users\Administrator\projects\px0`。
+- 训练格式与导出参考 pxzero-training：`C:\Users\Administrator\projects\pxzero-training`。
+- stream 按 [LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/) 的公开架构文档实现等价设计；LC3 未公开公式时参考对应 px0 语义，不能标称为源码翻译。
 
-## 模块边界
+## 当前认识
 
-`crates/xiangqi_core`：px0 `src/chess` 的 Rust 翻译，是唯一规则真相。
+### 当前事实
 
-`crates/engin`：px0 的 UCI/controller、网络外围与 MCTS Rust 翻译；不在搜索内复制规则。P2 UCI、P3 tree 与 P4 的 ONNX、MemCache、collision、prefetch、owner tree phase、watchdog、WDL display 已接入。task 仅持有输入/workspace/result，主 worker 在 `WaitForTasks` 后写 tree 和提交 backend；当前 task queue 的执行仍是 owner 同步 drain，常驻 processing task-worker 尚待逐段翻译。这替代了已删除、会在真实 ONNX 长 `go movetime` 停顿的 scoped raw-pointer bridge。gathering 仍在 owner 的 tree phase 执行。`WeightsFile` 保持 px0 的 UCI 名称，但只接受本项目 ONNX 模型，不实现 px0 的 backend registry、protobuf weight 或 autodiscover。P4 的 `SendUciInfo` 已生成深度、NPS/EPS、WDL、PV、MultiPV、ScoreType 与完整 WDL calibration display 语义。`ClassicEngine` 保持 px0 的会话边界：每个新 `go`、`position`、`ucinewgame` 都先回收旧搜索；`setoption` 只更新下一次 `go` 的参数快照，不中断当前搜索（`src/engine.cc:148-224`、`src/search/classic/wrapper.cc:100-140`）。
+GPU evaluation 昂贵；象棋的 NN cache 重用有限，因此单次 evaluation 珍贵；开中局的有限预算通常只能获得有限新增信息；网络已学习大量棋型、局面和局部战术，CPU 不应重复实现人类 HCE。最终目标只能是固定时间 Elo，EPS、NPS、参数量和 collision 都只是诊断指标。
 
-未完成对应 px0 stopper 或生命周期的 UCI 命令不得伪装支持：`nodes`、`movetime`、`infinite` 与
-px0 factory 默认 legacy 时钟字段可启动搜索。`depth/mate` 仍等待完整 stopper 翻译，
-`ponder/ponderhit` 仍等待 `engine.cc` 的 Ponder option/重设局面链路；`simple/smooth/alphazero`
-时间管理器不暴露。
+### 待验证假设
 
-`nn/`：pxzero-training 的 `dataset / model / training` 配置布局为参考的独立 Python 训练子项目；训练从单一 YAML 启动，固定 `124x10x9 -> 2062 + WDL` 的纯 CNN 契约。x7 v2 trunk 是 `3x3 stem + PreAct bottleneck + 两次 Global Broadcast` 的结构族；当前基准为 width=256、12 个 bottleneck（`BN/SiLU -> 1x1 256->112 -> 3x3 112->112 -> 3x3 112->112 -> 1x1 112->256 + identity`），并在三个 trunk stage 之间加入独立 Global Broadcast：`BN/SiLU -> 3x3 -> mean/max -> Linear -> x + bias`。YAML 可以试验其他正偶数 width 与不少于 3 个 blocks；恢复/初始化只接受尺寸与 checkpoint 元数据完全一致的 v2 权重。policy 保留 spatial 输出并注入 mean/max global bias；WDL 与 moves-left 共享 global readout：`1x1 conv -> mean/max pool -> FC` 后分为两个线性输出，不再展平 90 个格点。训练主线使用无权重的 policy CE、qMix WDL CE 和 pxzero 语义的 raw-plies Huber moves-left loss；学习率采用 YAML 分段计划，不使用隐藏的全程 cosine 衰减。训练 stream 使用有界 record shuffle，验证集保留文件级 10% 切分，并固定为持久化的 record-level material-stratified sample manifest，避免相邻局面相关性和每次只读取排序文件前缀；不进入规则或搜索热路径。
+更强 Knowledge 是否通常比更高吞吐更能提高象棋固定时间 Elo；困难局面是否主要是 Knowledge 不足且短时间内 Proof 也不足的局面；Knowledge/Proof 的占比是否由局面的可证明性而非开中残局阶段决定，均仍是待验证假设，而不是设计前提。
 
-`model.bottleneck_channels` 是 YAML 的正式模型尺寸参数；省略时保持历史默认值 `width * 7 // 16`，当前
-`width=256` 对应 `112`。该值与 width/blocks 一样写入 checkpoint，并在续训、初始化和 ONNX 导出时严格校验。
+NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-left Prediction，不模拟搜索、
+不承担 Proof。网络应跟进 Lc0、KataGo 已验证有效的实践，而非把发明网络结构作为项目研究；训练期
+辅助 target 可以帮助共享表示，但不以增加正式推理 head 为目标。项目的研究重点是 Knowledge 与 Proof
+如何协同。网络结构、loss、吞吐和参数量均是诊断或实现选择；网络是否保留只以它对固定时间 Elo 与
+搜索可用 Evidence 的实际贡献判断。
 
-## 翻译纪律
+### 开放问题与准入
 
-- 每个 Rust 函数必须标明 px0 文件与连续行区间。
-- 没有 px0 对照位置，不实现。
-- 旧 Rust 代码不得作为参考或兼容目标。
-- 规则测试优先移植 px0 `board_test.cc` 与 `position_test.cc`，搜索测试优先使用同 FEN、同 budget 的 px0 trace。
+后续研究只围绕四个开放问题：Knowledge 与 Proof 的最佳比例；何种局面应由谁主导；Proof 相对网络到底能提供多少新增信息；二者如何共同决定固定时间 Elo。每个新想法都必须回答：它增强 Knowledge 还是 Proof、是否制造了新的 Evidence、是否能提高固定时间 Elo。回答不了的工作只能作为工程优化，不进入长期主线。
+
+## 模块
+
+| 模块 | 职责 | 当前状态 |
+| --- | --- | --- |
+| `crates/xiangqi_core` | 唯一规则真相：棋盘、合法着、FEN、Position、history、RuleJudge | 已完成 |
+| `crates/engin/src/search` | 唯一的 LC3-style tree MCTS 与正式 UCI 主线；`tree.rs` 直接包含 node、edge、repository 与 tree reuse | 已接入 UCI，持续验证 |
+| `crates/engin/src/search/time.rs` | 单一 stream 的固定中性时钟分配 | 已接入 UCI |
+| `crates/engin/src/neural` | 124-plane 编码、policy 映射、ONNX、缓存 | stream 使用的 backend 契约 |
+| `nn/` | px0 record、训练、checkpoint、ONNX 导出 | 独立 Python 子项目 |
+
+## 单一搜索
+
+仓库只维护 stream 搜索。`Engine` 直接拥有其搜索会话，不保留 `SearchBase`、`SearchFactory` 或 classic 对照实现。`UniformBackend` 仅用于 stream 测试；正式 UCI 必须加载 ONNX。
+
+`search/time.rs` 独立于 tree/worker：只在 session 启动时计算 deadline、在 drain 后归还未用时间；
+它不是第二套搜索实现，也不提供策略化调参。
+
+## Stream
+
+- repository 是一个 64 分片的 key-value map，使用 `parent-key + move` 的 tree key；首版不做 DAG/TT。跨回合只保留已走主线及其子树，GC 先收集不可达 sibling subtree 的 key，再按分片批量删除；不为每个 root 创建独立 map。
+- 事件拥有完整 root history、variation、generation 和 edge reservation。
+- Engine session 常驻 Gather×4、Eval×4、NN×1、Backprop×1；每次 `go` 只下发独占 job（新的 queues、generation、root/tree view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
+- `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
+  session 启动时按固定中性的 px0 预算转换为不可变 deadline，job drain 后才归还剩余时间。
+- tree reuse 会保留已走主线及旧根，并遍历 repository 删除不可达兄弟子树；UCI/Watchdog 已输出最小 info 与一次 bestmove。
+- 当前没有 MultiPV 或 multivisit；NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
+
+stream 的 selection 使用项目批准的 X7 参数与 px0 PUCT/N-Q-P 语义，不是 LC3 Policy 的正式公式。
+
+## 模型
+
+正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。CNN 对照基线为
+`width=384`、`blocks=15`、`bottleneck_channels=192`，带两次 Global Broadcast。v3 开始试验
+PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residual scale、LayerNorm、FFN 与 from-to policy，
+默认 `width=512`、`blocks=12`、`heads=16`、`ffn=768`。v3 使用 PX0/Lc0 AttentionBody
+（MHA + Smolgen + LayerNorm + FFN）。训练期另有 Auxiliary Soft Policy 与 root-WDL
+辅助头；二者不进入 ONNX。CUDA 训练和导出均为 FP16 trunk、FP32 heads/outputs；训练、续训和导出
+校验 checkpoint 的关键架构元数据，避免模型尺寸漂移。
+
+## 纪律
+
+- px0 路径的新 Rust 函数必须记录连续 px0 参考区间；stream 新函数记录 LC3 URL 与对应标题。
+- 找不到参考语义时记录缺口，不自行添加搜索启发式。
+- `position ... moves ...` 必须保留完整历史。
+- stream UCI 持续验证 `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏且恰好一次 `bestmove`；真实 ONNX 回归仅在本地 `data/x7.onnx` 存在时运行。

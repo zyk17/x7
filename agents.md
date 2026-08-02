@@ -1,87 +1,32 @@
 # AGENTS
 
-面向在本仓库内工作的自动化助手。
+## 开始前
 
-## 开始前先读
+依次阅读：`README.MD`、`ARCHITECTURE.md`、`AGENTS.md`、`NextStep.md`、`TODO.md`。
 
-1. `README.MD`
-2. `ARCHITECTURE.md`
-3. `AGENTS.md`
-4. `NextStep.md`
-5. `TODO.md`
-6. `temp.md`
+## 工程共识
 
-## 当前共识
-
-- 这是全新 Rust 实现；旧 `xiangqi_core` 与旧 MCTS 不是兼容目标。
-- `xiangqi_core`、classic 和 NN 的工程参考是：
-  - `C:\Users\Administrator\projects\px0`
-  - `C:\Users\Administrator\projects\pxzero-training`
-- `search::stream` 的架构参考仅为 LC3 官方文档：
-  - <https://lczero.org/dev/lc0/search/lc3/overview/>
-  - <https://lczero.org/dev/lc0/search/lc3/policy/>
-  - <https://lczero.org/dev/lc0/search/lc3/glossary/>
-- 本地 lc0 checkout 不含 LC3 源码。因此 stream 只能按文档实现等价架构，不得伪称 1:1 源码翻译；也不得把
-  px0 classic 的共享 mutable tree/task-worker 模型补丁式移植到 stream。
-- 搜索主路线只有 MCTS；重建完成前 `go` 必须明确返回不可搜索状态，不能返回 heuristic 或旧结果。
-- 正式模型契约保持 `124x10x9 -> 2062 + WDL`。
+- 这是全新 Rust 实现；旧 Rust 核心与旧 MCTS 不是兼容目标。
+- `xiangqi_core`、网络外围和 NN 的工程参考为 `C:\Users\Administrator\projects\px0` 与 `C:\Users\Administrator\projects\pxzero-training`。
+- stream 仅参考 LC3 官方文档；本地没有 LC3 源码，不得宣称 1:1 翻译。
+- 正式模型契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。
+- 搜索只有 stream；不维护 classic 对照实现或 `TaskWorkers`。
 
 ## 模块边界
 
-- `crates/xiangqi_core`：翻译 px0 `src/chess`。
-- `crates/engin`：翻译 px0 UCI/controller、网络外围与搜索主线；P2/P3 已完成，P4 的 ONNX、
-  minibatch、MemCache、prefetch、collision、shared-tree、watchdog 与常驻 processing task-worker 已接入。
-  px0 `TaskWorkers` 创建的 Rust task 只拥有 extension 输入/workspace/result；主 worker 在 `WaitForTasks`
-  后独占 tree/backend phase。旧 scoped gather/processing bridge 在真实 ONNX 长 `go movetime` 中会停止推进，
-  已删除。`NodeArena` 保持外层 owner tree phase 管理的安全 `Vec<Box<Node>>`；task 不得直接借用它。
-  正式 ONNX 必须经 `CachingBackend`，其 key/collision guard/回填时序只能对照
-  `px0/src/neural/memcache.cc:38-190` 修改。
-  已删除的 `TaskTreeBridge` / `TaskWorkerRunner` 不是可用实现；task 生命周期以现有
-  `PickTaskQueue` / `TaskRunner` 与同步 tree phase 为准。唯一准确状态以 `NextStep.md`、`TODO.md` 为准。
-- `crates/engin/src/search/stream`：独立的 LC3-style streaming MCTS。不得复用 `classic::NodeTree`、
-  `classic::Node`、classic worker 或 snapshot/replay delta。事件必须 owned，且携带完整 root history + variation；
-  repository 的首版是树 key，不引入 DAG/TT。
-- `nn/`：对齐 pxzero-training 的数据、训练和导出。
+- `crates/xiangqi_core`：唯一规则真相，翻译 px0 `src/chess`。
+- `crates/engin`：UCI、网络外围、stream 搜索与固定中性时钟管理。
+- `crates/engin/src/search`：独立的 LC3-style streaming MCTS；事件必须 owned 并携带完整 root history 与 variation。首版只做 tree，不做 DAG/TT。
+- `nn/`：独立训练与 ONNX 导出，不进入规则或搜索热路径。
 
-不要引入：
+## 禁止项
 
-- 多套正式训练格式
-- 未经 px0 对照的抽象、参数或启发式
+- 不引入多套正式训练格式、未经参考支持的搜索参数或启发式。
+- stream 不引入共享可变树/task-worker 模型，不吸收 KataGo graph/DAG。
+- 正式 UCI 不得使用 `UniformBackend`；未接入的 UCI 命令必须明确拒绝，不能伪装支持。
 
-P4 task-worker 禁止 raw pointer、`unsafe impl Send` 和跨线程共享 `&mut SearchWorker`、`NodeTree`、minibatch、backend
-computation 或任何 workspace。常驻 processing worker 只允许逐段翻译 px0 的 task 生命周期，并以 owned task/result/
-workspace 与 owner tree phase API 建立边界。未扩展 node 必须保留 `TryStartScoreUpdate` CAS 语义。修改该路径前必须在
-`NextStep.md`/`TODO.md` 标明 px0
-`src/search/classic/search.h:205-244,348-445`、`search.cc:1069-1508` 的对应区间，并补齐固定 visits、
-`go movetime`、stop/wait、`NInFlight==0` 与真实 ONNX 回归。不得以整树锁串行化 task worker。
-px0 `nodes_mutex_` 的主线程持锁/task 线程直接读写模型不能按字面作为 Rust alias 模型搬运；必须先保住
-`Node::TryStartScoreUpdate` 的 `n_in_flight_` 唯一扩展语义（`node.cc:348-365`），不得用“已有 edges 则跳过”
-掩盖竞争。
+## 参考与文档
 
-## 依赖与关键路径
-
-- 不重复造轮子：成熟、通用且不承载象棋/搜索语义的能力，优先评估并复用 Rust 生态现有 crate。
-- 不为“零依赖”手写成熟的同步、容器、解析或工具能力；引入依赖时说明它替代的通用职责。
-- 关键路径保留可控实现：象棋规则、MCTS selection/backup/task 生命周期、模型输入输出与数据目标必须能逐行对照 px0，不能被通用库或黑盒抽象掩盖语义。
-- 判断标准是职责而非实现位置：crate 可以承载通用机制，项目代码必须保有决定棋力和搜索行为的语义。
-
-## 参考纪律
-
-- 每个新 Rust 函数必须在注释、变更说明、`NextStep.md`、`TODO.md` 或 review 记录中标出 px0 文件路径和连续行区间。
-- stream 新函数改为标出上述 LC3 URL 和对应标题；找不到 LC3 文档语义时，先记录缺口，不自行补充搜索策略。
-- 对规则层优先参考：
-  - `px0/src/chess/types.h`
-  - `px0/src/chess/bitboard.h`
-  - `px0/src/chess/board.h/.cc`
-  - `px0/src/chess/position.h/.cc`
-  - `px0/src/chess/board_test.cc`
-  - `px0/src/chess/position_test.cc`
-- 对搜索层优先参考 `px0/src/search`；对 UCI 优先参考 `px0/src/chess/uciloop.cc` 和 `px0/src/engine.cc`。
-- 找不到参考位置时，先记录缺口，不实现。
-- `position ... moves ...` 必须保留完整历史，不能退化成最终局面。
-
-## 文档规则
-
-稳定文档：`README.MD`、`ARCHITECTURE.md`、`AGENTS.md`。
-
-临时文档：`NextStep.md`、`TODO.md`、`temp.md`。
+- 每个新 Rust 函数必须在代码注释、变更说明、`NextStep.md`、`TODO.md` 或 review 记录中标明参考位置。
+- px0 找不到连续参考、或 LC3 找不到对应语义时，先记录缺口，再决定是否实现。
+- 稳定文档：`README.MD`、`ARCHITECTURE.md`、`AGENTS.md`；活动路线：`NextStep.md`、`TODO.md`。不要新增长期未合并的 `temp*.md` 记录。

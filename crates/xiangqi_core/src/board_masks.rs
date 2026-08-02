@@ -1,7 +1,7 @@
 //! px0 `board.cc:96-121, 368-386` 几何 mask 与距离辅助。
 
 use crate::bitboard::BitBoard;
-use crate::types::{file_distance, rank_distance, Direction, Square, EAST, NORTH, SOUTH, WEST};
+use crate::types::{Direction, EAST, NORTH, SOUTH, Square, WEST, file_distance, rank_distance};
 
 pub const PALACE: u128 = (0x0000_0000_0070_381Cu128 << 64) | 0x0000_0000_00E0_7038u128;
 pub const FILE_A_BB: u128 = (0x0000_0000_0002_0100u128 << 64) | 0x8040_2010_0804_0201u128;
@@ -74,7 +74,6 @@ pub fn distance(a: Square, b: Square) -> i32 {
     }
 }
 
-/// px0 `board.cc:382-386`。
 pub fn safe_destination(s: Square, step: Direction) -> BitBoard {
     let to = s.offset_by(step);
     if to.is_valid() && distance(s, to) <= 2 {
