@@ -46,6 +46,7 @@ pub trait StringUciResponder: UciResponder {
     fn send_id(&mut self, version: &str) {
         self.send_raw_response(&format!("id name x7 v{version}"));
         self.send_raw_response("id author aaa");
+        self.send_raw_response("");
     }
 }
 
