@@ -32,11 +32,15 @@ CUDA 包。两者不是同一二进制的运行时回退链；CUDA 使用 ORT �
 - `position startpos|fen ... [moves ...]`
 - `go nodes`、`go movetime`、`go wtime/btime/winc/binc/movestogo`、`go infinite`、`go searchmoves`
 - `stop`、`ucinewgame`、`quit`
-- `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`VirtualLoss`
+- `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`MiniBatchSize`、`MultiPV`
 
-`VirtualLoss` 直接使用搜索参数 `V`，范围 `0.0..5.0`，默认 `3.0`，例如
-`setoption name VirtualLoss value 2.5`。它是引擎
-生命周期配置：一次 `setoption` 会影响之后启动的每次 `go`；正在运行的搜索保持启动时的参数快照。
+`MiniBatchSize` 对应 px0/Lc0 的同名 option，范围 `0..=1024`，默认 `0`（由 backend
+建议）。它限制一次 NN 调用最多合并的局面数；较大值通常提高吞吐，却可能因增加在途局面和
+collision 降低固定时间棋力。它是引擎生命周期配置：一次 `setoption` 会影响之后启动的每次
+`go`；正在运行的搜索保持其 worker。
+
+`MultiPV` 是 `1..=500` 的整数，默认 `1`。它只控制每次 `info` 输出的根候选数量：候选沿用
+bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，不改变搜索预算、PUCT 或 worker。
 
 时钟使用固定中性的 px0 分配，固定 `MoveOverhead=200ms`，不额外暴露 UCI 调参项。`go movetime`
 不可与时钟字段混用；`go depth`、`go mate`、`go ponder` 与 `ponderhit`
@@ -48,13 +52,13 @@ CUDA 包。两者不是同一二进制的运行时回退链；CUDA 使用 ORT �
 `data/benchmark_positions.txt`；每行是“名称 | FEN”，使用时只复制 `|` 后的完整 FEN：
 
 ```powershell
-cargo run -p engin --release --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1 --virtual-loss 1
+cargo run -p engin --release --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1
 ```
 
 要诊断实战中的评分突变，优先保留完整历史而不是只复制最终 FEN：
 
 ```powershell
-cargo run -p engin --release --bin benchmark -- --moves "c3c4 g6g5 ..." --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1 --virtual-loss 1 --root-top 12
+cargo run -p engin --release --bin benchmark -- --moves "c3c4 g6g5 ..." --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1 --root-top 12
 ```
 
 `--moves` 从 startpos（或指定的 `--fen`）依次应用 ICCS 着法；它保留重复与规则历史，
@@ -86,8 +90,9 @@ Pikafish 的 `score cp` 是对照分数；stream 的 `Q` 是未校准的网络�
 | `crates/engin` | UCI、ONNX 外围、stream 搜索、watchdog 与时钟管理。 |
 | `nn` | 训练、权重处理与 ONNX 导出；不进入搜索热路径。 |
 
-架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。当前工作与待办只记录在本地的
-[NextStep.md](NextStep.md) 和 [TODO.md](TODO.md)。训练说明见 [nn/README.md](nn/README.md)。
+架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)，已完成研究尝试见
+[Research.md](Research.md)。当前工作与待办只记录在本地的 [NextStep.md](NextStep.md) 和
+[TODO.md](TODO.md)。训练说明见 [nn/README.md](nn/README.md)。
 
 ## 开发验证
 

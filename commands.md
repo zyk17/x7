@@ -129,8 +129,8 @@ quit
 cargo run --release -p engin
 ```
 
-当前 UCI options 是：`WeightsFile`、`VirtualLoss`、`UCI_ShowWDL`、`UCI_ShowEPS`。
-`VirtualLoss` 使用 `0.0..5.0` 的小数，默认 `3.0`；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留启动时快照。
+当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`。
+`MiniBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
 
 当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
 `movetime` 不可与时钟字段混用；`infinite` 不可与其他预算混用。`depth`、`mate`、`ponder` 仍会明确报错。
@@ -157,7 +157,7 @@ quit
 ```powershell
 @'
 uci
-setoption name VirtualLoss value 3.0
+setoption name MiniBatchSize value 64
 setoption name WeightsFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos
@@ -173,7 +173,7 @@ quit
 ```powershell
 cargo run --release -p engin --bin benchmark -- `
   --movetime 3000 --repeat 3 `
-  --gathers 4 --evals 4 --backprops 1 --virtual-loss 3
+  --gathers 4 --evals 4 --backprops 1
 ```
 
 使用完整历史诊断评分拐点：
@@ -183,7 +183,7 @@ cargo run --release -p engin --bin benchmark -- `
   --moves "c3c4 g6g5 ..." --movetime 3000 --repeat 3 --root-top 12
 ```
 
-`benchmark` 输出根候选的 `P / completed-N / in-flight / Q`；它不模拟实战 tree reuse。`nn_eval` 可单独检查 ONNX：
+`benchmark` 输出正常 cache hit（`hit`）以及根候选的 `P / completed-N / in-flight / Q`；它不模拟实战 tree reuse。`nn_eval` 可单独检查 ONNX：
 
 ```powershell
 cargo run --release -p engin --bin nn_eval -- --onnx data\x7.onnx --bench 20

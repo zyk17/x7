@@ -68,6 +68,8 @@ pub struct Stats {
     pub collisions: u64,
     pub network_batches: u64,
     pub network_evaluations: u64,
+    /// 正常 Eval 命中的 NN cache 次数。
+    pub cache_hits: u64,
     /// 本次搜索观察到的最大 `BackendComputation` batch。
     pub network_batch_size_max: u64,
     pub peak_in_flight: u64,
@@ -144,9 +146,6 @@ pub struct SearchConfig {
     /// 启用仅 benchmark 使用的时间/分布计数。
     /// 参考：LC3 Overview 的 "Stats Collection"。
     pub benchmark_telemetry: bool,
-    /// edge-local virtual loss。UCI 直接以小数 `VirtualLoss` 暴露它。
-    /// 参考：KataGo `cpp/search/search.cpp` 的 virtual-loss selection。
-    pub virtual_loss: f32,
 }
 
 impl Default for SearchConfig {
@@ -160,7 +159,6 @@ impl Default for SearchConfig {
             backprop_workers: 1,
             root_move_filter: Vec::new(),
             benchmark_telemetry: false,
-            virtual_loss: 3.0,
         }
     }
 }
@@ -173,11 +171,6 @@ impl SearchConfig {
         assert!(
             self.backprop_workers > 0,
             "stream requires at least one backprop worker"
-        );
-        // UCI 与 benchmark 都允许同一实验范围；默认值由 `Options` 和此处固定为 V=3。
-        assert!(
-            self.virtual_loss.is_finite() && (0.0..=5.0).contains(&self.virtual_loss),
-            "virtual loss must be finite and within [0, 5]"
         );
     }
 
@@ -208,7 +201,6 @@ impl SearchConfig {
             eval_workers: self.eval_workers,
             backprop_workers: self.backprop_workers,
             benchmark_telemetry: self.benchmark_telemetry,
-            virtual_loss: self.virtual_loss,
         }
     }
 }
@@ -222,7 +214,6 @@ struct ResolvedSearchConfig {
     eval_workers: usize,
     backprop_workers: usize,
     benchmark_telemetry: bool,
-    virtual_loss: f32,
 }
 
 enum GatherCommand {
@@ -263,6 +254,11 @@ impl WorkerPool {
     pub(crate) fn new(backend: &dyn Backend, config: &SearchConfig) -> Self {
         config.validate();
         Self::from_resolved(&config.resolve(backend))
+    }
+
+    /// 对齐 LC3 Overview 的固定 worker job：batch 改变必须使用对应的 NN worker。
+    pub(crate) fn matches_config(&self, backend: &dyn Backend, config: &SearchConfig) -> bool {
+        self.eval_batch_size == config.resolve(backend).eval_batch_size
     }
 
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
@@ -389,7 +385,6 @@ struct Shared {
     generation: SearchGeneration,
     params: SearchParams,
     benchmark_telemetry: bool,
-    virtual_loss: f32,
     root_move_filter: Vec<Move>,
     stopping: AtomicBool,
     outstanding: AtomicUsize,
@@ -401,6 +396,7 @@ struct Shared {
     collisions: AtomicU64,
     network_batches: AtomicU64,
     network_evaluations: AtomicU64,
+    cache_hits: AtomicU64,
     network_batch_size_max: AtomicU64,
     collisions_by_depth: Mutex<Vec<u64>>,
     gather_queue: QueueMetrics,
@@ -434,6 +430,13 @@ impl Shared {
             self.collisions.fetch_add(1, Ordering::AcqRel);
         }
         self.finish(false);
+    }
+
+    /// 正在评估的叶子不重复计算；直接归还这条未完成路径的 reservation。
+    /// 参考：LC3 Overview 的 Gather/Eval worker 所有权边界。
+    fn cancel_collision(&self, event: NodeEvent) {
+        self.record_collision_depths(&[event.variation.moves().len()]);
+        self.cancel_and_finish(event, true);
     }
 
     /// Cancels an event after Gather has claimed its leaf for Eval.
@@ -547,6 +550,7 @@ impl Shared {
             collisions: self.collisions.load(Ordering::Acquire),
             network_batches: self.network_batches.load(Ordering::Acquire),
             network_evaluations: self.network_evaluations.load(Ordering::Acquire),
+            cache_hits: self.cache_hits.load(Ordering::Acquire),
             network_batch_size_max: self.network_batch_size_max.load(Ordering::Acquire),
             peak_in_flight,
             collisions_by_depth,
@@ -632,7 +636,6 @@ impl Search {
             generation,
             params: resolved.params,
             benchmark_telemetry: resolved.benchmark_telemetry,
-            virtual_loss: resolved.virtual_loss,
             root_move_filter: config.root_move_filter.clone(),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
@@ -644,6 +647,7 @@ impl Search {
             collisions: AtomicU64::new(0),
             network_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
             network_batch_size_max: AtomicU64::new(0),
             collisions_by_depth: Mutex::new(Vec::new()),
             gather_queue: QueueMetrics::default(),
@@ -693,11 +697,10 @@ impl Search {
         }
     }
 
-    /// 测试 SearchState 的 option 快照语义；运行中的 job 不读取其后续配置。
-    /// 参考：LC3 Overview 的 “Search”。
     #[cfg(test)]
-    pub(crate) fn virtual_loss(&self) -> f32 {
-        self.shared.virtual_loss
+    /// 仅测试 SearchState 的 job 配置快照；对应 LC3 Overview 的独占 Search job。
+    pub(crate) fn eval_batch_size(&self) -> usize {
+        self.max_in_flight / 4
     }
 
     /// Requests a normal stream-search stop without tearing down worker
@@ -908,7 +911,7 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                 }
             }
             ExpansionState::Evaluating => {
-                shared.send_backprop(BackpropEvent::collision(event));
+                shared.cancel_collision(event);
                 return;
             }
             ExpansionState::Terminal => {
@@ -923,14 +926,8 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
             }
             ExpansionState::Expanded => {
                 let depth = event.variation.moves().len();
-                let edge_index = select_edge_from_node(
-                    node.as_ref(),
-                    depth,
-                    &shared.params,
-                    &shared.root_move_filter,
-                    shared.virtual_loss,
-                )
-                .expect("expanded stream node must have an edge");
+                let edge_index = select_edge_from_node(node.as_ref(), depth, &shared.params, &shared.root_move_filter)
+                    .expect("expanded stream node must have an edge");
                 let reservation = node.reserve_edge(edge_index).expect("selected stream edge");
                 let child_key = event.node_key.child(reservation.mv());
                 event = event.descend(child_key, reservation);
@@ -942,7 +939,7 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
 /// NN worker 返回的原始 logits[POLICY]、WDL[3] 与 moves-left[1]。
 type NnReply = Result<(Vec<f32>, Vec<f32>, f32), EnginError>;
 
-/// 交给 NN 线程的一个已编码局面。回复拥有三个 model head 的全部结果。
+/// 交给 NN 线程的一个已编码局面。
 struct NnRequest {
     planes: Vec<f32>,
     reply: Sender<NnReply>,
@@ -1117,6 +1114,7 @@ fn handle_eval_event(
                 legal_moves: legal_moves.clone(),
             };
             if let Some(eval) = shared.backend.cached_evaluation(&input) {
+                shared.cache_hits.fetch_add(1, Ordering::AcqRel);
                 return publish_eval(shared, event, node, legal_moves, eval);
             }
             let planes = encode_position_for_nn(&history, FillEmptyHistory::FenOnly);
@@ -1177,31 +1175,13 @@ fn complete_nn_item(
     wdl: Vec<f32>,
     moves_left: f32,
 ) -> Result<(), EnginError> {
-    let policies = match softmax_legal_policy(&logits, &item.legal_moves) {
-        Ok(policies) => policies,
+    let eval = match decode_nn_eval(logits, wdl, moves_left, &item.legal_moves) {
+        Ok(eval) => eval,
         Err(error) => {
             cancel_waiting_item(shared, item);
             return Err(error);
         }
     };
-    if wdl.len() < 3 {
-        cancel_waiting_item(shared, item);
-        return Err(EnginError::PortIncomplete("stream nn wdl length"));
-    }
-    if !wdl.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value))
-        || (wdl.iter().sum::<f32>() - 1.0).abs() > 1e-3
-        || !moves_left.is_finite()
-        || moves_left < 0.0
-    {
-        cancel_waiting_item(shared, item);
-        return Err(EnginError::Onnx("stream nn values are invalid".into()));
-    }
-    let eval = Arc::new(EvalResult {
-        wl: wdl[0] - wdl[2],
-        d: wdl[1],
-        plies_left: moves_left,
-        policies,
-    });
     shared.backend.store_evaluation(&item.input, Arc::clone(&eval));
     publish_eval(shared, item.event, item.node, item.legal_moves, eval)
 }
@@ -1232,7 +1212,7 @@ fn publish_eval(
         cancel_evaluation(shared, event, node);
         return Err(EnginError::Onnx("stream backend evaluation is invalid".into()));
     }
-    node.publish_edges(legal_moves.into_iter().zip(eval.policies.iter().copied()).collect());
+    node.publish_edges(legal_moves.iter().copied().zip(eval.policies.iter().copied()).collect());
     shared.send_backprop(BackpropEvent::evaluation(
         event,
         network_wl_to_node(eval.wl),
@@ -1240,6 +1220,34 @@ fn publish_eval(
         eval.plies_left,
     ));
     Ok(())
+}
+
+/// 将 raw ONNX 输出转为可缓存的正式 `EvalResult`。
+///
+/// 参考：px0 `BackendComputation` 的统一结果路径（`src/neural/backend.h:75-87`）。
+fn decode_nn_eval(
+    logits: Vec<f32>,
+    wdl: Vec<f32>,
+    moves_left: f32,
+    legal_moves: &[Move],
+) -> Result<Arc<EvalResult>, EnginError> {
+    let policies = softmax_legal_policy(&logits, legal_moves)?;
+    if wdl.len() < 3 {
+        return Err(EnginError::PortIncomplete("stream nn wdl length"));
+    }
+    if !wdl.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        || (wdl.iter().sum::<f32>() - 1.0).abs() > 1e-3
+        || !moves_left.is_finite()
+        || moves_left < 0.0
+    {
+        return Err(EnginError::Onnx("stream nn values are invalid".into()));
+    }
+    Ok(Arc::new(EvalResult {
+        wl: wdl[0] - wdl[2],
+        d: wdl[1],
+        plies_left: moves_left,
+        policies,
+    }))
 }
 
 fn cancel_waiting_item(shared: &Shared, item: WaitingNn) {
@@ -1256,8 +1264,7 @@ fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>) {
     shared.finish(false);
 }
 
-/// NN worker：从队列取已编码 planes，运行 ONNX 后回复。合并当前已排队的项目（最多
-/// `batch_size`）以保持 GPU 忙碌；Eval 从不等待队列凑满该数量。
+/// NN worker 按当前队列立即合并请求，Eval 不等待凑满 batch。
 fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usize) {
     let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
     loop {
@@ -1267,31 +1274,19 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
-        if shared.benchmark_telemetry
-            && let Some(wait) = first.take_queue_wait()
-        {
-            shared.nn_queue.record(wait);
-        }
+        record_nn_queue_wait(&shared, &mut first);
         let mut requests = vec![first];
         while requests.len() < batch_size {
             match receiver.try_recv() {
                 Ok(mut request) => {
-                    if shared.benchmark_telemetry
-                        && let Some(wait) = request.take_queue_wait()
-                    {
-                        shared.nn_queue.record(wait);
-                    }
+                    record_nn_queue_wait(&shared, &mut request);
                     requests.push(request);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
         if shared.stopping.load(Ordering::Acquire) {
-            for request in requests {
-                let _ = request
-                    .reply
-                    .send(Err(EnginError::PortIncomplete("stream nn stopping")));
-            }
+            reject_nn_requests(requests, EnginError::PortIncomplete("stream nn stopping"));
             continue;
         }
         let batch = requests.len();
@@ -1304,9 +1299,7 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
             Ok((logits, wdl, moves_left)) => {
                 if logits.len() != batch * POLICY_SIZE || wdl.len() != batch * 3 || moves_left.len() != batch {
                     let error = EnginError::PortIncomplete("stream nn output shape");
-                    for request in requests {
-                        let _ = request.reply.send(Err(error.clone()));
-                    }
+                    reject_nn_requests(requests, error);
                     continue;
                 }
                 shared.network_batches.fetch_add(1, Ordering::AcqRel);
@@ -1319,11 +1312,23 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
                 }
             }
             Err(error) => {
-                for request in requests {
-                    let _ = request.reply.send(Err(error.clone()));
-                }
+                reject_nn_requests(requests, error);
             }
         }
+    }
+}
+
+fn record_nn_queue_wait(shared: &Shared, request: &mut NnRequest) {
+    if shared.benchmark_telemetry
+        && let Some(wait) = request.take_queue_wait()
+    {
+        shared.nn_queue.record(wait);
+    }
+}
+
+fn reject_nn_requests(requests: Vec<NnRequest>, error: EnginError) {
+    for request in requests {
+        let _ = request.reply.send(Err(error.clone()));
     }
 }
 
@@ -1364,17 +1369,12 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
                     }
                 } else {
                     let result = BackpropEvent::complete_batch(events, &shared.repository);
-                    shared.record_collision_depths(&result.collision_depths);
                     shared
                         .completed_depth
                         .fetch_add(result.completed_depth, Ordering::AcqRel);
                     shared.max_depth.fetch_max(result.max_depth, Ordering::AcqRel);
                     for _ in 0..result.completed_playouts {
                         shared.finish(true);
-                    }
-                    for _ in 0..result.collisions {
-                        shared.collisions.fetch_add(1, Ordering::AcqRel);
-                        shared.finish(false);
                     }
                 }
             }
@@ -1728,7 +1728,6 @@ mod tests {
             generation: SearchGeneration(30),
             params: SearchParams::default(),
             benchmark_telemetry: false,
-            virtual_loss: 0.0,
             root_move_filter: Vec::new(),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(1),
@@ -1740,6 +1739,7 @@ mod tests {
             collisions: AtomicU64::new(0),
             network_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
             network_batch_size_max: AtomicU64::new(0),
             collisions_by_depth: Mutex::new(Vec::new()),
             gather_queue: super::QueueMetrics::default(),

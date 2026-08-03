@@ -16,7 +16,7 @@ use crate::neural::backend::Backend;
 
 use super::{
     GcStats, NodeKey, NodeRepository, Search, SearchConfig, SearchControl, SearchGeneration, SearchLimits, Stats, Tree,
-    WorkerPool, best_mate, best_move_filtered, principal_variation_filtered, root_stats,
+    WorkerPool, best_mate, best_move_filtered, principal_variation_filtered, root_stats, root_variations,
 };
 
 /// watchdog 持有的只读 root view，搜索 worker 不持有它。
@@ -26,10 +26,12 @@ pub(crate) struct WatchdogSnapshot {
     root_key: NodeKey,
     root_is_black: bool,
     root_move_filter: Vec<xiangqi_core::Move>,
+    multi_pv: usize,
 }
 
 impl WatchdogSnapshot {
-    pub fn thinking_info(&self, stats: Stats, started: Instant) -> ThinkingInfo {
+    /// 对齐 px0 `Search::SendUciInfo`：同一 root 快照输出按根边排序的多条 PV。
+    pub fn thinking_infos(&self, stats: Stats, started: Instant) -> Vec<ThinkingInfo> {
         let time = started.elapsed().as_millis() as i64;
         let nodes = stats.completed_playouts as i64;
         let nps = if time == 0 { 0 } else { (nodes * 1000 / time) as i32 };
@@ -39,7 +41,7 @@ impl WatchdogSnapshot {
             (stats.network_evaluations as i64 * 1000 / time) as i32
         };
         let Some(root) = root_stats(&self.repository, self.root_key) else {
-            return ThinkingInfo {
+            return vec![ThinkingInfo {
                 depth: stats.average_depth.min(i32::MAX as u64) as i32,
                 seldepth: stats.max_depth.min(i32::MAX as u64) as i32,
                 time,
@@ -47,7 +49,7 @@ impl WatchdogSnapshot {
                 nps,
                 eps,
                 ..ThinkingInfo::default()
-            };
+            }];
         };
 
         // root node 保存 incoming-edge/走子方视角；UCI 输出当前行棋方视角，故需要翻转
@@ -56,29 +58,65 @@ impl WatchdogSnapshot {
         let draw = root.draw.clamp(0.0, 1.0);
         let win = ((1.0 - draw + wl) * 0.5).clamp(0.0, 1.0);
         let loss = ((1.0 - draw - wl) * 0.5).clamp(0.0, 1.0);
-        let mate = best_mate(&self.repository, self.root_key, &self.root_move_filter);
-        ThinkingInfo {
+        let common = ThinkingInfo {
             depth: stats.average_depth.min(i32::MAX as u64) as i32,
             seldepth: stats.max_depth.min(i32::MAX as u64) as i32,
             time,
             nodes,
             nps,
             eps,
-            mate,
-            score: mate.is_none().then_some((wl * 1000.0).round() as i32),
-            wdl: Some(Wdl {
-                w: (win * 1000.0).round() as i32,
-                d: (draw * 1000.0).round() as i32,
-                l: (loss * 1000.0).round() as i32,
-            }),
-            pv: principal_variation_filtered(
-                &self.repository,
-                self.root_key,
-                self.root_is_black,
-                &self.root_move_filter,
-            ),
             ..ThinkingInfo::default()
+        };
+        let variations = root_variations(
+            &self.repository,
+            self.root_key,
+            self.root_is_black,
+            &self.root_move_filter,
+            self.multi_pv,
+        );
+        if variations.is_empty() {
+            let mate = best_mate(&self.repository, self.root_key, &self.root_move_filter);
+            return vec![ThinkingInfo {
+                mate,
+                score: mate.is_none().then_some((wl * 1000.0).round() as i32),
+                wdl: Some(Wdl {
+                    w: (win * 1000.0).round() as i32,
+                    d: (draw * 1000.0).round() as i32,
+                    l: (loss * 1000.0).round() as i32,
+                }),
+                pv: principal_variation_filtered(
+                    &self.repository,
+                    self.root_key,
+                    self.root_is_black,
+                    &self.root_move_filter,
+                ),
+                ..common
+            }];
         }
+        let show_multipv = variations.len() > 1;
+        variations
+            .into_iter()
+            .enumerate()
+            .map(|(index, variation)| {
+                let win = ((1.0 - variation.draw + variation.wl) * 0.5).clamp(0.0, 1.0);
+                let loss = ((1.0 - variation.draw - variation.wl) * 0.5).clamp(0.0, 1.0);
+                ThinkingInfo {
+                    mate: variation.mate,
+                    score: variation
+                        .mate
+                        .is_none()
+                        .then_some((variation.wl * 1000.0).round() as i32),
+                    wdl: Some(Wdl {
+                        w: (win * 1000.0).round() as i32,
+                        d: (variation.draw * 1000.0).round() as i32,
+                        l: (loss * 1000.0).round() as i32,
+                    }),
+                    pv: variation.pv,
+                    multipv: if show_multipv { (index + 1) as i32 } else { -1 },
+                    ..common.clone()
+                }
+            })
+            .collect()
     }
 }
 
@@ -95,7 +133,8 @@ pub(crate) struct SearchState {
     backend: Arc<dyn Backend>,
     tree: Option<Tree>,
     next_generation: u64,
-    virtual_loss: f32,
+    multi_pv: usize,
+    mini_batch_size: usize,
     worker_pool: Arc<WorkerPool>,
 }
 
@@ -104,6 +143,7 @@ pub(crate) struct RunningSearch {
     search: Search,
     root_is_black: bool,
     root_move_filter: Vec<xiangqi_core::Move>,
+    multi_pv: usize,
 }
 
 impl RunningSearch {
@@ -117,6 +157,7 @@ impl RunningSearch {
             root_key: self.search.root_key(),
             root_is_black: self.root_is_black,
             root_move_filter: self.root_move_filter.clone(),
+            multi_pv: self.multi_pv,
         }
     }
 
@@ -151,15 +192,22 @@ impl SearchState {
             backend,
             tree: None,
             next_generation: 0,
-            virtual_loss: config.virtual_loss,
+            multi_pv: 1,
+            mini_batch_size: config.eval_batch_size,
             worker_pool,
         }
     }
 
-    /// 更新 Engine 生命周期参数；已启动的搜索保留自己的配置快照。
-    /// 参考：LC3 Overview 的 "Search"。
-    pub fn set_virtual_loss(&mut self, virtual_loss: f32) {
-        self.virtual_loss = virtual_loss;
+    /// 更新 Engine 生命周期参数；下一次 job 若 batch 改变则重建常驻 worker。
+    /// 参考 px0 `BaseSearchParams::kMiniBatchSizeId`（`params.cc:178-182,546`）。
+    pub fn set_mini_batch_size(&mut self, mini_batch_size: usize) {
+        self.mini_batch_size = mini_batch_size;
+    }
+
+    /// 更新 Engine 生命周期参数；当前 job 的 watchdog 快照不受影响。
+    /// 参考 px0 `BaseSearchParams::GetMultiPv`（`params.h:101`）。
+    pub fn set_multi_pv(&mut self, multi_pv: usize) {
+        self.multi_pv = multi_pv;
     }
 
     /// 在 session stop/drain 后写入完整 UCI history。保留前缀复用 tree；无关线路
@@ -199,9 +247,12 @@ impl SearchState {
         self.next_generation = self.next_generation.wrapping_add(1);
         let config = SearchConfig {
             root_move_filter: root_move_filter.clone(),
-            virtual_loss: self.virtual_loss,
+            eval_batch_size: self.mini_batch_size,
             ..SearchConfig::default()
         };
+        if !self.worker_pool.matches_config(self.backend.as_ref(), &config) {
+            self.worker_pool = Arc::new(WorkerPool::new(self.backend.as_ref(), &config));
+        }
         let search = Search::new_with_tree_in_pool(
             Arc::clone(&self.backend),
             SearchGeneration(self.next_generation),
@@ -214,6 +265,7 @@ impl SearchState {
             search,
             root_is_black,
             root_move_filter,
+            multi_pv: self.multi_pv,
         })
     }
 }
@@ -264,19 +316,19 @@ mod tests {
     }
 
     #[test]
-    fn virtual_loss_is_snapshotted_per_search_job() {
+    fn mini_batch_size_rebuilds_workers_for_the_next_job() {
         let mut state = SearchState::new(Arc::new(UniformBackend::default()));
         let start = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         state
             .set_position(Arc::new(PositionHistory::from_positions(start.positions())))
             .expect("position");
 
-        state.set_virtual_loss(0.25);
+        state.set_mini_batch_size(2);
         let first = state.begin_search(&[]).expect("first search");
-        assert_eq!(first.search.virtual_loss(), 0.25);
+        assert_eq!(first.search.eval_batch_size(), 2);
 
-        // `setoption` 只更新 Engine 状态；已启动 job 保留自己的不可变配置快照。
-        state.set_virtual_loss(0.75);
+        // `setoption` 只更新 Engine 状态；已启动 job 继续使用已有 worker。
+        state.set_mini_batch_size(4);
         first
             .run(SearchLimits {
                 max_playouts: Some(1),
@@ -285,7 +337,7 @@ mod tests {
             .expect("first result");
 
         let second = state.begin_search(&[]).expect("second search");
-        assert_eq!(second.search.virtual_loss(), 0.75);
+        assert_eq!(second.search.eval_batch_size(), 4);
         second
             .run(SearchLimits {
                 max_playouts: Some(1),

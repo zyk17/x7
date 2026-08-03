@@ -65,9 +65,11 @@ fn watchdog(
                 }
                 match result {
                     Ok(result) => {
-                        let mut info = snapshot.thinking_info(result.stats.clone(), started);
-                        info.pv = result.principal_variation.clone();
-                        responder.output_thinking_info(&[info]);
+                        let mut infos = snapshot.thinking_infos(result.stats.clone(), started);
+                        if let Some(info) = infos.first_mut() {
+                            info.pv = result.principal_variation.clone();
+                        }
+                        responder.output_thinking_info(&infos);
                         responder
                             .output_best_move(&BestMoveInfo::new(result.best_move.unwrap_or(xiangqi_core::Move::NULL)));
                     }
@@ -85,7 +87,7 @@ fn watchdog(
             if !*publishing {
                 return;
             }
-            responder.output_thinking_info(&[snapshot.thinking_info(control.stats(), started)]);
+            responder.output_thinking_info(&snapshot.thinking_infos(control.stats(), started));
         }
     }
 }
@@ -105,8 +107,14 @@ impl SearchSession {
         self.responder = responder;
     }
 
-    pub(crate) fn set_virtual_loss(&mut self, virtual_loss: f32) {
-        self.state.set_virtual_loss(virtual_loss);
+    /// 对齐 px0 `MiniBatchSize`：只影响下一次启动的 job。
+    pub(crate) fn set_mini_batch_size(&mut self, mini_batch_size: usize) {
+        self.state.set_mini_batch_size(mini_batch_size);
+    }
+
+    /// px0 `BaseSearchParams::GetMultiPv`：只影响之后 job 的 UCI 展示快照。
+    pub(crate) fn set_multi_pv(&mut self, multi_pv: usize) {
+        self.state.set_multi_pv(multi_pv);
     }
 
     pub(crate) fn set_position(&mut self, state: &GameState) -> Result<(), EnginError> {
@@ -315,6 +323,7 @@ mod tests {
         INIT.call_once(initialize_magic_bitboards);
         let responder = Arc::new(RecordingResponder::default());
         let mut search = SearchSession::new(Arc::new(UniformBackend::default()));
+        search.set_multi_pv(2);
         search.set_responder(Some(Arc::clone(&responder) as Arc<dyn SearchResponder>));
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         search.set_position(&state).expect("position");
@@ -333,6 +342,8 @@ mod tests {
         assert_eq!(final_info.score, Some(0));
         assert!(final_info.wdl.is_some());
         assert!(!final_info.pv.is_empty());
+        assert!(infos.iter().any(|info| info.multipv == 1));
+        assert!(infos.iter().any(|info| info.multipv == 2));
         assert_eq!(responder.bestmoves.lock().expect("bestmove lock").len(), 1);
     }
 }

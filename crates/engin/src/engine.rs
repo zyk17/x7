@@ -116,7 +116,8 @@ impl Engine {
             Ok(backend) => {
                 let backend: Arc<dyn Backend> = Arc::new(CachingBackend::new(Box::new(backend)));
                 let mut search = SearchSession::new(Arc::clone(&backend));
-                search.set_virtual_loss(self.options.virtual_loss);
+                search.set_multi_pv(self.options.multi_pv);
+                search.set_mini_batch_size(self.options.mini_batch_size);
                 search.set_responder(self.responder.clone());
                 self.search = Some(search);
                 self.loaded_weights_file = Some(path.clone());
@@ -147,10 +148,15 @@ impl Engine {
 
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), EnginError> {
         self.options.set_uci_option(name, value)?;
-        if name == "VirtualLoss"
+        if name == "MultiPV"
             && let Some(search) = self.search.as_mut()
         {
-            search.set_virtual_loss(self.options.virtual_loss);
+            search.set_multi_pv(self.options.multi_pv);
+        }
+        if name == "MiniBatchSize"
+            && let Some(search) = self.search.as_mut()
+        {
+            search.set_mini_batch_size(self.options.mini_batch_size);
         }
         Ok(())
     }

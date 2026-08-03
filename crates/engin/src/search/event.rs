@@ -129,26 +129,17 @@ impl NodeEvent {
 /// 由 Gather/Eval 路由给 Backprop 的结果。
 ///
 /// 参考：LC3 Overview 的 “GatherWorker” 和 “BackpropWorker”：
-/// <https://lczero.org/dev/lc0/search/lc3/overview/>。collision 必须到达 Backprop，
-/// 让相同的收尾阶段释放 edge-local in-flight visit。
+/// <https://lczero.org/dev/lc0/search/lc3/overview/>。
 #[derive(Debug)]
 pub struct BackpropEvent {
     node: NodeEvent,
-    outcome: BackpropOutcome,
+    value: ValueDelta,
     queued_at: Option<Instant>,
-}
-
-#[derive(Debug)]
-enum BackpropOutcome {
-    Evaluation { wl: f32, draw: f32, plies_left: f32 },
-    Collision,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackpropResult {
     pub completed_playouts: u32,
-    pub collisions: u32,
-    pub collision_depths: Vec<usize>,
     /// 已完成叶子深度之和，root 记为深度一。对齐 px0 `cum_depth_` 的计数方式
     /// （`search.cc:2157-2167`）。
     pub completed_depth: u64,
@@ -159,15 +150,7 @@ impl BackpropEvent {
     pub(crate) fn evaluation(node: NodeEvent, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
             node,
-            outcome: BackpropOutcome::Evaluation { wl, draw, plies_left },
-            queued_at: None,
-        }
-    }
-
-    pub(crate) fn collision(node: NodeEvent) -> Self {
-        Self {
-            node,
-            outcome: BackpropOutcome::Collision,
+            value: ValueDelta::with_plies_left(wl, draw, plies_left),
             queued_at: None,
         }
     }
@@ -186,16 +169,10 @@ impl BackpropEvent {
         let mut result = BackpropResult::default();
 
         for event in events {
-            let Self { node, outcome, .. } = event;
-            let BackpropOutcome::Evaluation { wl, draw, plies_left } = outcome else {
-                result.collision_depths.push(node.variation.moves().len());
-                node.cancel();
-                result.collisions += 1;
-                continue;
-            };
+            let Self { node, value, .. } = event;
             debug_assert_eq!(node.node_path.len(), node.reservations.len() + 1);
             let depth = node.node_path.len() as u64;
-            let mut delta = ValueDelta::with_plies_left(wl, draw, plies_left);
+            let mut delta = value;
             let mut reservations = node.reservations.into_iter().rev();
             for (node_index, node_key) in node.node_path.into_iter().enumerate().rev() {
                 if let Some((terminal_wl, terminal_draw, terminal_m)) =
@@ -310,34 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn collision_backprop_releases_reservation_without_updating_nodes() {
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let root = NodeEvent::root(
-            SearchGeneration(1),
-            Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
-        );
-        let repository = NodeRepository::default();
-        let root_node = repository.get_or_insert(root.node_key);
-        assert!(root_node.try_begin_evaluation());
-        let mv = Move::new(
-            xiangqi_core::Square::parse("b2").expect("b2"),
-            xiangqi_core::Square::parse("b3").expect("b3"),
-        );
-        root_node.publish_edges(vec![(mv, 1.0)]);
-        let child = root.descend(NodeKey::root(42), root_node.reserve_edge(0).expect("edge"));
-
-        let result = BackpropEvent::complete_batch([BackpropEvent::collision(child)], &repository);
-
-        let edge = &root_node.edges()[0];
-        assert_eq!(result.completed_playouts, 0);
-        assert_eq!(result.collisions, 1);
-        assert_eq!(edge.visits(), 0);
-        assert_eq!(edge.completed_visits(), 0);
-        assert_eq!(root_node.completed_visits(), 0);
-        assert!(repository.get(NodeKey::root(42)).is_none());
-    }
-
-    #[test]
     fn batch_backprop_merges_node_updates_and_completes_each_edge_visit() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let root_history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
@@ -366,7 +315,6 @@ mod tests {
         let edge = &root_node.edges()[0];
         let child_node = repository.get(child_key).expect("child node");
         assert_eq!(result.completed_playouts, 2);
-        assert_eq!(result.collisions, 0);
         assert_eq!(result.completed_depth, 4);
         assert_eq!(result.max_depth, 2);
         assert_eq!(edge.visits(), 2);

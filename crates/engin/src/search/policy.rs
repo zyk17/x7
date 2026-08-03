@@ -56,8 +56,7 @@ pub(crate) fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
     }
 }
 
-// 尚未定义并验证事件/生命周期语义的能力不预留字段：OOO evaluation、MultiPV、
-// prefetch 与 DAG reuse。
+// 尚未定义并验证事件/生命周期语义的能力不预留字段：OOO evaluation、MultiPV 与 DAG reuse。
 
 // stream 搜索策略参考 px0 `ComputeCpuct` / `GetFpu` / PUCT edge scoring
 // （`src/search/classic/search.cc:408-433`）。`draw_score` 固定为 0（Q 为走子方视角的
@@ -150,23 +149,8 @@ pub fn get_fpu(params: &SearchParams, parent_wl: f32, edges: &[Arc<Edge>]) -> f3
 }
 
 /// 已访问 edge 返回 Q，未完成访问则返回 FPU。
-///
-/// virtual loss 将每个 reservation 视作临时一次败局，并按 started visits 缩放；
-/// reservation complete 或 cancel 后立即消失。
-/// 参考：KataGo `cpp/search/search.cpp` 管理 playout 下行期间的 `virtualLosses`。
-/// LC3 未公开 virtual-loss 公式；这是最小 tree 形式，不宣称等价于 LC3 或 KataGo。
-pub fn edge_utility(edge: &Edge, fpu: f32, virtual_loss: f32) -> f32 {
-    let completed = edge.completed_visits();
-    let q = if completed == 0 { fpu } else { edge.q() };
-    if virtual_loss == 0.0 {
-        return q;
-    }
-    let in_flight = edge.in_flight_visits();
-    if in_flight == 0 {
-        return q;
-    }
-    let total = completed + in_flight;
-    q - virtual_loss * in_flight as f32 / total.max(1) as f32
+pub fn edge_utility(edge: &Edge, fpu: f32) -> f32 {
+    if edge.completed_visits() == 0 { fpu } else { edge.q() }
 }
 
 fn root_filter_allows(is_root: bool, filter: &[Move], mv: Move) -> bool {
@@ -184,7 +168,6 @@ pub fn select_edge(
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
-    virtual_loss: f32,
 ) -> Option<usize> {
     if edges.is_empty() {
         return None;
@@ -203,7 +186,7 @@ pub fn select_edge(
         if !root_filter_allows(is_root, root_move_filter, edge.mv()) {
             continue;
         }
-        let q = edge_utility(edge, fpu, virtual_loss);
+        let q = edge_utility(edge, fpu);
         let score = q + u_coeff * edge.prior() / (1 + edge.visits()) as f32;
         if best.is_none_or(|(_, best_score)| score > best_score) {
             best = Some((index, score));
@@ -218,17 +201,14 @@ pub fn select_edge_from_node(
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
-    virtual_loss: f32,
 ) -> Option<usize> {
-    let edges = node.edges();
     select_edge(
-        &edges,
+        &node.edges(),
         node.completed_visits(),
         node.q(),
         depth,
         params,
         root_move_filter,
-        virtual_loss,
     )
 }
 
@@ -278,10 +258,10 @@ mod tests {
         node.publish_edges(vec![(mv("b2", "b3"), 0.6), (mv("c3", "c4"), 0.4)]);
         let edges = node.edges();
         let params = SearchParams::default();
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[], 0.0), Some(0));
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]), Some(0));
 
         let reservation = node.reserve_edge(0).expect("first edge");
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[], 0.0), Some(1));
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]), Some(1));
         reservation.cancel();
         assert_eq!(edges[0].completed_visits(), 0);
     }
@@ -296,7 +276,7 @@ mod tests {
         let edges = node.edges();
         let params = SearchParams::default();
         let filter = [mv("c3", "c4")];
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &filter, 0.0), Some(1));
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &filter), Some(1));
     }
 
     #[test]
@@ -308,22 +288,6 @@ mod tests {
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();
         node.reserve_edge(0).expect("res").complete(0.5);
-        assert!((edge_utility(&edge, 0.0, 0.0) - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn virtual_loss_lowers_only_an_in_flight_edge() {
-        let repo = NodeRepository::default();
-        let key = NodeKey::root(4);
-        let node = repo.get_or_insert(key);
-        assert!(node.try_begin_evaluation());
-        node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
-        let edge = node.edges()[0].clone();
-
-        assert_eq!(edge_utility(&edge, 0.3, 1.0), 0.3);
-        let reservation = node.reserve_edge(0).expect("reservation");
-        assert!((edge_utility(&edge, 0.3, 1.0) + 0.7).abs() < 1e-6);
-        reservation.cancel();
-        assert_eq!(edge_utility(&edge, 0.3, 1.0), 0.3);
+        assert!((edge_utility(&edge, 0.0) - 0.5).abs() < 1e-6);
     }
 }

@@ -126,7 +126,7 @@ fn fill_plane(planes: &mut [f32], plane: usize, value: f32) {
 
 #[cfg(test)]
 mod tests {
-    use xiangqi_core::Position;
+    use xiangqi_core::{GameState, Position};
 
     use super::*;
 
@@ -140,6 +140,56 @@ mod tests {
                 .iter()
                 .all(|&v| v == 0.0)
         );
+    }
+
+    /// 直接移植 px0 `src/neural/encoder_test.cc:25-137` 的 classical 基线：
+    /// square layout、黑方 auxiliary plane、rule60 与历史交替 mirror 都不能靠
+    /// 当前实现自身生成期望值。
+    #[test]
+    fn px0_classical_startpos_and_two_ply_history() {
+        fn mask(planes: &[f32], plane: usize) -> u128 {
+            planes[plane * BOARD_ROWS * BOARD_COLS..(plane + 1) * BOARD_ROWS * BOARD_COLS]
+                .iter()
+                .enumerate()
+                .filter_map(|(square, &value)| (value == 1.0).then_some(1_u128 << square))
+                .sum()
+        }
+
+        fn is_filled_with(planes: &[f32], plane: usize, value: f32) -> bool {
+            planes[plane * BOARD_ROWS * BOARD_COLS..(plane + 1) * BOARD_ROWS * BOARD_COLS]
+                .iter()
+                .all(|&cell| cell == value)
+        }
+
+        let start = PositionHistory::from_positions(vec![Position::from_fen(xiangqi_core::STARTPOS_FEN).unwrap()]);
+        let planes = encode_position_for_nn(&start, FillEmptyHistory::No);
+        assert_eq!(mask(&planes, 0), (1_u128 << 0) | (1 << 8));
+        assert_eq!(mask(&planes, 1), (1_u128 << 3) | (1 << 5));
+        assert_eq!(mask(&planes, 2), (1_u128 << 19) | (1 << 25));
+        assert_eq!(
+            mask(&planes, 3),
+            (1_u128 << 27) | (1 << 29) | (1 << 31) | (1 << 33) | (1 << 35)
+        );
+        assert_eq!(mask(&planes, 4), (1_u128 << 1) | (1 << 7));
+        assert_eq!(mask(&planes, 5), (1_u128 << 2) | (1 << 6));
+        assert_eq!(mask(&planes, 6), 1_u128 << 4);
+        assert_eq!(mask(&planes, 13), 1_u128 << 85);
+        assert_eq!(mask(&planes, AUX_PLANE_BASE), 0);
+        // px0 的 sparse plane 此时是“全 mask + value 0”；dense ONNX 输入中等价为全零。
+        assert!(is_filled_with(&planes, AUX_PLANE_BASE + 1, 0.0));
+
+        let game = GameState::from_fen_moves(xiangqi_core::STARTPOS_FEN, &["h2e2"]).unwrap();
+        let history = PositionHistory::from_positions(game.positions());
+        let planes = encode_position_for_nn(&history, FillEmptyHistory::No);
+        assert_eq!(mask(&planes, AUX_PLANE_BASE), (1_u128 << 90) - 1);
+        assert!(is_filled_with(&planes, AUX_PLANE_BASE + 1, 1.0));
+
+        let game = GameState::from_fen_moves(xiangqi_core::STARTPOS_FEN, &["h2e2", "h9g7"]).unwrap();
+        let history = PositionHistory::from_positions(game.positions());
+        let planes = encode_position_for_nn(&history, FillEmptyHistory::No);
+        assert_eq!(mask(&planes, AUX_PLANE_BASE), 0);
+        assert!(is_filled_with(&planes, AUX_PLANE_BASE + 1, 2.0));
+        assert_eq!(mask(&planes, PLANES_PER_BOARD), (1_u128 << 0) | (1 << 8));
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub(crate) use session::SearchSession;
 pub use state::SearchResult;
 pub(crate) use state::{SearchState, WatchdogSnapshot};
 pub(crate) use stats::best_mate;
+pub(crate) use stats::root_variations;
 pub use stats::{
     RootEdgeStats, RootStats, best_move, best_move_filtered, principal_variation, principal_variation_filtered,
     root_stats,

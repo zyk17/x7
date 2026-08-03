@@ -282,8 +282,8 @@ impl Node {
         ExpansionState::from_raw(self.expansion.load(Ordering::Acquire))
     }
 
-    /// 恰好一个 Eval worker 取得未展开 node。其他 worker 报告 collision，并
-    /// backprop/cancel 它们的 reservation，不重复评估同一局面。
+    /// 恰好一个 Eval worker 取得未展开 node。其他 worker 报告 collision 并直接
+    /// cancel 自己的 reservation，不重复评估同一局面。
     pub fn try_begin_evaluation(&self) -> bool {
         self.expansion
             .compare_exchange(
@@ -942,7 +942,7 @@ mod repository_tests {
     }
 
     #[test]
-    fn cancelled_reservation_does_not_leave_virtual_visit() {
+    fn cancelled_reservation_restores_started_visit_count() {
         let root = NodeRepository::default().get_or_insert(NodeKey::root(321));
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(b2_b3(), 1.0)]);

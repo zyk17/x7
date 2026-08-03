@@ -602,13 +602,28 @@ mod tests {
     }
 
     #[test]
-    fn virtual_loss_option_uses_decimal_units() {
+    fn minibatch_size_option_matches_px0_range() {
         let mut options = Options::default();
         options
-            .set_uci_option("VirtualLoss", "2.5")
-            .expect("virtual-loss option");
-        assert_eq!(options.virtual_loss, 2.5);
-        assert!(options.set_uci_option("VirtualLoss", "5.1").is_err());
+            .set_uci_option("MiniBatchSize", "128")
+            .expect("minibatch-size option");
+        assert_eq!(options.mini_batch_size, 128);
+        assert!(options.set_uci_option("MiniBatchSize", "1025").is_err());
+    }
+
+    #[test]
+    fn multipv_option_matches_px0_range() {
+        let mut options = Options::default();
+        options.set_uci_option("MultiPV", "3").expect("multipv option");
+        assert_eq!(options.multi_pv, 3);
+        assert!(options.set_uci_option("MultiPV", "0").is_err());
+        assert!(options.set_uci_option("MultiPV", "501").is_err());
+        assert!(
+            options
+                .list_options_uci()
+                .iter()
+                .any(|line| line == "option name MultiPV type spin default 3 min 1 max 500")
+        );
     }
 
     #[test]

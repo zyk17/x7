@@ -1,5 +1,6 @@
 //! 只读的 stream root 统计、bestmove 与 principal variation。
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use xiangqi_core::Move;
@@ -23,6 +24,18 @@ pub struct RootStats {
     pub q: f32,
     pub draw: f32,
     pub edges: Vec<RootEdgeStats>,
+}
+
+/// 一条根候选及其从当前行棋方视角得到的统计值。
+///
+/// 对齐 px0 `GetBestChildrenNoTemperature` / `SendUciInfo`
+/// （`search.cc:241-341`）：MultiPV 仅重排并展示已存在的根边，不改变搜索。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RootVariation {
+    pub wl: f32,
+    pub draw: f32,
+    pub mate: Option<i32>,
+    pub pv: Vec<Move>,
 }
 
 pub fn root_stats(repository: &NodeRepository, root_key: NodeKey) -> Option<RootStats> {
@@ -139,6 +152,106 @@ fn first_filtered_move(edges: &[Arc<Edge>], root_move_filter: &[Move]) -> Option
     edges.first().map(|edge| edge.mv())
 }
 
+fn ranked_root_edges(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_move_filter: &[Move],
+) -> Vec<(Arc<Edge>, Option<Arc<Node>>)> {
+    // px0 `GetBestChildrenNoTemperature`（`search.cc:241`）：复用 bestmove 的根边
+    // 排名，只改变展示顺序，不重新选择或分配 visit。
+    let Some(root) = repository.get(root_key) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<_> = root
+        .edges()
+        .iter()
+        .filter(|edge| root_move_filter.is_empty() || root_move_filter.contains(&edge.mv()))
+        .map(|edge| (Arc::clone(edge), repository.get(root_key.child(edge.mv()))))
+        .collect();
+    if root.completed_visits() > 0 {
+        candidates.sort_by(|(left, left_child), (right, right_child)| {
+            if edge_is_better(left, left_child.as_deref(), right, right_child.as_deref()) {
+                Ordering::Less
+            } else if edge_is_better(right, right_child.as_deref(), left, left_child.as_deref()) {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        });
+    }
+    candidates
+}
+
+fn mate_from_terminal(child: &Node) -> Option<i32> {
+    // px0 `SendUciInfo` 的 `edge.IsTerminal()` 分支（`search.cc:283-288`）。
+    let (wl, _, m) = child.terminal_value()?;
+    (wl != 0.0).then(|| {
+        let distance = m.round() as i32 / 2 + 1;
+        if wl > 0.0 { distance } else { -distance }
+    })
+}
+
+fn principal_variation_from_root_edge(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_is_black: bool,
+    first_move: Move,
+) -> Vec<Move> {
+    // px0 `SendUciInfo` 的 PV 遍历（`search.cc:343-350`）。
+    let mut pv = vec![orient_move(first_move, root_is_black)];
+    let mut key = root_key.child(first_move);
+    let mut flip = !root_is_black;
+    while let Some(node) = repository.get(key) {
+        if node.completed_visits() == 0 || node.expansion_state() != ExpansionState::Expanded {
+            break;
+        }
+        let Some(abs_mv) = best_edge_absolute(repository, key, &[]) else {
+            break;
+        };
+        if abs_mv.is_null() {
+            break;
+        }
+        pv.push(orient_move(abs_mv, flip));
+        key = key.child(abs_mv);
+        flip = !flip;
+    }
+    pv
+}
+
+pub(crate) fn root_variations(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_is_black: bool,
+    root_move_filter: &[Move],
+    max_pv: usize,
+) -> Vec<RootVariation> {
+    // px0 `SendUciInfo` 的 root-edge WDL/Q 默认值（`search.cc:269-341`）。
+    let Some(root) = repository.get(root_key) else {
+        return Vec::new();
+    };
+    let default_wl = (-root.q()).clamp(-1.0, 1.0);
+    let default_draw = root.draw().clamp(0.0, 1.0);
+    ranked_root_edges(repository, root_key, root_move_filter)
+        .into_iter()
+        .take(max_pv)
+        .map(|(edge, child)| {
+            let visited = edge.completed_visits() > 0;
+            let wl = if visited { edge.q() } else { default_wl };
+            let draw = child
+                .as_ref()
+                .filter(|_| visited)
+                .map_or(default_draw, |node| node.draw());
+            let mate = child.as_deref().filter(|_| visited).and_then(mate_from_terminal);
+            RootVariation {
+                wl,
+                draw,
+                mate,
+                pv: principal_variation_from_root_edge(repository, root_key, root_is_black, edge.mv()),
+            }
+        })
+        .collect()
+}
+
 /// 在当前根节点的边中，按内部棋盘坐标和搜索排名选出最佳的那条边；尚未转换为 UCI 坐标。
 fn best_edge_absolute(repository: &NodeRepository, root_key: NodeKey, root_move_filter: &[Move]) -> Option<Move> {
     let root = repository.get(root_key)?;
@@ -155,21 +268,10 @@ fn best_edge_absolute(repository: &NodeRepository, root_key: NodeKey, root_move_
     if root.completed_visits() == 0 {
         return first_filtered_move(&edges, root_move_filter);
     }
-    let mut best: Option<(Arc<Edge>, Option<Arc<Node>>)> = None;
-    for edge in edges.iter() {
-        if !root_move_filter.is_empty() && !root_move_filter.contains(&edge.mv()) {
-            continue;
-        }
-        let child = repository.get(root_key.child(edge.mv()));
-        let better = match &best {
-            None => true,
-            Some((best_edge, best_child)) => edge_is_better(edge, child.as_deref(), best_edge, best_child.as_deref()),
-        };
-        if better {
-            best = Some((Arc::clone(edge), child));
-        }
-    }
-    best.map(|(edge, _)| edge.mv())
+    ranked_root_edges(repository, root_key, root_move_filter)
+        .into_iter()
+        .next()
+        .map(|(edge, _)| edge.mv())
         .or_else(|| first_filtered_move(&edges, root_move_filter))
 }
 
@@ -201,11 +303,7 @@ pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_mov
     }
     let mv = best_edge_absolute(repository, root_key, root_move_filter)?;
     let child = repository.get(root_key.child(mv))?;
-    let (wl, _, m) = child.terminal_value()?;
-    (wl != 0.0).then(|| {
-        let distance = m.round() as i32 / 2 + 1;
-        if wl > 0.0 { distance } else { -distance }
-    })
+    mate_from_terminal(&child)
 }
 
 /// principal variation（UCI `pv` 行），不是 policy/value。
@@ -252,7 +350,7 @@ mod tests {
 
     use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN, Square};
 
-    use super::{best_mate, best_move, best_move_filtered, principal_variation, root_stats};
+    use super::{best_mate, best_move, best_move_filtered, principal_variation, root_stats, root_variations};
     use crate::neural::backend::UniformBackend;
     use crate::search::{Search, SearchConfig, SearchGeneration};
 
@@ -408,6 +506,38 @@ mod tests {
             best_move_filtered(&repo, root_key, false, &filter).expect("fallback"),
             mv("b0", "b1")
         );
+    }
+
+    #[test]
+    fn root_variations_use_bestmove_ranking_and_edge_values() {
+        use crate::search::{NodeKey, NodeRepository, ValueDelta};
+
+        fn mv(from: &str, to: &str) -> Move {
+            Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
+        }
+
+        let repository = NodeRepository::default();
+        let root_key = NodeKey::root(19);
+        let root = repository.get_or_insert(root_key);
+        let first = mv("a0", "a1");
+        let second = mv("b0", "b1");
+        assert!(root.try_begin_evaluation());
+        root.publish_edges(vec![(first, 0.9), (second, 0.1)]);
+        for _ in 0..3 {
+            root.reserve_edge(0).expect("first reservation").complete(0.1);
+            root.add_delta(ValueDelta::one(0.1, 0.0));
+        }
+        for _ in 0..5 {
+            root.reserve_edge(1).expect("second reservation").complete(0.2);
+            root.add_delta(ValueDelta::one(0.2, 0.0));
+        }
+
+        let variations = root_variations(&repository, root_key, false, &[], 2);
+        assert_eq!(variations.len(), 2);
+        assert_eq!(variations[0].pv, vec![second]);
+        assert_eq!(variations[1].pv, vec![first]);
+        assert!((variations[0].wl - 0.2).abs() < f32::EPSILON);
+        assert!((variations[1].wl - 0.1).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -31,13 +31,12 @@ struct Args {
     backprops: Vec<usize>,
     eval_batch: Option<usize>,
     cache: bool,
-    virtual_loss: f32,
     root_top: usize,
 }
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \
-     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache] [--virtual-loss 0.5] [--root-top 8]"
+     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -53,7 +52,6 @@ fn parse_args() -> Result<Args, String> {
     let mut backprops = vec![1]; // 除非遇到显示的back瓶颈, 它暂时很难成为瓶颈
     let mut eval_batch = None;
     let mut cache = false;
-    let mut virtual_loss: f32 = 0.0;
     let mut root_top = 8;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -114,13 +112,6 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--cache" => cache = true,
-            "--virtual-loss" => {
-                virtual_loss = args
-                    .next()
-                    .ok_or("--virtual-loss requires a number in [0, 5]")?
-                    .parse()
-                    .map_err(|_| "--virtual-loss must be a number in [0, 5]")?;
-            }
             "--root-top" => {
                 root_top = args
                     .next()
@@ -159,10 +150,6 @@ fn parse_args() -> Result<Args, String> {
     if positions.is_some() && !moves.is_empty() {
         return Err("--positions cannot be combined with --moves".into());
     }
-    // 正式 UCI 只允许 V≤1；benchmark 可扫描更强的分流参数。
-    if !virtual_loss.is_finite() || !(0.0..=5.0).contains(&virtual_loss) {
-        return Err("--virtual-loss must be within [0, 5]".into());
-    }
     Ok(Args {
         onnx,
         fen,
@@ -176,7 +163,6 @@ fn parse_args() -> Result<Args, String> {
         backprops,
         eval_batch,
         cache,
-        virtual_loss,
         root_top,
     })
 }
@@ -306,11 +292,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cells = args.gathers.len() * args.evals.len() * args.backprops.len();
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} cache={} virtual_loss={:.2} recommended_batch={} target_batch={} budget={} repeat={} matrix={} positions={}",
+        "onnx={} provider={} cache={} recommended_batch={} target_batch={} budget={} repeat={} matrix={} positions={}",
         args.onnx.display(),
         provider,
         args.cache,
-        args.virtual_loss,
         recommended,
         target_batch,
         args.playouts
@@ -320,10 +305,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cells,
         positions.len(),
     );
-    println!("note: fresh backend/cache per run; eps=NN-only; q_* is average queue delay in us");
+    println!("note: fresh backend/cache per run; hit is normal cache hits; q_* is average queue delay in us");
     println!(
-        "{:>3} {:>3} {:>3} {:>3} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6}",
-        "G", "E", "B", "run", "ms", "nps", "eps", "done", "coll%", "peak", "root%", "q_g", "q_e", "q_n"
+        "{:>3} {:>3} {:>3} {:>3} {:>8} {:>8} {:>8} {:>7} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>6}",
+        "G", "E", "B", "run", "ms", "nps", "eps", "done", "hit", "coll%", "peak", "root%", "q_g", "q_e", "q_n"
     );
 
     if !args.moves.is_empty() {
@@ -352,7 +337,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 eval_workers,
                                 backprop_workers,
                                 benchmark_telemetry: true,
-                                virtual_loss: args.virtual_loss,
                                 ..SearchConfig::default()
                             },
                         );
@@ -390,7 +374,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .map(|(best, total)| best as f64 * 100.0 / total.max(1) as f64)
                             .unwrap_or(0.0);
                         println!(
-                            "{:>3} {:>3} {:>3} {:>3} {:>8.1} {:>8.0} {:>8.0} {:>7} {:>6.1} {:>7} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
+                            "{:>3} {:>3} {:>3} {:>3} {:>8.1} {:>8.0} {:>8.0} {:>7} {:>6} {:>6.1} {:>7} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
                             gather_workers,
                             eval_workers,
                             backprop_workers,
@@ -399,6 +383,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             nps,
                             eps,
                             stats.completed_playouts,
+                            stats.cache_hits,
                             collision_rate,
                             stats.peak_in_flight,
                             root_share,

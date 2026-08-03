@@ -34,6 +34,37 @@ fn go_nodes_reports_info_and_bestmove() {
 }
 
 #[test]
+fn multipv_outputs_ranked_root_variations() {
+    ensure_init();
+    let mut engine = Engine::uniform();
+    let mut responder = VecUciResponder::default();
+    let mut uci = UciLoop::new(&mut responder, &mut engine);
+    uci.process_line("setoption name MultiPV value 2", "test")
+        .expect("multipv");
+    uci.process_line("position startpos", "test").expect("position");
+    uci.process_line("go nodes 16", "test").expect("go");
+    uci.process_line("wait", "test").expect("wait");
+    drop(uci);
+
+    let multipv: Vec<_> = responder
+        .responses
+        .iter()
+        .filter(|line| line.starts_with("info ") && line.contains(" multipv "))
+        .collect();
+    assert!(
+        multipv
+            .iter()
+            .any(|line| line.contains(" multipv 1 ") && line.contains(" pv "))
+    );
+    assert!(
+        multipv
+            .iter()
+            .any(|line| line.contains(" multipv 2 ") && line.contains(" pv "))
+    );
+    assert!(responder.responses.iter().any(|line| line.starts_with("bestmove ")));
+}
+
+#[test]
 fn stop_emits_exactly_one_bestmove() {
     ensure_init();
     let mut engine = Engine::uniform();

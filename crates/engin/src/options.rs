@@ -9,8 +9,10 @@ pub struct Options {
     pub weights_file: String,
     pub show_wdl: bool,
     pub show_eps: bool,
-    /// UCI `VirtualLoss` 直接使用搜索参数 V，例如 `3.0`。
-    pub virtual_loss: f32,
+    /// UCI `MultiPV`：每次 info 最多输出的根变化数。
+    pub multi_pv: usize,
+    /// UCI `MiniBatchSize`：单次 NN 调用最多合并的局面数；0 使用 backend 建议值。
+    pub mini_batch_size: usize,
 }
 
 impl Default for Options {
@@ -19,7 +21,8 @@ impl Default for Options {
             weights_file: String::new(),
             show_wdl: false,
             show_eps: false,
-            virtual_loss: 3.0,
+            multi_pv: 1,
+            mini_batch_size: 0,
         }
     }
 }
@@ -29,8 +32,12 @@ impl Options {
         vec![
             format!("option name UCI_ShowWDL type check default {}", self.show_wdl),
             format!("option name UCI_ShowEPS type check default {}", self.show_eps),
+            format!("option name MultiPV type spin default {} min 1 max 500", self.multi_pv),
+            format!(
+                "option name MiniBatchSize type spin default {} min 0 max 1024",
+                self.mini_batch_size
+            ),
             format!("option name WeightsFile type string default {}", self.weights_file),
-            format!("option name VirtualLoss type string default {:.1}", self.virtual_loss),
         ]
     }
 
@@ -45,15 +52,24 @@ impl Options {
         match name {
             "UCI_ShowWDL" => self.show_wdl = flag(name)?,
             "UCI_ShowEPS" => self.show_eps = flag(name)?,
-            "WeightsFile" => self.weights_file = value.to_owned(),
-            "VirtualLoss" => {
+            "MultiPV" => {
                 let value = value
-                    .parse::<f32>()
-                    .map_err(|_| crate::EnginError::Uci("VirtualLoss must be a decimal within [0, 5]".into()))?;
-                if !value.is_finite() || !(0.0..=5.0).contains(&value) {
-                    return Err(crate::EnginError::Uci("VirtualLoss must be within [0, 5]".into()));
+                    .parse::<usize>()
+                    .map_err(|_| crate::EnginError::Uci("MultiPV must be an integer within [1, 500]".into()))?;
+                if !(1..=500).contains(&value) {
+                    return Err(crate::EnginError::Uci("MultiPV must be within [1, 500]".into()));
                 }
-                self.virtual_loss = value;
+                self.multi_pv = value;
+            }
+            "WeightsFile" => self.weights_file = value.to_owned(),
+            "MiniBatchSize" => {
+                let value = value
+                    .parse::<usize>()
+                    .map_err(|_| crate::EnginError::Uci("MiniBatchSize must be an integer within [0, 1024]".into()))?;
+                if value > 1024 {
+                    return Err(crate::EnginError::Uci("MiniBatchSize must be within [0, 1024]".into()));
+                }
+                self.mini_batch_size = value;
             }
             _ => return Err(crate::EnginError::Uci(format!("Unknown option: {name}"))),
         }
