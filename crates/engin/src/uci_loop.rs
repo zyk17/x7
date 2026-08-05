@@ -627,6 +627,34 @@ mod tests {
     }
 
     #[test]
+    fn search_options_accept_puct_params_and_worker_counts() {
+        let mut options = Options::default();
+        options.set_uci_option("cpuct", "1.5").expect("cpuct");
+        options.set_uci_option("CPUctBase", "20000").expect("cpuct base");
+        options.set_uci_option("cpuctfactor", "2.5").expect("cpuct factor");
+        options.set_uci_option("fpureduction", "0.35").expect("fpu reduction");
+        options.set_uci_option("GatherWorkers", "2").expect("gather workers");
+        options.set_uci_option("EvalWorkers", "3").expect("eval workers");
+        options
+            .set_uci_option("BackpropWorkers", "2")
+            .expect("backprop workers");
+        assert_eq!(options.cpuct, 1.5);
+        assert_eq!(options.cpuct_base, 20_000.0);
+        assert_eq!(options.cpuct_factor, 2.5);
+        assert_eq!(options.fpu_reduction, 0.35);
+        assert_eq!(
+            (options.gather_workers, options.eval_workers, options.backprop_workers),
+            (2, 3, 2)
+        );
+        assert!(options.set_uci_option("CPuct", "NaN").is_err());
+        assert!(options.set_uci_option("CPuctBase", "0").is_err());
+        assert!(options.set_uci_option("CPuctFactor", "NaN").is_err());
+        assert!(options.set_uci_option("FpuReduction", "-0.1").is_err());
+        assert!(options.set_uci_option("GatherWorkers", "0").is_err());
+        assert!(options.set_uci_option("EvalWorkers", "65").is_err());
+    }
+
+    #[test]
     fn uci_transcript() {
         ensure_init();
         let mut engine = Engine::uniform();

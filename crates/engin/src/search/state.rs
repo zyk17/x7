@@ -15,8 +15,9 @@ use crate::callbacks::{ThinkingInfo, Wdl};
 use crate::neural::backend::Backend;
 
 use super::{
-    GcStats, NodeKey, NodeRepository, Search, SearchConfig, SearchControl, SearchGeneration, SearchLimits, Stats, Tree,
-    WorkerPool, best_mate, best_move_filtered, principal_variation_filtered, root_stats, root_variations,
+    GcStats, NodeKey, NodeRepository, Search, SearchConfig, SearchControl, SearchGeneration, SearchLimits,
+    SearchParams, Stats, Tree, WorkerPool, best_mate, best_move_filtered, principal_variation_filtered, root_stats,
+    root_variations,
 };
 
 /// watchdog 持有的只读 root view，搜索 worker 不持有它。
@@ -135,6 +136,10 @@ pub(crate) struct SearchState {
     next_generation: u64,
     multi_pv: usize,
     mini_batch_size: usize,
+    search_params: SearchParams,
+    gather_workers: usize,
+    eval_workers: usize,
+    backprop_workers: usize,
     worker_pool: Arc<WorkerPool>,
 }
 
@@ -194,6 +199,10 @@ impl SearchState {
             next_generation: 0,
             multi_pv: 1,
             mini_batch_size: config.eval_batch_size,
+            search_params: config.params,
+            gather_workers: config.gather_workers,
+            eval_workers: config.eval_workers,
+            backprop_workers: config.backprop_workers,
             worker_pool,
         }
     }
@@ -202,6 +211,24 @@ impl SearchState {
     /// 参考 px0 `BaseSearchParams::kMiniBatchSizeId`（`params.cc:178-182,546`）。
     pub fn set_mini_batch_size(&mut self, mini_batch_size: usize) {
         self.mini_batch_size = mini_batch_size;
+    }
+
+    /// 更新下一次 job 的 PUCT/FPU 快照。PUCT 增长形状对照 px0
+    /// `BaseSearchParams::kCpuctBaseId`/`kCpuctFactorId`
+    /// （`src/search/classic/params.cc:195-205`）；FPU 是当前 X7 选择公式的实验参数。
+    pub fn set_search_params(&mut self, cpuct: f32, cpuct_base: f32, cpuct_factor: f32, fpu_reduction: f32) {
+        self.search_params.cpuct = cpuct;
+        self.search_params.cpuct_base = cpuct_base;
+        self.search_params.cpuct_factor = cpuct_factor;
+        self.search_params.fpu_reduction = fpu_reduction;
+    }
+
+    /// 更新下一次 job 的常驻 worker 拓扑。
+    /// 参考 LC3 Overview 的 "Workers"：pool 跨 job 常驻，但拓扑属于 job 配置。
+    pub fn set_worker_counts(&mut self, gather_workers: usize, eval_workers: usize, backprop_workers: usize) {
+        self.gather_workers = gather_workers;
+        self.eval_workers = eval_workers;
+        self.backprop_workers = backprop_workers;
     }
 
     /// 更新 Engine 生命周期参数；当前 job 的 watchdog 快照不受影响。
@@ -248,6 +275,10 @@ impl SearchState {
         let config = SearchConfig {
             root_move_filter: root_move_filter.clone(),
             eval_batch_size: self.mini_batch_size,
+            params: self.search_params,
+            gather_workers: self.gather_workers,
+            eval_workers: self.eval_workers,
+            backprop_workers: self.backprop_workers,
             ..SearchConfig::default()
         };
         if !self.worker_pool.matches_config(self.backend.as_ref(), &config) {
@@ -344,5 +375,30 @@ mod tests {
                 deadline: None,
             })
             .expect("second result");
+    }
+
+    #[test]
+    fn search_params_and_worker_counts_apply_to_the_next_job() {
+        let mut state = SearchState::new(Arc::new(UniformBackend::default()));
+        let start = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        state
+            .set_position(Arc::new(PositionHistory::from_positions(start.positions())))
+            .expect("position");
+        let first_pool = Arc::clone(&state.worker_pool);
+
+        state.set_search_params(1.5, 20_000.0, 2.5, 0.4);
+        state.set_worker_counts(2, 3, 1);
+        let search = state.begin_search(&[]).expect("search");
+        assert_eq!(search.search.params().cpuct, 1.5);
+        assert_eq!(search.search.params().cpuct_base, 20_000.0);
+        assert_eq!(search.search.params().cpuct_factor, 2.5);
+        assert_eq!(search.search.params().fpu_reduction, 0.4);
+        assert!(!Arc::ptr_eq(&first_pool, &state.worker_pool));
+        search
+            .run(SearchLimits {
+                max_playouts: Some(1),
+                deadline: None,
+            })
+            .expect("result");
     }
 }

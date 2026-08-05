@@ -118,6 +118,17 @@ impl Engine {
                 let mut search = SearchSession::new(Arc::clone(&backend));
                 search.set_multi_pv(self.options.multi_pv);
                 search.set_mini_batch_size(self.options.mini_batch_size);
+                search.set_search_params(
+                    self.options.cpuct,
+                    self.options.cpuct_base,
+                    self.options.cpuct_factor,
+                    self.options.fpu_reduction,
+                );
+                search.set_worker_counts(
+                    self.options.gather_workers,
+                    self.options.eval_workers,
+                    self.options.backprop_workers,
+                );
                 search.set_responder(self.responder.clone());
                 self.search = Some(search);
                 self.loaded_weights_file = Some(path.clone());
@@ -148,15 +159,38 @@ impl Engine {
 
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), EnginError> {
         self.options.set_uci_option(name, value)?;
-        if name == "MultiPV"
-            && let Some(search) = self.search.as_mut()
-        {
-            search.set_multi_pv(self.options.multi_pv);
-        }
-        if name == "MiniBatchSize"
-            && let Some(search) = self.search.as_mut()
-        {
-            search.set_mini_batch_size(self.options.mini_batch_size);
+        let option_name = name.to_ascii_lowercase();
+        match option_name.as_str() {
+            "multipv" => {
+                if let Some(search) = self.search.as_mut() {
+                    search.set_multi_pv(self.options.multi_pv);
+                }
+            }
+            "minibatchsize" => {
+                if let Some(search) = self.search.as_mut() {
+                    search.set_mini_batch_size(self.options.mini_batch_size);
+                }
+            }
+            "cpuct" | "cpuctbase" | "cpuctfactor" | "fpureduction" => {
+                if let Some(search) = self.search.as_mut() {
+                    search.set_search_params(
+                        self.options.cpuct,
+                        self.options.cpuct_base,
+                        self.options.cpuct_factor,
+                        self.options.fpu_reduction,
+                    );
+                }
+            }
+            "gatherworkers" | "evalworkers" | "backpropworkers" => {
+                if let Some(search) = self.search.as_mut() {
+                    search.set_worker_counts(
+                        self.options.gather_workers,
+                        self.options.eval_workers,
+                        self.options.backprop_workers,
+                    );
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

@@ -256,9 +256,14 @@ impl WorkerPool {
         Self::from_resolved(&config.resolve(backend))
     }
 
-    /// 对齐 LC3 Overview 的固定 worker job：batch 改变必须使用对应的 NN worker。
+    /// 对齐 LC3 Overview 的固定 worker job：batch 或任一 worker 数改变时，必须
+    /// 使用相应拓扑的新 pool。
     pub(crate) fn matches_config(&self, backend: &dyn Backend, config: &SearchConfig) -> bool {
-        self.eval_batch_size == config.resolve(backend).eval_batch_size
+        let config = config.resolve(backend);
+        self.eval_batch_size == config.eval_batch_size
+            && self.gather_commands.len() == config.gather_workers
+            && self.eval_commands.len() == config.eval_workers
+            && self.backprop_commands.len() == config.backprop_workers
     }
 
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
@@ -701,6 +706,12 @@ impl Search {
     /// 仅测试 SearchState 的 job 配置快照；对应 LC3 Overview 的独占 Search job。
     pub(crate) fn eval_batch_size(&self) -> usize {
         self.max_in_flight / 4
+    }
+
+    #[cfg(test)]
+    /// 仅测试 SearchState 的参数快照；对应独占 job 的不可变 `SearchConfig`。
+    pub(crate) fn params(&self) -> SearchParams {
+        self.shared.params
     }
 
     /// Requests a normal stream-search stop without tearing down worker

@@ -33,6 +33,7 @@ CUDA 包。两者不是同一二进制的运行时回退链；CUDA 使用 ORT �
 - `go nodes`、`go movetime`、`go wtime/btime/winc/binc/movestogo`、`go infinite`、`go searchmoves`
 - `stop`、`ucinewgame`、`quit`
 - `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`MiniBatchSize`、`MultiPV`
+- `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`GatherWorkers`、`EvalWorkers`、`BackpropWorkers`
 
 `MiniBatchSize` 对应 px0/Lc0 的同名 option，范围 `0..=1024`，默认 `0`（由 backend
 建议）。它限制一次 NN 调用最多合并的局面数；较大值通常提高吞吐，却可能因增加在途局面和
@@ -41,6 +42,12 @@ collision 降低固定时间棋力。它是引擎生命周期配置：一次 `se
 
 `MultiPV` 是 `1..=500` 的整数，默认 `1`。它只控制每次 `info` 输出的根候选数量：候选沿用
 bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，不改变搜索预算、PUCT 或 worker。
+
+`CPuct`（默认 `1.745`）控制初始探索强度；`CPuctBase`（默认 `38739`）决定 PUCT 随访问数增长何时显著，
+`CPuctFactor`（默认 `3.894`）决定增长幅度；二者是当前主要搜索实验参数。`FpuReduction`
+（默认 `0.330`）控制未访问边相对 parent Q 的降幅。原 X7 实验基线为 `CPuct=1.0`、`FpuReduction=0.220`，保留为对照参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`GatherWorkers`、`EvalWorkers`、
+`BackpropWorkers` 默认分别为 `4`、`4`、`1`，范围均为 `1..=64`。它们与 `MiniBatchSize` 一样是
+引擎生命周期配置：`setoption` 影响之后的每次 `go`，当前 job 始终使用启动时的参数与 worker pool。
 
 时钟使用固定中性的 px0 分配，固定 `MoveOverhead=200ms`，不额外暴露 UCI 调参项。`go movetime`
 不可与时钟字段混用；`go depth`、`go mate`、`go ponder` 与 `ponderhit`
@@ -55,11 +62,29 @@ bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，�
 cargo run -p engin --release --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1
 ```
 
-要诊断实战中的评分突变，优先保留完整历史而不是只复制最终 FEN：
+要诊断实战中的评分突变，优先保留完整历史而不是只复制最终 FEN；分流参数使用独立的
+`search_benchmark`，固定 `4/4/1` worker、backend 默认 batch 与 fresh tree：
 
 ```powershell
-cargo run -p engin --release --bin benchmark -- --moves "c3c4 g6g5 ..." --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1 --root-top 12
+cargo run -p engin --release --bin search_benchmark -- --moves "c3c4 g6g5 ..." --playouts 2000 --root-top 12
 ```
+
+固定节点扫描 cPUCT 形状时，`--cpuct`、`--cpuct-base` 与 `--cpuct-factor` 接受逗号列表并交叉运行；`--fpu-reduction` 每次只取一个值，比较两套 FPU 时分别运行：
+
+```powershell
+cargo run -p engin --release --bin search_benchmark -- --onnx data/x7_v3_b12c512_v697.onnx --fen "<FEN>" --playouts 1000 --cpuct 1.0,1.745 --cpuct-base 20000,38739,80000 --cpuct-factor 2.5,3.894,5.0 --fpu-reduction 0.330 --root-top 3
+```
+
+`--trace 128,256,512,...` 只用于固定 `--playouts`：它在同一棵 fresh tree 上输出各个
+completed-visit 里程碑的 root `P/N/Q`，用于比较“新 Q 证据出现后，N 是否改变”。每个里程碑
+会先 drain 在途事件再取快照，因此它是可重复的 completed-visit 轨迹，不等价于一段完全不中断的
+流水线搜索。
+
+`--track g6g9,i0g0,...` 可在每个 trace 里程碑额外输出指定根着的 `N` 排名和 `P/N/Q`；即使
+该着不在 `--root-top` 中也会显示，适合观察 challenger 是未访问、被 Q 反驳，还是没有获得后续预算。
+
+`--searchmoves "g6g9 i0g0 ..."` 与 UCI `go searchmoves` 使用相同的根过滤语义，可将比较限制在
+指定候选中；它用于诊断候选获得预算后的 Q/N 轨迹，不把外部引擎的候选当作真值。
 
 `--moves` 从 startpos（或指定的 `--fen`）依次应用 ICCS 着法；它保留重复与规则历史，
 但每次 benchmark 仍从 fresh tree 开始，不模拟前几回合的 tree reuse。

@@ -1,30 +1,31 @@
 //! Stream 的选择参数。
 //!
 //! LC3 Policy 描述 worker/policy 架构，但未公开具体 PUCT 公式。因此在有
-//! stream 原生公式前，默认值保持项目批准的 X7 策略
+//! stream 原生公式前，PUCT 形状参考 px0，当前默认的探索/FPU 强度采用 LC0 参数
 //! （px0 `src/search/classic/search.cc:408-433`）。
 
 use crate::utils::fastmath::fast_log;
 
 /// Stream 自己拥有的最小选择参数集。
 ///
-/// 不包含 root 专用参数、absolute FPU、draw score、contempt 或旧
-/// task-worker 参数；stream 固定使用中性和棋分数与 reduction FPU。
+/// 不包含 root 专用参数、absolute FPU、draw score、contempt 或旧 task-worker 参数；
+/// stream 固定使用中性和棋分数与 reduction FPU。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SearchParams {
     pub cpuct: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
+    pub cpuct_base: f32,   // 增长何时开始。更小 → 更早、更快变宽；更大 → 更久保持利用 Q。
+    pub cpuct_factor: f32, // 增长幅度。更大 → 后期更强地向 PUCT/P 分流；更小 → 后期更容易让已验证的高 Q 分支继续积累 N。
     pub fpu_reduction: f32,
 }
 
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            cpuct: 1.0,
+            // 原 X7 实验基线：cpuct=1.0，fpu_reduction=0.220。
+            cpuct: 1.745,
             cpuct_base: 38_739.0,
             cpuct_factor: 3.894,
-            fpu_reduction: 0.220,
+            fpu_reduction: 0.330,
         }
     }
 }
@@ -222,7 +223,6 @@ mod tests {
     fn mv(from: &str, to: &str) -> Move {
         Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
     }
-
     #[test]
     fn parent_delta_flips_wl_not_draw() {
         let leaf = ValueDelta::one(0.6, 0.2);
@@ -230,12 +230,12 @@ mod tests {
     }
 
     #[test]
-    fn defaults_preserve_the_approved_x7_policy() {
+    fn defaults_use_the_selected_lc0_exploration_values() {
         let params = SearchParams::default();
-        assert_eq!(params.cpuct, 1.0);
+        assert_eq!(params.cpuct, 1.745);
         assert_eq!(params.cpuct_base, 38_739.0);
         assert_eq!(params.cpuct_factor, 3.894);
-        assert_eq!(params.fpu_reduction, 0.220);
+        assert_eq!(params.fpu_reduction, 0.330);
         assert_eq!(compute_cpuct(params, 0), params.cpuct);
     }
 

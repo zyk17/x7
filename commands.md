@@ -97,7 +97,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test
 
 ## 9. 当前引擎 UCI 冒烟
 
-当前引擎提供正式 UCI stdin/stdout 入口；另有 `nn_eval`、`benchmark` 和 Pikafish 对照脚本用于本地诊断。权重由 `WeightsFile` 在下一条 `position` 前加载。
+当前引擎提供正式 UCI stdin/stdout 入口；另有 `nn_eval`、`benchmark`、`search_benchmark` 和 Pikafish 对照脚本用于本地诊断。权重由 `WeightsFile` 在下一条 `position` 前加载。
 
 ```powershell
 @'
@@ -129,8 +129,11 @@ quit
 cargo run --release -p engin
 ```
 
-当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`。
+当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
+`CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`GatherWorkers`、`EvalWorkers`、`BackpropWorkers`。
 `MiniBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
+搜索参数默认采用 LC0 的 `CPuct=1.745`、`CPuctBase=38739`、`CPuctFactor=3.894`、`FpuReduction=0.330`；
+worker 默认 `4/4/1`。option 名称和布尔值大小写不敏感。
 
 当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
 `movetime` 不可与时钟字段混用；`infinite` 不可与其他预算混用。`depth`、`mate`、`ponder` 仍会明确报错。
@@ -176,14 +179,15 @@ cargo run --release -p engin --bin benchmark -- `
   --gathers 4 --evals 4 --backprops 1
 ```
 
-使用完整历史诊断评分拐点：
+`search_benchmark` 固定 `4/4/1` worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-tree 根部分流。使用完整历史诊断评分拐点：
 
 ```powershell
-cargo run --release -p engin --bin benchmark -- `
-  --moves "c3c4 g6g5 ..." --movetime 3000 --repeat 3 --root-top 12
+cargo run --release -p engin --bin search_benchmark -- `
+  --moves "c3c4 g6g5 ..." --playouts 2000 --root-top 12
 ```
 
-`benchmark` 输出正常 cache hit（`hit`）以及根候选的 `P / completed-N / in-flight / Q`；它不模拟实战 tree reuse。`nn_eval` 可单独检查 ONNX：
+`benchmark` 输出正常 cache hit（`hit`）和流水线队列数据；`search_benchmark` 输出根候选的
+`P / completed-N / in-flight / Q`，可加 `--trace` 和 `--track` 观察固定节点轨迹。两者都不模拟实战 tree reuse。`nn_eval` 可单独检查 ONNX：
 
 ```powershell
 cargo run --release -p engin --bin nn_eval -- --onnx data\x7.onnx --bench 20

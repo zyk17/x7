@@ -112,6 +112,18 @@ impl SearchSession {
         self.state.set_mini_batch_size(mini_batch_size);
     }
 
+    /// 搜索参数属于 Engine 生命周期；每次 `go` 从 state 取不可变快照。
+    pub(crate) fn set_search_params(&mut self, cpuct: f32, cpuct_base: f32, cpuct_factor: f32, fpu_reduction: f32) {
+        self.state
+            .set_search_params(cpuct, cpuct_base, cpuct_factor, fpu_reduction);
+    }
+
+    /// worker 拓扑同样只影响下一次 job；当前 job 继续 drain 自己的 pool。
+    pub(crate) fn set_worker_counts(&mut self, gather_workers: usize, eval_workers: usize, backprop_workers: usize) {
+        self.state
+            .set_worker_counts(gather_workers, eval_workers, backprop_workers);
+    }
+
     /// px0 `BaseSearchParams::GetMultiPv`：只影响之后 job 的 UCI 展示快照。
     pub(crate) fn set_multi_pv(&mut self, multi_pv: usize) {
         self.state.set_multi_pv(multi_pv);
@@ -206,6 +218,11 @@ impl SearchSession {
         };
         let control = running.control();
         let snapshot = running.watchdog_snapshot();
+        // `go` 的首条 info 必须在 `start` 返回前入队，不能依赖 watchdog 的首个
+        // 100ms 周期；根尚未扩展时仍输出合法的零节点快照。
+        if let Some(responder) = self.responder.as_ref() {
+            responder.output_thinking_info(&snapshot.thinking_infos(control.stats(), started));
+        }
         let deadline = params
             .movetime
             .map(|ms| started + Duration::from_millis(ms.max(0) as u64))
@@ -316,6 +333,25 @@ mod tests {
         fn output_thinking_info(&self, infos: &[ThinkingInfo]) {
             self.infos.lock().expect("info lock").extend_from_slice(infos);
         }
+    }
+
+    #[test]
+    fn search_start_immediately_publishes_an_info_snapshot() {
+        INIT.call_once(initialize_magic_bitboards);
+        let responder = Arc::new(RecordingResponder::default());
+        let mut search = SearchSession::new(Arc::new(UniformBackend::default()));
+        search.set_responder(Some(Arc::clone(&responder) as Arc<dyn SearchResponder>));
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        search.set_position(&state).expect("position");
+        search
+            .start(&GoParams {
+                infinite: true,
+                ..GoParams::default()
+            })
+            .expect("start");
+
+        assert!(!responder.infos.lock().expect("info lock").is_empty());
+        search.abort().expect("stop infinite search");
     }
 
     #[test]
