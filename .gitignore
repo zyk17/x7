@@ -41,6 +41,9 @@ data/
 !data/
 data/*
 !data/benchmark_positions.txt
+!data/collision_snapshots/
+!data/collision_snapshots/README.md
+!data/collision_snapshots/*.txt
 datasets/
 checkpoints/
 pgns/

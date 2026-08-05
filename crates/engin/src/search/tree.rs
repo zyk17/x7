@@ -169,17 +169,12 @@ impl Edge {
     }
 
     fn cancel(&self) {
-        loop {
-            let started = self.started.load(Ordering::Acquire);
-            assert!(started > self.completed_visits(), "stream edge reservation underflow");
-            if self
-                .started
-                .compare_exchange_weak(started, started - 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return;
-            }
-        }
+        // `complete` 也持有此锁。必须在同一临界区内检查并减少 `started`，否则
+        // complete 可在检查与 CAS 之间增加 completed，破坏 started >= completed。
+        let completed = self.completed.lock();
+        let started = self.started.load(Ordering::Acquire);
+        assert!(started > completed.visits, "stream edge reservation underflow");
+        self.started.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn complete(&self, wl: f32) {
@@ -837,7 +832,7 @@ mod tree_tests {
 
 #[cfg(test)]
 mod repository_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     use xiangqi_core::{Move, Square};
@@ -949,6 +944,36 @@ mod repository_tests {
         root.reserve_edge(0).expect("edge").cancel();
         assert_eq!(root.edges()[0].visits(), 0);
         assert_eq!(root.edges()[0].completed_visits(), 0);
+    }
+
+    #[test]
+    // LC3 Overview 的 owned event 约束：每个 reservation 只能完成或取消一次。
+    fn concurrent_complete_and_cancel_keep_reservation_balanced() {
+        for _ in 0..128 {
+            let root = NodeRepository::default().get_or_insert(NodeKey::root(654));
+            assert!(root.try_begin_evaluation());
+            root.publish_edges(vec![(b2_b3(), 1.0)]);
+            let completed = root.reserve_edge(0).expect("completed reservation");
+            let cancelled = root.reserve_edge(0).expect("cancelled reservation");
+            let barrier = Arc::new(Barrier::new(3));
+
+            thread::scope(|scope| {
+                let complete_barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    complete_barrier.wait();
+                    completed.complete(0.5);
+                });
+                let cancel_barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    cancel_barrier.wait();
+                    cancelled.cancel();
+                });
+                barrier.wait();
+            });
+
+            assert_eq!(root.edges()[0].visits(), 1);
+            assert_eq!(root.edges()[0].completed_visits(), 1);
+        }
     }
 
     #[test]

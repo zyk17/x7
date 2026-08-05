@@ -43,9 +43,10 @@ collision 降低固定时间棋力。它是引擎生命周期配置：一次 `se
 `MultiPV` 是 `1..=500` 的整数，默认 `1`。它只控制每次 `info` 输出的根候选数量：候选沿用
 bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，不改变搜索预算、PUCT 或 worker。
 
-`CPuct`（默认 `1.745`）控制初始探索强度；`CPuctBase`（默认 `38739`）决定 PUCT 随访问数增长何时显著，
-`CPuctFactor`（默认 `3.894`）决定增长幅度；二者是当前主要搜索实验参数。`FpuReduction`
-（默认 `0.330`）控制未访问边相对 parent Q 的降幅。原 X7 实验基线为 `CPuct=1.0`、`FpuReduction=0.220`，保留为对照参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`GatherWorkers`、`EvalWorkers`、
+`CPuct` 默认 `2.7182817`（`f32` 下的 e），`CPuctFactor` 默认 `0`，因此正式默认使用常数探索强度。
+`CPuctBase` 默认 `38739`，只在 `CPuctFactor > 0` 时决定 PUCT 随访问数增长何时显著；`CPuctFactor`
+决定增长幅度。三者是当前主要搜索实验参数。`FpuReduction`（默认 `0.330`）控制未访问边相对 parent Q
+的降幅。原 X7 基线 `CPuct=1.0`、`FpuReduction=0.220` 与 LC0 对照形状保留为实验参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`GatherWorkers`、`EvalWorkers`、
 `BackpropWorkers` 默认分别为 `4`、`4`、`1`，范围均为 `1..=64`。它们与 `MiniBatchSize` 一样是
 引擎生命周期配置：`setoption` 影响之后的每次 `go`，当前 job 始终使用启动时的参数与 worker pool。
 
@@ -85,6 +86,14 @@ completed-visit 里程碑的 root `P/N/Q`，用于比较“新 Q 证据出现后
 
 `--searchmoves "g6g9 i0g0 ..."` 与 UCI `go searchmoves` 使用相同的根过滤语义，可将比较限制在
 指定候选中；它用于诊断候选获得预算后的 Q/N 轨迹，不把外部引擎的候选当作真值。
+
+`tree_shape` 从固定节点预算后的 fresh tree 递归打印形状：每一行是一个已访问 node，只显示进入该 node
+的 `P/N/Q/M`；root 没有入边，故只显示 `N/Q/M`。`M` 是 moves-left 的平均 ply 数。`--depth` 限制展示深度，`--top` 限制每个节点展示的
+已访问子节点数。首行同时给出总 collision 及其占所有提交尝试的比例；它用于看树的访问形状，而不是记录运行中的 collision 热点：
+
+```powershell
+cargo run -p engin --release --bin tree_shape -- --fen "<FEN>" --playouts 2000 --depth 4 --top 8
+```
 
 `--moves` 从 startpos（或指定的 `--fen`）依次应用 ICCS 着法；它保留重复与规则历史，
 但每次 benchmark 仍从 fresh tree 开始，不模拟前几回合的 tree reuse。

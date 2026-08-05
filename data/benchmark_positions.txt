@@ -60,3 +60,15 @@ evasion_04 | 4ka3/4a4/9/9/4N4/p8/9/4C3c/7n1/2BK5 w - - 0 1
 evasion_05 | 2b1ka3/9/b3N4/4n4/9/9/9/4C4/2p6/2BK5 w - - 0 1
 evasion_06 | 1C2ka3/9/C1Nab1n2/p3p3p/6p2/9/P3P3P/3AB4/3p2c2/c1BAK4 w - - 0 1
 evasion_07 | CnN1k1b2/c3a4/4ba3/9/2nr5/9/9/4C4/4A4/4KA3 w - - 0 1
+
+# 防守反例：Pikafish 的 `h6a6` 可守和，但网络高估红方；用于区分低先验防守
+# 是否未获预算，还是已访问仍无足够 Evidence。
+proof_draw_01 | 4k1b2/4a2N1/3ab4/p5PC1/9/8R/2n6/3ABC3/1c3K3/2BA3r1 w - - 0 1
+
+# 长强制反例：黑方 `i3e3` 是 Pikafish 已验证的杀棋。用于观察低估候选的 Q
+# 何时翻正，以及历史 N 是否会遮蔽后期 Evidence；不是吞吐基准。
+proof_mate_01 | 5aC2/1P2k4/9/7R1/9/3n5/8r/B3B4/9/4K4 b - - 0 1
+
+# 强制反例：Pikafish 验证 `h9h4` 为 mate -10；`i4e4` 是相对顽强的败着。
+# 用于观察搜索是否将强制反例变为 terminal evidence，而非只按暂时 Q 选择 `h9h4`。
+proof_mate_02 | 4kabC1/9/3ab4/p5P1N/9/8R/9/1n1ABC3/1c3K3/2Br5 w - - 0 1

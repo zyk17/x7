@@ -260,7 +260,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| format!("movetime={}ms", args.movetime.unwrap_or(0))),
         args.repeat,
         args.gathers.len() * args.evals.len() * args.backprops.len(),
-        positions.len()
+        positions.len(),
     );
     println!("note: fresh backend/cache per run; hit is normal cache hits; q_* is average queue delay in us");
     println!("  G   E   B run       ms      nps      eps    done    hit  coll%    peak  root%    q_g    q_e    q_n");

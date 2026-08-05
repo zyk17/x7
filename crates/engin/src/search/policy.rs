@@ -1,8 +1,8 @@
 //! Stream 的选择参数。
 //!
 //! LC3 Policy 描述 worker/policy 架构，但未公开具体 PUCT 公式。因此在有
-//! stream 原生公式前，PUCT 形状参考 px0，当前默认的探索/FPU 强度采用 LC0 参数
-//! （px0 `src/search/classic/search.cc:408-433`）。
+//! stream 原生公式前，PUCT 形状参考 px0。当前默认的常数探索强度由 X7 固定时间
+//! 实验选定；FPU 强度采用 LC0 对照值（px0 `src/search/classic/search.cc:408-433`）。
 
 use crate::utils::fastmath::fast_log;
 
@@ -21,10 +21,11 @@ pub struct SearchParams {
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            // 原 X7 实验基线：cpuct=1.0，fpu_reduction=0.220。
-            cpuct: 1.745,
+            // 固定时间实验基线：常数 e 足以验证低先验候选，又不会持续打散已有证据。
+            // `f32` 的最接近 e；factor 为 0 时 cpuct_base 不参与计算。
+            cpuct: 2.718_281_7,
             cpuct_base: 38_739.0,
-            cpuct_factor: 3.894,
+            cpuct_factor: 0.0,
             fpu_reduction: 0.330,
         }
     }
@@ -154,10 +155,6 @@ pub fn edge_utility(edge: &Edge, fpu: f32) -> f32 {
     if edge.completed_visits() == 0 { fpu } else { edge.q() }
 }
 
-fn root_filter_allows(is_root: bool, filter: &[Move], mv: Move) -> bool {
-    !is_root || filter.is_empty() || filter.contains(&mv)
-}
-
 /// 选择 px0 风格 PUCT 最高的 edge。
 ///
 /// `root_move_filter` 对应 px0 `Search::root_move_filter_` 与 UCI `go searchmoves`
@@ -174,17 +171,14 @@ pub fn select_edge(
         return None;
     }
     let is_root = depth == 0;
-    let children_visits = if parent_completed_visits > 0 {
-        parent_completed_visits - 1
-    } else {
-        0
-    };
+    let children_visits = parent_completed_visits.saturating_sub(1);
     let cpuct = compute_cpuct(*params, parent_completed_visits);
     let u_coeff = cpuct * (children_visits.max(1) as f32).sqrt();
     let fpu = get_fpu(params, parent_wl, edges);
     let mut best: Option<(usize, f32)> = None;
+    let filter_root_moves = is_root && !root_move_filter.is_empty();
     for (index, edge) in edges.iter().enumerate() {
-        if !root_filter_allows(is_root, root_move_filter, edge.mv()) {
+        if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
             continue;
         }
         let q = edge_utility(edge, fpu);
@@ -230,11 +224,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_use_the_selected_lc0_exploration_values() {
+    fn defaults_use_the_selected_constant_cpuct() {
         let params = SearchParams::default();
-        assert_eq!(params.cpuct, 1.745);
+        assert_eq!(params.cpuct, 2.718_281_7);
         assert_eq!(params.cpuct_base, 38_739.0);
-        assert_eq!(params.cpuct_factor, 3.894);
+        assert_eq!(params.cpuct_factor, 0.0);
         assert_eq!(params.fpu_reduction, 0.330);
         assert_eq!(compute_cpuct(params, 0), params.cpuct);
     }

@@ -72,7 +72,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 - tree reuse 会保留已走主线及旧根，并遍历 repository 删除不可达兄弟子树；UCI/Watchdog 已输出最小 info 与一次 bestmove。
 - `MultiPV` 只在 watchdog 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 tree、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCTS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
-stream 的 selection 使用 px0 PUCT/N-Q-P 语义，不是 LC3 Policy 的正式公式。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认采用 LC0 的 `CPuct=1.745`、`FpuReduction=0.330`，保留原 X7 `1.0/0.220` 作为对照基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
+stream 的 selection 使用 px0 PUCT/N-Q-P 语义，不是 LC3 Policy 的正式公式。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认采用固定 `CPuct=e≈2.7182817` 与 `CPuctFactor=0`，使低先验候选可较早获得验证、又不在后期持续打散已有证据；`CPuctBase` 在此默认下无效。`FpuReduction=0.330` 为 LC0 对照值，原 X7 `1.0/0.220` 与动态 cPUCT 形状均保留为实验基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
 
 ## 模型
 
