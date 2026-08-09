@@ -352,7 +352,10 @@ impl BackendComputation for OnnxBackendComputation {
         let mut results = HashMap::with_capacity(entries.len());
         for (index, (ticket, entry)) in entries.iter().enumerate() {
             let values = &logits[index * POLICY_SIZE..(index + 1) * POLICY_SIZE];
-            let policies = softmax_legal_policy(values, &entry.legal_moves)?;
+            let policies = softmax_legal_policy(values, &entry.legal_moves).map_err(|error| {
+                let position = entry.positions.last().expect("EvalPosition has a position");
+                EnginError::Onnx(format!("{error}; position: {}", position.to_fen()))
+            })?;
             let value = &wdl[index * 3..(index + 1) * 3];
             results.insert(
                 ticket.0,

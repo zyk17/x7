@@ -16,13 +16,13 @@
 
 - `crates/xiangqi_core`：唯一规则真相，翻译 px0 `src/chess`。
 - `crates/engin`：UCI、网络外围、stream 搜索与固定中性时钟管理。
-- `crates/engin/src/search`：独立的 LC3-style streaming MCTS；事件必须 owned 并携带完整 root history 与 variation。首版只做 tree，不做 DAG/TT。
+- `crates/engin/src/search`：独立的 streaming MCGS；事件必须 owned 并携带完整 root history 与 variation。node 只按棋盘共享，历史规则仍在 variation 内裁决。
 - `nn/`：独立训练与 ONNX 导出，不进入规则或搜索热路径。
 
 ## 禁止项
 
 - 不引入多套正式训练格式、未经参考支持的搜索参数或启发式。
-- stream 不引入共享可变树/task-worker 模型，不吸收 KataGo graph/DAG。
+- stream 不引入共享可变树/task-worker 模型；MCGS 不新增独立 TT，也不为兼容树 MCTS 保留双轨数据结构。
 - 正式 UCI 不得使用 `UniformBackend`；未接入的 UCI 命令必须明确拒绝，不能伪装支持。
 
 ## 参考与文档

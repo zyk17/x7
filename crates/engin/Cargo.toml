@@ -11,6 +11,18 @@ default-run = "engin"
 default = ["directml"]
 directml = ["ort/directml", "ort/download-binaries", "ort/copy-dylibs", "ort/tls-native"]
 cuda = ["ort/cuda", "ort/load-dynamic", "ort/api-24"]
+# 仅基准诊断：队列等待、collision 深度与 in-flight 分布不进入正式 UCI 热路径。
+benchmark = []
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+required-features = ["benchmark"]
+
+[[bin]]
+name = "graph_shape"
+path = "src/bin/graph_shape.rs"
+required-features = ["benchmark"]
 
 [dependencies]
 crossbeam-channel = "0.5"

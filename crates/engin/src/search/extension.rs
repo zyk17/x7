@@ -12,8 +12,11 @@ use super::{rule_judge_wl_for_node, terminal_wl_for_node};
 pub(crate) enum ExtensionKind {
     /// NN 评估并发布 edge。
     Evaluate,
-    /// 终局叶子：incoming-edge 视角 `wl` / `draw`≡`d` / `plies_left`≡`m`。
-    Terminal { wl: f32, draw: f32, plies_left: f32 },
+    /// 只由棋盘决定的终局，可安全发布到共享 node。
+    SharedTerminal { wl: f32, draw: f32, plies_left: f32 },
+    /// 依赖当前 Variation 的终局。不得改变 board-key shared node；由实际入边保存这次
+    /// 路径的裁决。参见 `MCGS.md` “环与重复”。
+    PathTerminal { wl: f32, draw: f32, plies_left: f32 },
 }
 
 /// 为 stream Gather/Eval 分类 `history` 的叶子。
@@ -27,9 +30,16 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
         // `wl` 按 incoming edge / 上一走子方视角保存。因此无合法着的中国象棋局面对它
         // 总是胜利。对齐 px0 的 `WHITE_WON` canonical-board 快径
         // （`search.cc:1913-1919`、`node.cc:300-317`）。
-        return ExtensionKind::Terminal {
+        return ExtensionKind::SharedTerminal {
             wl: 1.0,
             draw: 0.0,
+            plies_left: 0.0,
+        };
+    }
+    if !board.has_mating_material() {
+        return ExtensionKind::SharedTerminal {
+            wl: 0.0,
+            draw: 1.0,
             plies_left: 0.0,
         };
     }
@@ -37,7 +47,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
         if history.last().repetitions() >= 2 {
             // 对齐 px0 `MakeTerminal(history->RuleJudge())`，勿经绝对颜色转换。
             let (wl, draw) = rule_judge_wl_for_node(history.rule_judge());
-            return ExtensionKind::Terminal {
+            return ExtensionKind::PathTerminal {
                 wl,
                 draw,
                 plies_left: 0.0,
@@ -52,7 +62,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
             let result = history.rule_judge();
             if result == GameResult::Draw {
                 let (wl, draw) = rule_judge_wl_for_node(result);
-                return ExtensionKind::Terminal {
+                return ExtensionKind::PathTerminal {
                     wl,
                     draw,
                     plies_left: cycle_length,
@@ -60,15 +70,15 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
             }
             if two_fold_chase_or_check_cycle(history) && history.last().rule60_ply() < 120 {
                 let (wl, draw) = rule_judge_wl_for_node(result);
-                return ExtensionKind::Terminal {
+                return ExtensionKind::PathTerminal {
                     wl,
                     draw,
                     plies_left: cycle_length,
                 };
             }
         }
-        if !board.has_mating_material() || history.last().rule60_ply() >= 120 {
-            return ExtensionKind::Terminal {
+        if history.last().rule60_ply() >= 120 {
+            return ExtensionKind::PathTerminal {
                 wl: 0.0,
                 draw: 1.0,
                 plies_left: 0.0,
@@ -80,7 +90,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
             GameResult::Undecided => {}
             result => {
                 let (wl, draw) = terminal_wl_for_node(result, history.last().is_black_to_move());
-                return ExtensionKind::Terminal {
+                return ExtensionKind::PathTerminal {
                     wl,
                     draw,
                     plies_left: 0.0,
@@ -134,12 +144,28 @@ mod tests {
 
         assert_eq!(
             classify_extension(&history, 1),
-            ExtensionKind::Terminal {
+            ExtensionKind::SharedTerminal {
                 wl: 1.0,
                 draw: 0.0,
                 plies_left: 0.0,
             }
         );
+    }
+
+    #[test]
+    fn rule60_terminal_is_path_local() {
+        let state =
+            GameState::from_fen_moves("4k4/9/9/9/9/9/9/9/R8/4K4 w - - 120 1", &[] as &[&str]).expect("rule60 fen");
+        let history = PositionHistory::from_positions(state.positions());
+
+        assert!(matches!(
+            classify_extension(&history, 0),
+            ExtensionKind::PathTerminal {
+                wl: 0.0,
+                draw: 1.0,
+                plies_left: 0.0,
+            }
+        ));
     }
 
     /// 白方长将、终局落在**白方行棋**时：`rule_judge` 不能再经绝对颜色转换，
@@ -169,7 +195,7 @@ mod tests {
 
         let depth = history.len().saturating_sub(1).max(1);
         match classify_extension(&history, depth) {
-            ExtensionKind::Terminal { wl, draw, .. } => {
+            ExtensionKind::PathTerminal { wl, draw, .. } => {
                 assert_eq!(draw, 0.0);
                 assert_eq!(wl, 1.0, "escape from perpetual check must be winning for escaper");
             }

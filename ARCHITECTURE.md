@@ -50,7 +50,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 | 模块 | 职责 | 当前状态 |
 | --- | --- | --- |
 | `crates/xiangqi_core` | 唯一规则真相：棋盘、合法着、FEN、Position、history、RuleJudge | 已完成 |
-| `crates/engin/src/search` | 唯一的 LC3-style tree MCTS 与正式 UCI 主线；`tree.rs` 直接包含 node、edge、repository 与 tree reuse | 已接入 UCI，持续验证 |
+| `crates/engin/src/search` | stream MCGS；`graph.rs` 直接包含 node、edge、repository 与跨回合 graph reuse | `feat/mcgs` 研究实现 |
 | `crates/engin/src/search/time.rs` | 单一 stream 的固定中性时钟分配 | 已接入 UCI |
 | `crates/engin/src/neural` | 124-plane 编码、policy 映射、ONNX、缓存 | stream 使用的 backend 契约 |
 | `nn/` | px0 record、训练、checkpoint、ONNX 导出 | 独立 Python 子项目 |
@@ -59,18 +59,18 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 
 仓库只维护 stream 搜索。`Engine` 直接拥有其搜索会话，不保留 `SearchBase`、`SearchFactory` 或 classic 对照实现。`UniformBackend` 仅用于 stream 测试；正式 UCI 必须加载 ONNX。
 
-`search/time.rs` 独立于 tree/worker：只在 session 启动时计算 deadline、在 drain 后归还未用时间；
+`search/time.rs` 独立于 graph/worker：只在 session 启动时计算 deadline、在 drain 后归还未用时间；
 它不是第二套搜索实现，也不提供策略化调参。
 
 ## Stream
 
-- repository 是一个 64 分片的 key-value map，使用 `parent-key + move` 的 tree key；首版不做 DAG/TT。跨回合只保留已走主线及其子树，GC 先收集不可达 sibling subtree 的 key，再按分片批量删除；不为每个 root 创建独立 map。
+- repository 是一个 64 分片的 key-value map。MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。环、重复与 rule60 等路径终局只在 variation 内裁决，不创建重复 node，也不标记 shared node；每次结果作为实际入边的一次 local 样本，不能由首次路径永久覆盖。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
-- Engine session 常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/tree view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
+- Engine session 常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
   session 启动时按固定中性的 px0 预算转换为不可变 deadline，job drain 后才归还剩余时间。
-- tree reuse 会保留已走主线及旧根，并遍历 repository 删除不可达兄弟子树；UCI/Watchdog 已输出最小 info 与一次 bestmove。
-- `MultiPV` 只在 watchdog 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 tree、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCTS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
+- graph reuse 保留已走 root 供悔棋，并从所有 retained root 遍历可达 node 后批量 GC；UCI/Watchdog 已输出最小 info 与一次 bestmove。
+- `MultiPV` 只在 watchdog 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCGS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
 stream 的 selection 使用 px0 PUCT/N-Q-P 语义，不是 LC3 Policy 的正式公式。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认采用固定 `CPuct=e≈2.7182817` 与 `CPuctFactor=0`，使低先验候选可较早获得验证、又不在后期持续打散已有证据；`CPuctBase` 在此默认下无效。`FpuReduction=0.330` 为 LC0 对照值，原 X7 `1.0/0.220` 与动态 cPUCT 形状均保留为实验基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
 

@@ -2,7 +2,7 @@
 //!
 //! 参考：LC3 Overview 的 "Search" / "WatchdogWorker"：
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>.
-//! tree 替换对照 px0 `NodeTree::ResetToPosition`
+//! graph 替换对照 px0 `NodeTree::ResetToPosition`
 //! （`src/search/classic/node.cc:484-520`）。
 
 use std::sync::Arc;
@@ -15,8 +15,8 @@ use crate::callbacks::{ThinkingInfo, Wdl};
 use crate::neural::backend::Backend;
 
 use super::{
-    GcStats, NodeKey, NodeRepository, Search, SearchConfig, SearchControl, SearchGeneration, SearchLimits,
-    SearchParams, Stats, Tree, WorkerPool, best_mate, best_move_filtered, principal_variation_filtered, root_stats,
+    GcStats, NodeKey, NodeRepository, Search, SearchConfig, SearchControl, SearchGeneration, SearchGraph, SearchLimits,
+    SearchParams, Stats, WorkerPool, best_mate, best_move_filtered, principal_variation_filtered, root_stats,
     root_variations,
 };
 
@@ -129,10 +129,10 @@ pub struct SearchResult {
     pub principal_variation: Vec<xiangqi_core::Move>,
 }
 
-/// 可复用 stream 状态：backend、保留 tree、generation 与 worker pool。
+/// 可复用 stream 状态：backend、保留 graph、generation 与 worker pool。
 pub(crate) struct SearchState {
     backend: Arc<dyn Backend>,
-    tree: Option<Tree>,
+    graph: Option<SearchGraph>,
     next_generation: u64,
     multi_pv: usize,
     mini_batch_size: usize,
@@ -195,7 +195,7 @@ impl SearchState {
         let worker_pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
         Self {
             backend,
-            tree: None,
+            graph: None,
             next_generation: 0,
             multi_pv: 1,
             mini_batch_size: config.eval_batch_size,
@@ -237,14 +237,14 @@ impl SearchState {
         self.multi_pv = multi_pv;
     }
 
-    /// 在 session stop/drain 后写入完整 UCI history。保留前缀复用 tree；无关线路
+    /// 在 session stop/drain 后写入完整 UCI history。保留前缀复用 graph；无关线路
     /// 重建 repository。参考 px0 `NodeTree::ResetToPosition`
     /// （`src/search/classic/node.cc:484-520`）。
     pub fn set_position(&mut self, history: Arc<PositionHistory>) -> Result<GcStats, EnginError> {
-        match self.tree.as_mut() {
-            Some(tree) => tree.reset_to_history_after_drain(history),
+        match self.graph.as_mut() {
+            Some(graph) => graph.reset_to_history_after_drain(history),
             None => {
-                self.tree = Some(Tree::new(history));
+                self.graph = Some(SearchGraph::new(history));
                 Ok(GcStats::default())
             }
         }
@@ -253,15 +253,15 @@ impl SearchState {
     /// 启动一个独占 job。
     ///
     /// 只有当前 job drain 并归还 worker 后，下一次 `set_position` 才能
-    /// prune 或 rewind 保留树；这是 reservation 的边界。
+    /// prune 或 rewind 保留图；这是 reservation 的边界。
     pub fn begin_search(&mut self, searchmoves: &[String]) -> Result<RunningSearch, EnginError> {
-        let tree = self
-            .tree
+        let graph = self
+            .graph
             .as_ref()
             .ok_or(EnginError::Uci("position is not configured".into()))?;
         // px0 `StringsToMovelist`（`src/search/classic/wrapper.cc:78-100`）：保留合法
         // root 请求；非空列表中没有合法着时拒绝。
-        let board = tree.root_history().last().board();
+        let board = graph.root_history().last().board();
         let legal_moves = board.generate_legal_moves();
         let root_move_filter: Vec<_> = searchmoves
             .iter()
@@ -284,14 +284,14 @@ impl SearchState {
         if !self.worker_pool.matches_config(self.backend.as_ref(), &config) {
             self.worker_pool = Arc::new(WorkerPool::new(self.backend.as_ref(), &config));
         }
-        let search = Search::new_with_tree_in_pool(
+        let search = Search::new_with_graph_in_pool(
             Arc::clone(&self.backend),
             SearchGeneration(self.next_generation),
-            tree,
+            graph,
             config,
             Arc::clone(&self.worker_pool),
         );
-        let root_is_black = tree.root_history().last().is_black_to_move();
+        let root_is_black = graph.root_history().last().is_black_to_move();
         Ok(RunningSearch {
             search,
             root_is_black,
@@ -312,7 +312,7 @@ mod tests {
     use super::{SearchLimits, SearchState};
 
     #[test]
-    fn state_reuses_tree_and_worker_pool_between_completed_searches() {
+    fn state_reuses_graph_and_worker_pool_between_completed_searches() {
         let mut state = SearchState::new(Arc::new(UniformBackend::default()));
         let worker_pool = Arc::clone(&state.worker_pool);
         let start = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -332,7 +332,7 @@ mod tests {
         let next = GameState::from_fen_moves(STARTPOS_FEN, &[best.to_string()]).expect("played move");
         state
             .set_position(Arc::new(PositionHistory::from_positions(next.positions())))
-            .expect("advance tree");
+            .expect("advance graph");
         let second = state
             .begin_search(&[])
             .expect("start second")

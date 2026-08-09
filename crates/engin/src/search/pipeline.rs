@@ -22,8 +22,8 @@ use crate::neural::{BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLI
 
 use super::extension::{ExtensionKind, classify_extension};
 use super::{
-    BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGeneration, SearchParams, Tree,
-    network_wl_to_node, select_edge_from_node,
+    BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGeneration, SearchGraph,
+    SearchParams, ValueDelta, Variation, network_wl_to_node, select_edge_from_node,
 };
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
@@ -46,7 +46,7 @@ impl SearchLimits {
 }
 
 /// 一条队列的 benchmark 等待时间快照。
-/// 参考：LC3 Overview 的 "Stats Collection"。
+#[cfg(feature = "benchmark")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueueStats {
     pub samples: u64,
@@ -54,10 +54,11 @@ pub struct QueueStats {
     pub max_wait_ns: u64,
 }
 
-/// 正式搜索计数与仅 benchmark 使用的流水线遥测。
+/// 正式搜索计数。
 /// 参考：LC3 Overview 的 "Stats Collection"。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Stats {
+    #[cfg(feature = "benchmark")]
     pub submitted_playouts: u64,
     pub completed_playouts: u64,
     /// 已完成 leaf 的平均深度，root 深度为一；语义对应 px0 `ThinkingInfo::depth`，
@@ -65,6 +66,7 @@ pub struct Stats {
     pub average_depth: u64,
     /// 最深已完成 leaf，语义对应 px0 `seldepth`。
     pub max_depth: u64,
+    #[cfg(feature = "benchmark")]
     pub collisions: u64,
     pub network_batches: u64,
     pub network_evaluations: u64,
@@ -72,15 +74,22 @@ pub struct Stats {
     pub cache_hits: u64,
     /// 本次搜索观察到的最大 `BackendComputation` batch。
     pub network_batch_size_max: u64,
+    #[cfg(feature = "benchmark")]
     pub peak_in_flight: u64,
     /// 按距 root 的 variation 深度统计 collision。
+    #[cfg(feature = "benchmark")]
     pub collisions_by_depth: Vec<u64>,
+    #[cfg(feature = "benchmark")]
     pub gather_queue: QueueStats,
+    #[cfg(feature = "benchmark")]
     pub eval_queue: QueueStats,
+    #[cfg(feature = "benchmark")]
     pub nn_queue: QueueStats,
+    #[cfg(feature = "benchmark")]
     pub backprop_queue: QueueStats,
 }
 
+#[cfg(feature = "benchmark")]
 #[derive(Default)]
 struct QueueMetrics {
     samples: AtomicU64,
@@ -88,6 +97,7 @@ struct QueueMetrics {
     max_wait_ns: AtomicU64,
 }
 
+#[cfg(feature = "benchmark")]
 impl QueueMetrics {
     /// 记录一次 event 交接；仅 benchmark 启用。
     /// 参考：LC3 Overview 的 "Stats Collection"。
@@ -143,9 +153,6 @@ pub struct SearchConfig {
     pub backprop_workers: usize,
     /// UCI `go searchmoves` 对应 px0 `root_move_filter_`（空表示不限制）。
     pub root_move_filter: Vec<Move>,
-    /// 启用仅 benchmark 使用的时间/分布计数。
-    /// 参考：LC3 Overview 的 "Stats Collection"。
-    pub benchmark_telemetry: bool,
 }
 
 impl Default for SearchConfig {
@@ -158,7 +165,6 @@ impl Default for SearchConfig {
             eval_workers: 4,
             backprop_workers: 1,
             root_move_filter: Vec::new(),
-            benchmark_telemetry: false,
         }
     }
 }
@@ -200,7 +206,6 @@ impl SearchConfig {
             gather_workers: self.gather_workers,
             eval_workers: self.eval_workers,
             backprop_workers: self.backprop_workers,
-            benchmark_telemetry: self.benchmark_telemetry,
         }
     }
 }
@@ -213,7 +218,6 @@ struct ResolvedSearchConfig {
     gather_workers: usize,
     eval_workers: usize,
     backprop_workers: usize,
-    benchmark_telemetry: bool,
 }
 
 enum GatherCommand {
@@ -386,27 +390,35 @@ impl Drop for WorkerPool {
 struct Shared {
     backend: Arc<dyn Backend>,
     repository: Arc<NodeRepository>,
-    root_key: NodeKey,
     generation: SearchGeneration,
     params: SearchParams,
-    benchmark_telemetry: bool,
     root_move_filter: Vec<Move>,
+    /// 当前 root 的 history 已裁决结束，但不能污染同 board 的共享 node。
+    root_path_terminal: AtomicBool,
     stopping: AtomicBool,
     outstanding: AtomicUsize,
+    #[cfg(feature = "benchmark")]
     submitted: AtomicU64,
+    #[cfg(feature = "benchmark")]
     peak_in_flight: AtomicU64,
     completed: AtomicU64,
     completed_depth: AtomicU64,
     max_depth: AtomicU64,
+    #[cfg(feature = "benchmark")]
     collisions: AtomicU64,
     network_batches: AtomicU64,
     network_evaluations: AtomicU64,
     cache_hits: AtomicU64,
     network_batch_size_max: AtomicU64,
+    #[cfg(feature = "benchmark")]
     collisions_by_depth: Mutex<Vec<u64>>,
+    #[cfg(feature = "benchmark")]
     gather_queue: QueueMetrics,
+    #[cfg(feature = "benchmark")]
     eval_queue: QueueMetrics,
+    #[cfg(feature = "benchmark")]
     nn_queue: QueueMetrics,
+    #[cfg(feature = "benchmark")]
     backprop_queue: QueueMetrics,
     error: Mutex<Option<EnginError>>,
     idle_lock: Mutex<()>,
@@ -431,15 +443,19 @@ impl Shared {
 
     fn cancel_and_finish(&self, event: NodeEvent, collision: bool) {
         event.cancel();
+        #[cfg(feature = "benchmark")]
         if collision {
             self.collisions.fetch_add(1, Ordering::AcqRel);
         }
+        #[cfg(not(feature = "benchmark"))]
+        let _ = collision;
         self.finish(false);
     }
 
     /// 正在评估的叶子不重复计算；直接归还这条未完成路径的 reservation。
     /// 参考：LC3 Overview 的 Gather/Eval worker 所有权边界。
     fn cancel_collision(&self, event: NodeEvent) {
+        #[cfg(feature = "benchmark")]
         self.record_collision_depths(&[event.variation.moves().len()]);
         self.cancel_and_finish(event, true);
     }
@@ -469,9 +485,8 @@ impl Shared {
     /// Non-blocking enqueue: `try_send` + yield instead of parking on a full
     /// queue so Gather can keep polling `stopping` and stay schedulable.
     fn send_eval(&self, mut event: NodeEvent) {
-        if self.benchmark_telemetry {
-            event.mark_queued();
-        }
+        #[cfg(feature = "benchmark")]
+        event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 self.cancel_claimed_evaluation(event);
@@ -492,9 +507,8 @@ impl Shared {
     }
 
     fn send_backprop(&self, mut event: BackpropEvent) {
-        if self.benchmark_telemetry {
-            event.mark_queued();
-        }
+        #[cfg(feature = "benchmark")]
+        event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 event.cancel();
@@ -518,61 +532,38 @@ impl Shared {
 
     fn stats(&self) -> Stats {
         let completed_playouts = self.completed.load(Ordering::Acquire);
-        let (
-            submitted_playouts,
-            peak_in_flight,
-            collisions_by_depth,
-            gather_queue,
-            eval_queue,
-            nn_queue,
-            backprop_queue,
-        ) = if self.benchmark_telemetry {
-            (
-                self.submitted.load(Ordering::Acquire),
-                self.peak_in_flight.load(Ordering::Acquire),
-                self.collisions_by_depth.lock().clone(),
-                self.gather_queue.snapshot(),
-                self.eval_queue.snapshot(),
-                self.nn_queue.snapshot(),
-                self.backprop_queue.snapshot(),
-            )
-        } else {
-            (
-                0,
-                0,
-                Vec::new(),
-                QueueStats::default(),
-                QueueStats::default(),
-                QueueStats::default(),
-                QueueStats::default(),
-            )
-        };
         Stats {
-            submitted_playouts,
+            #[cfg(feature = "benchmark")]
+            submitted_playouts: self.submitted.load(Ordering::Acquire),
             completed_playouts,
             average_depth: self.completed_depth.load(Ordering::Acquire) / completed_playouts.max(1),
             max_depth: self.max_depth.load(Ordering::Acquire),
+            #[cfg(feature = "benchmark")]
             collisions: self.collisions.load(Ordering::Acquire),
             network_batches: self.network_batches.load(Ordering::Acquire),
             network_evaluations: self.network_evaluations.load(Ordering::Acquire),
             cache_hits: self.cache_hits.load(Ordering::Acquire),
             network_batch_size_max: self.network_batch_size_max.load(Ordering::Acquire),
-            peak_in_flight,
-            collisions_by_depth,
-            gather_queue,
-            eval_queue,
-            nn_queue,
-            backprop_queue,
+            #[cfg(feature = "benchmark")]
+            peak_in_flight: self.peak_in_flight.load(Ordering::Acquire),
+            #[cfg(feature = "benchmark")]
+            collisions_by_depth: self.collisions_by_depth.lock().clone(),
+            #[cfg(feature = "benchmark")]
+            gather_queue: self.gather_queue.snapshot(),
+            #[cfg(feature = "benchmark")]
+            eval_queue: self.eval_queue.snapshot(),
+            #[cfg(feature = "benchmark")]
+            nn_queue: self.nn_queue.snapshot(),
+            #[cfg(feature = "benchmark")]
+            backprop_queue: self.backprop_queue.snapshot(),
         }
     }
 
     /// Adds per-depth collision counts without changing selection behavior.
     ///
     /// Reference: LC3 overview, "Stats Collection".
+    #[cfg(feature = "benchmark")]
     fn record_collision_depths(&self, depths: &[usize]) {
-        if !self.benchmark_telemetry {
-            return;
-        }
         let mut counts = self.collisions_by_depth.lock();
         for &depth in depths {
             if counts.len() <= depth {
@@ -604,25 +595,25 @@ impl Search {
         root_history: Arc<PositionHistory>,
         config: SearchConfig,
     ) -> Self {
-        let tree = Tree::new(root_history);
-        Self::new_with_tree(backend, generation, &tree, config)
+        let graph = SearchGraph::new(root_history);
+        Self::new_with_graph(backend, generation, &graph, config)
     }
 
-    /// 从保留树创建独立搜索；该搜索自己创建、销毁 worker pool。
-    pub fn new_with_tree(
+    /// 从保留图创建独立搜索；该搜索自己创建、销毁 worker pool。
+    pub fn new_with_graph(
         backend: Arc<dyn Backend>,
         generation: SearchGeneration,
-        tree: &Tree,
+        graph: &SearchGraph,
         config: SearchConfig,
     ) -> Self {
         let worker_pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
-        Self::new_with_tree_in_pool(backend, generation, tree, config, worker_pool)
+        Self::new_with_graph_in_pool(backend, generation, graph, config, worker_pool)
     }
 
-    pub(crate) fn new_with_tree_in_pool(
+    pub(crate) fn new_with_graph_in_pool(
         backend: Arc<dyn Backend>,
         generation: SearchGeneration,
-        tree: &Tree,
+        graph: &SearchGraph,
         config: SearchConfig,
         worker_pool: Arc<WorkerPool>,
     ) -> Self {
@@ -632,32 +623,39 @@ impl Search {
         let (gather_tx, gather_rx) = bounded(resolved.queue_capacity);
         let (eval_tx, eval_rx) = bounded(resolved.queue_capacity);
         let (backprop_tx, backprop_rx) = bounded(resolved.queue_capacity);
-        let root_history = Arc::clone(tree.root_history());
-        let root_key = tree.root_key();
+        let root_history = Arc::clone(graph.root_history());
+        let root_key = graph.root_key();
         let shared = Arc::new(Shared {
             backend,
-            repository: Arc::clone(tree.repository()),
-            root_key,
+            repository: Arc::clone(graph.repository()),
             generation,
             params: resolved.params,
-            benchmark_telemetry: resolved.benchmark_telemetry,
             root_move_filter: config.root_move_filter.clone(),
+            root_path_terminal: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
+            #[cfg(feature = "benchmark")]
             submitted: AtomicU64::new(0),
+            #[cfg(feature = "benchmark")]
             peak_in_flight: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             completed_depth: AtomicU64::new(0),
             max_depth: AtomicU64::new(0),
+            #[cfg(feature = "benchmark")]
             collisions: AtomicU64::new(0),
             network_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             network_batch_size_max: AtomicU64::new(0),
+            #[cfg(feature = "benchmark")]
             collisions_by_depth: Mutex::new(Vec::new()),
+            #[cfg(feature = "benchmark")]
             gather_queue: QueueMetrics::default(),
+            #[cfg(feature = "benchmark")]
             eval_queue: QueueMetrics::default(),
+            #[cfg(feature = "benchmark")]
             nn_queue: QueueMetrics::default(),
+            #[cfg(feature = "benchmark")]
             backprop_queue: QueueMetrics::default(),
             error: Mutex::new(None),
             idle_lock: Mutex::new(()),
@@ -747,16 +745,18 @@ impl Search {
             return Err(EnginError::PortIncomplete("stale stream search generation"));
         }
         let outstanding = self.shared.outstanding.fetch_add(1, Ordering::AcqRel) + 1;
-        if self.shared.benchmark_telemetry {
+        #[cfg(feature = "benchmark")]
+        {
             self.shared.submitted.fetch_add(1, Ordering::Relaxed);
             self.shared
                 .peak_in_flight
                 .fetch_max(outstanding as u64, Ordering::Relaxed);
         }
+        #[cfg(not(feature = "benchmark"))]
+        let _ = outstanding;
         let mut event = event;
-        if self.shared.benchmark_telemetry {
-            event.mark_queued();
-        }
+        #[cfg(feature = "benchmark")]
+        event.mark_queued();
         loop {
             if self.shared.stopping.load(Ordering::Acquire) {
                 self.shared.cancel_and_finish(event, false);
@@ -798,7 +798,7 @@ impl Search {
                 .repository
                 .get(self.root_key)
                 .map(|root| root.expansion_state());
-            if root_state == Some(ExpansionState::Terminal) {
+            if root_state == Some(ExpansionState::Terminal) || self.shared.root_path_terminal.load(Ordering::Acquire) {
                 break;
             }
             if root_state != Some(ExpansionState::Expanded) {
@@ -834,7 +834,7 @@ impl Search {
             }
         }
         // 请求停止是正常搜索结果。`wait_for_idle()` 已保证每个入队 event 都已完成或取消
-        // reservation，因此调用方可安全快照部分 tree。
+        // reservation，因此调用方可安全快照部分 graph。
         self.wait_for_idle()?;
         Ok(self.stats())
     }
@@ -876,12 +876,20 @@ impl Drop for Search {
 fn gather_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
+            #[cfg(feature = "benchmark")]
             Ok(mut event) => {
-                if shared.benchmark_telemetry
-                    && let Some(wait) = event.take_queue_wait()
-                {
+                #[cfg(feature = "benchmark")]
+                if let Some(wait) = event.take_queue_wait() {
                     shared.gather_queue.record(wait);
                 }
+                if shared.stopping.load(Ordering::Acquire) {
+                    shared.cancel_and_finish(event, false);
+                    continue;
+                }
+                process_gather_event(&shared, event);
+            }
+            #[cfg(not(feature = "benchmark"))]
+            Ok(event) => {
                 if shared.stopping.load(Ordering::Acquire) {
                     shared.cancel_and_finish(event, false);
                     continue;
@@ -926,24 +934,42 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                 return;
             }
             ExpansionState::Terminal => {
-                let (wl, draw) = node.terminal_wl().expect("terminal stream wl");
-                shared.send_backprop(BackpropEvent::evaluation(
-                    event,
-                    wl,
-                    draw,
-                    node.terminal_plies_left().expect("terminal stream plies"),
-                ));
+                shared.send_backprop(BackpropEvent::evaluation(event));
                 return;
             }
             ExpansionState::Expanded => {
                 let depth = event.variation.moves().len();
-                let edge_index = select_edge_from_node(node.as_ref(), depth, &shared.params, &shared.root_move_filter)
-                    .expect("expanded stream node must have an edge");
+                let edge_index = select_edge_from_node(
+                    &shared.repository,
+                    node.as_ref(),
+                    depth,
+                    &shared.params,
+                    &shared.root_move_filter,
+                )
+                .expect("expanded stream node must have an edge");
                 let reservation = node.reserve_edge(edge_index).expect("selected stream edge");
-                let child_key = event.node_key.child(reservation.mv());
-                event = event.descend(child_key, reservation);
+                let graph_child = event.variation.child_board_key(reservation.mv());
+                if event.node_path().contains(&graph_child) {
+                    let value = cycle_value(&event.variation, reservation.mv());
+                    shared.send_backprop(BackpropEvent::path_terminal(event.descend_cycle(reservation), value));
+                    return;
+                }
+                node.edges()[edge_index].bind_child_key(graph_child);
+                event = event.descend(graph_child, reservation);
             }
         }
+    }
+}
+
+/// MCGS 的环只在当前 variation 内裁决，不能把历史相关结果写入共享 node。优先复用
+/// px0 风格的 extension 判定；尚未达到 two-fold 门槛的闭环按首版约定视为本地和棋。
+fn cycle_value(variation: &Variation, mv: Move) -> ValueDelta {
+    let mut history = variation.replay_history();
+    history.append(mv);
+    match classify_extension(&history, variation.moves().len() + 1) {
+        ExtensionKind::SharedTerminal { wl, draw, plies_left }
+        | ExtensionKind::PathTerminal { wl, draw, plies_left } => ValueDelta::with_plies_left(wl, draw, plies_left),
+        ExtensionKind::Evaluate => ValueDelta::with_plies_left(0.0, 1.0, 0.0),
     }
 }
 
@@ -954,20 +980,17 @@ type NnReply = Result<(Vec<f32>, Vec<f32>, f32), EnginError>;
 struct NnRequest {
     planes: Vec<f32>,
     reply: Sender<NnReply>,
+    #[cfg(feature = "benchmark")]
     queued_at: Option<Instant>,
 }
 
 impl NnRequest {
-    /// Records the NN queue handoff when benchmark telemetry is enabled.
-    ///
-    /// Reference: LC3 overview, "Stats Collection".
+    #[cfg(feature = "benchmark")]
     fn mark_queued(&mut self) {
         self.queued_at = Some(Instant::now());
     }
 
-    /// Returns the NN queue delay for benchmark reporting.
-    ///
-    /// Reference: LC3 overview, "Stats Collection".
+    #[cfg(feature = "benchmark")]
     fn take_queue_wait(&mut self) -> Option<Duration> {
         self.queued_at.take().map(|queued_at| queued_at.elapsed())
     }
@@ -1001,12 +1024,18 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender
         poll_nn_completions(&shared, &mut waiting);
 
         match receiver.recv_timeout(RECEIVE_POLL) {
+            #[cfg(feature = "benchmark")]
             Ok(mut event) => {
-                if shared.benchmark_telemetry
-                    && let Some(wait) = event.take_queue_wait()
-                {
+                #[cfg(feature = "benchmark")]
+                if let Some(wait) = event.take_queue_wait() {
                     shared.eval_queue.record(wait);
                 }
+                if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
+                    shared.fail(error);
+                }
+            }
+            #[cfg(not(feature = "benchmark"))]
+            Ok(event) => {
                 if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
                     shared.fail(error);
                 }
@@ -1110,12 +1139,20 @@ fn handle_eval_event(
     let history = event.variation.replay_history();
     let depth = event.variation.moves().len();
     match classify_extension(&history, depth) {
-        ExtensionKind::Terminal { wl, draw, plies_left } => {
+        ExtensionKind::SharedTerminal { wl, draw, plies_left } => {
             node.mark_terminal(wl, draw, plies_left);
-            shared
-                .repository
-                .propagate_proven_bounds(event.node_path(), shared.root_key);
-            shared.send_backprop(BackpropEvent::evaluation(event, wl, draw, plies_left));
+            shared.send_backprop(BackpropEvent::evaluation(event));
+            Ok(())
+        }
+        ExtensionKind::PathTerminal { wl, draw, plies_left } => {
+            let value = ValueDelta::with_plies_left(wl, draw, plies_left);
+            node.abort_evaluation();
+            if event.reservations.is_empty() {
+                shared.root_path_terminal.store(true, Ordering::Release);
+                shared.finish(true);
+            } else {
+                shared.send_backprop(BackpropEvent::path_terminal(event.discard_leaf_node(), value));
+            }
             Ok(())
         }
         ExtensionKind::Evaluate => {
@@ -1136,6 +1173,7 @@ fn handle_eval_event(
                 NnRequest {
                     planes,
                     reply: reply_tx,
+                    #[cfg(feature = "benchmark")]
                     queued_at: None,
                 },
             ) {
@@ -1159,9 +1197,8 @@ fn handle_eval_event(
 }
 
 fn send_nn_request(shared: &Shared, nn_tx: &Sender<NnRequest>, mut request: NnRequest) -> Result<(), EnginError> {
-    if shared.benchmark_telemetry {
-        request.mark_queued();
-    }
+    #[cfg(feature = "benchmark")]
+    request.mark_queued();
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             return Err(EnginError::PortIncomplete("stream nn stopping"));
@@ -1197,7 +1234,7 @@ fn complete_nn_item(
     publish_eval(shared, item.event, item.node, item.legal_moves, eval)
 }
 
-/// 在 backend 完成结果写入 tree 前校验它。
+/// 在 backend 完成结果写入 graph 前校验它。
 ///
 /// 参考：ARCHITECTURE 固定的 `WDL + moves-left` backend 契约。worker 失败必须通过
 /// LC3 取消路径返回；持有 owned event 后不得 panic。
@@ -1223,13 +1260,15 @@ fn publish_eval(
         cancel_evaluation(shared, event, node);
         return Err(EnginError::Onnx("stream backend evaluation is invalid".into()));
     }
-    node.publish_edges(legal_moves.iter().copied().zip(eval.policies.iter().copied()).collect());
-    shared.send_backprop(BackpropEvent::evaluation(
-        event,
+    node.set_graph_value(ValueDelta::with_plies_left(
         network_wl_to_node(eval.wl),
         eval.d,
         eval.plies_left,
     ));
+    // 先发布共享基值，再把 node 变为 Expanded；否则并发 Gather 可能在两者之间
+    // 完成一次回传，而那次幂等重算会看不到基值。
+    node.publish_edges(legal_moves.iter().copied().zip(eval.policies.iter().copied()).collect());
+    shared.send_backprop(BackpropEvent::evaluation(event));
     Ok(())
 }
 
@@ -1279,20 +1318,33 @@ fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>) {
 fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usize) {
     let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
     loop {
+        #[cfg(feature = "benchmark")]
         let mut first = match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(request) => request,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        #[cfg(not(feature = "benchmark"))]
+        let first = match receiver.recv_timeout(RECEIVE_POLL) {
+            Ok(request) => request,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        #[cfg(feature = "benchmark")]
         record_nn_queue_wait(&shared, &mut first);
         let mut requests = vec![first];
         while requests.len() < batch_size {
             match receiver.try_recv() {
+                #[cfg(feature = "benchmark")]
                 Ok(mut request) => {
+                    #[cfg(feature = "benchmark")]
                     record_nn_queue_wait(&shared, &mut request);
                     requests.push(request);
                 }
+                #[cfg(not(feature = "benchmark"))]
+                Ok(request) => requests.push(request),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
@@ -1329,10 +1381,9 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
     }
 }
 
+#[cfg(feature = "benchmark")]
 fn record_nn_queue_wait(shared: &Shared, request: &mut NnRequest) {
-    if shared.benchmark_telemetry
-        && let Some(wait) = request.take_queue_wait()
-    {
+    if let Some(wait) = request.take_queue_wait() {
         shared.nn_queue.record(wait);
     }
 }
@@ -1358,21 +1409,39 @@ fn persistent_nn_worker(commands: Receiver<NnCommand>, job_done: Sender<()>, bat
 fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
+            #[cfg(feature = "benchmark")]
             Ok(mut first) => {
-                if shared.benchmark_telemetry
-                    && let Some(wait) = first.take_queue_wait()
-                {
+                #[cfg(feature = "benchmark")]
+                if let Some(wait) = first.take_queue_wait() {
                     shared.backprop_queue.record(wait);
                 }
                 let mut events = vec![first];
                 for mut event in receiver.try_iter() {
-                    if shared.benchmark_telemetry
-                        && let Some(wait) = event.take_queue_wait()
-                    {
+                    #[cfg(feature = "benchmark")]
+                    if let Some(wait) = event.take_queue_wait() {
                         shared.backprop_queue.record(wait);
                     }
                     events.push(event);
                 }
+                if shared.stopping.load(Ordering::Acquire) {
+                    for event in events {
+                        event.cancel();
+                        shared.finish(false);
+                    }
+                } else {
+                    let result = BackpropEvent::complete_batch(events, &shared.repository);
+                    shared
+                        .completed_depth
+                        .fetch_add(result.completed_depth, Ordering::AcqRel);
+                    shared.max_depth.fetch_max(result.max_depth, Ordering::AcqRel);
+                    for _ in 0..result.completed_playouts {
+                        shared.finish(true);
+                    }
+                }
+            }
+            #[cfg(not(feature = "benchmark"))]
+            Ok(first) => {
+                let events: Vec<_> = std::iter::once(first).chain(receiver.try_iter()).collect();
                 if shared.stopping.load(Ordering::Acquire) {
                     for event in events {
                         event.cancel();
@@ -1503,16 +1572,14 @@ mod tests {
         pipeline.stop_and_finish();
     }
 
+    #[cfg(feature = "benchmark")]
     #[test]
     fn benchmark_telemetry_reports_pipeline_handoffs() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
             SearchGeneration(22),
             startpos_history(),
-            SearchConfig {
-                benchmark_telemetry: true,
-                ..SearchConfig::default()
-            },
+            SearchConfig::default(),
         );
 
         let stats = pipeline.run_playouts(16).expect("benchmark playouts");
@@ -1657,6 +1724,31 @@ mod tests {
     }
 
     #[test]
+    fn path_terminal_root_does_not_mark_the_shared_node() {
+        let state =
+            GameState::from_fen_moves("4k4/9/9/9/9/9/9/9/R8/4K4 w - - 120 1", &[] as &[&str]).expect("rule60 root");
+        let mut pipeline = Search::new(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(26),
+            Arc::new(PositionHistory::from_positions(state.positions())),
+            SearchConfig::default(),
+        );
+
+        let stats = pipeline.run_playouts(8).expect("path terminal search");
+
+        assert_eq!(stats.completed_playouts, 1);
+        assert_eq!(
+            pipeline
+                .repository()
+                .get(pipeline.root_key())
+                .expect("root exists")
+                .expansion_state(),
+            ExpansionState::Unexpanded
+        );
+        pipeline.stop_and_finish();
+    }
+
+    #[test]
     fn fixed_playout_root_contract() {
         let count = 64;
         let mut workers = Search::new(
@@ -1724,7 +1816,7 @@ mod tests {
     #[test]
     fn failed_eval_enqueue_releases_the_claimed_node() {
         let history = startpos_history();
-        let root_key = crate::search::NodeKey::root(history.last().hash());
+        let root_key = crate::search::NodeKey::board(history.last().board().hash());
         let repository = Arc::new(NodeRepository::default());
         let root = repository.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
@@ -1735,27 +1827,34 @@ mod tests {
         let shared = Shared {
             backend: Arc::new(UniformBackend::default()),
             repository,
-            root_key,
             generation: SearchGeneration(30),
             params: SearchParams::default(),
-            benchmark_telemetry: false,
             root_move_filter: Vec::new(),
+            root_path_terminal: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(1),
+            #[cfg(feature = "benchmark")]
             submitted: AtomicU64::new(0),
+            #[cfg(feature = "benchmark")]
             peak_in_flight: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             completed_depth: AtomicU64::new(0),
             max_depth: AtomicU64::new(0),
+            #[cfg(feature = "benchmark")]
             collisions: AtomicU64::new(0),
             network_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             network_batch_size_max: AtomicU64::new(0),
+            #[cfg(feature = "benchmark")]
             collisions_by_depth: Mutex::new(Vec::new()),
+            #[cfg(feature = "benchmark")]
             gather_queue: super::QueueMetrics::default(),
+            #[cfg(feature = "benchmark")]
             eval_queue: super::QueueMetrics::default(),
+            #[cfg(feature = "benchmark")]
             nn_queue: super::QueueMetrics::default(),
+            #[cfg(feature = "benchmark")]
             backprop_queue: super::QueueMetrics::default(),
             error: Mutex::new(None),
             idle_lock: Mutex::new(()),
@@ -1772,13 +1871,13 @@ mod tests {
     }
 
     #[test]
-    fn completed_search_can_reuse_a_tree_at_its_played_child() {
+    fn completed_search_can_reuse_a_graph_at_its_played_child() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
-        let mut tree = super::Tree::new(history);
+        let mut tree = super::SearchGraph::new(history);
         let backend = Arc::new(UniformBackend::default()) as Arc<dyn Backend>;
 
-        let mut first = Search::new_with_tree(
+        let mut first = Search::new_with_graph(
             Arc::clone(&backend),
             SearchGeneration(29),
             &tree,
@@ -1792,7 +1891,7 @@ mod tests {
         tree.advance(played).expect("advance retained tree");
         assert!(tree.repository().get(old_root).is_some());
 
-        let mut second = Search::new_with_tree(backend, SearchGeneration(30), &tree, SearchConfig::default());
+        let mut second = Search::new_with_graph(backend, SearchGeneration(30), &tree, SearchConfig::default());
         second.run_playouts(8).expect("reused search");
         let root = second.repository().get(second.root_key()).expect("reused root");
         assert!(root.edges().iter().all(|edge| edge.visits() == edge.completed_visits()));

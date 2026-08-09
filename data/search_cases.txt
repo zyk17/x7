@@ -1,0 +1,12 @@
+# 固定的搜索行为诊断局面。
+#
+# 每个 case 必须保留 `position startpos moves` 的完整历史；只保存末局 FEN 会丢失
+# 重复、长将/长捉等路径规则上下文。这里是人工维护的固定输入，不由 benchmark 自动批量读取。
+#
+# 运行：
+# cargo run -p engin --release --bin search_benchmark -- --moves "<moves>" --playouts 10000 --trace 1000,10000 --track g6g9,g6h6 --root-top 8
+
+# 黑方 20...f9h8 后，红方走。Pikafish 的最强候选为 g6g9（当时报告 mate 2），
+# 而 g6h6 是仍明显优势的次优候选。用于观察低先验强制候选能否获得后续 N，
+# 不作为规则或 mate 距离的断言。
+punish_low_prior_01 | b2e2 b9c7 b0c2 c6c5 a0b0 a9b9 b0b6 h9g7 g3g4 b7a7 b6c6 b9b7 h2g2 g9e7 g4g5 e7g5 h0i2 h7h8 i0i1 h8c8 c6d6 c7b5 i1b1 c8c3 e3e4 f9e8 e4e5 e6e5 d6g6 i9f9 d0e1 g5i7 i2g3 f9f3 g3h5 g7f9 h5f6 a7a8 g2h2 f9h8

@@ -5,24 +5,27 @@
 //! - <https://lczero.org/dev/lc0/search/lc3/policy/>
 //! - <https://lczero.org/dev/lc0/search/lc3/glossary/>
 //!
-//! 本模块拥有 tree 与 worker 生命周期。LC3 未公开公式时，选择和最终着法使用
+//! 本模块拥有 MCGS 图与 worker 生命周期。LC3 未公开公式时，选择和最终着法使用
 //! 有文档的 px0 PUCT / N-Q-P 语义。
 
 use xiangqi_core::GameResult;
 
 mod event;
 mod extension;
+mod graph;
 mod pipeline;
 mod policy;
 mod session;
 mod state;
 mod stats;
 mod time;
-mod tree;
 
 pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
+pub use graph::{Edge, EdgeReservation, ExpansionState, GcStats, Node, NodeKey, NodeRepository, SearchGraph};
+#[cfg(feature = "benchmark")]
+pub use pipeline::QueueStats;
 pub(crate) use pipeline::WorkerPool;
-pub use pipeline::{QueueStats, Search, SearchConfig, SearchControl, SearchLimits, Stats};
+pub use pipeline::{Search, SearchConfig, SearchControl, SearchLimits, Stats};
 pub use policy::{SearchParams, ValueDelta, select_edge, select_edge_from_node};
 pub(crate) use session::SearchSession;
 pub use state::SearchResult;
@@ -33,7 +36,6 @@ pub use stats::{
     RootEdgeStats, RootStats, best_move, best_move_filtered, principal_variation, principal_variation_filtered,
     root_stats,
 };
-pub use tree::{Edge, EdgeReservation, ExpansionState, GcStats, Node, NodeKey, NodeRepository, Tree};
 
 /// px0 `FetchSingleNodeResult`：`eval->q = -eval->q`（`search.cc:2129`）。NN WDL
 /// 按 side-to-move 表示；node 统计按 incoming-edge / 走子方视角表示，对齐 px0 `Node::wl_`。

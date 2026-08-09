@@ -4,21 +4,17 @@
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 //! <https://lczero.org/dev/lc0/search/lc3/glossary/>
 
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
 use std::sync::Arc;
+#[cfg(feature = "benchmark")]
 use std::time::Instant;
 
-use nohash_hasher::NoHashHasher;
-use xiangqi_core::{Move, PositionHistory};
+use xiangqi_core::{Move, Position, PositionHistory};
 
 use super::{EdgeReservation, NodeKey, ValueDelta};
 
-type NodeDeltaMap = HashMap<NodeKey, ValueDelta, BuildHasherDefault<NoHashHasher<u64>>>;
-
 /// 拒绝 `position`、`ucinewgame` 或替换 `go` 之后残留的旧 event。
 ///
-/// 一个 LC3 event 只属于一次流式搜索。x7 为每次 UCI 搜索分配单调递增 generation，
+/// 一个 event 只属于一次流式搜索。x7 为每次 UCI 搜索分配单调递增 generation，
 /// 不让旧 event 更新新的 root。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct SearchGeneration(pub u64);
@@ -31,17 +27,23 @@ pub struct SearchGeneration(pub u64);
 pub struct Variation {
     root_history: Arc<PositionHistory>,
     moves: Vec<Move>,
+    /// Gather 当前所在局面。MCGS 必须从真实棋盘取得 child board key；保留这份轻量
+    /// snapshot 避免每下降一层都从 root 重放整条 variation。
+    /// 完整 history 仍只在 Eval 的规则裁决与 NN 编码时重建。
+    position: Position,
 }
 
 impl Variation {
     pub fn root(root_history: Arc<PositionHistory>) -> Self {
         Self {
+            position: root_history.last().clone(),
             root_history,
             moves: Vec::new(),
         }
     }
 
     pub fn push(&mut self, mv: Move) {
+        self.position = Position::after(&self.position, mv);
         self.moves.push(mv);
     }
 
@@ -61,11 +63,18 @@ impl Variation {
         }
         history
     }
+
+    /// MCGS child identity 只使用走子后的棋盘，不混入 repetition/rule60/history。
+    /// `Position::after`（px0 `position.cc:31-60`）只复制当前 position，不重放整个
+    /// variation。
+    pub fn child_board_key(&self, mv: Move) -> NodeKey {
+        NodeKey::board(Position::after(&self.position, mv).board().hash())
+    }
 }
 
 /// Gather、Eval 与 Backprop worker 间传递的工作项。
 ///
-/// event 拥有全部搜索专用数据，不持有 tree/backend 的 `&mut` 引用，因此可安全地通过
+/// event 拥有全部搜索专用数据，不持有 graph/backend 的 `&mut` 引用，因此可安全地通过
 /// 有界 worker 队列发送。
 #[derive(Debug)]
 pub struct NodeEvent {
@@ -74,12 +83,17 @@ pub struct NodeEvent {
     node_path: Vec<NodeKey>,
     pub variation: Variation,
     pub reservations: Vec<EdgeReservation>,
+    #[cfg(feature = "benchmark")]
     queued_at: Option<Instant>,
 }
 
 impl NodeEvent {
     pub fn root(generation: SearchGeneration, root_history: Arc<PositionHistory>) -> Self {
-        Self::at_root(generation, NodeKey::root(root_history.last().hash()), root_history)
+        Self::at_root(
+            generation,
+            NodeKey::board(root_history.last().board().hash()),
+            root_history,
+        )
     }
 
     pub fn at_root(generation: SearchGeneration, root_key: NodeKey, root_history: Arc<PositionHistory>) -> Self {
@@ -89,6 +103,7 @@ impl NodeEvent {
             node_path: vec![root_key],
             variation: Variation::root(root_history),
             reservations: Vec::new(),
+            #[cfg(feature = "benchmark")]
             queued_at: None,
         }
     }
@@ -98,6 +113,26 @@ impl NodeEvent {
         self.node_key = child_key;
         self.node_path.push(child_key);
         self.reservations.push(reservation);
+        self
+    }
+
+    /// 环边仍消耗该 edge 的 reservation 与 variation move，但不把已存在的 board node
+    /// 再次塞入 path；回传只重算真实经过的 parent node。
+    pub fn descend_cycle(mut self, reservation: EdgeReservation) -> Self {
+        self.variation.push(reservation.mv());
+        self.reservations.push(reservation);
+        self
+    }
+
+    /// 当前 leaf 是路径终局但不是共享 node 时，在回传前丢弃它；实际入边仍保留在
+    /// `reservations` 中。这样与环边一样，只重算真正可共享的 parent node。
+    pub(crate) fn discard_leaf_node(mut self) -> Self {
+        assert_eq!(
+            self.node_path.len(),
+            self.reservations.len() + 1,
+            "normal path must end at one shared leaf"
+        );
+        self.node_path.pop();
         self
     }
 
@@ -113,14 +148,13 @@ impl NodeEvent {
         &self.node_path
     }
 
-    /// 标记一次 worker 队列交接，供可选 benchmark 遥测使用。
-    ///
-    /// 参考：LC3 Overview 的 “Stats Collection”。普通 UCI 搜索不设置它，因此计时
-    /// 不在其热路径上。
+    /// 标记一次 worker 队列交接，仅编入 benchmark 二进制。
+    #[cfg(feature = "benchmark")]
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at = Some(Instant::now());
     }
 
+    #[cfg(feature = "benchmark")]
     pub(crate) fn take_queue_wait(&mut self) -> Option<std::time::Duration> {
         self.queued_at.take().map(|queued_at| queued_at.elapsed())
     }
@@ -133,7 +167,11 @@ impl NodeEvent {
 #[derive(Debug)]
 pub struct BackpropEvent {
     node: NodeEvent,
-    value: ValueDelta,
+    /// 此 event 的 leaf 只是 variation-local 的结果，没有可重算的 shared leaf node。
+    /// 它在完成最后一条 reservation 时成为一个 edge-local 样本，绝不能永久覆盖该
+    /// board edge 的其他历史。参见 KataGo `docs/GraphSearch.md` 的 edge-local N。
+    local_terminal: Option<ValueDelta>,
+    #[cfg(feature = "benchmark")]
     queued_at: Option<Instant>,
 }
 
@@ -147,10 +185,20 @@ pub(crate) struct BackpropResult {
 }
 
 impl BackpropEvent {
-    pub(crate) fn evaluation(node: NodeEvent, wl: f32, draw: f32, plies_left: f32) -> Self {
+    pub(crate) fn evaluation(node: NodeEvent) -> Self {
         Self {
             node,
-            value: ValueDelta::with_plies_left(wl, draw, plies_left),
+            local_terminal: None,
+            #[cfg(feature = "benchmark")]
+            queued_at: None,
+        }
+    }
+
+    pub(crate) fn path_terminal(node: NodeEvent, value: ValueDelta) -> Self {
+        Self {
+            node,
+            local_terminal: Some(value),
+            #[cfg(feature = "benchmark")]
             queued_at: None,
         }
     }
@@ -164,43 +212,37 @@ impl BackpropEvent {
         events: impl IntoIterator<Item = Self>,
         repository: &super::NodeRepository,
     ) -> BackpropResult {
-        // `NodeKey` 已混合；与 repository 使用相同的 identity hasher。
-        let mut node_deltas = NodeDeltaMap::default();
         let mut result = BackpropResult::default();
 
         for event in events {
-            let Self { node, value, .. } = event;
-            debug_assert_eq!(node.node_path.len(), node.reservations.len() + 1);
-            let depth = node.node_path.len() as u64;
-            let mut delta = value;
-            let mut reservations = node.reservations.into_iter().rev();
-            for (node_index, node_key) in node.node_path.into_iter().enumerate().rev() {
-                if let Some((terminal_wl, terminal_draw, terminal_m)) =
-                    repository.get(node_key).and_then(|node| node.terminal_value())
-                {
-                    delta = ValueDelta::with_plies_left(terminal_wl, terminal_draw, terminal_m);
+            let Self {
+                node, local_terminal, ..
+            } = event;
+            let expected_nodes = node.reservations.len() + usize::from(local_terminal.is_none());
+            debug_assert_eq!(
+                node.node_path.len(),
+                expected_nodes,
+                "shared-leaf path has one more node; local terminal path has no shared leaf"
+            );
+            let depth = node.reservations.len() as u64 + 1;
+            let mut local_terminal = local_terminal;
+            for reservation in node.reservations.into_iter().rev() {
+                if let Some(value) = local_terminal.take() {
+                    reservation.complete_path_terminal(value);
+                } else {
+                    reservation.complete();
                 }
-                node_deltas
-                    .entry(node_key)
-                    .and_modify(|aggregate| *aggregate = aggregate.merge(delta))
-                    .or_insert(delta);
-                if node_index == 0 {
-                    break;
-                }
-                // px0 `EdgeAndNode::GetQ` 读取 child.wl（走子方视角）。先用 child
-                // delta 完成 edge，再为 parent node 翻转（`search.cc:2175-2257`：
-                // `finalize(v); v = -v`）。
-                reservations.next().expect("path reservation").complete(delta.q());
-                delta = delta.for_parent().one_ply_up();
+            }
+            // KataGo GraphSearch 的 idempotent 回传：只重算本 variation 上已实际经过的
+            // node。共享 child 不向所有 parent 广播，未走到的 parent 以后被访问时再重算。
+            for node_key in node.node_path.into_iter().rev() {
+                repository.recompute_graph_node(node_key);
             }
             result.completed_playouts += 1;
             result.completed_depth += depth;
             result.max_depth = result.max_depth.max(depth);
         }
 
-        for (node_key, delta) in node_deltas {
-            repository.get_or_insert(node_key).add_delta(delta);
-        }
         result
     }
 
@@ -208,6 +250,7 @@ impl BackpropEvent {
         self.node.cancel();
     }
 
+    #[cfg(feature = "benchmark")]
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at = Some(Instant::now());
     }
@@ -215,6 +258,7 @@ impl BackpropEvent {
     /// 返回进入 Backprop 队列后的可选等待时间。
     ///
     /// 参考：LC3 Overview 的 “Stats Collection”。
+    #[cfg(feature = "benchmark")]
     pub(crate) fn take_queue_wait(&mut self) -> Option<std::time::Duration> {
         self.queued_at.take().map(|queued_at| queued_at.elapsed())
     }
@@ -240,7 +284,7 @@ mod tests {
             xiangqi_core::Square::parse("b2").expect("b2"),
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
-        let child_key = root.node_key.child(mv);
+        let child_key = root.variation.child_board_key(mv);
         let root_history_len = root.variation.root_history().len();
         let next = root.descend(child_key, crate::search::EdgeReservation::test_only(mv));
 
@@ -267,20 +311,23 @@ mod tests {
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         root_node.publish_edges(vec![(mv, 1.0)]);
-        let child = root.descend(NodeKey::root(42), root_node.reserve_edge(0).expect("edge"));
+        root_node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        let child_key = NodeKey::board(42);
+        root_node.edges()[0].bind_child_key(child_key);
+        let child_node = repository.get_or_insert(child_key);
+        child_node.set_graph_value(crate::search::ValueDelta::with_plies_left(0.4, 0.2, 2.0));
+        let child = root.descend(child_key, root_node.reserve_edge(0).expect("edge"));
 
-        BackpropEvent::complete_batch([BackpropEvent::evaluation(child, 0.4, 0.2, 2.0)], &repository);
+        BackpropEvent::complete_batch([BackpropEvent::evaluation(child)], &repository);
 
         let edge = &root_node.edges()[0];
         assert_eq!(edge.visits(), 1);
         assert_eq!(edge.completed_visits(), 1);
-        // 走子方视角的叶子价值存于 child 和 edge；parent 接收翻转后的回传
-        // （px0 `search.cc:2129,2175-2257`）。
-        assert!((edge.q() - 0.4).abs() < f32::EPSILON);
-        assert_eq!(root_node.completed_visits(), 1);
-        assert!((root_node.q() + 0.4).abs() < f32::EPSILON);
-        assert!((root_node.m() - 3.0).abs() < f32::EPSILON);
-        let child_node = repository.get(NodeKey::root(42)).expect("child node");
+        // child Q 是走子方视角；parent 的 shared Q 幂等重算后取反。
+        assert_eq!(root_node.completed_visits(), 2);
+        assert!((root_node.q() + 0.2).abs() < f32::EPSILON);
+        assert!((root_node.m() - 1.5).abs() < f32::EPSILON);
+        let child_node = repository.get(child_key).expect("child node");
         assert_eq!(child_node.completed_visits(), 1);
         assert!((child_node.q() - 0.4).abs() < f32::EPSILON);
         assert!((child_node.m() - 2.0).abs() < f32::EPSILON);
@@ -299,16 +346,18 @@ mod tests {
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         root_node.publish_edges(vec![(mv, 1.0)]);
-        let child_key = NodeKey::root(42);
+        root_node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        let child_key = NodeKey::board(42);
+        root_node.edges()[0].bind_child_key(child_key);
+        repository
+            .get_or_insert(child_key)
+            .set_graph_value(crate::search::ValueDelta::one(0.3, 0.3));
         let first = first.descend(child_key, root_node.reserve_edge(0).expect("first edge"));
         let second = NodeEvent::root(SearchGeneration(1), root_history)
             .descend(child_key, root_node.reserve_edge(0).expect("second edge"));
 
         let result = BackpropEvent::complete_batch(
-            [
-                BackpropEvent::evaluation(first, 0.4, 0.2, 0.0),
-                BackpropEvent::evaluation(second, 0.2, 0.4, 0.0),
-            ],
+            [BackpropEvent::evaluation(first), BackpropEvent::evaluation(second)],
             &repository,
         );
 
@@ -319,10 +368,107 @@ mod tests {
         assert_eq!(result.max_depth, 2);
         assert_eq!(edge.visits(), 2);
         assert_eq!(edge.completed_visits(), 2);
-        assert!((edge.q() - 0.3).abs() < f32::EPSILON);
-        assert_eq!(root_node.completed_visits(), 2);
-        assert!((root_node.q() + 0.3).abs() < f32::EPSILON);
-        assert_eq!(child_node.completed_visits(), 2);
+        assert_eq!(root_node.completed_visits(), 3);
+        assert!((root_node.q() + 0.2).abs() < f32::EPSILON);
+        assert_eq!(child_node.completed_visits(), 1);
         assert!((child_node.q() - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cycle_backprop_keeps_the_result_on_the_edge_without_a_duplicate_node() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let root = NodeEvent::root(
+            SearchGeneration(2),
+            Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
+        );
+        let repository = NodeRepository::default();
+        let node = repository.get_or_insert(root.node_key);
+        assert!(node.try_begin_evaluation());
+        let mv = Move::new(
+            xiangqi_core::Square::parse("b2").expect("b2"),
+            xiangqi_core::Square::parse("b3").expect("b3"),
+        );
+        node.publish_edges(vec![(mv, 1.0)]);
+        node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        let event = root.descend_cycle(node.reserve_edge(0).expect("cycle edge"));
+        BackpropEvent::complete_batch(
+            [BackpropEvent::path_terminal(
+                event,
+                crate::search::ValueDelta::one(0.6, 0.0),
+            )],
+            &repository,
+        );
+
+        let edge = node.edges()[0].clone();
+        assert_eq!(edge.completed_visits(), 1);
+        assert!(edge.child_key().is_none());
+        assert_eq!(node.completed_visits(), 2);
+        assert!((node.q() + 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn path_terminal_samples_do_not_make_a_shared_edge_first_writer_wins() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
+        let repository = NodeRepository::default();
+        let root_key = NodeEvent::root(SearchGeneration(4), Arc::clone(&history)).node_key;
+        let root = repository.get_or_insert(root_key);
+        assert!(root.try_begin_evaluation());
+        let mv = Move::new(
+            xiangqi_core::Square::parse("b2").expect("b2"),
+            xiangqi_core::Square::parse("b3").expect("b3"),
+        );
+        root.publish_edges(vec![(mv, 1.0)]);
+        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+
+        for value in [0.6, -0.2] {
+            let event = NodeEvent::root(SearchGeneration(4), Arc::clone(&history))
+                .descend_cycle(root.reserve_edge(0).expect("cycle edge"));
+            BackpropEvent::complete_batch(
+                [BackpropEvent::path_terminal(
+                    event,
+                    crate::search::ValueDelta::one(value, 0.0),
+                )],
+                &repository,
+            );
+        }
+
+        let stats = root.edges()[0].completed_stats();
+        assert_eq!(stats.local_terminal.visits, 2);
+        assert!((stats.local_terminal.q() - 0.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn path_terminal_discards_its_unshared_leaf_before_backprop() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let root_history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
+        let root_event = NodeEvent::root(SearchGeneration(3), root_history);
+        let repository = NodeRepository::default();
+        let root = repository.get_or_insert(root_event.node_key);
+        assert!(root.try_begin_evaluation());
+        let mv = Move::new(
+            xiangqi_core::Square::parse("b2").expect("b2"),
+            xiangqi_core::Square::parse("b3").expect("b3"),
+        );
+        root.publish_edges(vec![(mv, 1.0)]);
+        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        let child_key = root_event.variation.child_board_key(mv);
+        root.edges()[0].bind_child_key(child_key);
+        let child = repository.get_or_insert(child_key);
+        assert!(child.try_begin_evaluation());
+
+        let event = root_event.descend(child_key, root.reserve_edge(0).expect("root edge"));
+        child.abort_evaluation();
+        BackpropEvent::complete_batch(
+            [BackpropEvent::path_terminal(
+                event.discard_leaf_node(),
+                crate::search::ValueDelta::one(0.0, 1.0),
+            )],
+            &repository,
+        );
+
+        assert_eq!(child.expansion_state(), crate::search::ExpansionState::Unexpanded);
+        assert_eq!(root.edges()[0].completed_visits(), 1);
+        assert_eq!(root.completed_visits(), 2);
     }
 }

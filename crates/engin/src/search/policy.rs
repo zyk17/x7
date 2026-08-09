@@ -68,7 +68,7 @@ use std::sync::Arc;
 
 use xiangqi_core::Move;
 
-use super::{Edge, Node};
+use super::{Edge, Node, NodeRepository};
 
 /// stream backpropagation 使用的紧凑 WDL 更新。
 ///
@@ -150,9 +150,24 @@ pub fn get_fpu(params: &SearchParams, parent_wl: f32, edges: &[Arc<Edge>]) -> f3
     -parent_wl - params.fpu_reduction * visited_policy(edges).sqrt()
 }
 
-/// 已访问 edge 返回 Q，未完成访问则返回 FPU。
-pub fn edge_utility(edge: &Edge, fpu: f32) -> f32 {
-    if edge.completed_visits() == 0 { fpu } else { edge.q() }
+/// MCGS action Q 由该 edge 已观察到的两类 evidence 组成：普通访问读取 shared child
+/// 的当前 Q；重复、连将/追击和 rule60 的路径终局只保留为这一次 edge visit 的本地样本。
+/// 访问数仍严格属于 edge，不能读取 child N。
+pub(crate) fn edge_utility(repository: &NodeRepository, edge: &Edge, fpu: f32) -> f32 {
+    let stats = edge.completed_stats();
+    if stats.visits == 0 {
+        return fpu;
+    }
+    let propagated = stats.visits.saturating_sub(stats.local_terminal.visits);
+    let child_value = if propagated == 0 {
+        0.0
+    } else {
+        let Some(child) = edge.child_key().and_then(|key| repository.get(key)) else {
+            return fpu;
+        };
+        child.q() * propagated as f32
+    };
+    (stats.local_terminal.wl_sum + child_value) / stats.visits as f32
 }
 
 /// 选择 px0 风格 PUCT 最高的 edge。
@@ -160,6 +175,7 @@ pub fn edge_utility(edge: &Edge, fpu: f32) -> f32 {
 /// `root_move_filter` 对应 px0 `Search::root_move_filter_` 与 UCI `go searchmoves`
 /// （`search.cc:53-58,721-724,1668-1739`）；空数组表示不过滤。
 pub fn select_edge(
+    repository: &NodeRepository,
     edges: &[Arc<Edge>],
     parent_completed_visits: u32,
     parent_wl: f32,
@@ -181,7 +197,7 @@ pub fn select_edge(
         if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
             continue;
         }
-        let q = edge_utility(edge, fpu);
+        let q = edge_utility(repository, edge, fpu);
         let score = q + u_coeff * edge.prior() / (1 + edge.visits()) as f32;
         if best.is_none_or(|(_, best_score)| score > best_score) {
             best = Some((index, score));
@@ -192,12 +208,14 @@ pub fn select_edge(
 
 /// 供已持有 parent node 的 Gather 调用点使用的便利函数。
 pub fn select_edge_from_node(
+    repository: &NodeRepository,
     node: &Node,
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
 ) -> Option<usize> {
     select_edge(
+        repository,
         &node.edges(),
         node.completed_visits(),
         node.q(),
@@ -246,16 +264,16 @@ mod tests {
     #[test]
     fn in_flight_visit_deflects_selection_without_changing_completed_q() {
         let repo = NodeRepository::default();
-        let key = NodeKey::root(9);
+        let key = NodeKey::board(9);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("b2", "b3"), 0.6), (mv("c3", "c4"), 0.4)]);
         let edges = node.edges();
         let params = SearchParams::default();
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]), Some(0));
+        assert_eq!(select_edge(&repo, &edges, 0, 0.0, 0, &params, &[]), Some(0));
 
         let reservation = node.reserve_edge(0).expect("first edge");
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]), Some(1));
+        assert_eq!(select_edge(&repo, &edges, 0, 0.0, 0, &params, &[]), Some(1));
         reservation.cancel();
         assert_eq!(edges[0].completed_visits(), 0);
     }
@@ -263,25 +281,51 @@ mod tests {
     #[test]
     fn root_move_filter_restricts_selection() {
         let repo = NodeRepository::default();
-        let key = NodeKey::root(9);
+        let key = NodeKey::board(9);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("b2", "b3"), 0.9), (mv("c3", "c4"), 0.1)]);
         let edges = node.edges();
         let params = SearchParams::default();
         let filter = [mv("c3", "c4")];
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &filter), Some(1));
+        assert_eq!(select_edge(&repo, &edges, 0, 0.0, 0, &params, &filter), Some(1));
     }
 
     #[test]
-    fn visited_edge_utility_is_raw_q() {
+    fn visited_edge_utility_reads_shared_child_q() {
         let repo = NodeRepository::default();
-        let key = NodeKey::root(3);
+        let key = NodeKey::board(3);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();
-        node.reserve_edge(0).expect("res").complete(0.5);
-        assert!((edge_utility(&edge, 0.0) - 0.5).abs() < 1e-6);
+        let child_key = NodeKey::board(4);
+        edge.bind_child_key(child_key);
+        repo.get_or_insert(child_key).set_graph_value(ValueDelta::one(0.5, 0.0));
+        repo.recompute_graph_node(child_key);
+        node.reserve_edge(0).expect("res").complete();
+        assert!((edge_utility(&repo, &edge, 0.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn path_terminal_is_one_edge_sample_not_a_permanent_child_override() {
+        let repo = NodeRepository::default();
+        let key = NodeKey::board(30);
+        let node = repo.get_or_insert(key);
+        assert!(node.try_begin_evaluation());
+        node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
+        let edge = node.edges()[0].clone();
+        let child_key = NodeKey::board(31);
+        edge.bind_child_key(child_key);
+        let child = repo.get_or_insert(child_key);
+        child.set_graph_value(ValueDelta::one(-0.2, 0.0));
+        repo.recompute_graph_node(child_key);
+
+        node.reserve_edge(0)
+            .expect("terminal reservation")
+            .complete_path_terminal(ValueDelta::one(0.6, 0.0));
+        node.reserve_edge(0).expect("child reservation").complete();
+
+        assert!((edge_utility(&repo, &edge, 0.0) - 0.2).abs() < 1e-6);
     }
 }

@@ -285,7 +285,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 gather_workers,
                                 eval_workers,
                                 backprop_workers,
-                                benchmark_telemetry: true,
                                 ..SearchConfig::default()
                             },
                         );

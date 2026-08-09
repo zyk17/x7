@@ -4,7 +4,7 @@
 
 这是一个新的中国象棋研究引擎。项目目标是在有限计算资源、固定思考时间下研究上述协同，并只以固定时间 Elo 评估成果；网络架构、搜索算法和硬件分工都是实现选择，不是项目目标。
 
-当前正式主线只有 stream tree MCTS；规则层参考 px0，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+`mcts` 分支固定当前 `master` 的树 MCTS；本分支研究 stream MCGS。两者共用规则、网络与 UCI 外围，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 快速运行
 
@@ -60,11 +60,11 @@ bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，�
 `data/benchmark_positions.txt`；每行是“名称 | FEN”，使用时只复制 `|` 后的完整 FEN：
 
 ```powershell
-cargo run -p engin --release --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1
+cargo run -p engin --release --features benchmark --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1
 ```
 
 要诊断实战中的评分突变，优先保留完整历史而不是只复制最终 FEN；分流参数使用独立的
-`search_benchmark`，固定 `4/4/1` worker、backend 默认 batch 与 fresh tree：
+`search_benchmark`，固定 `4/4/1` worker、backend 默认 batch 与 fresh graph：
 
 ```powershell
 cargo run -p engin --release --bin search_benchmark -- --moves "c3c4 g6g5 ..." --playouts 2000 --root-top 12
@@ -76,7 +76,7 @@ cargo run -p engin --release --bin search_benchmark -- --moves "c3c4 g6g5 ..." -
 cargo run -p engin --release --bin search_benchmark -- --onnx data/x7_v3_b12c512_v697.onnx --fen "<FEN>" --playouts 1000 --cpuct 1.0,1.745 --cpuct-base 20000,38739,80000 --cpuct-factor 2.5,3.894,5.0 --fpu-reduction 0.330 --root-top 3
 ```
 
-`--trace 128,256,512,...` 只用于固定 `--playouts`：它在同一棵 fresh tree 上输出各个
+`--trace 128,256,512,...` 只用于固定 `--playouts`：它在同一个 fresh graph 上输出各个
 completed-visit 里程碑的 root `P/N/Q`，用于比较“新 Q 证据出现后，N 是否改变”。每个里程碑
 会先 drain 在途事件再取快照，因此它是可重复的 completed-visit 轨迹，不等价于一段完全不中断的
 流水线搜索。
@@ -87,16 +87,19 @@ completed-visit 里程碑的 root `P/N/Q`，用于比较“新 Q 证据出现后
 `--searchmoves "g6g9 i0g0 ..."` 与 UCI `go searchmoves` 使用相同的根过滤语义，可将比较限制在
 指定候选中；它用于诊断候选获得预算后的 Q/N 轨迹，不把外部引擎的候选当作真值。
 
-`tree_shape` 从固定节点预算后的 fresh tree 递归打印形状：每一行是一个已访问 node，只显示进入该 node
+`graph_shape` 从固定节点预算后的 fresh graph 递归打印形状：每一行是一个已访问 node，只显示进入该 node
 的 `P/N/Q/M`；root 没有入边，故只显示 `N/Q/M`。`M` 是 moves-left 的平均 ply 数。`--depth` 限制展示深度，`--top` 限制每个节点展示的
-已访问子节点数。首行同时给出总 collision 及其占所有提交尝试的比例；它用于看树的访问形状，而不是记录运行中的 collision 热点：
+已访问子节点数。首行同时给出总 collision 及其占所有提交尝试的比例；它用于看图的访问形状，而不是记录运行中的 collision 热点：
 
 ```powershell
-cargo run -p engin --release --bin tree_shape -- --fen "<FEN>" --playouts 2000 --depth 4 --top 8
+cargo run -p engin --release --features benchmark --bin graph_shape -- --fen "<FEN>" --playouts 2000 --depth 4 --top 8
 ```
 
 `--moves` 从 startpos（或指定的 `--fen`）依次应用 ICCS 着法；它保留重复与规则历史，
-但每次 benchmark 仍从 fresh tree 开始，不模拟前几回合的 tree reuse。
+但每次 benchmark 仍从 fresh graph 开始，不模拟前几回合的 graph reuse。
+固定的完整历史搜索诊断局面放在 `data/search_cases.txt`；其中 `punish_low_prior_01`
+用于观察黑方失误后低先验候选 `g6g9` 是否能获得足够的后续访问，不能把外部引擎的
+短 PV 或 mate 输出当作规则正确性的断言。
 
 诊断评分拐点时，可用本地 Pikafish 作为外部对照。`scripts/pikafish_compare.py` 只走标准
 UCI 生命周期并打印最终 MultiPV；默认使用本机的 Pikafish 路径，也可用 `--engine` 覆盖：

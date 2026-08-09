@@ -1,6 +1,7 @@
 //! 只读的 stream root 统计、bestmove 与 principal variation。
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use xiangqi_core::Move;
@@ -17,7 +18,7 @@ pub struct RootEdgeStats {
     pub prior: f32,
 }
 
-/// root node 快照（不是全局原子 tree view）。
+/// root node 快照（不是全局原子 graph view）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct RootStats {
     pub completed_visits: u32,
@@ -51,11 +52,30 @@ pub fn root_stats(repository: &NodeRepository, root_key: NodeKey) -> Option<Root
                 mv: edge.mv(),
                 completed_visits: edge.completed_visits(),
                 started_visits: edge.visits(),
-                q: edge.q(),
+                q: edge_value(repository, edge),
                 prior: edge.prior(),
             })
             .collect(),
     })
+}
+
+/// MCGS 的 action Q 混合 shared child 的当前值与该 edge 实际遇到的路径终局样本。
+/// 未完成 edge 的 Q 不参与最终统计。
+fn edge_value(repository: &NodeRepository, edge: &Edge) -> f32 {
+    let stats = edge.completed_stats();
+    if stats.visits == 0 {
+        return 0.0;
+    }
+    let propagated = stats.visits.saturating_sub(stats.local_terminal.visits);
+    let child_value = edge
+        .child_key()
+        .and_then(|key| repository.get(key))
+        .map_or(0.0, |node| node.q() * propagated as f32);
+    (stats.local_terminal.wl_sum + child_value) / stats.visits as f32
+}
+
+fn edge_child(repository: &NodeRepository, edge: &Edge) -> Option<Arc<Node>> {
+    edge.child_key().and_then(|key| repository.get(key))
 }
 
 fn orient_move(mv: Move, flip: bool) -> Move {
@@ -91,8 +111,8 @@ fn best_edge_rank(edge: &Edge, child: Option<&Node>) -> BestEdgeRank {
     }
 }
 
-fn edge_q_for_ranking(edge: &Edge) -> f32 {
-    if edge.completed_visits() > 0 { edge.q() } else { 0.0 }
+fn edge_q_for_ranking(repository: &NodeRepository, edge: &Edge) -> f32 {
+    edge_value(repository, edge)
 }
 
 fn terminal_plies(child: &Node) -> f32 {
@@ -103,7 +123,13 @@ fn is_visited_terminal(edge: &Edge, child: Option<&Node>) -> bool {
     child.is_some_and(|node| node.expansion_state() == ExpansionState::Terminal && edge.completed_visits() > 0)
 }
 
-fn edge_is_better(left: &Arc<Edge>, left_child: Option<&Node>, right: &Arc<Edge>, right_child: Option<&Node>) -> bool {
+fn edge_is_better(
+    repository: &NodeRepository,
+    left: &Arc<Edge>,
+    left_child: Option<&Node>,
+    right: &Arc<Edge>,
+    right_child: Option<&Node>,
+) -> bool {
     let left_rank = best_edge_rank(left, left_child);
     let right_rank = best_edge_rank(right, right_child);
     if left_rank != right_rank {
@@ -126,8 +152,8 @@ fn edge_is_better(left: &Arc<Edge>, left_child: Option<&Node>, right: &Arc<Edge>
         if left_n != right_n {
             return left_n > right_n;
         }
-        let left_q = edge_q_for_ranking(left);
-        let right_q = edge_q_for_ranking(right);
+        let left_q = edge_q_for_ranking(repository, left);
+        let right_q = edge_q_for_ranking(repository, right);
         if (left_q - right_q).abs() > f32::EPSILON {
             return left_q > right_q;
         }
@@ -166,13 +192,13 @@ fn ranked_root_edges(
         .edges()
         .iter()
         .filter(|edge| root_move_filter.is_empty() || root_move_filter.contains(&edge.mv()))
-        .map(|edge| (Arc::clone(edge), repository.get(root_key.child(edge.mv()))))
+        .map(|edge| (Arc::clone(edge), edge_child(repository, edge)))
         .collect();
     if root.completed_visits() > 0 {
         candidates.sort_by(|(left, left_child), (right, right_child)| {
-            if edge_is_better(left, left_child.as_deref(), right, right_child.as_deref()) {
+            if edge_is_better(repository, left, left_child.as_deref(), right, right_child.as_deref()) {
                 Ordering::Less
-            } else if edge_is_better(right, right_child.as_deref(), left, left_child.as_deref()) {
+            } else if edge_is_better(repository, right, right_child.as_deref(), left, left_child.as_deref()) {
                 Ordering::Greater
             } else {
                 Ordering::Equal
@@ -199,9 +225,21 @@ fn principal_variation_from_root_edge(
 ) -> Vec<Move> {
     // px0 `SendUciInfo` 的 PV 遍历（`search.cc:343-350`）。
     let mut pv = vec![orient_move(first_move, root_is_black)];
-    let mut key = root_key.child(first_move);
+    let Some(first_edge) = repository
+        .get(root_key)
+        .and_then(|root| root.edges().iter().find(|edge| edge.mv() == first_move).cloned())
+    else {
+        return pv;
+    };
+    let Some(mut key) = first_edge.child_key() else {
+        return pv;
+    };
+    let mut seen = HashSet::from([root_key]);
     let mut flip = !root_is_black;
     while let Some(node) = repository.get(key) {
+        if !seen.insert(key) {
+            break;
+        }
         if node.completed_visits() == 0 || node.expansion_state() != ExpansionState::Expanded {
             break;
         }
@@ -212,7 +250,15 @@ fn principal_variation_from_root_edge(
             break;
         }
         pv.push(orient_move(abs_mv, flip));
-        key = key.child(abs_mv);
+        let Some(next) = node
+            .edges()
+            .iter()
+            .find(|edge| edge.mv() == abs_mv)
+            .and_then(|edge| edge.child_key())
+        else {
+            break;
+        };
+        key = next;
         flip = !flip;
     }
     pv
@@ -236,7 +282,11 @@ pub(crate) fn root_variations(
         .take(max_pv)
         .map(|(edge, child)| {
             let visited = edge.completed_visits() > 0;
-            let wl = if visited { edge.q() } else { default_wl };
+            let wl = if visited {
+                edge_value(repository, &edge)
+            } else {
+                default_wl
+            };
             let draw = child
                 .as_ref()
                 .filter(|_| visited)
@@ -302,7 +352,12 @@ pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_mov
         });
     }
     let mv = best_edge_absolute(repository, root_key, root_move_filter)?;
-    let child = repository.get(root_key.child(mv))?;
+    let child = repository
+        .get(root_key)?
+        .edges()
+        .iter()
+        .find(|edge| edge.mv() == mv)
+        .and_then(|edge| edge_child(repository, edge))?;
     mate_from_terminal(&child)
 }
 
@@ -322,8 +377,12 @@ pub fn principal_variation_filtered(
 ) -> Vec<Move> {
     let mut pv = Vec::new();
     let mut key = root_key;
+    let mut seen = HashSet::new();
     let mut flip = root_is_black;
     while let Some(node) = repository.get(key) {
+        if !seen.insert(key) {
+            break;
+        }
         if node.completed_visits() == 0 {
             break;
         }
@@ -338,7 +397,15 @@ pub fn principal_variation_filtered(
             break;
         }
         pv.push(orient_move(abs_mv, flip));
-        key = key.child(abs_mv);
+        let Some(next) = node
+            .edges()
+            .iter()
+            .find(|edge| edge.mv() == abs_mv)
+            .and_then(|edge| edge.child_key())
+        else {
+            break;
+        };
+        key = next;
         flip = !flip;
     }
     pv
@@ -406,14 +473,14 @@ mod tests {
 
     #[test]
     fn terminal_win_outranks_higher_n_terminal_loss() {
-        use crate::search::{ExpansionState, NodeKey, NodeRepository, ValueDelta};
+        use crate::search::{ExpansionState, NodeKey, NodeRepository};
 
         fn mv(from: &str, to: &str) -> Move {
             Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
         }
 
         let repo = NodeRepository::default();
-        let root_key = NodeKey::root(7);
+        let root_key = NodeKey::board(7);
         let root = repo.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![
@@ -421,6 +488,7 @@ mod tests {
             (mv("b0", "b1"), 0.20),
             (mv("c0", "c1"), 0.70),
         ]);
+        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
         let edges = root.edges();
         let idx = |target: Move| edges.iter().position(|edge| edge.mv() == target).expect("edge");
         let loss_idx = idx(mv("a0", "a1"));
@@ -428,28 +496,35 @@ mod tests {
         let other_idx = idx(mv("c0", "c1"));
 
         {
-            let child = repo.get_or_insert(root_key.child(mv("a0", "a1")));
+            let child_key = NodeKey::board(71);
+            edges[loss_idx].bind_child_key(child_key);
+            let child = repo.get_or_insert(child_key);
             assert!(child.try_begin_evaluation());
             child.mark_terminal(-1.0, 0.0, 0.0);
             assert_eq!(child.expansion_state(), ExpansionState::Terminal);
             for _ in 0..50 {
-                root.reserve_edge(loss_idx).expect("res").complete(-1.0);
-                root.add_delta(ValueDelta::one(-1.0, 0.0));
+                root.reserve_edge(loss_idx).expect("res").complete();
             }
         }
         {
-            let child = repo.get_or_insert(root_key.child(mv("b0", "b1")));
+            let child_key = NodeKey::board(72);
+            edges[win_idx].bind_child_key(child_key);
+            let child = repo.get_or_insert(child_key);
             assert!(child.try_begin_evaluation());
             child.mark_terminal(1.0, 0.0, 0.0);
             for _ in 0..5 {
-                root.reserve_edge(win_idx).expect("res").complete(1.0);
-                root.add_delta(ValueDelta::one(1.0, 0.0));
+                root.reserve_edge(win_idx).expect("res").complete();
             }
         }
+        let other_key = NodeKey::board(73);
+        edges[other_idx].bind_child_key(other_key);
+        let other = repo.get_or_insert(other_key);
+        other.set_graph_value(crate::search::ValueDelta::one(0.1, 0.0));
+        repo.recompute_graph_node(other_key);
         for _ in 0..20 {
-            root.reserve_edge(other_idx).expect("res").complete(0.1);
-            root.add_delta(ValueDelta::one(0.1, 0.0));
+            root.reserve_edge(other_idx).expect("res").complete();
         }
+        repo.recompute_graph_node(root_key);
 
         assert_eq!(
             best_move(&repo, root_key, false).expect("best"),
@@ -460,16 +535,17 @@ mod tests {
 
     #[test]
     fn best_mate_reports_proven_terminal_child_distance() {
-        use crate::search::{NodeKey, NodeRepository, ValueDelta};
+        use crate::search::{NodeKey, NodeRepository};
 
         let repository = NodeRepository::default();
-        let root_key = NodeKey::root(99);
+        let root_key = NodeKey::board(99);
         let root = repository.get_or_insert(root_key);
         let mv = Move::new(Square::parse("b2").expect("from"), Square::parse("b3").expect("to"));
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(mv, 1.0)]);
-        root.add_delta(ValueDelta::one(0.0, 0.0));
-        let child = repository.get_or_insert(root_key.child(mv));
+        let child_key = NodeKey::board(1000);
+        root.edges()[0].bind_child_key(child_key);
+        let child = repository.get_or_insert(child_key);
         assert!(child.try_begin_evaluation());
         child.mark_terminal(1.0, 0.0, 3.0);
 
@@ -481,11 +557,11 @@ mod tests {
         use crate::search::{NodeKey, NodeRepository};
 
         let repository = NodeRepository::default();
-        let root = repository.get_or_insert(NodeKey::root(100));
+        let root = repository.get_or_insert(NodeKey::board(100));
         assert!(root.try_begin_evaluation());
         root.mark_terminal(1.0, 0.0, 0.0);
 
-        assert_eq!(best_mate(&repository, NodeKey::root(100), &[]), Some(-1));
+        assert_eq!(best_mate(&repository, NodeKey::board(100), &[]), Some(-1));
     }
 
     #[test]
@@ -497,7 +573,7 @@ mod tests {
         }
 
         let repo = NodeRepository::default();
-        let root_key = NodeKey::root(5);
+        let root_key = NodeKey::board(5);
         let root = repo.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(mv("a0", "a1"), 0.9), (mv("b0", "b1"), 0.1)]);
@@ -510,27 +586,33 @@ mod tests {
 
     #[test]
     fn root_variations_use_bestmove_ranking_and_edge_values() {
-        use crate::search::{NodeKey, NodeRepository, ValueDelta};
+        use crate::search::{NodeKey, NodeRepository};
 
         fn mv(from: &str, to: &str) -> Move {
             Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
         }
 
         let repository = NodeRepository::default();
-        let root_key = NodeKey::root(19);
+        let root_key = NodeKey::board(19);
         let root = repository.get_or_insert(root_key);
         let first = mv("a0", "a1");
         let second = mv("b0", "b1");
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(first, 0.9), (second, 0.1)]);
+        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        for (index, (key, value)) in [(0, (NodeKey::board(191), 0.1)), (1, (NodeKey::board(192), 0.2))] {
+            root.edges()[index].bind_child_key(key);
+            let child = repository.get_or_insert(key);
+            child.set_graph_value(crate::search::ValueDelta::one(value, 0.0));
+            repository.recompute_graph_node(key);
+        }
         for _ in 0..3 {
-            root.reserve_edge(0).expect("first reservation").complete(0.1);
-            root.add_delta(ValueDelta::one(0.1, 0.0));
+            root.reserve_edge(0).expect("first reservation").complete();
         }
         for _ in 0..5 {
-            root.reserve_edge(1).expect("second reservation").complete(0.2);
-            root.add_delta(ValueDelta::one(0.2, 0.0));
+            root.reserve_edge(1).expect("second reservation").complete();
         }
+        repository.recompute_graph_node(root_key);
 
         let variations = root_variations(&repository, root_key, false, &[], 2);
         assert_eq!(variations.len(), 2);
@@ -542,14 +624,14 @@ mod tests {
 
     #[test]
     fn shorter_terminal_draw_outranks_longer_draw_at_equal_n() {
-        use crate::search::{NodeKey, NodeRepository, ValueDelta};
+        use crate::search::{NodeKey, NodeRepository};
 
         fn mv(from: &str, to: &str) -> Move {
             Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
         }
 
         let repo = NodeRepository::default();
-        let root_key = NodeKey::root(11);
+        let root_key = NodeKey::board(11);
         let root = repo.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(mv("a0", "a1"), 0.5), (mv("b0", "b1"), 0.5)]);
@@ -558,18 +640,20 @@ mod tests {
         let long_idx = edges.iter().position(|e| e.mv() == mv("b0", "b1")).unwrap();
 
         {
-            let child = repo.get_or_insert(root_key.child(mv("a0", "a1")));
+            let child_key = NodeKey::board(111);
+            edges[short_idx].bind_child_key(child_key);
+            let child = repo.get_or_insert(child_key);
             assert!(child.try_begin_evaluation());
             child.mark_terminal(0.0, 1.0, 2.0);
-            root.reserve_edge(short_idx).unwrap().complete(0.0);
-            root.add_delta(ValueDelta::one(0.0, 1.0));
+            root.reserve_edge(short_idx).unwrap().complete();
         }
         {
-            let child = repo.get_or_insert(root_key.child(mv("b0", "b1")));
+            let child_key = NodeKey::board(112);
+            edges[long_idx].bind_child_key(child_key);
+            let child = repo.get_or_insert(child_key);
             assert!(child.try_begin_evaluation());
             child.mark_terminal(0.0, 1.0, 8.0);
-            root.reserve_edge(long_idx).unwrap().complete(0.0);
-            root.add_delta(ValueDelta::one(0.0, 1.0));
+            root.reserve_edge(long_idx).unwrap().complete();
         }
 
         assert_eq!(
@@ -577,5 +661,23 @@ mod tests {
             mv("a0", "a1"),
             "equal-N terminal draws prefer shorter m"
         );
+    }
+
+    #[test]
+    fn principal_variation_stops_at_a_graph_cycle() {
+        use crate::search::{NodeKey, NodeRepository};
+
+        let repository = NodeRepository::default();
+        let root_key = NodeKey::board(400);
+        let root = repository.get_or_insert(root_key);
+        let mv = Move::new(Square::parse("a0").unwrap(), Square::parse("a1").unwrap());
+        assert!(root.try_begin_evaluation());
+        root.publish_edges(vec![(mv, 1.0)]);
+        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        root.edges()[0].bind_child_key(root_key);
+        root.reserve_edge(0).unwrap().complete();
+        repository.recompute_graph_node(root_key);
+
+        assert_eq!(principal_variation(&repository, root_key, false), vec![mv]);
     }
 }

@@ -1,7 +1,7 @@
 //! 固定节点下观察 cPUCT/FPU 对根边分流的影响。
 //!
 //! worker、batch、缓存吞吐实验见 `benchmark`。本工具固定正式默认的 worker
-//! 拓扑，只改变 `SearchParams`，并始终从 fresh tree 开始。
+//! 拓扑，只改变 `SearchParams`，并始终从 fresh graph 开始。
 //! 根过滤沿用 `SearchState::begin_search` 的 `searchmoves` 语义。
 
 use std::path::PathBuf;
@@ -273,7 +273,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.cpuct_factors,
         args.fpu_reduction
     );
-    println!("note: fresh tree; worker=4/4/1; batch uses backend default; trace drains at each milestone");
+    println!("note: fresh graph; worker=4/4/1; batch uses backend default; trace drains at each milestone");
     let mut generation = 0;
     for &cpuct in &args.cpucts {
         for &cpuct_base in &args.cpuct_bases {

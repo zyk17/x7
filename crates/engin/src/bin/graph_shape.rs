@@ -1,10 +1,11 @@
-//! 固定节点预算后的 stream tree 形状快照。
+//! 固定节点预算后的 stream MCGS 图形状快照。
 //!
-//! 复用 `Node` / `Edge` 的只读统计；不改变 PUCT、worker 或正式 UCI。树按已完成
+//! 复用 `Node` / `Edge` 的只读统计；不改变 PUCT、worker 或正式 UCI。图按已完成
 //! visit 展开，参考 LC3 Overview 的 "Node structure"。每一行代表一个已访问 node，
 //! 只展示进入该 node 的 `P/N/Q/M`，不重复打印 edge 或内部状态。`M` 是 node 聚合的
 //! moves-left 平均值，单位为 ply。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ struct Args {
 }
 
 fn usage() -> &'static str {
-    "usage: tree_shape [--onnx data/x7.onnx] [--fen \"...\"] [--moves \"c3c4 h7h3 ...\"] \\
+    "usage: graph_shape [--onnx data/x7.onnx] [--fen \"...\"] [--moves \"c3c4 h7h3 ...\"] \\
      [--playouts 2000] [--depth 4] [--top 8]"
 }
 
@@ -87,7 +88,7 @@ fn parse_args() -> Result<Args, String> {
 
 struct Child {
     mv: Move,
-    key: NodeKey,
+    key: Option<NodeKey>,
     prior: f32,
     completed: u32,
 }
@@ -98,6 +99,11 @@ struct PrintStyle {
     top: usize,
 }
 
+struct PrintContext<'a> {
+    style: &'a PrintStyle,
+    path: &'a mut HashSet<NodeKey>,
+}
+
 fn children(repository: &NodeRepository, key: NodeKey) -> Vec<Child> {
     let Some(node) = repository.get(key) else {
         return Vec::new();
@@ -105,14 +111,12 @@ fn children(repository: &NodeRepository, key: NodeKey) -> Vec<Child> {
     let mut children: Vec<_> = node
         .edges()
         .iter()
-        .map(|edge| {
-            let child_key = key.child(edge.mv());
-            Child {
-                mv: edge.mv(),
-                key: child_key,
-                prior: edge.prior(),
-                completed: edge.completed_visits(),
-            }
+        .filter(|edge| edge.completed_visits() > 0)
+        .map(|edge| Child {
+            mv: edge.mv(),
+            key: edge.child_key(),
+            prior: edge.prior(),
+            completed: edge.completed_visits(),
         })
         .collect();
     children.sort_unstable_by(|left, right| {
@@ -134,15 +138,15 @@ fn print_node(
     key: NodeKey,
     incoming: Option<&Child>,
     remaining_depth: usize,
-    style: &PrintStyle,
     prefix: &str,
     is_last: bool,
+    context: &mut PrintContext<'_>,
 ) {
     let Some(node) = repository.get(key) else {
         return;
     };
     let children = children(repository, key);
-    let visited = children.iter().filter(|child| child.completed > 0).count();
+    let visited = children.len();
     match incoming {
         None => println!(
             "root  N={}  Q={:.4}  M={:.1}",
@@ -153,7 +157,11 @@ fn print_node(
         Some(child) => println!(
             "{prefix}{} {}  P={:.4}  N={}  Q={:.4}  M={:.1}",
             if is_last { "└─" } else { "├─" },
-            move_text(child.mv, style.root_is_black, style.display_depth - remaining_depth - 1,),
+            move_text(
+                child.mv,
+                context.style.root_is_black,
+                context.style.display_depth - remaining_depth - 1,
+            ),
             child.prior,
             node.completed_visits(),
             node.q(),
@@ -163,26 +171,52 @@ fn print_node(
     if remaining_depth == 0 || visited == 0 {
         return;
     }
-    let shown = children
-        .iter()
-        .filter(|child| child.completed > 0)
-        .take(style.top)
-        .collect::<Vec<_>>();
+    let shown = children.iter().take(context.style.top).collect::<Vec<_>>();
     let child_prefix = match incoming {
         None => String::new(),
         Some(_) if is_last => format!("{prefix}   "),
         Some(_) => format!("{prefix}│  "),
     };
     for (index, child) in shown.iter().enumerate() {
+        let last = index + 1 == shown.len() && visited == shown.len();
+        let branch = if last { "└─" } else { "├─" };
+        let Some(child_key) = child.key else {
+            println!(
+                "{child_prefix}{branch} {}  P={:.4}  N={}  ↻ local cycle",
+                move_text(
+                    child.mv,
+                    context.style.root_is_black,
+                    context.style.display_depth - remaining_depth - 1,
+                ),
+                child.prior,
+                child.completed,
+            );
+            continue;
+        };
+        if context.path.contains(&child_key) {
+            println!(
+                "{child_prefix}{branch} {}  P={:.4}  N={}  ↻ graph cycle",
+                move_text(
+                    child.mv,
+                    context.style.root_is_black,
+                    context.style.display_depth - remaining_depth - 1,
+                ),
+                child.prior,
+                child.completed,
+            );
+            continue;
+        }
+        context.path.insert(child_key);
         print_node(
             repository,
-            child.key,
+            child_key,
             Some(child),
             remaining_depth - 1,
-            style,
             &child_prefix,
-            index + 1 == shown.len() && visited == shown.len(),
+            last,
+            context,
         );
+        context.path.remove(&child_key);
     }
     if visited > shown.len() {
         println!("{child_prefix}└─ ... {} nodes omitted by --top", visited - shown.len());
@@ -215,18 +249,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "total  N={}  collisions={}  rate={collision_rate:.1}%",
         stats.completed_playouts, stats.collisions
     );
+    let style = PrintStyle {
+        root_is_black,
+        display_depth: args.depth,
+        top: args.top,
+    };
+    let mut path = HashSet::from([search.root_key()]);
+    let mut context = PrintContext {
+        style: &style,
+        path: &mut path,
+    };
     print_node(
         search.repository(),
         search.root_key(),
         None,
         args.depth,
-        &PrintStyle {
-            root_is_black,
-            display_depth: args.depth,
-            top: args.top,
-        },
         "",
         true,
+        &mut context,
     );
     search.stop_and_finish();
     Ok(())
@@ -234,7 +274,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("tree_shape: {error}");
+        eprintln!("graph_shape: {error}");
         std::process::exit(2);
     }
 }
