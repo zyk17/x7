@@ -546,7 +546,7 @@ impl SearchGraph {
 
     /// Engine 已停止并 drain worker 后使用的推进路径。
     ///
-    /// `SearchSession::set_position` 已保证 reservation 全部归还；保留 debug
+    /// Engine 的 `set_position` 已保证 reservation 全部归还；保留 debug
     /// 断言以防生命周期边界被破坏。参考 LC3 Overview 的 "Node repository" 与
     /// px0 `NodeTree::MakeMove`（`src/search/classic/node.cc:465-483`）。
     fn advance_after_drain(&mut self, mv: Move) -> Result<GcStats, EnginError> {

@@ -5,9 +5,69 @@ use std::sync::{Arc, Mutex};
 
 use xiangqi_core::STARTPOS_FEN;
 
-use crate::callbacks::{BestMoveInfo, SearchResponder, ThinkingInfo};
 use crate::error::EnginError;
 use crate::{Engine, Options};
+
+/// px0 `BestMoveInfo`。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BestMoveInfo {
+    pub bestmove: xiangqi_core::Move,
+    pub ponder: xiangqi_core::Move,
+}
+
+impl BestMoveInfo {
+    pub const fn new(bestmove: xiangqi_core::Move) -> Self {
+        Self {
+            bestmove,
+            ponder: xiangqi_core::Move::NULL,
+        }
+    }
+}
+
+/// px0 `ThinkingInfo::WDL`。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Wdl {
+    pub w: i32,
+    pub d: i32,
+    pub l: i32,
+}
+
+/// px0 `ThinkingInfo`。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThinkingInfo {
+    pub depth: i32,
+    pub seldepth: i32,
+    pub time: i64,
+    pub nodes: i64,
+    pub nps: i32,
+    pub eps: i32,
+    pub mate: Option<i32>,
+    pub score: Option<i32>,
+    pub wdl: Option<Wdl>,
+    pub pv: Vec<xiangqi_core::Move>,
+    pub multipv: i32,
+    pub comment: String,
+}
+
+impl Default for ThinkingInfo {
+    /// px0 `ThinkingInfo` field defaults (`callbacks.h:58-101`)。
+    fn default() -> Self {
+        Self {
+            depth: -1,
+            seldepth: -1,
+            time: -1,
+            nodes: -1,
+            nps: -1,
+            eps: -1,
+            mate: None,
+            score: None,
+            wdl: None,
+            pv: Vec::new(),
+            multipv: -1,
+            comment: String::new(),
+        }
+    }
+}
 
 /// px0 `GoParams` (`uciloop.h:42-55`)。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -50,12 +110,9 @@ pub trait StringUciResponder: UciResponder {
     }
 }
 
-/// 从搜索 watchdog 到唯一 UCI 输出 owner 的安全桥接。
-///
-/// 搜索 worker 发布结构化回调；只有 `UciLoop::flush_output` 借用文本 responder，
-/// 并将回调格式化为 UCI 行。
+/// watchdog 到 UCI 主线程的输出队列。主线程是唯一格式化、写 stdout 的 owner。
 #[derive(Default)]
-pub struct UciOutputQueue {
+pub(crate) struct UciOutputQueue {
     events: Mutex<Vec<UciOutput>>,
 }
 
@@ -65,6 +122,22 @@ enum UciOutput {
 }
 
 impl UciOutputQueue {
+    /// watchdog 放入一条 bestmove，UCI 主线程随后统一输出。
+    pub(crate) fn push_best_move(&self, info: BestMoveInfo) {
+        self.events
+            .lock()
+            .expect("uci output queue lock")
+            .push(UciOutput::BestMove(info));
+    }
+
+    /// watchdog 放入一组 info，UCI 主线程随后统一输出。
+    pub(crate) fn push_thinking_info(&self, infos: Vec<ThinkingInfo>) {
+        self.events
+            .lock()
+            .expect("uci output queue lock")
+            .push(UciOutput::Thinking(infos));
+    }
+
     fn flush(&self, responder: &mut dyn UciResponder) {
         let events = std::mem::take(&mut *self.events.lock().expect("uci output queue lock"));
         for event in events {
@@ -73,22 +146,6 @@ impl UciOutputQueue {
                 UciOutput::Thinking(infos) => responder.output_thinking_info(&infos),
             }
         }
-    }
-}
-
-impl SearchResponder for UciOutputQueue {
-    fn output_best_move(&self, info: &BestMoveInfo) {
-        self.events
-            .lock()
-            .expect("uci output queue lock")
-            .push(UciOutput::BestMove(info.clone()));
-    }
-
-    fn output_thinking_info(&self, infos: &[ThinkingInfo]) {
-        self.events
-            .lock()
-            .expect("uci output queue lock")
-            .push(UciOutput::Thinking(infos.to_vec()));
     }
 }
 
@@ -104,7 +161,7 @@ impl<'a> UciLoop<'a> {
     pub fn new(responder: &'a mut dyn StringUciResponder, engine: &'a mut Engine) -> Self {
         responder.set_options(engine.options().clone());
         let output = Arc::new(UciOutputQueue::default());
-        engine.set_search_responder(Some(Arc::clone(&output) as Arc<dyn SearchResponder>));
+        engine.set_output_queue(Some(Arc::clone(&output)));
         Self {
             responder,
             engine,
@@ -215,7 +272,7 @@ impl<'a> UciLoop<'a> {
         self.dispatch_command(&command, &params, version)
     }
 
-    /// Flushes watchdog callbacks even while no new UCI command arrives.
+    /// 即使没有新 UCI 命令，也会 flush watchdog 已写入的输出队列。
     pub fn flush_output(&mut self) {
         self.output.flush(self.responder);
     }
@@ -225,7 +282,7 @@ impl Drop for UciLoop<'_> {
     /// px0 `UciLoop::~UciLoop` (`uciloop.cc:176`).
     fn drop(&mut self) {
         let _ = self.engine.stop();
-        self.engine.set_search_responder(None);
+        self.engine.set_output_queue(None);
         self.flush_output();
     }
 }
@@ -537,8 +594,8 @@ fn token_offset(text: &str, needle: &str) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use super::Wdl;
     use super::*;
-    use crate::callbacks::Wdl;
     use std::sync::Once;
     use xiangqi_core::{Move, Square, initialize_magic_bitboards};
 

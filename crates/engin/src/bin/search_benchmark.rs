@@ -2,7 +2,7 @@
 //!
 //! worker、batch、缓存吞吐实验见 `benchmark`。本工具固定正式默认的 worker
 //! 拓扑，只改变 `SearchParams`，并始终从 fresh graph 开始。
-//! 根过滤沿用 `SearchState::begin_search` 的 `searchmoves` 语义。
+//! 根过滤沿用 Engine 的 `searchmoves` 语义。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -180,7 +180,7 @@ fn parse_move_list(text: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// 与 `SearchState::begin_search` 保持相同的根着过滤语义。
+/// 与 Engine 保持相同的根着过滤语义。
 fn root_filter(history: &PositionHistory, requested: &[String]) -> Result<Vec<xiangqi_core::Move>, String> {
     let board = history.last().board();
     let legal = board.generate_legal_moves();

@@ -28,11 +28,11 @@ use super::{
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
 
-/// 相对当前 completed playout 的搜索预算。
+/// 当前 root 的累计 visit 搜索预算。
 ///
-/// UCI watchdog 将 `go nodes` / `go movetime` 映射到这里；worker 只观察不可变
-/// budget 与显式 `request_stop()`。参考：LC3 Overview 的 "Stats Collection" /
-/// "WatchdogWorker"。
+/// `go nodes N` 包含 tree reuse 前已有的 root N。参考 px0 `Search::Search` 的
+/// `initial_visits_` 和 `VisitsStopper`（`classic/search.cc:149,919`，
+/// `classic/stoppers/stoppers.cc:59-69`）；时钟仍只约束本次 job。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SearchLimits {
     pub max_playouts: Option<u64>,
@@ -136,18 +136,6 @@ impl SearchControl {
 
     pub fn stats(&self) -> Stats {
         self.shared.stats()
-    }
-
-    /// 等待一次完成回传或 stop；watchdog 用它在 Backprop 后立即检查新的 root 快照。
-    /// 参考 px0 `SearchWorker::UpdateCounters`（`classic/search.cc:2332-2336`）：worker
-    /// 每完成一个 minibatch 都有机会触发一次条件化 UCI 输出。
-    pub fn wait_for_progress(&self, completed_playouts: u64, timeout: Duration) {
-        let mut guard = self.shared.idle_lock.lock();
-        if self.shared.completed.load(Ordering::Acquire) == completed_playouts
-            && !self.shared.stopping.load(Ordering::Acquire)
-        {
-            self.shared.idle.wait_for(&mut guard, timeout);
-        }
     }
 }
 
@@ -593,6 +581,8 @@ pub struct Search {
     shared: Arc<Shared>,
     root_history: Arc<PositionHistory>,
     root_key: NodeKey,
+    /// 启动本次 job 前 root 已有的 completed N。它计入 UCI `go nodes`，但不计入本次 NPS。
+    initial_visits: u64,
     /// Cap concurrent owned playouts after root expansion. Much smaller than
     /// queue capacity: saturating thousands of in-flight walks explodes collisions.
     max_in_flight: usize,
@@ -637,6 +627,10 @@ impl Search {
         let (backprop_tx, backprop_rx) = bounded(resolved.queue_capacity);
         let root_history = Arc::clone(graph.root_history());
         let root_key = graph.root_key();
+        let initial_visits = graph
+            .repository()
+            .get(root_key)
+            .map_or(0, |root| root.completed_visits() as u64);
         let shared = Arc::new(Shared {
             backend,
             repository: Arc::clone(graph.repository()),
@@ -683,6 +677,7 @@ impl Search {
             shared,
             root_history,
             root_key,
+            initial_visits,
             // 保持数个 Eval batch 的叶子处于 in-flight，而非占满全部队列深度。
             max_in_flight: resolved
                 .eval_batch_size
@@ -702,6 +697,10 @@ impl Search {
         self.root_key
     }
 
+    pub fn initial_visits(&self) -> u64 {
+        self.initial_visits
+    }
+
     pub fn stats(&self) -> Stats {
         self.shared.stats()
     }
@@ -710,18 +709,6 @@ impl Search {
         SearchControl {
             shared: Arc::clone(&self.shared),
         }
-    }
-
-    #[cfg(test)]
-    /// 仅测试 SearchState 的 job 配置快照；对应 LC3 Overview 的独占 Search job。
-    pub(crate) fn eval_batch_size(&self) -> usize {
-        self.max_in_flight / 4
-    }
-
-    #[cfg(test)]
-    /// 仅测试 SearchState 的参数快照；对应独占 job 的不可变 `SearchConfig`。
-    pub(crate) fn params(&self) -> SearchParams {
-        self.shared.params
     }
 
     /// Requests a normal stream-search stop without tearing down worker
@@ -794,17 +781,21 @@ impl Search {
         })
     }
 
-    /// Runs owned stream events until a relative playout budget, deadline, or
+    /// Runs owned stream events until a cumulative root-visit budget, deadline, or
     /// explicit stop is reached. After root expansion it keeps the pipeline
     /// filled up to `max_in_flight` (~4× eval batch) instead of draining to idle
     /// between waves. It always waits for submitted events to complete or
     /// cancel before returning, so root snapshots never observe a leaked edge
     /// reservation.
     pub fn run_with_limits(&self, limits: SearchLimits) -> Result<Stats, EnginError> {
-        let initial_completed = self.stats().completed_playouts;
-        let target = initial_completed.saturating_add(limits.max_playouts.unwrap_or(u64::MAX));
+        let target = limits.max_playouts.unwrap_or(u64::MAX);
         let max_in_flight = self.max_in_flight;
-        while !self.is_stopping() && !limits.is_exhausted(self.stats().completed_playouts, target) {
+        while !self.is_stopping()
+            && !limits.is_exhausted(
+                self.initial_visits.saturating_add(self.stats().completed_playouts),
+                target,
+            )
+        {
             let root_state = self
                 .shared
                 .repository
@@ -826,7 +817,12 @@ impl Search {
             }
             let outstanding = self.shared.outstanding.load(Ordering::Acquire);
             let completed = self.stats().completed_playouts;
-            if completed.saturating_add(outstanding as u64) >= target {
+            if self
+                .initial_visits
+                .saturating_add(completed)
+                .saturating_add(outstanding as u64)
+                >= target
+            {
                 if outstanding == 0 {
                     break;
                 }

@@ -15,8 +15,6 @@ mod extension;
 mod graph;
 mod pipeline;
 mod policy;
-mod session;
-mod state;
 mod stats;
 mod time;
 
@@ -27,15 +25,13 @@ pub use pipeline::QueueStats;
 pub(crate) use pipeline::WorkerPool;
 pub use pipeline::{Search, SearchConfig, SearchControl, SearchLimits, Stats};
 pub use policy::{SearchParams, ValueDelta, select_edge, select_edge_from_node};
-pub(crate) use session::SearchSession;
-pub use state::SearchResult;
-pub(crate) use state::{SearchState, WatchdogProgress, WatchdogSnapshot};
 pub(crate) use stats::best_mate;
 pub(crate) use stats::root_variations;
 pub use stats::{
     RootEdgeStats, RootStats, best_move, best_move_filtered, principal_variation, principal_variation_filtered,
     root_stats,
 };
+pub(crate) use time::{TimeBudget, TimeManager};
 
 /// px0 `FetchSingleNodeResult`：`eval->q = -eval->q`（`search.cc:2129`）。NN WDL
 /// 按 side-to-move 表示；node 统计按 incoming-edge / 走子方视角表示，对齐 px0 `Node::wl_`。

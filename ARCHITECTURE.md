@@ -57,9 +57,9 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 
 ## 单一搜索
 
-仓库只维护 stream 搜索。`Engine` 直接拥有其搜索会话，不保留 `SearchBase`、`SearchFactory` 或 classic 对照实现。`UniformBackend` 仅用于 stream 测试；正式 UCI 必须加载 ONNX。
+仓库只维护 stream 搜索。`Engine` 直接拥有 graph、worker pool 与每次 job，不保留 `SearchBase`、`SearchFactory`、`SearchSession` 或 classic 对照实现。`UniformBackend` 仅用于 stream 测试；正式 UCI 必须加载 ONNX。
 
-`search/time.rs` 独立于 graph/worker：只在 session 启动时计算 deadline、在 drain 后归还未用时间；
+`search/time.rs` 独立于 graph/worker：只在 Engine 启动 job 时计算 deadline、在 drain 后归还未用时间；
 它不是第二套搜索实现，也不提供策略化调参。
 
 ## Stream
@@ -67,9 +67,9 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 - repository 是一个 64 分片的 key-value map。MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。环、重复与 rule60 等路径终局只在 variation 内裁决，不创建重复 node，也不标记 shared node；每次结果作为实际入边的一次 local 样本，不能由首次路径永久覆盖。
 - NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
-- Engine session 常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
+- Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
-  session 启动时按固定中性的 px0 预算转换为不可变 deadline，job drain 后才归还剩余时间。
+  Engine 启动 job 时按固定中性的 px0 预算转换为不可变 deadline，job drain 后才归还剩余时间。
 - graph reuse 保留已走 root 供悔棋，并从所有 retained root 遍历可达 node 后批量 GC；UCI/Watchdog 已输出最小 info 与一次 bestmove。
 - `MultiPV` 只在 watchdog 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCGS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 

@@ -31,7 +31,7 @@ fn default_weights_file() -> PathBuf {
 fn main() {
     let mut responder = StdoutUciResponder::default();
     let mut engine = Engine::new();
-    // 首个 `position` 命令创建 backend。
+    // 首个 `position` 命令初始化 ONNX backend；Engine 本身已经在上一行创建。
     engine
         .set_option("WeightsFile", &default_weights_file().to_string_lossy())
         .expect("default UCI options must be valid");
