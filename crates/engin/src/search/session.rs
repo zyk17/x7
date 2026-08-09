@@ -13,7 +13,7 @@ use crate::neural::backend::Backend;
 use crate::{EnginError, GoParams};
 
 use super::time::{TimeBudget, TimeManager};
-use super::{SearchControl, SearchLimits, SearchState, WatchdogSnapshot};
+use super::{SearchControl, SearchLimits, SearchState, WatchdogProgress, WatchdogSnapshot};
 
 /// Engine 持有的 LC3 风格搜索会话。
 ///
@@ -36,6 +36,34 @@ struct ActiveSearch {
     clock_budget: Option<TimeBudget>,
 }
 
+/// px0 `search.cc` 的 `kUciInfoMinimumFrequencyMs`。
+const UCI_INFO_MINIMUM_FREQUENCY: Duration = Duration::from_secs(5);
+
+/// 上次已发布的主变例摘要。watchdog 每 100ms 醒来仅是为了检查 stop/完成；只有
+/// 这个摘要变化或长期未输出时，才发送新的 UCI `info`。
+#[derive(Default)]
+struct PublishedInfo {
+    progress: Option<WatchdogProgress>,
+    time: i64,
+}
+
+impl PublishedInfo {
+    /// 对齐 px0 `Search::MaybeOutputInfo`（`classic/search.cc:363-383`）。watchdog 的
+    /// 100ms 唤醒只决定检查粒度；只有状态变化才输出。
+    fn should_publish(&self, progress: WatchdogProgress, time: i64) -> bool {
+        if progress.best_move.is_none() {
+            return false;
+        }
+        self.progress != Some(progress)
+            || time.saturating_sub(self.time) > UCI_INFO_MINIMUM_FREQUENCY.as_millis() as i64
+    }
+
+    fn update(&mut self, progress: WatchdogProgress, time: i64) {
+        self.progress = Some(progress);
+        self.time = time;
+    }
+}
+
 #[derive(Default)]
 struct Completion {
     result: Mutex<Option<Result<super::SearchResult, EnginError>>>,
@@ -52,11 +80,9 @@ fn watchdog(
 ) {
     // LC3 Overview 的 "WatchdogWorker"：每次搜索一个 watchdog；它只负责
     // 输出，Gather/Eval/NN/Backprop 负责搜索。
+    let mut published = PublishedInfo::default();
     loop {
-        let mut result = completion.result.lock();
-        if result.is_none() {
-            completion.ready.wait_for(&mut result, Duration::from_millis(100));
-        }
+        let result = completion.result.lock();
         if let Some(result) = result.as_ref() {
             if let Some(responder) = responder.as_ref() {
                 let publishing = publish_output.lock();
@@ -82,13 +108,23 @@ fn watchdog(
             return;
         }
         drop(result);
+        let stats = control.stats();
         if let Some(responder) = responder.as_ref() {
             let publishing = publish_output.lock();
             if !*publishing {
                 return;
             }
-            responder.output_thinking_info(&snapshot.thinking_infos(control.stats(), started));
+            let time = started.elapsed().as_millis() as i64;
+            let progress = snapshot.progress(&stats);
+            if published.should_publish(progress, time) {
+                let infos = snapshot.thinking_infos(stats.clone(), started);
+                responder.output_thinking_info(&infos);
+                published.update(progress, time);
+            }
         }
+        // Backprop 的 `finish(true)` 会唤醒这里；搜索完成但没有新回传时，最多 100ms
+        // 后仍会检查 completion。
+        control.wait_for_progress(stats.completed_playouts, Duration::from_millis(100));
     }
 }
 
@@ -222,11 +258,6 @@ impl SearchSession {
         };
         let control = running.control();
         let snapshot = running.watchdog_snapshot();
-        // `go` 的首条 info 必须在 `start` 返回前入队，不能依赖 watchdog 的首个
-        // 100ms 周期；根尚未扩展时仍输出合法的零节点快照。
-        if let Some(responder) = self.responder.as_ref() {
-            responder.output_thinking_info(&snapshot.thinking_infos(control.stats(), started));
-        }
         let deadline = params
             .movetime
             .map(|ms| started + Duration::from_millis(ms.max(0) as u64))
@@ -340,22 +371,18 @@ mod tests {
     }
 
     #[test]
-    fn search_start_immediately_publishes_an_info_snapshot() {
-        INIT.call_once(initialize_magic_bitboards);
-        let responder = Arc::new(RecordingResponder::default());
-        let mut search = SearchSession::new(Arc::new(UniformBackend::default()));
-        search.set_responder(Some(Arc::clone(&responder) as Arc<dyn SearchResponder>));
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        search.set_position(&state).expect("position");
-        search
-            .start(&GoParams {
-                infinite: true,
-                ..GoParams::default()
-            })
-            .expect("start");
-
-        assert!(!responder.infos.lock().expect("info lock").is_empty());
-        search.abort().expect("stop infinite search");
+    fn watchdog_info_requires_progress_or_a_long_interval() {
+        let progress = super::WatchdogProgress {
+            best_move: Some(xiangqi_core::Move::NULL),
+            depth: 3,
+            seldepth: 6,
+        };
+        let mut published = super::PublishedInfo::default();
+        assert!(published.should_publish(progress, 100));
+        published.update(progress, 100);
+        assert!(!published.should_publish(progress, 200));
+        assert!(published.should_publish(super::WatchdogProgress { depth: 4, ..progress }, 200));
+        assert!(published.should_publish(progress, 5_101));
     }
 
     #[test]

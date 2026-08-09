@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use xiangqi_core::PositionHistory;
+use xiangqi_core::{Move, PositionHistory};
 
 use crate::EnginError;
 use crate::callbacks::{ThinkingInfo, Wdl};
@@ -30,7 +30,30 @@ pub(crate) struct WatchdogSnapshot {
     multi_pv: usize,
 }
 
+/// 仅用于判断是否值得构造完整 UCI `info` 的根快照。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WatchdogProgress {
+    pub best_move: Option<Move>,
+    pub depth: i32,
+    pub seldepth: i32,
+}
+
 impl WatchdogSnapshot {
+    /// 对齐 px0 `MaybeOutputInfo` 的比较字段。这里刻意不构造 PV/MultiPV；只有 marker
+    /// 变化时才调用 `thinking_infos` 做完整格式化。
+    pub fn progress(&self, stats: &Stats) -> WatchdogProgress {
+        WatchdogProgress {
+            best_move: best_move_filtered(
+                &self.repository,
+                self.root_key,
+                self.root_is_black,
+                &self.root_move_filter,
+            ),
+            depth: stats.average_depth.min(i32::MAX as u64) as i32,
+            seldepth: stats.max_depth.min(i32::MAX as u64) as i32,
+        }
+    }
+
     /// 对齐 px0 `Search::SendUciInfo`：同一 root 快照输出按根边排序的多条 PV。
     pub fn thinking_infos(&self, stats: Stats, started: Instant) -> Vec<ThinkingInfo> {
         let time = started.elapsed().as_millis() as i64;

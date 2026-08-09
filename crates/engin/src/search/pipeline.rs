@@ -137,6 +137,18 @@ impl SearchControl {
     pub fn stats(&self) -> Stats {
         self.shared.stats()
     }
+
+    /// 等待一次完成回传或 stop；watchdog 用它在 Backprop 后立即检查新的 root 快照。
+    /// 参考 px0 `SearchWorker::UpdateCounters`（`classic/search.cc:2332-2336`）：worker
+    /// 每完成一个 minibatch 都有机会触发一次条件化 UCI 输出。
+    pub fn wait_for_progress(&self, completed_playouts: u64, timeout: Duration) {
+        let mut guard = self.shared.idle_lock.lock();
+        if self.shared.completed.load(Ordering::Acquire) == completed_playouts
+            && !self.shared.stopping.load(Ordering::Acquire)
+        {
+            self.shared.idle.wait_for(&mut guard, timeout);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

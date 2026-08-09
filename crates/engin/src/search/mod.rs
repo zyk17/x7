@@ -29,7 +29,7 @@ pub use pipeline::{Search, SearchConfig, SearchControl, SearchLimits, Stats};
 pub use policy::{SearchParams, ValueDelta, select_edge, select_edge_from_node};
 pub(crate) use session::SearchSession;
 pub use state::SearchResult;
-pub(crate) use state::{SearchState, WatchdogSnapshot};
+pub(crate) use state::{SearchState, WatchdogProgress, WatchdogSnapshot};
 pub(crate) use stats::best_mate;
 pub(crate) use stats::root_variations;
 pub use stats::{
