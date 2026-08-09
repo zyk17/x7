@@ -1,6 +1,6 @@
 //! px0 `src/chess/gamestate.h:38-47` 与 `gamestate.cc:35-55`、`engine.cc:65-78`。
 
-use crate::{CoreError, MoveList, Position};
+use crate::{CoreError, MoveList, Position, PositionHistory};
 
 /// px0 `GameState` (`gamestate.h:38-46`)。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,18 +28,26 @@ impl GameState {
     }
 
     pub fn current_position(&self) -> Position {
-        self.moves
-            .iter()
-            .fold(self.startpos.clone(), |pos, &mv| Position::after(&pos, mv))
+        self.position_history().last().clone()
     }
 
-    pub fn positions(&self) -> Vec<Position> {
-        let mut positions = Vec::with_capacity(self.moves.len() + 1);
-        positions.push(self.startpos.clone());
+    /// 从 UCI 的初始局面和完整 moves 重放规则历史。
+    ///
+    /// 不能只连续调用 `Position::after`：重复次数与 cycle length 只能由
+    /// `PositionHistory::append` 在完整路径中计算。参考 px0
+    /// `GameState` + `PositionHistory::Append`（`gamestate.cc:35-55`、
+    /// `position.cc:113-124,171-186`）。
+    pub fn position_history(&self) -> PositionHistory {
+        let mut history = PositionHistory::default();
+        history.reset_position(self.startpos.clone());
         for &mv in &self.moves {
-            let next = Position::after(positions.last().expect("startpos present"), mv);
-            positions.push(next);
+            history.append(mv);
         }
-        positions
+        history
+    }
+
+    /// 包含初始局面与每一步后的完整规则 position。
+    pub fn positions(&self) -> Vec<Position> {
+        self.position_history().positions().to_vec()
     }
 }

@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
-use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
+use xiangqi_core::{GameState, Move, STARTPOS_FEN};
 
 use crate::neural::backend::{Backend, CachingBackend, UniformBackend};
 use crate::neural::onnx::OnnxBackend;
@@ -214,13 +214,12 @@ impl Engine {
     pub(crate) fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), EnginError> {
         self.update_backend_config()?;
         let state = GameState::from_fen_moves(fen, moves)?;
+        let history = Arc::new(state.position_history());
         self.abort()?;
         if let Some(graph) = self.graph.as_mut() {
-            graph.reset_to_history_after_drain(Arc::new(PositionHistory::from_positions(state.positions())))?;
+            graph.reset_to_history_after_drain(Arc::clone(&history))?;
         } else if self.backend.is_some() {
-            self.graph = Some(SearchGraph::new(Arc::new(PositionHistory::from_positions(
-                state.positions(),
-            ))));
+            self.graph = Some(SearchGraph::new(history));
         }
         self.position = Some(state);
         Ok(())

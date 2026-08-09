@@ -54,10 +54,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
             };
         }
         // px0 `search.cc:1930-1959`：初始重复局面可能成为 TwoFold。
-        if history.last().repetitions() == 1
-            && depth.saturating_sub(1) >= 4
-            && depth.saturating_sub(1) as u32 >= history.last().cycle_length()
-        {
+        if history.last().repetitions() == 1 && depth >= 4 && depth as u32 >= history.last().cycle_length() {
             let cycle_length = history.last().cycle_length() as f32;
             let result = history.rule_judge();
             if result == GameResult::Draw {
@@ -201,5 +198,31 @@ mod tests {
             }
             other => panic!("expected terminal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repeated_check_cycle_from_game_history_is_terminal_at_root() {
+        // 用户实战 PGN（2026-08-10）第 32 回合后：红马 h8-f7-f7-h8、黑将
+        // e9-f9-f9-e9 构成四 ply 循环。px0 `PositionHistory::ComputeGameResult`
+        // （position.cc:88-103）：第二次重复（repetitions >= 2）在 root 也须裁决。
+        let moves = [
+            "b2e2", "b9c7", "b0c2", "a9b9", "a0b0", "c6c5", "b0b6", "h9g7", "h0g2", "g6g5", "i0i1", "g9e7", "i1f1",
+            "f9e8", "e3e4", "h7h3", "e4e5", "b7a7", "b6b9", "c7b9", "g3g4", "g5g4", "g2e3", "i9f9", "f1f9", "e9f9",
+            "e3g4", "e6e5", "h2f2", "e5e4", "g4f6", "e4f4", "f6d5", "f4e4", "e2e1", "h3h5", "c0e2", "h5e5", "e1e4",
+            "g7e6", "d0e1", "b9c7", "d5e3", "e6g5", "f2f5", "e5e3", "c2e3", "a7a3", "c3c4", "a3i3", "c4c5", "e7c5",
+            "e3g4", "i3b3", "g4e5", "b3b5", "e5f7", "b5f5", "f7g5", "i6i5", "g5i6", "c7e6", "i6h8", "f9e9", "h8f7",
+            "e9f9", "f7h8", "f9e9", "h8f7", "e9f9", "f7h8", "f9e9", "h8f7", "e9f9", "f7h8", "f9e9",
+        ];
+        let state = GameState::from_fen_moves(xiangqi_core::STARTPOS_FEN, &moves).expect("game history");
+        let history = state.position_history();
+
+        assert!(
+            history.last().repetitions() >= 2,
+            "second repetition must be visible in full UCI history"
+        );
+        assert!(matches!(
+            classify_extension(&history, 0),
+            ExtensionKind::PathTerminal { .. }
+        ));
     }
 }
