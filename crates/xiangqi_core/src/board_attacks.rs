@@ -4,8 +4,8 @@ use std::sync::OnceLock;
 
 use crate::bitboard::BitBoard;
 use crate::board_masks::{
-    BISHOP_DIRECTIONS, FILE_A_BB, FILE_I_BB, HALF_BB, KNIGHT_DIRECTIONS, PALACE, RANK0_BB, RANK9_BB, distance, file_bb,
-    rank_bb, safe_destination, shift,
+    ADVISOR_SQUARES, BISHOP_DIRECTIONS, FILE_A_BB, FILE_I_BB, HALF_BB, KNIGHT_DIRECTIONS, PALACE, RANK0_BB, RANK9_BB,
+    distance, file_bb, rank_bb, safe_destination, shift,
 };
 use crate::magic_numbers::{KBISHOPMAGICNUMBERS, KKNIGHTMAGICNUMBERS, KKNIGHTTOMAGICNUMBERS, KROOKMAGICNUMBERS};
 use crate::types::{
@@ -291,12 +291,14 @@ impl AttackTables {
                 pseudo_attacks[PieceType::King as usize][square as usize] =
                     king_attacks.intersection(BitBoard::from_bits(PALACE));
 
-                let mut advisor_attacks = BitBoard::EMPTY;
-                for d in [NORTH_WEST, NORTH_EAST, SOUTH_WEST, SOUTH_EAST] {
-                    advisor_attacks = advisor_attacks.union(safe_destination(b_sq, d));
+                if (ADVISOR_SQUARES & (1u128 << square)) != 0 {
+                    let mut advisor_attacks = BitBoard::EMPTY;
+                    for d in [NORTH_WEST, NORTH_EAST, SOUTH_WEST, SOUTH_EAST] {
+                        advisor_attacks = advisor_attacks.union(safe_destination(b_sq, d));
+                    }
+                    pseudo_attacks[PieceType::Advisor as usize][square as usize] =
+                        advisor_attacks.intersection(BitBoard::from_bits(ADVISOR_SQUARES));
                 }
-                pseudo_attacks[PieceType::Advisor as usize][square as usize] =
-                    advisor_attacks.intersection(BitBoard::from_bits(PALACE));
             }
 
             pseudo_attacks[PieceType::Knight as usize][square as usize] =

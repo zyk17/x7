@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use crate::bitboard::BitBoard;
 use crate::board_attacks::get_attacks;
-use crate::board_masks::{PALACE, bishop_bb, pawn_bb};
+use crate::board_masks::{ADVISOR_SQUARES, PALACE, bishop_bb, pawn_bb};
 use crate::hashcat::hash_cat_u128s;
 use crate::{CoreError, File, Move, MoveList, PieceType, Rank, Square};
 
@@ -127,13 +127,18 @@ impl ChessBoard {
             }
             let file = file.unwrap();
             let sq = Square::new(file, rank);
-            if matches!(piece, PieceType::Advisor | PieceType::King)
+            if piece == PieceType::Advisor
+                && BitBoard::from_square(sq)
+                    .intersection(BitBoard::from_bits(ADVISOR_SQUARES))
+                    .is_empty()
+            {
+                return Err(complain("advisor not on an advisor square"));
+            } else if piece == PieceType::King
                 && BitBoard::from_square(sq)
                     .intersection(BitBoard::from_bits(PALACE))
                     .is_empty()
             {
-                let label = if piece == PieceType::Advisor { "advisor" } else { "king" };
-                return Err(complain(&format!("{label} not in palace")));
+                return Err(complain("king not in palace"));
             } else if piece == PieceType::Pawn {
                 let is_theirs = c.is_ascii_lowercase();
                 if !BitBoard::from_square(sq).difference(pawn_bb(is_theirs)).is_empty() {
@@ -665,6 +670,13 @@ impl ChessBoard {
         ];
         let union: BitBoard = bbs.iter().copied().fold(BitBoard::EMPTY, |a, b| a.union(b));
         if union != all {
+            return false;
+        }
+        if !self
+            .advisors()
+            .difference(BitBoard::from_bits(ADVISOR_SQUARES))
+            .is_empty()
+        {
             return false;
         }
         for i in 0..bbs.len() {
