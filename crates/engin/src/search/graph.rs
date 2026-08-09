@@ -73,6 +73,9 @@ pub struct Edge {
     /// MCGS 中 move 指向的共享 board node。首次沿此 edge 下降时绑定；同一 parent
     /// board 与 move 必然导向同一 child board。KataGo GraphSearch 的 action/state 分离。
     child_key: OnceLock<NodeKey>,
+    /// 这条合法 edge 若接入 child 会闭合 shared-Q 图环，则固定保存 child 的首次
+    /// 网络预测 U。它与 `child_key` 互斥：前者是 edge-local leaf，后者是共享图边。
+    cycle_leaf: OnceLock<ValueDelta>,
     /// IEEE-754 `f32` 位模式的 policy prior（`f32::to_bits` / `from_bits`）。
     /// std 没有 `AtomicF32`，故保存为 `AtomicU32`。
     prior_bits: AtomicU32,
@@ -83,7 +86,7 @@ pub struct Edge {
     /// first-writer-wins；每次命中的路径终局只计入自己的这一次 edge visit。
     /// 参考 KataGo `docs/GraphSearch.md` 的 edge-local action statistic。
     ///
-    /// 受保护的聚合值：必须同时读取 completed N 与 local terminal 样本。
+    /// 受保护的聚合值：必须同时读取 completed N 与 local leaf 样本。
     /// 与 `started` 协同维护 `started >= completed`。`complete` 与 `cancel` 必须在
     /// 同一把锁下先检查、再修改，不能拆成独立原子计数。
     completed: Mutex<EdgeStats>,
@@ -92,7 +95,7 @@ pub struct Edge {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EdgeStats {
     pub visits: u32,
-    pub local_terminal: ValueDelta,
+    pub local_leaf: ValueDelta,
 }
 
 impl Edge {
@@ -101,6 +104,7 @@ impl Edge {
         Self {
             mv,
             child_key: OnceLock::new(),
+            cycle_leaf: OnceLock::new(),
             prior_bits: AtomicU32::new(prior.to_bits()),
             started: AtomicU32::new(0),
             completed: Mutex::new(EdgeStats::default()),
@@ -157,22 +161,27 @@ impl Edge {
         self.child_key.get().copied()
     }
 
+    pub(crate) fn cycle_leaf(&self) -> Option<ValueDelta> {
+        self.cycle_leaf.get().copied()
+    }
+
     pub fn bind_child_key(&self, key: NodeKey) {
+        assert!(self.cycle_leaf.get().is_none(), "cycle-cut edge cannot bind a child");
         if let Err(existing) = self.child_key.set(key) {
             assert_eq!(existing, key, "one edge must keep one child board");
         }
     }
 
-    fn complete(&self, local_terminal: Option<ValueDelta>) {
+    fn complete(&self, local_leaf: Option<ValueDelta>) {
         let mut completed = self.completed.lock();
         assert!(
             self.started.load(Ordering::Acquire) > completed.visits,
             "stream edge completion without reservation"
         );
         completed.visits += 1;
-        if let Some(value) = local_terminal {
-            assert_eq!(value.visits, 1, "one path terminal completes one edge visit");
-            completed.local_terminal = completed.local_terminal.merge(value);
+        if let Some(value) = local_leaf {
+            assert_eq!(value.visits, 1, "one local leaf completes one edge visit");
+            completed.local_leaf = completed.local_leaf.merge(value);
         }
     }
 }
@@ -193,7 +202,7 @@ impl EdgeReservation {
         self.edge.complete(None);
     }
 
-    pub(crate) fn complete_path_terminal(self, value: ValueDelta) {
+    pub(crate) fn complete_local_leaf(self, value: ValueDelta) {
         self.edge.complete(Some(value));
     }
 
@@ -244,34 +253,36 @@ impl Node {
             *graph_value = Some(value);
         }
     }
+
+    /// 首次网络预测 U。图边若会闭合 Q 依赖环时，调用方把它作为本 edge 的一次
+    /// 固定叶子样本，而不连接 child；因此不会把同一份统计重新读回自身。
+    pub(crate) fn graph_value(&self) -> Option<ValueDelta> {
+        *self.graph_value.lock()
+    }
     pub fn completed_visits(&self) -> u32 {
         self.stats.lock().visits
     }
 
     pub fn q(&self) -> f32 {
-        let stats = self.stats.lock();
-        if stats.visits == 0 {
-            0.0
-        } else {
-            stats.wl_sum / stats.visits as f32
-        }
+        self.value_snapshot().0
     }
 
     pub fn draw(&self) -> f32 {
-        let stats = self.stats.lock();
-        if stats.visits == 0 {
-            0.0
-        } else {
-            stats.draw_sum / stats.visits as f32
-        }
+        self.value_snapshot().1
     }
 
     pub fn m(&self) -> f32 {
+        self.value_snapshot().2
+    }
+
+    /// 在同一把统计锁下读取 WDL/M，避免 parent 重算混合 child 的两个不同版本。
+    pub(crate) fn value_snapshot(&self) -> (f32, f32, f32) {
         let stats = self.stats.lock();
         if stats.visits == 0 {
-            0.0
+            (0.0, 0.0, 0.0)
         } else {
-            stats.m_sum / stats.visits as f32
+            let visits = stats.visits as f32;
+            (stats.wl_sum / visits, stats.draw_sum / visits, stats.m_sum / visits)
         }
     }
 
@@ -362,6 +373,22 @@ type ShardNodes = RwLock<HashMap<NodeKey, Arc<Node>, BuildHasherDefault<NoHashHa
 pub struct NodeRepository {
     /// `NoHashHasher`：`NodeKey` 已经 `hash_cat`，不得再次 hash。
     shards: Box<[ShardNodes]>,
+    /// 仅序列化“检查新边是否会闭环 + 绑定新边”这一极少发生的操作。正常 PUCT、
+    /// reservation 与统计更新均不经过此锁。
+    ///
+    /// KataGo `cpp/search/search.cpp:1426-1445` 在单条 playout 的 graph path 上截断
+    /// cycle；这里的 shared-Q 重算要求更强：不允许 repository 的已绑定边形成 Q
+    /// 依赖环，故在第一次连接 edge 时做一次 DFS。
+    link_lock: Mutex<()>,
+}
+
+/// 新 edge 指向已有 board 时的连接结果。
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChildLink {
+    Bound,
+    /// 不绑定会形成图环的 edge。值是 child 首次 NN 预测 U，作为本 edge 的固定
+    /// local leaf sample；这不是重复/和棋裁决。
+    Cycle(ValueDelta),
 }
 
 impl NodeRepository {
@@ -380,7 +407,7 @@ impl NodeRepository {
                 continue;
             }
             total.visits += visits;
-            let local = edge_stats.local_terminal;
+            let local = edge_stats.local_leaf;
             total.wl_sum -= local.wl_sum;
             total.draw_sum += local.draw_sum;
             total.m_sum += local.m_sum + local.visits as f32;
@@ -392,10 +419,11 @@ impl NodeRepository {
             let Some(child) = edge.child_key().and_then(|child| self.get(child)) else {
                 continue;
             };
+            let (child_q, child_draw, child_m) = child.value_snapshot();
             let weight = propagated as f32;
-            total.wl_sum -= child.q() * weight;
-            total.draw_sum += child.draw() * weight;
-            total.m_sum += (child.m() + 1.0) * weight;
+            total.wl_sum -= child_q * weight;
+            total.draw_sum += child_draw * weight;
+            total.m_sum += (child_m + 1.0) * weight;
         }
         let mut stats = node.stats.lock();
         stats.visits = total.visits;
@@ -411,6 +439,7 @@ impl NodeRepository {
         assert!(shard_count > 0, "stream shard count must be non-zero");
         Self {
             shards: (0..shard_count).map(|_| RwLock::new(HashMap::default())).collect(),
+            link_lock: Mutex::new(()),
         }
     }
 
@@ -426,6 +455,59 @@ impl NodeRepository {
     pub fn get(&self, key: NodeKey) -> Option<Arc<Node>> {
         let shard = &self.shards[self.shard_index(key)];
         shard.read().get(&key).cloned()
+    }
+
+    /// 原子地检查并绑定一条此前未绑定的 graph edge。
+    ///
+    /// 若 `child` 已能沿已绑定 edge 到达 `parent`，再连接 `parent -> child` 会让
+    /// `recompute_graph_node` 的 shared Q 产生循环依赖。此时不把 edge 接入图，而是
+    /// 返回 child 的固定 U，供调用方作为 edge-local leaf 回传。这样保留 board-key
+    /// node 复用，却不伪造历史相关的 draw/terminal。
+    pub(crate) fn bind_child_or_cut_cycle(&self, parent: NodeKey, edge: &Edge, child: NodeKey) -> ChildLink {
+        let _link = self.link_lock.lock();
+        if let Some(existing) = edge.child_key() {
+            assert_eq!(existing, child, "one edge must keep one child board");
+            return ChildLink::Bound;
+        }
+        if let Some(value) = edge.cycle_leaf() {
+            return ChildLink::Cycle(value);
+        }
+        // 新 child 尚未进入 repository 时不可能沿既有图边回到 parent，直接绑定。
+        // 这避免绝大多数首次 expansion 的无意义 DFS。
+        let Some(child_node) = self.get(child) else {
+            edge.bind_child_key(child);
+            return ChildLink::Bound;
+        };
+        if self.reaches(child, parent) {
+            let value = child_node
+                .graph_value()
+                .expect("a reachable graph node must have a base value");
+            edge.cycle_leaf
+                .set(value)
+                .expect("cycle-cut edge is initialized once under link lock");
+            return ChildLink::Cycle(value);
+        }
+        edge.bind_child_key(child);
+        ChildLink::Bound
+    }
+
+    /// 新边检查专用 DFS。它只读取已绑定 edge，且只在首次连接 edge 时调用。
+    fn reaches(&self, from: NodeKey, target: NodeKey) -> bool {
+        let mut pending = vec![from];
+        let mut seen: HashSet<NodeKey, BuildHasherDefault<NoHashHasher<u64>>> = HashSet::default();
+        while let Some(key) = pending.pop() {
+            if !seen.insert(key) {
+                continue;
+            }
+            if key == target {
+                return true;
+            }
+            let Some(node) = self.get(key) else {
+                continue;
+            };
+            pending.extend(node.edges().iter().filter_map(|edge| edge.child_key()));
+        }
+        false
     }
 
     fn shard_index(&self, key: NodeKey) -> usize {
@@ -778,7 +860,7 @@ mod repository_tests {
 
     use xiangqi_core::{Move, Square};
 
-    use super::{ExpansionState, NodeKey, NodeRepository};
+    use super::{ChildLink, ExpansionState, NodeKey, NodeRepository};
     use crate::search::ValueDelta;
 
     fn b2_b3() -> Move {
@@ -822,6 +904,66 @@ mod repository_tests {
         assert_eq!(repo.get(c).unwrap().completed_visits(), 1);
         assert_eq!(repo.get(b).unwrap().completed_visits(), 2);
         assert!((repo.get(b).unwrap().q() + 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn new_edge_that_would_close_a_graph_cycle_stays_a_local_leaf() {
+        // A -> B -> D 与 A -> C -> D 合并后，D -> B 必须不连接；否则 B/D 的 Q
+        // 会互相依赖。参考 KataGo `cpp/search/search.cpp:1426-1445` 的 cycle 截断，
+        // 但这里不把非重复局面伪装成 draw，而使用 B 的固定网络 U。
+        let repo = NodeRepository::default();
+        let a = NodeKey::board(10);
+        let b = NodeKey::board(11);
+        let c = NodeKey::board(12);
+        let d = NodeKey::board(13);
+        let moves = [
+            b2_b3(),
+            Move::new(Square::parse("c2").unwrap(), Square::parse("c3").unwrap()),
+            Move::new(Square::parse("d2").unwrap(), Square::parse("d3").unwrap()),
+            Move::new(Square::parse("e2").unwrap(), Square::parse("e3").unwrap()),
+            Move::new(Square::parse("f2").unwrap(), Square::parse("f3").unwrap()),
+        ];
+        for (key, edges, value) in [
+            (a, vec![(moves[0], 0.5), (moves[1], 0.5)], 0.1),
+            (b, vec![(moves[2], 1.0)], 0.25),
+            (c, vec![(moves[3], 1.0)], 0.2),
+            (d, vec![(moves[4], 1.0)], 0.4),
+        ] {
+            let node = repo.get_or_insert(key);
+            assert!(node.try_begin_evaluation());
+            node.set_graph_value(ValueDelta::one(value, 0.0));
+            node.publish_edges(edges);
+        }
+        assert!(matches!(
+            repo.bind_child_or_cut_cycle(a, &repo.get(a).unwrap().edges()[0], b),
+            ChildLink::Bound
+        ));
+        assert!(matches!(
+            repo.bind_child_or_cut_cycle(a, &repo.get(a).unwrap().edges()[1], c),
+            ChildLink::Bound
+        ));
+        assert!(matches!(
+            repo.bind_child_or_cut_cycle(b, &repo.get(b).unwrap().edges()[0], d),
+            ChildLink::Bound
+        ));
+        assert!(matches!(
+            repo.bind_child_or_cut_cycle(c, &repo.get(c).unwrap().edges()[0], d),
+            ChildLink::Bound
+        ));
+
+        let d_node = repo.get(d).expect("D node");
+        let d_edges = d_node.edges();
+        let d_edge = &d_edges[0];
+        let ChildLink::Cycle(value) = repo.bind_child_or_cut_cycle(d, d_edge, b) else {
+            panic!("D -> B must be cut")
+        };
+        assert_eq!(value, ValueDelta::one(0.25, 0.0));
+        assert!(d_edge.child_key().is_none());
+        assert_eq!(d_edge.cycle_leaf(), Some(value));
+        assert!(matches!(
+            repo.bind_child_or_cut_cycle(d, d_edge, b),
+            ChildLink::Cycle(reused) if reused == value
+        ));
     }
 
     #[test]

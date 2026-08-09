@@ -66,12 +66,12 @@ fn edge_value(repository: &NodeRepository, edge: &Edge) -> f32 {
     if stats.visits == 0 {
         return 0.0;
     }
-    let propagated = stats.visits.saturating_sub(stats.local_terminal.visits);
+    let propagated = stats.visits.saturating_sub(stats.local_leaf.visits);
     let child_value = edge
         .child_key()
         .and_then(|key| repository.get(key))
         .map_or(0.0, |node| node.q() * propagated as f32);
-    (stats.local_terminal.wl_sum + child_value) / stats.visits as f32
+    (stats.local_leaf.wl_sum + child_value) / stats.visits as f32
 }
 
 fn edge_child(repository: &NodeRepository, edge: &Edge) -> Option<Arc<Node>> {

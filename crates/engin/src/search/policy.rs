@@ -2,7 +2,7 @@
 //!
 //! LC3 Policy 描述 worker/policy 架构，但未公开具体 PUCT 公式。因此在有
 //! stream 原生公式前，PUCT 形状参考 px0。当前默认的常数探索强度由 X7 固定时间
-//! 实验选定；FPU 强度采用 LC0 对照值（px0 `src/search/classic/search.cc:408-433`）。
+//! 实验选定；FPU 强度采用小网络基线，LC0 对照值见 px0 `src/search/classic/search.cc:408-433`。
 
 use crate::utils::fastmath::fast_log;
 
@@ -21,12 +21,12 @@ pub struct SearchParams {
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            // 固定时间实验基线：常数 e 足以验证低先验候选，又不会持续打散已有证据。
-            // `f32` 的最接近 e；factor 为 0 时 cpuct_base 不参与计算。
-            cpuct: 2.718_281_7,
-            cpuct_base: 38_739.0,
-            cpuct_factor: 0.0,
-            fpu_reduction: 0.330,
+            // 固定节点诊断后采用的中性曲线：C(0)=1.5，C(25k)≈5。
+            cpuct: 1.5,
+            cpuct_base: 2_000.0,
+            cpuct_factor: 1.347_017,
+            // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
+            fpu_reduction: 0.200,
         }
     }
 }
@@ -41,7 +41,10 @@ impl SearchParams {
             self.cpuct_base.is_finite() && self.cpuct_base > 0.0,
             "stream cpuct base must be finite and positive"
         );
-        assert!(self.cpuct_factor.is_finite(), "stream cpuct factor must be finite");
+        assert!(
+            self.cpuct_factor.is_finite() && self.cpuct_factor >= 0.0,
+            "stream cpuct factor must be finite and non-negative"
+        );
         assert!(
             self.fpu_reduction.is_finite() && self.fpu_reduction >= 0.0,
             "stream FPU reduction must be finite and non-negative"
@@ -49,7 +52,8 @@ impl SearchParams {
     }
 }
 
-/// 项目批准的 PUCT 对齐；等待公开的 LC3 公式。
+/// px0 `ComputeCpuct` 形状：常数 `cpuct` 加上随访问数缓慢增长的对数项。
+/// `cpuct_base` 越小，增长越早开始；`cpuct_factor` 控制增长幅度。
 pub(crate) fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
     if params.cpuct_factor == 0.0 {
         params.cpuct
@@ -58,7 +62,12 @@ pub(crate) fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
     }
 }
 
-// 尚未定义并验证事件/生命周期语义的能力不预留字段：OOO evaluation、MultiPV 与 DAG reuse。
+/// reduction 越大，未知 edge 的 FPU 越低，越晚获得首次选择。
+pub(crate) fn get_fpu(repository: &NodeRepository, params: &SearchParams, parent_q: f32, edges: &[Arc<Edge>]) -> f32 {
+    -parent_q - params.fpu_reduction * visited_policy(repository, edges).sqrt()
+}
+
+// 未定义并验证的能力不预留字段：OOO evaluation、multi-visit、prefetch 等。
 
 // stream 搜索策略参考 px0 `ComputeCpuct` / `GetFpu` / PUCT edge scoring
 // （`src/search/classic/search.cc:408-433`）。`draw_score` 固定为 0（Q 为走子方视角的
@@ -137,28 +146,34 @@ impl ValueDelta {
 }
 
 /// stream edge 上的 px0 `Node::GetVisitedPolicy`。
-pub fn visited_policy(edges: &[Arc<Edge>]) -> f32 {
+pub(crate) fn visited_policy(repository: &NodeRepository, edges: &[Arc<Edge>]) -> f32 {
     edges
         .iter()
-        .filter(|edge| edge.completed_visits() > 0)
+        .filter(|edge| {
+            edge.completed_visits() > 0
+                || edge
+                    .child_key()
+                    .and_then(|key| repository.get(key))
+                    .is_some_and(|child| child.completed_visits() > 0)
+        })
         .map(|edge| edge.prior())
         .sum()
 }
 
-/// `draw_score = 0` 时的 px0 `GetFpu`（`search.cc:408-424`）。
-pub fn get_fpu(params: &SearchParams, parent_wl: f32, edges: &[Arc<Edge>]) -> f32 {
-    -parent_wl - params.fpu_reduction * visited_policy(edges).sqrt()
-}
-
-/// MCGS action Q 由该 edge 已观察到的两类 evidence 组成：普通访问读取 shared child
-/// 的当前 Q；重复、连将/追击和 rule60 的路径终局只保留为这一次 edge visit 的本地样本。
-/// 访问数仍严格属于 edge，不能读取 child N。
+/// MCGS action Q 优先读取共享 child 的当前 Q：即使这条入边尚无本地 N，只要转置 child
+/// 已完成过，也已有可复用的 state evidence。FPU 只用于尚无 child Q 的真正未知边。
+/// 重复、连将/追击和 rule60 的路径终局则只保留为这一次 edge visit 的本地样本。访问数仍
+/// 严格属于 edge，不能读取 child N。
 pub(crate) fn edge_utility(repository: &NodeRepository, edge: &Edge, fpu: f32) -> f32 {
     let stats = edge.completed_stats();
     if stats.visits == 0 {
-        return fpu;
+        return edge
+            .child_key()
+            .and_then(|key| repository.get(key))
+            .filter(|child| child.completed_visits() > 0)
+            .map_or(fpu, |child| child.q());
     }
-    let propagated = stats.visits.saturating_sub(stats.local_terminal.visits);
+    let propagated = stats.visits.saturating_sub(stats.local_leaf.visits);
     let child_value = if propagated == 0 {
         0.0
     } else {
@@ -167,7 +182,7 @@ pub(crate) fn edge_utility(repository: &NodeRepository, edge: &Edge, fpu: f32) -
         };
         child.q() * propagated as f32
     };
-    (stats.local_terminal.wl_sum + child_value) / stats.visits as f32
+    (stats.local_leaf.wl_sum + child_value) / stats.visits as f32
 }
 
 /// 选择 px0 风格 PUCT 最高的 edge。
@@ -178,7 +193,7 @@ pub fn select_edge(
     repository: &NodeRepository,
     edges: &[Arc<Edge>],
     parent_completed_visits: u32,
-    parent_wl: f32,
+    parent_q: f32,
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
@@ -190,7 +205,7 @@ pub fn select_edge(
     let children_visits = parent_completed_visits.saturating_sub(1);
     let cpuct = compute_cpuct(*params, parent_completed_visits);
     let u_coeff = cpuct * (children_visits.max(1) as f32).sqrt();
-    let fpu = get_fpu(params, parent_wl, edges);
+    let fpu = get_fpu(repository, params, parent_q, edges);
     let mut best: Option<(usize, f32)> = None;
     let filter_root_moves = is_root && !root_move_filter.is_empty();
     for (index, edge) in edges.iter().enumerate() {
@@ -229,7 +244,7 @@ pub fn select_edge_from_node(
 mod tests {
     use xiangqi_core::{Move, Square};
 
-    use super::{SearchParams, ValueDelta, compute_cpuct, edge_utility, select_edge};
+    use super::{SearchParams, ValueDelta, compute_cpuct, edge_utility, select_edge, visited_policy};
     use crate::search::{NodeKey, NodeRepository};
 
     fn mv(from: &str, to: &str) -> Move {
@@ -244,10 +259,10 @@ mod tests {
     #[test]
     fn defaults_use_the_selected_constant_cpuct() {
         let params = SearchParams::default();
-        assert_eq!(params.cpuct, 2.718_281_7);
-        assert_eq!(params.cpuct_base, 38_739.0);
-        assert_eq!(params.cpuct_factor, 0.0);
-        assert_eq!(params.fpu_reduction, 0.330);
+        assert_eq!(params.cpuct, 1.5);
+        assert_eq!(params.cpuct_base, 2_000.0);
+        assert_eq!(params.cpuct_factor, 1.347_017);
+        assert_eq!(params.fpu_reduction, 0.200);
         assert_eq!(compute_cpuct(params, 0), params.cpuct);
     }
 
@@ -308,6 +323,24 @@ mod tests {
     }
 
     #[test]
+    fn unvisited_transposition_uses_shared_child_q_not_fpu() {
+        let repo = NodeRepository::default();
+        let key = NodeKey::board(40);
+        let node = repo.get_or_insert(key);
+        assert!(node.try_begin_evaluation());
+        node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
+        let edge = node.edges()[0].clone();
+        let child_key = NodeKey::board(41);
+        edge.bind_child_key(child_key);
+        repo.get_or_insert(child_key).set_graph_value(ValueDelta::one(0.5, 0.0));
+        repo.recompute_graph_node(child_key);
+
+        assert_eq!(edge.completed_visits(), 0);
+        assert!((edge_utility(&repo, &edge, -0.4) - 0.5).abs() < 1e-6);
+        assert!((visited_policy(&repo, &[edge]) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn path_terminal_is_one_edge_sample_not_a_permanent_child_override() {
         let repo = NodeRepository::default();
         let key = NodeKey::board(30);
@@ -323,7 +356,7 @@ mod tests {
 
         node.reserve_edge(0)
             .expect("terminal reservation")
-            .complete_path_terminal(ValueDelta::one(0.6, 0.0));
+            .complete_local_leaf(ValueDelta::one(0.6, 0.0));
         node.reserve_edge(0).expect("child reservation").complete();
 
         assert!((edge_utility(&repo, &edge, 0.0) - 0.2).abs() < 1e-6);

@@ -478,9 +478,16 @@ fn run_search(
     limits: SearchLimits,
 ) -> Result<CompletedSearch, EnginError> {
     let stats = search.run_with_limits(limits)?;
-    let best_move = best_move_filtered(search.repository(), search.root_key(), root_is_black, &root_move_filter);
-    let principal_variation =
-        principal_variation_filtered(search.repository(), search.root_key(), root_is_black, &root_move_filter);
+    // path-local repetition/rule60 不能标记共享 board node，但对这次 UCI root 已是
+    // 真正终局；不得从旧图的 edge 回退出一着看似合法的棋。
+    let (best_move, principal_variation) = if search.root_is_path_terminal() {
+        (None, Vec::new())
+    } else {
+        (
+            best_move_filtered(search.repository(), search.root_key(), root_is_black, &root_move_filter),
+            principal_variation_filtered(search.repository(), search.root_key(), root_is_black, &root_move_filter),
+        )
+    };
     search.stop_and_finish();
     Ok(CompletedSearch {
         stats,

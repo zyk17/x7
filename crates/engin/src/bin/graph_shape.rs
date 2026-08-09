@@ -1,7 +1,7 @@
 //! 固定节点预算后的 stream MCGS 图形状快照。
 //!
-//! 复用 `Node` / `Edge` 的只读统计；不改变 PUCT、worker 或正式 UCI。图按已完成
-//! visit 展开，参考 LC3 Overview 的 "Node structure"。每一行代表一个已访问 node，
+//! 复用 `Node` / `Edge` 的只读统计；不改变 worker 或正式 UCI。可通过参数覆盖 PUCT，
+//! 图按已完成 visit 展开，参考 LC3 Overview 的 "Node structure"。每一行代表一个已访问 node，
 //! 只展示进入该 node 的 `P/N/Q/M`，不重复打印 edge 或内部状态。`M` 是 node 聚合的
 //! moves-left 平均值，单位为 ply。
 
@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use engin::neural::backend::Backend;
 use engin::neural::onnx::OnnxBackend;
-use engin::search::{NodeKey, NodeRepository, Search, SearchConfig, SearchGeneration};
-use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
+use engin::search::{NodeKey, NodeRepository, Search, SearchConfig, SearchGeneration, SearchParams};
+use xiangqi_core::{GameState, Move, STARTPOS_FEN};
 
 struct Args {
     onnx: PathBuf,
@@ -21,11 +21,16 @@ struct Args {
     playouts: u64,
     depth: usize,
     top: usize,
+    cpuct: f32,
+    cpuct_base: f32,
+    cpuct_factor: f32,
+    fpu_reduction: f32,
 }
 
 fn usage() -> &'static str {
     "usage: graph_shape [--onnx data/x7.onnx] [--fen \"...\"] [--moves \"c3c4 h7h3 ...\"] \\
-     [--playouts 2000] [--depth 4] [--top 8]"
+     [--playouts 2000] [--depth 4] [--top 8] [--cpuct 1.5] [--cpuct-base 2000] \\
+     [--cpuct-factor 1.347017] [--fpu-reduction 0.2]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -35,6 +40,11 @@ fn parse_args() -> Result<Args, String> {
     let mut playouts = 2_000;
     let mut depth = 4;
     let mut top = 8;
+    let defaults = SearchParams::default();
+    let mut cpuct = defaults.cpuct;
+    let mut cpuct_base = defaults.cpuct_base;
+    let mut cpuct_factor = defaults.cpuct_factor;
+    let mut fpu_reduction = defaults.fpu_reduction;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -69,12 +79,53 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--top must be an unsigned integer")?
             }
+            "--cpuct" => {
+                cpuct = args
+                    .next()
+                    .ok_or("--cpuct requires a number")?
+                    .parse()
+                    .map_err(|_| "--cpuct must be non-negative")?
+            }
+            "--cpuct-base" => {
+                cpuct_base = args
+                    .next()
+                    .ok_or("--cpuct-base requires a number")?
+                    .parse()
+                    .map_err(|_| "--cpuct-base must be positive")?
+            }
+            "--cpuct-factor" => {
+                cpuct_factor = args
+                    .next()
+                    .ok_or("--cpuct-factor requires a number")?
+                    .parse()
+                    .map_err(|_| "--cpuct-factor must be non-negative")?
+            }
+            "--fpu-reduction" => {
+                fpu_reduction = args
+                    .next()
+                    .ok_or("--fpu-reduction requires a number")?
+                    .parse()
+                    .map_err(|_| "--fpu-reduction must be non-negative")?
+            }
             "--help" | "-h" => return Err(usage().into()),
             _ => return Err(format!("unknown argument: {argument}\n{}", usage())),
         }
     }
-    if playouts == 0 || top == 0 {
-        return Err("--playouts and --top must be positive".into());
+    if playouts == 0
+        || top == 0
+        || !cpuct.is_finite()
+        || cpuct < 0.0
+        || !cpuct_base.is_finite()
+        || cpuct_base <= 0.0
+        || !cpuct_factor.is_finite()
+        || cpuct_factor < 0.0
+        || !fpu_reduction.is_finite()
+        || fpu_reduction < 0.0
+    {
+        return Err(
+            "--playouts, --top, and --cpuct-base must be positive; search parameters must be finite and non-negative"
+                .into(),
+        );
     }
     Ok(Args {
         onnx,
@@ -83,6 +134,10 @@ fn parse_args() -> Result<Args, String> {
         playouts,
         depth,
         top,
+        cpuct,
+        cpuct_base,
+        cpuct_factor,
+        fpu_reduction,
     })
 }
 
@@ -229,14 +284,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("onnx missing: {}", args.onnx.display()).into());
     }
     let state = GameState::from_fen_moves(&args.fen, &args.moves)?;
-    let history = Arc::new(PositionHistory::from_positions(state.positions()));
+    let history = Arc::new(state.position_history());
     let root_is_black = history.is_black_to_move();
     let backend = OnnxBackend::from_file(&args.onnx)?;
     let mut search = Search::new(
         Arc::new(backend) as Arc<dyn Backend>,
         SearchGeneration(1),
         history,
-        SearchConfig::default(),
+        SearchConfig {
+            params: SearchParams {
+                cpuct: args.cpuct,
+                cpuct_base: args.cpuct_base,
+                cpuct_factor: args.cpuct_factor,
+                fpu_reduction: args.fpu_reduction,
+            },
+            ..SearchConfig::default()
+        },
     );
     let stats = search.run_playouts(args.playouts)?;
     let attempts = stats.completed_playouts + stats.collisions;

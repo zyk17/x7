@@ -27,6 +27,9 @@ pub struct SearchGeneration(pub u64);
 pub struct Variation {
     root_history: Arc<PositionHistory>,
     moves: Vec<Move>,
+    /// 首次需要规则或 NN 编码时才重放 root history；之后随 `push` 增量追加。
+    /// 同一个 Gather event 不会在每层 Expanded node 重放整条 variation。
+    history: Option<PositionHistory>,
     /// Gather 当前所在局面。MCGS 必须从真实棋盘取得 child board key；保留这份轻量
     /// snapshot 避免每下降一层都从 root 重放整条 variation。
     /// 完整 history 仍只在 Eval 的规则裁决与 NN 编码时重建。
@@ -39,12 +42,16 @@ impl Variation {
             position: root_history.last().clone(),
             root_history,
             moves: Vec::new(),
+            history: None,
         }
     }
 
     pub fn push(&mut self, mv: Move) {
         self.position = Position::after(&self.position, mv);
         self.moves.push(mv);
+        if let Some(history) = self.history.as_mut() {
+            history.append(mv);
+        }
     }
 
     pub fn root_history(&self) -> &Arc<PositionHistory> {
@@ -55,13 +62,17 @@ impl Variation {
         &self.moves
     }
 
-    /// 在 worker 私有工作区重建准确的叶子 history。
-    pub fn replay_history(&self) -> PositionHistory {
-        let mut history = self.root_history.as_ref().clone();
-        for &mv in self.moves.iter() {
-            history.append(mv);
+    /// 返回 worker 私有的准确 history。首次读取才从共享 root 重放一次，之后由
+    /// `push` 维护，供重复规则、RuleJudge 与 NN 编码共用。
+    pub(crate) fn history(&mut self) -> &PositionHistory {
+        if self.history.is_none() {
+            let mut history = self.root_history.as_ref().clone();
+            for &mv in &self.moves {
+                history.append(mv);
+            }
+            self.history = Some(history);
         }
-        history
+        self.history.as_ref().expect("variation history is initialized")
     }
 
     /// MCGS child identity 只使用走子后的棋盘，不混入 repetition/rule60/history。
@@ -69,6 +80,15 @@ impl Variation {
     /// variation。
     pub fn child_board_key(&self, mv: Move) -> NodeKey {
         NodeKey::board(Position::after(&self.position, mv).board().hash())
+    }
+
+    /// 下一局面若已出现在 UCI root history 中，继续绑定共享 board node 会把跨回合
+    /// 历史接回当前图，形成回边。严格 board-key DAG 必须在此之前走 path-local 裁决。
+    pub(crate) fn returns_to_root_history(&self, child_key: NodeKey) -> bool {
+        self.root_history
+            .positions()
+            .iter()
+            .any(|position| NodeKey::board(position.board().hash()) == child_key)
     }
 }
 
@@ -170,7 +190,7 @@ pub struct BackpropEvent {
     /// 此 event 的 leaf 只是 variation-local 的结果，没有可重算的 shared leaf node。
     /// 它在完成最后一条 reservation 时成为一个 edge-local 样本，绝不能永久覆盖该
     /// board edge 的其他历史。参见 KataGo `docs/GraphSearch.md` 的 edge-local N。
-    local_terminal: Option<ValueDelta>,
+    local_leaf: Option<ValueDelta>,
     #[cfg(feature = "benchmark")]
     queued_at: Option<Instant>,
 }
@@ -188,16 +208,16 @@ impl BackpropEvent {
     pub(crate) fn evaluation(node: NodeEvent) -> Self {
         Self {
             node,
-            local_terminal: None,
+            local_leaf: None,
             #[cfg(feature = "benchmark")]
             queued_at: None,
         }
     }
 
-    pub(crate) fn path_terminal(node: NodeEvent, value: ValueDelta) -> Self {
+    pub(crate) fn local_leaf(node: NodeEvent, value: ValueDelta) -> Self {
         Self {
             node,
-            local_terminal: Some(value),
+            local_leaf: Some(value),
             #[cfg(feature = "benchmark")]
             queued_at: None,
         }
@@ -215,20 +235,18 @@ impl BackpropEvent {
         let mut result = BackpropResult::default();
 
         for event in events {
-            let Self {
-                node, local_terminal, ..
-            } = event;
-            let expected_nodes = node.reservations.len() + usize::from(local_terminal.is_none());
+            let Self { node, local_leaf, .. } = event;
+            let expected_nodes = node.reservations.len() + usize::from(local_leaf.is_none());
             debug_assert_eq!(
                 node.node_path.len(),
                 expected_nodes,
-                "shared-leaf path has one more node; local terminal path has no shared leaf"
+                "shared-leaf path has one more node; local leaf path has no shared leaf"
             );
             let depth = node.reservations.len() as u64 + 1;
-            let mut local_terminal = local_terminal;
+            let mut local_leaf = local_leaf;
             for reservation in node.reservations.into_iter().rev() {
-                if let Some(value) = local_terminal.take() {
-                    reservation.complete_path_terminal(value);
+                if let Some(value) = local_leaf.take() {
+                    reservation.complete_local_leaf(value);
                 } else {
                     reservation.complete();
                 }
@@ -276,24 +294,26 @@ mod tests {
     #[test]
     fn variation_keeps_root_history_and_owns_its_path() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let root = NodeEvent::root(
+        let mut root = NodeEvent::root(
             SearchGeneration(7),
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
+        // 先物化 cached history，再下行；`push` 必须同步追加而不是重新回放。
+        assert_eq!(root.variation.history().len(), state.positions().len());
         let mv = Move::new(
             xiangqi_core::Square::parse("b2").expect("b2"),
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         let child_key = root.variation.child_board_key(mv);
         let root_history_len = root.variation.root_history().len();
-        let next = root.descend(child_key, crate::search::EdgeReservation::test_only(mv));
+        let mut next = root.descend(child_key, crate::search::EdgeReservation::test_only(mv));
 
         assert_eq!(next.variation.moves(), &[mv]);
         assert_eq!(next.variation.root_history().len(), root_history_len);
         assert_eq!(next.generation, SearchGeneration(7));
         let mut expected = xiangqi_core::PositionHistory::from_positions(state.positions());
         expected.append(mv);
-        assert_eq!(next.variation.replay_history().last().hash(), expected.last().hash());
+        assert_eq!(next.variation.history().last().hash(), expected.last().hash());
     }
 
     #[test]
@@ -392,7 +412,7 @@ mod tests {
         node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
         let event = root.descend_cycle(node.reserve_edge(0).expect("cycle edge"));
         BackpropEvent::complete_batch(
-            [BackpropEvent::path_terminal(
+            [BackpropEvent::local_leaf(
                 event,
                 crate::search::ValueDelta::one(0.6, 0.0),
             )],
@@ -425,7 +445,7 @@ mod tests {
             let event = NodeEvent::root(SearchGeneration(4), Arc::clone(&history))
                 .descend_cycle(root.reserve_edge(0).expect("cycle edge"));
             BackpropEvent::complete_batch(
-                [BackpropEvent::path_terminal(
+                [BackpropEvent::local_leaf(
                     event,
                     crate::search::ValueDelta::one(value, 0.0),
                 )],
@@ -434,8 +454,8 @@ mod tests {
         }
 
         let stats = root.edges()[0].completed_stats();
-        assert_eq!(stats.local_terminal.visits, 2);
-        assert!((stats.local_terminal.q() - 0.2).abs() < f32::EPSILON);
+        assert_eq!(stats.local_leaf.visits, 2);
+        assert!((stats.local_leaf.q() - 0.2).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -460,7 +480,7 @@ mod tests {
         let event = root_event.descend(child_key, root.reserve_edge(0).expect("root edge"));
         child.abort_evaluation();
         BackpropEvent::complete_batch(
-            [BackpropEvent::path_terminal(
+            [BackpropEvent::local_leaf(
                 event.discard_leaf_node(),
                 crate::search::ValueDelta::one(0.0, 1.0),
             )],

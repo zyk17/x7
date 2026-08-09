@@ -1,7 +1,7 @@
 //! NN 前的局面分类与终局标记。
 //!
 //! 以 px0 `evaluate_extension`（`search.cc:1913-1959`）为参考，实现 X7 stream 所需的
-//! 将死、重复、早期 two-fold、材料和 rule60 和棋。终局保存 plies-left `m` 用于排序；
+//! 将死、重复、two-fold 闭环裁决、子力和 rule60 和棋。终局保存 plies-left `m` 用于排序；
 //! MultiPV/TB 不在范围内。
 
 use xiangqi_core::{GameResult, PositionHistory};
@@ -23,7 +23,6 @@ pub(crate) enum ExtensionKind {
 ///
 /// `depth` 是自搜索 root 起的 variation 长度（0 即 root）。
 pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> ExtensionKind {
-    let is_root = depth == 0;
     let board = history.last().board();
     let legal_moves = board.generate_legal_moves();
     if legal_moves.is_empty() {
@@ -43,43 +42,37 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
             plies_left: 0.0,
         };
     }
+    if let Some((wl, draw, plies_left)) = path_terminal_value(history, depth) {
+        return ExtensionKind::PathTerminal { wl, draw, plies_left };
+    }
+    ExtensionKind::Evaluate
+}
+
+/// 只检查依赖 variation history 的终局。共享 node 已展开后再次被另一条 variation
+/// 命中时，Gather 必须仍调用它；不能因 board node 已存在而跳过重复、长将/长捉或 rule60。
+pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Option<(f32, f32, f32)> {
+    let is_root = depth == 0;
     if !is_root {
         if history.last().repetitions() >= 2 {
             // 对齐 px0 `MakeTerminal(history->RuleJudge())`，勿经绝对颜色转换。
             let (wl, draw) = rule_judge_wl_for_node(history.rule_judge());
-            return ExtensionKind::PathTerminal {
-                wl,
-                draw,
-                plies_left: 0.0,
-            };
+            return Some((wl, draw, 0.0));
         }
-        // px0 `search.cc:1930-1959`：初始重复局面可能成为 TwoFold。
-        if history.last().repetitions() == 1 && depth >= 4 && depth as u32 >= history.last().cycle_length() {
-            let cycle_length = history.last().cycle_length() as f32;
+        // board-key 图不能在第一次闭环后继续扩展为带环图。这里是搜索截断，
+        // 不是正式实战的重复门槛：普通重复按和棋，长将/长捉按 RuleJudge 裁决。
+        if history.last().repetitions() == 1 {
+            let plies_left = history.last().cycle_length() as f32;
             let result = history.rule_judge();
-            if result == GameResult::Draw {
+            if result == GameResult::Draw
+                || matches!(result, GameResult::WhiteWon | GameResult::BlackWon)
+                    && two_fold_chase_or_check_cycle(history)
+            {
                 let (wl, draw) = rule_judge_wl_for_node(result);
-                return ExtensionKind::PathTerminal {
-                    wl,
-                    draw,
-                    plies_left: cycle_length,
-                };
-            }
-            if two_fold_chase_or_check_cycle(history) && history.last().rule60_ply() < 120 {
-                let (wl, draw) = rule_judge_wl_for_node(result);
-                return ExtensionKind::PathTerminal {
-                    wl,
-                    draw,
-                    plies_left: cycle_length,
-                };
+                return Some((wl, draw, plies_left));
             }
         }
         if history.last().rule60_ply() >= 120 {
-            return ExtensionKind::PathTerminal {
-                wl: 0.0,
-                draw: 1.0,
-                plies_left: 0.0,
-            };
+            return Some((0.0, 1.0, 0.0));
         }
     } else {
         // root 仍通过 compute_game_result 判断将死和已确定的和棋。
@@ -87,18 +80,15 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
             GameResult::Undecided => {}
             result => {
                 let (wl, draw) = terminal_wl_for_node(result, history.last().is_black_to_move());
-                return ExtensionKind::PathTerminal {
-                    wl,
-                    draw,
-                    plies_left: 0.0,
-                };
+                return Some((wl, draw, 0.0));
             }
         }
     }
-    ExtensionKind::Evaluate
+    None
 }
 
-/// px0 的 two-fold chase/check cycle 探测（`search.cc:1940-1958`）。
+/// px0 `search.cc:1940-1958` 的 two-fold chase/check cycle 探测。它只用于严格
+/// board-key DAG 的首次闭环搜索截断，不改变正式 `compute_game_result` 的重复规则。
 fn two_fold_chase_or_check_cycle(history: &PositionHistory) -> bool {
     let mut idx = history.len() - 1;
     let mut idx2 = idx;
@@ -108,10 +98,7 @@ fn two_fold_chase_or_check_cycle(history: &PositionHistory) -> bool {
             break;
         }
     }
-    if idx2 == 0 {
-        return false;
-    }
-    if history.get(idx - 1).board() != history.get(idx2 - 1).board() {
+    if idx2 == 0 || history.get(idx - 1).board() != history.get(idx2 - 1).board() {
         return false;
     }
     idx -= 1;
@@ -129,7 +116,6 @@ mod tests {
     use xiangqi_core::{ChessBoard, GameResult, GameState, PositionHistory};
 
     use super::{ExtensionKind, classify_extension};
-    use crate::search::{rule_judge_wl_for_node, terminal_wl_for_node};
 
     #[test]
     fn checkmated_side_to_move_is_a_terminal_win_for_the_incoming_edge() {
@@ -165,10 +151,9 @@ mod tests {
         ));
     }
 
-    /// 白方长将、终局落在**白方行棋**时：`rule_judge` 不能再经绝对颜色转换，
-    /// 否则长将方会被标成胜利（对方先变招）。
+    /// 严格 board-key DAG 在首次闭环时必须截断；长将方不能被当作和棋。
     #[test]
-    fn white_perpetual_check_at_white_to_move_is_loss_for_checker() {
+    fn first_perpetual_check_cycle_is_a_path_terminal() {
         let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
         let mut history = PositionHistory::default();
         history.reset(board, 2, 30);
@@ -180,24 +165,16 @@ mod tests {
         assert!(!history.last().is_black_to_move());
         assert!(history.last().repetitions() >= 1);
 
-        let judged = history.rule_judge();
-        // 仅对方被将 → RuleJudge::WHITE_WON；px0 MakeTerminal → node wl = +1
-        //（incoming 是黑方逃将，长将方白应负）。
-        assert_eq!(judged, GameResult::WhiteWon);
-        assert_eq!(rule_judge_wl_for_node(judged), (1.0, 0.0));
-
-        // 错误路径（把 rule_judge 当绝对胜负）会得到 -1，回传后长将方变“赢”。
-        let wrong = terminal_wl_for_node(judged, history.last().is_black_to_move());
-        assert_eq!(wrong, (-1.0, 0.0));
-
         let depth = history.len().saturating_sub(1).max(1);
-        match classify_extension(&history, depth) {
-            ExtensionKind::PathTerminal { wl, draw, .. } => {
-                assert_eq!(draw, 0.0);
-                assert_eq!(wl, 1.0, "escape from perpetual check must be winning for escaper");
+        assert_eq!(history.rule_judge(), GameResult::WhiteWon);
+        assert_eq!(
+            classify_extension(&history, depth),
+            ExtensionKind::PathTerminal {
+                wl: 1.0,
+                draw: 0.0,
+                plies_left: 4.0,
             }
-            other => panic!("expected terminal, got {other:?}"),
-        }
+        );
     }
 
     #[test]

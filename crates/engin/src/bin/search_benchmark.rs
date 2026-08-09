@@ -299,15 +299,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         ..SearchConfig::default()
                     },
                 );
-                let mut previous = 0;
                 for &milestone in &args.trace {
-                    search.run_playouts(milestone - previous)?;
-                    previous = milestone;
+                    // `Search::run_playouts` 的参数是当前 Search 的累计目标；trace
+                    // milestone 不能再减去上一项，否则 100→1000 会错误停在 1000 而
+                    // 非“额外跑 900”后的 1000。
+                    search.run_playouts(milestone)?;
                     println!("    trace completed={milestone}");
                     print_roots(&search, root_is_black, args.root_top, &args.track);
                 }
-                if previous < args.playouts {
-                    search.run_playouts(args.playouts - previous)?;
+                if args.trace.last().copied().unwrap_or(0) < args.playouts {
+                    search.run_playouts(args.playouts)?;
                 }
                 print_roots(&search, root_is_black, args.root_top, &args.track);
                 search.stop_and_finish();

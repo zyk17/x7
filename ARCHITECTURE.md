@@ -64,7 +64,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 
 ## Stream
 
-- repository 是一个 64 分片的 key-value map。MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。环、重复与 rule60 等路径终局只在 variation 内裁决，不创建重复 node，也不标记 shared node；每次结果作为实际入边的一次 local 样本，不能由首次路径永久覆盖。
+- repository 是一个 64 分片的 key-value map。MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。重复与 rule60 等路径终局只在 variation 内裁决，不创建重复 node，也不标记 shared node；每次结果作为实际入边的一次 local 样本，不能由首次路径永久覆盖。首次绑定 edge 时若 DFS 发现会形成 shared-Q 图环，则不绑定，并将 child 的固定 NN `U` 作为该 edge 的 local leaf；这不是规则和棋裁决。
 - NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
 - Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
@@ -73,7 +73,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 - graph reuse 保留已走 root 供悔棋，并从所有 retained root 遍历可达 node 后批量 GC；UCI/Watchdog 已输出最小 info 与一次 bestmove。
 - `MultiPV` 只在 watchdog 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCGS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
-stream 的 selection 使用 px0 PUCT/N-Q-P 语义，不是 LC3 Policy 的正式公式。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认采用固定 `CPuct=e≈2.7182817` 与 `CPuctFactor=0`，使低先验候选可较早获得验证、又不在后期持续打散已有证据；`CPuctBase` 在此默认下无效。`FpuReduction=0.330` 为 LC0 对照值，原 X7 `1.0/0.220` 与动态 cPUCT 形状均保留为实验基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
+stream 的 selection 使用 px0 PUCT/N-Q-P 语义，不是 LC3 Policy 的正式公式。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.5 / 2000 / 1.347017`，即 `C(0)=1.5`、`C(25k)≈5` 的平缓增长曲线。固定节点诊断中，它相较于常数 e 保留更多次选验证预算，又没有 Base=4k 的早期过度集中；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
 
 ## 模型
 

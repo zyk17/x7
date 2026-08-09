@@ -20,7 +20,8 @@ use crate::neural::backend::{Backend, EvalPosition, EvalResult};
 use crate::neural::onnx::softmax_legal_policy;
 use crate::neural::{BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLICY_SIZE, encode_position_for_nn};
 
-use super::extension::{ExtensionKind, classify_extension};
+use super::extension::{ExtensionKind, classify_extension, path_terminal_value};
+use super::graph::ChildLink;
 use super::{
     BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGeneration, SearchGraph,
     SearchParams, ValueDelta, Variation, network_wl_to_node, select_edge_from_node,
@@ -701,6 +702,12 @@ impl Search {
         self.initial_visits
     }
 
+    /// 当前完整 history 已在路径规则下裁决结束。它不能写入 board-key shared node，
+    /// 但 UCI 仍必须把当前 root 当作终局处理。
+    pub(crate) fn root_is_path_terminal(&self) -> bool {
+        self.shared.root_path_terminal.load(Ordering::Acquire)
+    }
+
     pub fn stats(&self) -> Stats {
         self.shared.stats()
     }
@@ -946,7 +953,23 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                 return;
             }
             ExpansionState::Expanded => {
+                // board-key node 可由历史中已展开的局面复用；重复、长将/长捉和 rule60
+                // 仍只属于当前 variation，不能因 node 已展开而绕过裁决。
                 let depth = event.variation.moves().len();
+                if let Some((wl, draw, plies_left)) = path_terminal_value(event.variation.history(), depth) {
+                    let value = ValueDelta::with_plies_left(wl, draw, plies_left);
+                    if event.reservations.is_empty() {
+                        shared.root_path_terminal.store(true, Ordering::Release);
+                        shared.finish(true);
+                    } else {
+                        shared.send_backprop(BackpropEvent::local_leaf(event.discard_leaf_node(), value));
+                    }
+                    return;
+                }
+                // MCGS 的共享 child 可能刚刚由另一条 variation 更新。回传只重算实际
+                // 路径上的 node；因此每次再次访问本 node 前都要按最新 child Q 重算。
+                // 参考 KataGo `docs/GraphSearch.md` “Stale Q Values”。
+                shared.repository.recompute_graph_node(event.node_key);
                 let edge_index = select_edge_from_node(
                     &shared.repository,
                     node.as_ref(),
@@ -957,22 +980,30 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                 .expect("expanded stream node must have an edge");
                 let reservation = node.reserve_edge(edge_index).expect("selected stream edge");
                 let graph_child = event.variation.child_board_key(reservation.mv());
-                if event.node_path().contains(&graph_child) {
-                    let value = cycle_value(&event.variation, reservation.mv());
-                    shared.send_backprop(BackpropEvent::path_terminal(event.descend_cycle(reservation), value));
+                if event.node_path().contains(&graph_child) || event.variation.returns_to_root_history(graph_child) {
+                    let value = cycle_value(&mut event.variation, reservation.mv());
+                    shared.send_backprop(BackpropEvent::local_leaf(event.descend_cycle(reservation), value));
                     return;
                 }
-                node.edges()[edge_index].bind_child_key(graph_child);
-                event = event.descend(graph_child, reservation);
+                match shared
+                    .repository
+                    .bind_child_or_cut_cycle(event.node_key, &node.edges()[edge_index], graph_child)
+                {
+                    ChildLink::Bound => event = event.descend(graph_child, reservation),
+                    ChildLink::Cycle(value) => {
+                        shared.send_backprop(BackpropEvent::local_leaf(event.descend_cycle(reservation), value));
+                        return;
+                    }
+                }
             }
         }
     }
 }
 
-/// MCGS 的环只在当前 variation 内裁决，不能把历史相关结果写入共享 node。优先复用
+/// MCGS 的 path-local 环只在当前 variation 内裁决，不能把历史相关结果写入共享 node。优先复用
 /// px0 风格的 extension 判定；尚未达到 two-fold 门槛的闭环按首版约定视为本地和棋。
-fn cycle_value(variation: &Variation, mv: Move) -> ValueDelta {
-    let mut history = variation.replay_history();
+fn cycle_value(variation: &mut Variation, mv: Move) -> ValueDelta {
+    let mut history = variation.history().clone();
     history.append(mv);
     match classify_extension(&history, variation.moves().len() + 1) {
         ExtensionKind::SharedTerminal { wl, draw, plies_left }
@@ -1137,16 +1168,16 @@ fn handle_eval_event(
     shared: &Shared,
     nn_tx: &Sender<NnRequest>,
     waiting: &mut Vec<WaitingNn>,
-    event: NodeEvent,
+    mut event: NodeEvent,
 ) -> Result<(), EnginError> {
     if shared.stopping.load(Ordering::Acquire) {
         shared.cancel_claimed_evaluation(event);
         return Ok(());
     }
     let node = shared.repository.get_or_insert(event.node_key);
-    let history = event.variation.replay_history();
     let depth = event.variation.moves().len();
-    match classify_extension(&history, depth) {
+    let history = event.variation.history();
+    match classify_extension(history, depth) {
         ExtensionKind::SharedTerminal { wl, draw, plies_left } => {
             node.mark_terminal(wl, draw, plies_left);
             shared.send_backprop(BackpropEvent::evaluation(event));
@@ -1159,7 +1190,7 @@ fn handle_eval_event(
                 shared.root_path_terminal.store(true, Ordering::Release);
                 shared.finish(true);
             } else {
-                shared.send_backprop(BackpropEvent::path_terminal(event.discard_leaf_node(), value));
+                shared.send_backprop(BackpropEvent::local_leaf(event.discard_leaf_node(), value));
             }
             Ok(())
         }
@@ -1173,7 +1204,7 @@ fn handle_eval_event(
                 shared.cache_hits.fetch_add(1, Ordering::AcqRel);
                 return publish_eval(shared, event, node, legal_moves, eval);
             }
-            let planes = encode_position_for_nn(&history, FillEmptyHistory::FenOnly);
+            let planes = encode_position_for_nn(history, FillEmptyHistory::FenOnly);
             let (reply_tx, reply_rx) = bounded(1);
             if let Err(error) = send_nn_request(
                 shared,
@@ -1494,14 +1525,16 @@ mod tests {
 
     use crossbeam_channel::bounded;
     use parking_lot::{Condvar, Mutex};
-    use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
+    use xiangqi_core::{ChessBoard, GameState, Move, PositionHistory, STARTPOS_FEN, Square};
 
     use super::{NodeEvent, Search, SearchConfig, SearchLimits, Shared};
     use crate::EnginError;
     use crate::neural::backend::{
         Backend, BackendAttributes, BackendComputation, EncodedInference, EvalResult, UniformBackend,
     };
-    use crate::search::{ExpansionState, NodeRepository, SearchGeneration, SearchParams, best_move, root_stats};
+    use crate::search::{
+        ExpansionState, NodeRepository, SearchGeneration, SearchGraph, SearchParams, ValueDelta, best_move, root_stats,
+    };
 
     struct FailingComputationBackend;
 
@@ -1732,6 +1765,82 @@ mod tests {
     }
 
     #[test]
+    fn reused_expanded_root_still_applies_perpetual_check_rule() {
+        // 同一 board 曾作为正常局面展开；随后以带完整历史的相同 board 作为 root
+        // 重新进入时，不能因 node 已 Expanded 而跳过 path-local 长将裁决。
+        let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
+        let mut history = PositionHistory::default();
+        history.reset(board, 2, 30);
+        for mv in ["d9e9", "d2e2", "e9d9", "e2d2", "d9e9", "d2e2", "e9d9", "e2d2"] {
+            history.append(history.last().board().parse_move(mv).expect(mv));
+        }
+        assert!(history.last().repetitions() >= 2);
+
+        let history = Arc::new(history);
+        let tree = super::SearchGraph::new(Arc::clone(&history));
+        let root = tree.repository().get_or_insert(tree.root_key());
+        assert!(root.try_begin_evaluation());
+        let legal = history.last().board().generate_legal_moves();
+        root.publish_edges(legal.iter().map(|&mv| (mv, 1.0 / legal.len() as f32)).collect());
+        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+
+        let mut search = Search::new_with_graph(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(27),
+            &tree,
+            SearchConfig::default(),
+        );
+        let stats = search.run_playouts(1).expect("path terminal root");
+
+        assert_eq!(stats.completed_playouts, 1);
+        assert!(root.edges().iter().all(|edge| edge.completed_visits() == 0));
+        assert!(search.root_is_path_terminal());
+        search.stop_and_finish();
+    }
+
+    #[test]
+    fn gather_cuts_a_global_graph_cycle_to_an_edge_local_nn_leaf() {
+        // 以真实 Gather/Backprop 路径覆盖：root -> child 若接上 child -> root 的既有
+        // 图边会闭环。它必须完成 root edge 的 reservation，但不能绑定 child。
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(PositionHistory::from_positions(state.positions()));
+        let tree = SearchGraph::new(Arc::clone(&history));
+        let root_key = tree.root_key();
+        let mv = history.last().board().parse_move("b2b3").expect("legal root move");
+        let child_key = NodeEvent::root(SearchGeneration(41), Arc::clone(&history))
+            .variation
+            .child_board_key(mv);
+
+        let root = tree.repository().get_or_insert(root_key);
+        assert!(root.try_begin_evaluation());
+        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.publish_edges(vec![(mv, 1.0)]);
+
+        let child = tree.repository().get_or_insert(child_key);
+        assert!(child.try_begin_evaluation());
+        child.set_graph_value(ValueDelta::one(0.4, 0.0));
+        child.publish_edges(vec![(
+            Move::new(Square::parse("b9").unwrap(), Square::parse("b8").unwrap()),
+            1.0,
+        )]);
+        child.edges()[0].bind_child_key(root_key);
+
+        let mut search = Search::new_with_graph(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(41),
+            &tree,
+            SearchConfig::default(),
+        );
+        let stats = search.run_playouts(1).expect("cycle-cut playout");
+        let root_edge = &root.edges()[0];
+        assert_eq!(stats.completed_playouts, 1);
+        assert_eq!(root_edge.completed_visits(), 1);
+        assert_eq!(root_edge.child_key(), None);
+        assert_eq!(root_edge.cycle_leaf(), Some(ValueDelta::one(0.4, 0.0)));
+        search.stop_and_finish();
+    }
+
+    #[test]
     fn path_terminal_root_does_not_mark_the_shared_node() {
         let state =
             GameState::from_fen_moves("4k4/9/9/9/9/9/9/9/R8/4K4 w - - 120 1", &[] as &[&str]).expect("rule60 root");
@@ -1753,6 +1862,7 @@ mod tests {
                 .expansion_state(),
             ExpansionState::Unexpanded
         );
+        assert!(pipeline.root_is_path_terminal());
         pipeline.stop_and_finish();
     }
 

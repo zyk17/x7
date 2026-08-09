@@ -84,7 +84,8 @@ A → C → D
 
 因此 `C→D` 不会因 B 的访问伪装成“已被 C 验证过”；但 D 的 `Q(D)` 已因共享 continuation 变得更准。
 当 C 以后真正被访问时，它根据自己的 `N(C,D)` 和最新 `Q(D)` 重新计算 `Q(C)`。这叫 stale Q：非路径
-parent 暂时落后，但不会永久落后，且避免了向所有 ancestor 广播造成的统计污染。
+parent 暂时落后，但不会永久落后，且避免了向所有 ancestor 广播造成的统计污染。实现上，Gather 每次进入
+已展开 node 后、PUCT 选边前必须先做这次重算；只在 Backprop 时重算不足以满足这个条件。
 
 根选边仍以 root edge 的 `N(root,a)` 排名。node `Q(root)` 是 root posterior policy 的局面估值；两者
 都需要，但不能互相替代。
@@ -165,7 +166,22 @@ variation 中出现两次，不能无限下降，也不能把一次 evidence 重
 
 ## 环与重复：第一版的硬边界
 
-图允许跨分支汇合，也允许走法形成 ancestor cycle。Gather 必须维护本 event 的 visited board keys。
+图允许跨分支汇合，但 shared-Q 的幂等重算不能读成循环依赖。Gather 必须维护本 event 的
+visited board keys；此外 repository 在**首次绑定一条 edge** 时做一次 DFS：若候选 child 已经
+沿既有图边可达 parent，则不绑定这条会闭环的 edge。该 DFS 不在正常 PUCT 热路径运行，且用一把
+很小的链接锁包住“检查 + 绑定”，避免两个 worker 同时穿透检查而新建二元环。
+
+这不是重复裁决。截断 edge 仍代表一个合法、但无法安全接入 shared-Q 图的走法：它以 candidate
+child 首次网络预测 `U(child)` 作为这一次 edge-local leaf sample 完成，然后不建立 child link。
+因此既不会把非重复局面伪装成和棋，也不会让 `Q(B)` 与 `Q(D)` 在 `B ↔ D` 中递归读取。设计取
+KataGo `cpp/search/search.cpp:1426-1445` 对 graph-path cycle 的截断作为参照；KataGo 的累计统计
+语义与本项目不同，故 X7 选择固定 U leaf 而不是其“加一次 parent edge visit 后结束”的方式。
+
+实现只在 candidate child 已存在于 repository 时 DFS：新 child 不可能沿既有图边回到 parent，直接绑定。
+被截断的 edge 缓存固定 `U(child)`，以后再次被选中不再遍历。两项均不改变规则裁决或 edge-local 统计；若
+基准显示这类 edge 仍是热点，才考虑更细的 cut 统计，不提前引入索引或 parent 表。
+
+path-local 闭环仍按以下规则处理：
 
 候选 child 的 board key 已在本 path 出现时，一律视为 **repetition**，而非 collision 或普通 graph edge。
 worker 在私有 `PositionHistory` 上先调用既有 px0 风格 extension/rule judge；若首次闭环尚未达到
@@ -289,8 +305,31 @@ cargo run -p engin --release --bin graph_measure -- --fen "<FEN>" --moves "..." 
 同一网络、worker、MiniBatchSize 和固定时间/固定节点下，对比：唯一 state 数、NN eval 数、cache hit、
 collision、有效完成 playout、PV 稳定性和 Elo。合并率或 EPS 上升本身不是采用理由。
 
+图实现的 CPU/NPS 回归不以初始局面单独判断：它的换位负载偏低。固定采用
+`middle_20`（宽换位）、`evasion_05`（强制/窄树但高合并）和 `proof_mate_01`（强制反例）三个
+局面，在相同 ONNX、4/4/1、MiniBatchSize、fresh graph 与固定时间下报告多轮 NPS/EPS；初始局面只保留为
+一般流水线冒烟。每次图结构、DFS、GC 或 worker 热路径改变后，都用这组比较，不能由单一局面外推。
+
+#### 2026-08-10：`b7b8` 的 tree/graph 候选分歧
+
+`data/x7.onnx`、完整历史 `test.pgn` 至 `41...e8d7`、25,000 completed playout、
+`CPuct=1.5`、`CPuctBase=2000`、`CPuctFactor=1.347017`、`FpuReduction=0.2` 下，
+MCGS 根选 `b7b8`（N=3733），tree 基线根选 `b4c6`（N=5983；`b7b8` N=5261）。
+本地 Pikafish 5 秒 MultiPV 的前列为 `h8h7`、`b4c6`、`b4a6`、`h8i8`、`a3a4`，不含 `b7b8`。
+
+这说明图不是纯吞吐替换：在相同模型、历史、参数与预算下，shared-state 的路径演化足以改变根
+action N 排名。它是需要复现的 MCGS 回归样本，但还不能据此直接认定图统计错误：tree 分支并非与
+当前分支逐提交同步。后续诊断应记录 `b7b8`/`b4c6` 子图的 transpose、shared node fan-in、首次读取
+shared child Q 的位置及其后的 edge N/Q，而不是先修改 PUCT 或图回传语义。
+
 ## 当前结论
 
-MCGS 不是“加一个 TT”。当前实现已切换 board-key、edge-local N、幂等回传、edge-local 路径终局样本、可达 GC 与防环 PV。
+MCGS 不是“加一个 TT”。当前实现已切换 board-key、edge-local N、幂等回传、edge-local 路径终局样本、首次绑定 edge 的 DFS 闭环截断、可达 GC 与防环 PV。
 它仍是 board-key 的上下文近似，不是严格 state 合并。下一步评估 reuse/stop 边界、唯一 state 数、NN eval 数、
 稳定性与 Elo；合并率或 EPS 上升本身不是采用理由。
+
+## 后续 CPU Proof 的边界
+
+当前 CPU 在 NN batch 等待期间仍有余量；这不是要求刻意降低 collision 的理由。未来若加入 Proof，应优先
+利用 collision/等待期间未占用的 CPU 产生可验证的新 Evidence，并且不阻塞 Gather、Eval、Backprop 或长期持有
+graph 锁。它可能降低 NPS，但是否采用只能由固定时间 Elo 判断；“NPS 不下降”不是硬约束。

@@ -49,10 +49,11 @@ identity、px0 的 NN cache 取舍保持一致。`setoption` 在下一次 `go` �
 `MultiPV` 是 `1..=500` 的整数，默认 `1`。它只控制每次 `info` 输出的根候选数量：候选沿用
 bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，不改变搜索预算、PUCT 或 worker。
 
-`CPuct` 默认 `2.7182817`（`f32` 下的 e），`CPuctFactor` 默认 `0`，因此正式默认使用常数探索强度。
-`CPuctBase` 默认 `38739`，只在 `CPuctFactor > 0` 时决定 PUCT 随访问数增长何时显著；`CPuctFactor`
-决定增长幅度。三者是当前主要搜索实验参数。`FpuReduction`（默认 `0.330`）控制未访问边相对 parent Q
-的降幅。原 X7 基线 `CPuct=1.0`、`FpuReduction=0.220` 与 LC0 对照形状保留为实验参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`GatherWorkers`、`EvalWorkers`、
+`CPuct`、`CPuctBase`、`CPuctFactor` 默认分别为 `1.5`、`2000`、`1.347017`：对应
+`C(0)=1.5`、`C(25k)≈5` 的平缓增长曲线。`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度。
+三者仍可作为一个整体实验，但默认不再扩散扫描。`FpuReduction`（默认 `0.200`）控制未访问边相对 parent Q
+的降幅；小网络可能有系统性偏差，故降低未知候选的首次入场门槛。LC0 对照值 `0.330` 与原 X7
+基线 `CPuct=1.0`、`FpuReduction=0.220` 保留为实验参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`GatherWorkers`、`EvalWorkers`、
 `BackpropWorkers` 默认分别为 `4`、`4`、`1`，范围均为 `1..=64`。它们与 `MiniBatchSize` 一样是
 引擎生命周期配置：`setoption` 影响之后的每次 `go`，当前 job 始终使用启动时的参数与 worker pool。
 
@@ -83,7 +84,7 @@ cargo run -p engin --release --bin search_benchmark -- --moves "c3c4 g6g5 ..." -
 固定节点扫描 cPUCT 形状时，`--cpuct`、`--cpuct-base` 与 `--cpuct-factor` 接受逗号列表并交叉运行；`--fpu-reduction` 每次只取一个值，比较两套 FPU 时分别运行：
 
 ```powershell
-cargo run -p engin --release --bin search_benchmark -- --onnx data/x7_v3_b12c512_v697.onnx --fen "<FEN>" --playouts 1000 --cpuct 1.0,1.745 --cpuct-base 20000,38739,80000 --cpuct-factor 2.5,3.894,5.0 --fpu-reduction 0.330 --root-top 3
+cargo run -p engin --release --bin search_benchmark -- --onnx data/x7_v3_b12c512_v697.onnx --fen "<FEN>" --playouts 1000 --cpuct 1.0,1.745 --cpuct-base 20000,38739,80000 --cpuct-factor 2.5,3.894,5.0 --fpu-reduction 0.200 --root-top 3
 ```
 
 `--trace 128,256,512,...` 只用于固定 `--playouts`：它在同一个 fresh graph 上输出各个
