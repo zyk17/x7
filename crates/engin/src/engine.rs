@@ -114,7 +114,10 @@ impl Engine {
         self.stop_and_drop_search()?;
         match OnnxBackend::from_file(&path) {
             Ok(backend) => {
-                let backend: Arc<dyn Backend> = Arc::new(CachingBackend::new(Box::new(backend)));
+                let backend: Arc<dyn Backend> = Arc::new(CachingBackend::with_cache_size_power_of_two(
+                    Box::new(backend),
+                    self.options.nn_cache_size_power_of_two,
+                ));
                 let mut search = SearchSession::new(Arc::clone(&backend));
                 search.set_multi_pv(self.options.multi_pv);
                 search.set_mini_batch_size(self.options.mini_batch_size);
@@ -169,6 +172,11 @@ impl Engine {
             "minibatchsize" => {
                 if let Some(search) = self.search.as_mut() {
                     search.set_mini_batch_size(self.options.mini_batch_size);
+                }
+            }
+            "nncachesizepoweroftwo" => {
+                if let Some(search) = self.search.as_mut() {
+                    search.set_nn_cache_size_power_of_two(self.options.nn_cache_size_power_of_two);
                 }
             }
             "cpuct" | "cpuctbase" | "cpuctfactor" | "fpureduction" => {

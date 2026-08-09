@@ -112,6 +112,10 @@ impl SearchSession {
         self.state.set_mini_batch_size(mini_batch_size);
     }
 
+    pub(crate) fn set_nn_cache_size_power_of_two(&mut self, size_power_of_two: u8) {
+        self.state.set_nn_cache_size_power_of_two(size_power_of_two);
+    }
+
     /// 搜索参数属于 Engine 生命周期；每次 `go` 从 state 取不可变快照。
     pub(crate) fn set_search_params(&mut self, cpuct: f32, cpuct_base: f32, cpuct_factor: f32, fpu_reduction: f32) {
         self.state

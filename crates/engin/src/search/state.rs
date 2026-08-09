@@ -132,6 +132,7 @@ pub struct SearchResult {
 /// 可复用 stream 状态：backend、保留 graph、generation 与 worker pool。
 pub(crate) struct SearchState {
     backend: Arc<dyn Backend>,
+    pending_nn_cache_size_power_of_two: Option<u8>,
     graph: Option<SearchGraph>,
     next_generation: u64,
     multi_pv: usize,
@@ -195,6 +196,7 @@ impl SearchState {
         let worker_pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
         Self {
             backend,
+            pending_nn_cache_size_power_of_two: None,
             graph: None,
             next_generation: 0,
             multi_pv: 1,
@@ -211,6 +213,11 @@ impl SearchState {
     /// 参考 px0 `BaseSearchParams::kMiniBatchSizeId`（`params.cc:178-182,546`）。
     pub fn set_mini_batch_size(&mut self, mini_batch_size: usize) {
         self.mini_batch_size = mini_batch_size;
+    }
+
+    /// NN cache 是 backend 的跨局状态。只记录下一次 job 的容量，不能在运行中替换表。
+    pub fn set_nn_cache_size_power_of_two(&mut self, size_power_of_two: u8) {
+        self.pending_nn_cache_size_power_of_two = Some(size_power_of_two);
     }
 
     /// 更新下一次 job 的 PUCT/FPU 快照。PUCT 增长形状对照 px0
@@ -255,6 +262,9 @@ impl SearchState {
     /// 只有当前 job drain 并归还 worker 后，下一次 `set_position` 才能
     /// prune 或 rewind 保留图；这是 reservation 的边界。
     pub fn begin_search(&mut self, searchmoves: &[String]) -> Result<RunningSearch, EnginError> {
+        if let Some(size_power_of_two) = self.pending_nn_cache_size_power_of_two.take() {
+            self.backend.set_cache_size_power_of_two(size_power_of_two);
+        }
         let graph = self
             .graph
             .as_ref()

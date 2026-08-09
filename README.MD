@@ -32,13 +32,19 @@ CUDA 包。两者不是同一二进制的运行时回退链；CUDA 使用 ORT �
 - `position startpos|fen ... [moves ...]`
 - `go nodes`、`go movetime`、`go wtime/btime/winc/binc/movestogo`、`go infinite`、`go searchmoves`
 - `stop`、`ucinewgame`、`quit`
-- `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`MiniBatchSize`、`MultiPV`
+- `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`MiniBatchSize`、`NNCacheSizePowerOfTwo`、`MultiPV`
 - `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`GatherWorkers`、`EvalWorkers`、`BackpropWorkers`
 
 `MiniBatchSize` 对应 px0/Lc0 的同名 option，范围 `0..=1024`，默认 `0`（由 backend
 建议）。它限制一次 NN 调用最多合并的局面数；较大值通常提高吞吐，却可能因增加在途局面和
 collision 降低固定时间棋力。它是引擎生命周期配置：一次 `setoption` 会影响之后启动的每次
 `go`；正在运行的搜索保持其 worker。
+
+`NNCacheSizePowerOfTwo` 对应 KataGo 的同名配置，范围 `0..=48`，默认 `20`，即
+`1,048,576` 个槽（KataGo GTP 默认）。它是按当前棋盘 state key 的直映缓存：索引冲突时新结果替换旧结果，完整
+64 位 key 与合法着数量仍会在命中时校验。它不把完整历史加入 key，和 MCGS 的 board node
+identity、px0 的 NN cache 取舍保持一致。`setoption` 在下一次 `go` 开始前替换缓存表；当前
+搜索继续使用原表。
 
 `MultiPV` 是 `1..=500` 的整数，默认 `1`。它只控制每次 `info` 输出的根候选数量：候选沿用
 bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，不改变搜索预算、PUCT 或 worker。
@@ -62,6 +68,10 @@ bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，�
 ```powershell
 cargo run -p engin --release --features benchmark --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1
 ```
+
+`benchmark` 默认每轮都使用 fresh graph 与 fresh backend/cache，适合比较流水线本身。仅诊断 NN
+cache 跨图复用时加入 `--warm-cache`：每个 worker 配置的首轮填表，后续 `--repeat` 轮仍使用 fresh
+graph、但共享同一 NN cache；输出的 `hit` 是实际跳过 NN 的次数，不能与 graph reuse 混淆。
 
 要诊断实战中的评分突变，优先保留完整历史而不是只复制最终 FEN；分流参数使用独立的
 `search_benchmark`，固定 `4/4/1` worker、backend 默认 batch 与 fresh graph：

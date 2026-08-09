@@ -3,6 +3,7 @@
 //! 对照 px0 `src/engine.h` 的 `OptionsDict`：`Engine` 持有 option，搜索在
 //! 启动 job 时读取需要的快照。
 
+use crate::neural::cache::{DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, MAX_NN_CACHE_SIZE_POWER_OF_TWO};
 use crate::search::SearchParams;
 
 /// 正式 UCI 的最小 option 集。
@@ -15,6 +16,8 @@ pub struct Options {
     pub multi_pv: usize,
     /// UCI `MiniBatchSize`：单次 NN 调用最多合并的局面数；0 使用 backend 建议值。
     pub mini_batch_size: usize,
+    /// UCI `NNCacheSizePowerOfTwo`：NN cache 固定保存 `2^N` 个直映槽。
+    pub nn_cache_size_power_of_two: u8,
     /// UCI `CPuct`：PUCT 的初始探索系数。
     pub cpuct: f32,
     /// UCI `CPuctBase`/`CPuctFactor`：PUCT 随访问数增长的形状。
@@ -37,6 +40,7 @@ impl Default for Options {
             show_eps: false,
             multi_pv: 1,
             mini_batch_size: 0,
+            nn_cache_size_power_of_two: DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO,
             cpuct: search.cpuct,
             cpuct_base: search.cpuct_base,
             cpuct_factor: search.cpuct_factor,
@@ -57,6 +61,10 @@ impl Options {
             format!(
                 "option name MiniBatchSize type spin default {} min 0 max 1024",
                 self.mini_batch_size
+            ),
+            format!(
+                "option name NNCacheSizePowerOfTwo type spin default {} min 0 max {}",
+                self.nn_cache_size_power_of_two, MAX_NN_CACHE_SIZE_POWER_OF_TWO
             ),
             format!("option name CPuct type string default {}", self.cpuct),
             format!("option name CPuctBase type string default {}", self.cpuct_base),
@@ -108,6 +116,19 @@ impl Options {
                     return Err(crate::EnginError::Uci("MiniBatchSize must be within [0, 1024]".into()));
                 }
                 self.mini_batch_size = value;
+            }
+            "nncachesizepoweroftwo" => {
+                let value = value.parse::<u8>().map_err(|_| {
+                    crate::EnginError::Uci(format!(
+                        "NNCacheSizePowerOfTwo must be an integer within [0, {MAX_NN_CACHE_SIZE_POWER_OF_TWO}]"
+                    ))
+                })?;
+                if value > MAX_NN_CACHE_SIZE_POWER_OF_TWO {
+                    return Err(crate::EnginError::Uci(format!(
+                        "NNCacheSizePowerOfTwo must be within [0, {MAX_NN_CACHE_SIZE_POWER_OF_TWO}]"
+                    )));
+                }
+                self.nn_cache_size_power_of_two = value;
             }
             "cpuctbase" => self.cpuct_base = parse_positive_float("CPuctBase", value)?,
             "cpuctfactor" => self.cpuct_factor = parse_non_negative_float("CPuctFactor", value)?,

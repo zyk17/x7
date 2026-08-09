@@ -25,6 +25,7 @@ struct Args {
     backprops: Vec<usize>,
     eval_batch: Option<usize>,
     cache: bool,
+    warm_cache: bool,
     root_top: usize,
 }
 
@@ -32,7 +33,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache] [--root-top 8]"
+     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache|--warm-cache] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -48,6 +49,7 @@ fn parse_args() -> Result<Args, String> {
     let mut backprops = vec![1];
     let mut eval_batch = None;
     let mut cache = false;
+    let mut warm_cache = false;
     let mut root_top = 8;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -100,6 +102,10 @@ fn parse_args() -> Result<Args, String> {
                 )
             }
             "--cache" => cache = true,
+            "--warm-cache" => {
+                cache = true;
+                warm_cache = true;
+            }
             "--root-top" => {
                 root_top = args
                     .next()
@@ -139,6 +145,7 @@ fn parse_args() -> Result<Args, String> {
         backprops,
         eval_batch,
         cache,
+        warm_cache,
         root_top,
     })
 }
@@ -249,10 +256,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} cache={} recommended_batch={} target_batch={} budget={} repeat={} worker_matrix={} positions={}",
+        "onnx={} provider={} cache={} warm_cache={} recommended_batch={} target_batch={} budget={} repeat={} worker_matrix={} positions={}",
         args.onnx.display(),
         provider,
         args.cache,
+        args.warm_cache,
         recommended,
         target_batch,
         args.playouts
@@ -262,7 +270,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.gathers.len() * args.evals.len() * args.backprops.len(),
         positions.len(),
     );
-    println!("note: fresh backend/cache per run; hit is normal cache hits; q_* is average queue delay in us");
+    println!(
+        "note: each run has a fresh graph; --warm-cache alone reuses one NN cache between repeats; hit is normal cache hits; q_* is average queue delay in us"
+    );
     println!("  G   E   B run       ms      nps      eps    done    hit  coll%    peak  root%    q_g    q_e    q_n");
     let mut generation = 0;
     for (name, fen) in positions {
@@ -273,9 +283,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         for &gather_workers in &args.gathers {
             for &eval_workers in &args.evals {
                 for &backprop_workers in &args.backprops {
+                    let warm_backend = args.warm_cache.then(|| make_backend(&args.onnx, true)).transpose()?;
                     for run_index in 1..=args.repeat {
                         generation += 1;
-                        let (backend, _, _) = make_backend(&args.onnx, args.cache)?;
+                        let backend = match &warm_backend {
+                            Some((backend, _, _)) => Arc::clone(backend),
+                            None => make_backend(&args.onnx, args.cache)?.0,
+                        };
                         let mut search = Search::new(
                             backend,
                             SearchGeneration(generation),

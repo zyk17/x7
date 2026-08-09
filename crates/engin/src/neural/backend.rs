@@ -7,7 +7,7 @@ use xiangqi_core::{Move, MoveList, Position, PositionHistory};
 
 use crate::EnginError;
 
-use super::cache::{CachedEval, DEFAULT_NN_CACHE_SIZE, EvalCache};
+use super::cache::{CachedEval, DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, EvalCache};
 use super::{BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE};
 
 /// px0 `BackendAttributes` (`src/neural/backend.h:45-52`)。
@@ -60,6 +60,14 @@ pub type EncodedInference = (Vec<f32>, Vec<f32>, Vec<f32>);
 pub struct EvalPosition {
     pub positions: Vec<Position>,
     pub legal_moves: MoveList,
+}
+
+impl EvalPosition {
+    /// 与 MCGS `NodeKey::board` 一致的 state key。NN cache 刻意只按当前棋盘复用，
+    /// 不纳入完整 history 或 `Position::repetitions`；这是为了与 graph node 一致的取舍。
+    pub(crate) fn board_key(&self) -> u64 {
+        self.positions.last().map_or(0, |position| position.board().hash())
+    }
 }
 
 /// px0 `BackendComputation::AddInputResult` (`backend.h:69-73`)。
@@ -116,8 +124,8 @@ pub trait Backend: Send + Sync {
     /// 非缓存 backend 刻意保留此空实现。
     fn clear_cache(&self) {}
 
-    /// px0 `CachingBackend::SetCacheSize` (`src/neural/memcache.h:36-38`).
-    fn set_cache_size(&self, _size: usize) {}
+    /// KataGo `nnCacheSizePowerOfTwo`：缓存容量为 `2^N` 个直映槽。
+    fn set_cache_size_power_of_two(&self, _size_power_of_two: u8) {}
 }
 
 /// px0 `CachingBackend` / `MemCache`（`src/neural/memcache.h:34-45`、
@@ -130,24 +138,26 @@ pub struct CachingBackend {
 
 impl CachingBackend {
     pub fn new(wrapped: Box<dyn Backend>) -> Self {
+        Self::with_cache_size_power_of_two(wrapped, DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)
+    }
+
+    pub fn with_cache_size_power_of_two(wrapped: Box<dyn Backend>, size_power_of_two: u8) -> Self {
         Self {
             wrapped: Arc::from(wrapped),
-            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
+            cache: Arc::new(EvalCache::new(size_power_of_two)),
         }
     }
 
     fn cache_key(position: &EvalPosition) -> u64 {
-        // px0 `ComputeEvalPositionHash`（`memcache.cc:38-45`）。暂不将 history 和
-        // repetition 放入此 cache key。
-        position.positions.last().map_or(0, Position::hash)
+        position.board_key()
     }
 
     fn cached(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
         self.cache.get(Self::cache_key(position), position.legal_moves.len())
     }
 
-    fn resize_cache(&self, size: usize) {
-        self.cache.set_capacity(size);
+    fn resize_cache(&self, size_power_of_two: u8) {
+        self.cache.set_size_power_of_two(size_power_of_two);
     }
 }
 
@@ -185,7 +195,7 @@ impl Backend for CachingBackend {
     }
 
     fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {
-        self.cache.insert_if_absent(
+        self.cache.insert(
             Self::cache_key(position),
             CachedEval {
                 result,
@@ -199,9 +209,9 @@ impl Backend for CachingBackend {
         self.wrapped.clear_cache();
     }
 
-    fn set_cache_size(&self, size: usize) {
-        self.resize_cache(size);
-        self.wrapped.set_cache_size(size);
+    fn set_cache_size_power_of_two(&self, size_power_of_two: u8) {
+        self.resize_cache(size_power_of_two);
+        self.wrapped.set_cache_size_power_of_two(size_power_of_two);
     }
 }
 
@@ -269,7 +279,7 @@ impl BackendComputation for CachingBackendComputation {
         let mut results = Vec::with_capacity(entries.len());
         for entry in entries {
             let result = self.wrapped.take_result(entry.inner_ticket)?;
-            self.cache.insert_if_absent(
+            self.cache.insert(
                 entry.key,
                 CachedEval {
                     result: Arc::clone(&result),
@@ -380,14 +390,14 @@ impl Default for UniformBackend {
             wl: 0.0,
             d: 0.0,
             plies_left: 0.0,
-            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
+            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)),
         }
     }
 }
 
 impl UniformBackend {
     fn cache_key(position: &EvalPosition) -> u64 {
-        position.positions.last().map(|p| p.hash()).unwrap_or(0)
+        position.board_key()
     }
 
     pub fn with_wdl(wl: f32, d: f32, plies_left: f32) -> Self {
@@ -395,7 +405,7 @@ impl UniformBackend {
             wl,
             d,
             plies_left,
-            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE)),
+            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)),
         }
     }
 }
@@ -448,15 +458,15 @@ impl Backend for UniformBackend {
         self.cache.clear();
     }
 
-    fn set_cache_size(&self, size: usize) {
-        self.cache.set_capacity(size);
+    fn set_cache_size_power_of_two(&self, size_power_of_two: u8) {
+        self.cache.set_size_power_of_two(size_power_of_two);
     }
 }
 
 impl UniformBackend {
     pub fn store_cache(&self, position: &EvalPosition, result: Arc<EvalResult>) {
         let key = Self::cache_key(position);
-        self.cache.insert_if_absent(
+        self.cache.insert(
             key,
             CachedEval {
                 result,
@@ -556,13 +566,13 @@ mod tests {
     }
 
     #[test]
-    fn caching_backend_respects_px0_zero_capacity() {
+    fn caching_backend_can_use_a_single_cache_slot() {
         let backend = CachingBackend::new(Box::new(UniformBackend::default()));
-        backend.set_cache_size(0);
+        backend.set_cache_size_power_of_two(0);
         let computation = backend.create_computation().expect("computation");
         let (_, ticket) = computation.add_input(startpos_request(1)).expect("input");
         computation.compute_blocking().expect("compute");
         computation.take_result(ticket).expect("result");
-        assert!(backend.cached_evaluation(&startpos_request(1)).is_none());
+        assert!(backend.cached_evaluation(&startpos_request(1)).is_some());
     }
 }

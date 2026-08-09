@@ -638,10 +638,14 @@ mod tests {
         options
             .set_uci_option("BackpropWorkers", "2")
             .expect("backprop workers");
+        options
+            .set_uci_option("nncachesizepoweroftwo", "20")
+            .expect("cache size power");
         assert_eq!(options.cpuct, 1.5);
         assert_eq!(options.cpuct_base, 20_000.0);
         assert_eq!(options.cpuct_factor, 2.5);
         assert_eq!(options.fpu_reduction, 0.35);
+        assert_eq!(options.nn_cache_size_power_of_two, 20);
         assert_eq!(
             (options.gather_workers, options.eval_workers, options.backprop_workers),
             (2, 3, 2)
@@ -652,6 +656,7 @@ mod tests {
         assert!(options.set_uci_option("FpuReduction", "-0.1").is_err());
         assert!(options.set_uci_option("GatherWorkers", "0").is_err());
         assert!(options.set_uci_option("EvalWorkers", "65").is_err());
+        assert!(options.set_uci_option("NNCacheSizePowerOfTwo", "49").is_err());
     }
 
     #[test]

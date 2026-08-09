@@ -65,6 +65,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 ## Stream
 
 - repository 是一个 64 分片的 key-value map。MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。环、重复与 rule60 等路径终局只在 variation 内裁决，不创建重复 node，也不标记 shared node；每次结果作为实际入边的一次 local 样本，不能由首次路径永久覆盖。
+- NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
 - Engine session 常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
