@@ -4,6 +4,20 @@ use crate::bitboard::BitBoard;
 use crate::types::{Direction, EAST, NORTH, SOUTH, Square, WEST, file_distance, rank_distance};
 
 pub const PALACE: u128 = (0x0000_0000_0070_381Cu128 << 64) | 0x0000_0000_00E0_7038u128;
+/// 士只能停在九宫的五个斜线交点；`PALACE` 还包含将可走、但士不可停的四个边点。
+///
+/// px0 的 FEN 校验只要求士在九宫内。Rust 在合法着生成前额外区分士位，防止
+/// `f1e0` 这类从九宫边点出发的非法士着进入 policy 与搜索。
+pub const ADVISOR_SQUARES: u128 = (1u128 << 3)
+    | (1u128 << 5)
+    | (1u128 << 13)
+    | (1u128 << 21)
+    | (1u128 << 23)
+    | (1u128 << 66)
+    | (1u128 << 68)
+    | (1u128 << 76)
+    | (1u128 << 84)
+    | (1u128 << 86);
 pub const FILE_A_BB: u128 = (0x0000_0000_0002_0100u128 << 64) | 0x8040_2010_0804_0201u128;
 pub const FILE_C_BB: u128 = FILE_A_BB << 2;
 pub const FILE_E_BB: u128 = FILE_A_BB << 4;

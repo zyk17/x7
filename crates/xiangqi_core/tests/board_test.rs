@@ -85,6 +85,7 @@ fn invalid_fen_cases() {
         "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/6A2/RNBAK1BNR w",
         "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/6B2/RNBAKA1NR w",
         "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/6K2/RNBA1ABNR w",
+        "4k4/9/9/9/9/9/9/9/5A3/4K4 w",
     ];
     for fen in fens {
         assert!(ChessBoard::from_fen(fen).is_err(), "expected invalid fen: {fen}");
