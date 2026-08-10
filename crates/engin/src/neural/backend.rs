@@ -113,6 +113,22 @@ pub trait Backend: Send + Sync {
         Err(EnginError::PortIncomplete("backend has no encoded inference"))
     }
 
+    /// 与 [`Self::infer_encoded`] 相同，但写入调用方缓冲（先 `clear` 再追加），供 NN worker 跨 batch 复用。
+    fn infer_encoded_into(
+        &self,
+        planes: &[f32],
+        batch: usize,
+        logits: &mut Vec<f32>,
+        wdl: &mut Vec<f32>,
+        moves_left: &mut Vec<f32>,
+    ) -> Result<(), EnginError> {
+        let (out_logits, out_wdl, out_moves_left) = self.infer_encoded(planes, batch)?;
+        *logits = out_logits;
+        *wdl = out_wdl;
+        *moves_left = out_moves_left;
+        Ok(())
+    }
+
     /// Eval 构造完整 `EvalResult` 后可选地写入 cache。
     fn store_evaluation(&self, _position: &EvalPosition, _result: Arc<EvalResult>) {}
 
@@ -185,6 +201,17 @@ impl Backend for CachingBackend {
 
     fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<EncodedInference, EnginError> {
         self.wrapped.infer_encoded(planes, batch)
+    }
+
+    fn infer_encoded_into(
+        &self,
+        planes: &[f32],
+        batch: usize,
+        logits: &mut Vec<f32>,
+        wdl: &mut Vec<f32>,
+        moves_left: &mut Vec<f32>,
+    ) -> Result<(), EnginError> {
+        self.wrapped.infer_encoded_into(planes, batch, logits, wdl, moves_left)
     }
 
     fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {

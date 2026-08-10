@@ -3,9 +3,9 @@
 //! worker 角色划分可参考 LC3 Overview 的 "Workers"：
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 //!
-//! Eval 负责终局、缓存、合法着和编码；NN 线程只对队列中的 tensor 执行 ONNX。
-//! worker 之间只传递 owned event。本实现不做 multivisit、prefetch 或 tree-batch
-//! gather；一次 Gather 路径对应一次真实异步 playout。
+//! Eval 负责终局、缓存、合法着和编码；NN 线程只做「取批 → 推理 → 交回」，
+//! 不处理象棋/搜索逻辑。worker 之间只传递 owned event。本实现不做 multivisit、
+//! prefetch 或 tree-batch gather；一次 Gather 路径对应一次真实异步 playout。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -18,8 +18,10 @@ use xiangqi_core::{Move, PositionHistory};
 
 use crate::EnginError;
 use crate::neural::backend::{Backend, EvalPosition, EvalResult};
-use crate::neural::onnx::softmax_legal_policy;
-use crate::neural::{BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLICY_SIZE, encode_position_for_nn};
+use crate::neural::{
+    ENCODED_PLANE_FLOATS, EncodedBatch, FillEmptyHistory, InputPlanes, encode_position_input_planes,
+    eval_result_from_encoded_row, expand_input_planes,
+};
 
 use super::extension::{ExtensionKind, classify_extension, path_terminal_value};
 use super::graph::ChildLink;
@@ -575,8 +577,8 @@ impl Shared {
 }
 
 /// LC3 风格流式搜索：Gather / Eval / NN / Backprop。
-/// Eval：terminal | cache → Backprop；否则编码 planes → NN queue；NN 返回后
-/// softmax/edges → Backprop。NN：取出 tensor → GPU → 回复。
+/// Eval：terminal | cache → Backprop；否则稀疏编码 → NN queue；NN expand + 合批推理后
+/// 整批交回 → Eval 切行/softmax/edges → Backprop。
 pub struct Search {
     shared: Arc<Shared>,
     root_history: Arc<PositionHistory>,
@@ -1019,12 +1021,12 @@ fn cycle_value(variation: &mut Variation, mv: Move) -> ValueDelta {
     }
 }
 
-/// NN worker 返回的原始 logits[POLICY]、WDL[3] 与 moves-left[1]。
-type NnReply = Result<(Vec<f32>, Vec<f32>, f32), EnginError>;
+/// NN 只交回整批 [`EncodedBatch`] + 行号；切行与 softmax 在 Eval。
+type NnReply = Result<(Arc<EncodedBatch>, usize), EnginError>;
 
-/// 交给 NN 线程的一个已编码局面。
+/// 交给 NN 线程的一个已编码局面（稀疏 InputPlanes；ORT 前再 expand）。
 struct NnRequest {
-    planes: Vec<f32>,
+    planes: InputPlanes,
     reply: Sender<NnReply>,
     #[cfg(feature = "benchmark")]
     queued_at: Option<Instant>,
@@ -1114,9 +1116,9 @@ fn poll_nn_completions(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
     let mut i = 0;
     while i < waiting.len() {
         match waiting[i].reply.try_recv() {
-            Ok(Ok((logits, wdl, moves_left))) => {
+            Ok(Ok((batch, row))) => {
                 let item = waiting.swap_remove(i);
-                if let Err(error) = complete_nn_item(shared, item, logits, wdl, moves_left) {
+                if let Err(error) = complete_nn_item(shared, item, batch, row) {
                     shared.fail(error);
                     return;
                 }
@@ -1147,9 +1149,9 @@ fn wait_one_nn_completion(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
         return;
     }
     match waiting[0].reply.recv_timeout(RECEIVE_POLL) {
-        Ok(Ok((logits, wdl, moves_left))) => {
+        Ok(Ok((batch, row))) => {
             let item = waiting.remove(0);
-            if let Err(error) = complete_nn_item(shared, item, logits, wdl, moves_left) {
+            if let Err(error) = complete_nn_item(shared, item, batch, row) {
                 shared.fail(error);
             }
         }
@@ -1211,7 +1213,7 @@ fn handle_eval_event(
                 shared.cache_hits.fetch_add(1, Ordering::AcqRel);
                 return publish_eval(shared, event, node, legal_moves, eval);
             }
-            let planes = encode_position_for_nn(history, FillEmptyHistory::FenOnly);
+            let planes = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
             let (reply_tx, reply_rx) = bounded(1);
             if let Err(error) = send_nn_request(
                 shared,
@@ -1262,14 +1264,8 @@ fn send_nn_request(shared: &Shared, nn_tx: &Sender<NnRequest>, mut request: NnRe
     }
 }
 
-fn complete_nn_item(
-    shared: &Shared,
-    item: WaitingNn,
-    logits: Vec<f32>,
-    wdl: Vec<f32>,
-    moves_left: f32,
-) -> Result<(), EnginError> {
-    let eval = match decode_nn_eval(logits, wdl, moves_left, &item.legal_moves) {
+fn complete_nn_item(shared: &Shared, item: WaitingNn, batch: Arc<EncodedBatch>, row: usize) -> Result<(), EnginError> {
+    let eval = match eval_result_from_encoded_row(&batch, row, &item.legal_moves) {
         Ok(eval) => eval,
         Err(error) => {
             cancel_waiting_item(shared, item);
@@ -1318,34 +1314,6 @@ fn publish_eval(
     Ok(())
 }
 
-/// 将 raw ONNX 输出转为可缓存的正式 `EvalResult`。
-///
-/// 参考：px0 `BackendComputation` 的统一结果路径（`src/neural/backend.h:75-87`）。
-fn decode_nn_eval(
-    logits: Vec<f32>,
-    wdl: Vec<f32>,
-    moves_left: f32,
-    legal_moves: &[Move],
-) -> Result<Arc<EvalResult>, EnginError> {
-    let policies = softmax_legal_policy(&logits, legal_moves)?;
-    if wdl.len() < 3 {
-        return Err(EnginError::PortIncomplete("stream nn wdl length"));
-    }
-    if !wdl.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value))
-        || (wdl.iter().sum::<f32>() - 1.0).abs() > 1e-3
-        || !moves_left.is_finite()
-        || moves_left < 0.0
-    {
-        return Err(EnginError::Onnx("stream nn values are invalid".into()));
-    }
-    Ok(Arc::new(EvalResult {
-        wl: wdl[0] - wdl[2],
-        d: wdl[1],
-        plies_left: moves_left,
-        policies,
-    }))
-}
-
 fn cancel_waiting_item(shared: &Shared, item: WaitingNn) {
     cancel_evaluation(shared, item.event, item.node);
 }
@@ -1360,9 +1328,13 @@ fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>) {
     shared.finish(false);
 }
 
-/// NN worker 按当前队列立即合并请求，Eval 不等待凑满 batch。
+/// NN：取队列 → 稀疏 expand → 合批推理 → 整批交回 → 继续取。
+/// 不负责局面编码、合法着过滤或 softmax；切行与棋理由 Eval 完成。
 fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usize) {
-    let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
+    let mut packed = Vec::new();
+    let mut logits = Vec::new();
+    let mut wdl = Vec::new();
+    let mut moves_left = Vec::new();
     loop {
         #[cfg(feature = "benchmark")]
         let mut first = match receiver.recv_timeout(RECEIVE_POLL) {
@@ -1399,25 +1371,30 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
             continue;
         }
         let batch = requests.len();
-        let mut packed = Vec::with_capacity(batch * plane_len);
-        for request in &requests {
-            debug_assert_eq!(request.planes.len(), plane_len);
-            packed.extend_from_slice(&request.planes);
+        packed.clear();
+        packed.resize(batch * ENCODED_PLANE_FLOATS, 0.0);
+        for (index, request) in requests.iter().enumerate() {
+            let offset = index * ENCODED_PLANE_FLOATS;
+            expand_input_planes(&request.planes, &mut packed[offset..offset + ENCODED_PLANE_FLOATS]);
         }
-        match shared.backend.infer_encoded(&packed, batch) {
-            Ok((logits, wdl, moves_left)) => {
-                if logits.len() != batch * POLICY_SIZE || wdl.len() != batch * 3 || moves_left.len() != batch {
-                    let error = EnginError::PortIncomplete("stream nn output shape");
+        let infer_result =
+            shared
+                .backend
+                .infer_encoded_into(&packed, batch, &mut logits, &mut wdl, &mut moves_left);
+        match infer_result {
+            Ok(()) => {
+                let output = EncodedBatch::take_from(&mut logits, &mut wdl, &mut moves_left);
+                if let Err(error) = output.ensure_batch_len(batch) {
                     reject_nn_requests(requests, error);
                     continue;
                 }
                 shared.network_batches.fetch_add(1, Ordering::AcqRel);
                 shared.network_evaluations.fetch_add(batch as u64, Ordering::AcqRel);
                 shared.network_batch_size_max.fetch_max(batch as u64, Ordering::AcqRel);
-                for (index, request) in requests.into_iter().enumerate() {
-                    let part_logits = logits[index * POLICY_SIZE..(index + 1) * POLICY_SIZE].to_vec();
-                    let part_wdl = wdl[index * 3..(index + 1) * 3].to_vec();
-                    let _ = request.reply.send(Ok((part_logits, part_wdl, moves_left[index])));
+                EncodedBatch::reserve_scratch(&mut logits, &mut wdl, &mut moves_left, batch);
+                let output = Arc::new(output);
+                for (row, request) in requests.into_iter().enumerate() {
+                    let _ = request.reply.send(Ok((Arc::clone(&output), row)));
                 }
             }
             Err(error) => {

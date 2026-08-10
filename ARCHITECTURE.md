@@ -70,7 +70,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 - repository 是一个 64 分片的 key-value map。MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。重复与 rule60 等路径终局只在 variation 内裁决，不创建重复 node，也不标记 shared node；每次结果作为实际入边的一次 local 样本，不能由首次路径永久覆盖。首次绑定 edge 时若 DFS 发现会形成 shared-Q 图环，则不绑定，并将 child 的固定 NN `U` 作为该 edge 的 local leaf；这不是规则和棋裁决。
 - NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
-- Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
+- Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、合批 `infer_encoded`，并以整批 `EncodedBatch` 交回。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
   Engine 启动 job 时按固定中性的时间预算（历史上参考 px0 legacy stopper）转换为不可变 deadline，job drain 后才归还剩余时间。
 - graph reuse 只保留当前 root 可达图：确认走子后，旧 root 的 sibling 图由后台 mark/sweep 回收，UCI 可立即启动新
@@ -84,7 +84,9 @@ stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 �
 
 ## 模型
 
-正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。CNN 对照基线为
+正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。Eval 编码产出与 px0 同系的稀疏
+`InputPlane{mask,value}`；进 ORT 前再 CPU expand 为 dense NCHW（对齐 px0 ONNX 非 CUDA
+分支）。CNN 对照基线为
 `width=384`、`blocks=15`、`bottleneck_channels=192`，带两次 Global Broadcast。v3 开始试验
 PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residual scale、LayerNorm、FFN 与 from-to policy，
 默认 `width=512`、`blocks=12`、`heads=16`、`ffn=768`。v3 使用 PX0/Lc0 AttentionBody

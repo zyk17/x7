@@ -1,6 +1,8 @@
 //! ONNX Runtime backend。
 //!
-//! 负责 batch 输入、网络执行和合法着 softmax。NN cache 是独立包装层，不在此偷偷实现。
+//! 负责 batch 输入与网络执行。`BackendComputation` 路径仍在此做合法着 softmax；
+//! stream NN worker 只走 `infer_encoded*`，softmax/组装在 Eval。
+//! NN cache 是独立包装层。热路径复用 host scratch；无 DirectML pad 时对 dense planes 零拷贝建 TensorRef。
 
 #[cfg(all(feature = "cuda", feature = "directml"))]
 compile_error!("ONNX runtime build must select either `cuda` or `directml`, not both");
@@ -9,6 +11,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::EnginError;
+use crate::neural::backend::{
+    AddInputResult, Backend, BackendAttributes, BackendComputation, EncodedInference, EvalPosition, EvalResult,
+    EvalTicket,
+};
+#[cfg(feature = "cuda")]
 use ndarray::Array4;
 #[cfg(feature = "cuda")]
 use ort::ep::{CUDA, cuda::ConvAlgorithmSearch};
@@ -16,15 +24,11 @@ use ort::ep::{CUDA, cuda::ConvAlgorithmSearch};
 use ort::ep::{DirectML, directml::PerformancePreference};
 use ort::session::Session;
 use ort::value::TensorRef;
-
-use crate::EnginError;
-use crate::neural::backend::{
-    AddInputResult, Backend, BackendAttributes, BackendComputation, EncodedInference, EvalPosition, EvalResult,
-    EvalTicket,
-};
+use xiangqi_core::PositionHistory;
 
 use super::{
-    BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLICY_SIZE, encode_position_for_nn, move_to_nn_index,
+    BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLICY_SIZE, encode_position_input_planes,
+    expand_input_planes, softmax_legal_policy,
 };
 
 /// ONNX Runtime backend。
@@ -68,11 +72,13 @@ const DML_BATCH_STEPS: usize = 4;
 #[cfg(feature = "directml")]
 const DML_MAX_BATCH: usize = DML_BATCH_STEP * DML_BATCH_STEPS;
 
-/// CUDA 使用一个动态 batch session；DirectML 使用 px0 风格的固定形状 session 集合。
+/// CUDA 使用一个动态 batch session；DirectML 使用固定形状 session 集合。
 struct OnnxSessions {
     #[cfg(feature = "directml")]
     provider: OnnxProvider,
     sessions: Vec<(usize, Session)>,
+    /// DirectML pad / 偶发 owned 输入的常驻 host scratch；容量按需增长，跨次 `run` 复用。
+    input_scratch: Vec<f32>,
 }
 
 impl OnnxSessions {
@@ -81,6 +87,7 @@ impl OnnxSessions {
             #[cfg(feature = "directml")]
             provider: OnnxProvider::Cpu,
             sessions: vec![(usize::MAX, session)],
+            input_scratch: Vec::new(),
         }
     }
 
@@ -89,6 +96,7 @@ impl OnnxSessions {
         Self {
             provider: OnnxProvider::DirectMl,
             sessions,
+            input_scratch: Vec::new(),
         }
     }
 
@@ -126,7 +134,7 @@ impl OnnxSessions {
         }
     }
 
-    fn session_for(&mut self, batch_size: usize) -> Result<&mut Session, EnginError> {
+    fn session_index(&self, batch_size: usize) -> Result<usize, EnginError> {
         #[cfg(feature = "cuda")]
         let expected = usize::MAX;
         #[cfg(feature = "directml")]
@@ -136,8 +144,8 @@ impl OnnxSessions {
             usize::MAX
         };
         self.sessions
-            .iter_mut()
-            .find_map(|(size, session)| (*size == expected).then_some(session))
+            .iter()
+            .position(|(size, _)| *size == expected)
             .ok_or_else(|| EnginError::Onnx(format!("missing ONNX session for batch size {batch_size}")))
     }
 }
@@ -269,7 +277,7 @@ fn create_direct_ml_sessions(path: &Path) -> Result<Vec<(usize, Session)>, Engin
 }
 
 impl Backend for OnnxBackend {
-    fn evaluate(&self, history: &xiangqi_core::PositionHistory, legal_moves: &[xiangqi_core::Move]) -> Arc<EvalResult> {
+    fn evaluate(&self, history: &PositionHistory, legal_moves: &[xiangqi_core::Move]) -> Arc<EvalResult> {
         let computation = self.create_computation().expect("create ONNX computation");
         let (_, ticket) = computation
             .add_input(EvalPosition {
@@ -290,8 +298,23 @@ impl Backend for OnnxBackend {
     }
 
     fn infer_encoded(&self, planes: &[f32], batch: usize) -> Result<EncodedInference, EnginError> {
+        let mut logits = Vec::new();
+        let mut wdl = Vec::new();
+        let mut moves_left = Vec::new();
+        self.infer_encoded_into(planes, batch, &mut logits, &mut wdl, &mut moves_left)?;
+        Ok((logits, wdl, moves_left))
+    }
+
+    fn infer_encoded_into(
+        &self,
+        planes: &[f32],
+        batch: usize,
+        logits: &mut Vec<f32>,
+        wdl: &mut Vec<f32>,
+        moves_left: &mut Vec<f32>,
+    ) -> Result<(), EnginError> {
         let mut sessions = self.sessions.lock().expect("ONNX session lock");
-        infer_encoded_planes(&mut sessions, planes, batch)
+        infer_encoded_planes(&mut sessions, planes, batch, logits, wdl, moves_left)
     }
 }
 
@@ -341,12 +364,22 @@ impl BackendComputation for OnnxBackendComputation {
         let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
         let mut packed = vec![0.0; entries.len() * plane_len];
         for (index, (_, entry)) in entries.iter().enumerate() {
-            let history = xiangqi_core::PositionHistory::from_positions(entry.positions.clone());
-            let planes = encode_position_for_nn(&history, FillEmptyHistory::FenOnly);
-            packed[index * plane_len..(index + 1) * plane_len].copy_from_slice(&planes);
+            let history = PositionHistory::from_positions(entry.positions.clone());
+            let sparse = encode_position_input_planes(&history, FillEmptyHistory::FenOnly);
+            expand_input_planes(&sparse, &mut packed[index * plane_len..(index + 1) * plane_len]);
         }
         let mut sessions = self.sessions.lock().expect("ONNX session lock");
-        let (logits, wdl, moves_left) = infer_encoded_planes(&mut sessions, &packed, entries.len())?;
+        let mut logits = Vec::new();
+        let mut wdl = Vec::new();
+        let mut moves_left = Vec::new();
+        infer_encoded_planes(
+            &mut sessions,
+            &packed,
+            entries.len(),
+            &mut logits,
+            &mut wdl,
+            &mut moves_left,
+        )?;
         let mut results = HashMap::with_capacity(entries.len());
         for (index, (ticket, entry)) in entries.iter().enumerate() {
             let values = &logits[index * POLICY_SIZE..(index + 1) * POLICY_SIZE];
@@ -383,39 +416,19 @@ impl BackendComputation for OnnxBackendComputation {
     }
 }
 
-/// 对合法着做 softmax，得到 policy 概率。
-pub fn softmax_legal_policy(logits: &[f32], legal_moves: &[xiangqi_core::Move]) -> Result<Vec<f32>, EnginError> {
-    let mut selected = Vec::with_capacity(legal_moves.len());
-    let mut maximum = f32::NEG_INFINITY;
-    for &mv in legal_moves {
-        let index = move_to_nn_index(mv)
-            .ok_or_else(|| EnginError::Onnx(format!("legal move absent from px0 policy table: {mv}")))?;
-        let logit = logits[index];
-        maximum = maximum.max(logit);
-        selected.push(logit);
-    }
-    let total: f32 = selected
-        .iter_mut()
-        .map(|value| {
-            *value = (*value - maximum).exp();
-            *value
-        })
-        .sum();
-    if !total.is_finite() || total <= 0.0 {
-        return Err(EnginError::Onnx("legal policy softmax is invalid".into()));
-    }
-    for value in &mut selected {
-        *value /= total;
-    }
-    Ok(selected)
-}
-
 /// 仅供 ONNX 使用：在预编码 planes 上运行当前发行包的 ONNX session。
+///
+/// - `run_batch == actual_batch`：对 `planes` 切片零拷贝建 `TensorRef`
+/// - DirectML pad：写入常驻 `input_scratch`，只拷贝有效样本并清零 pad
+/// - 输出只把 `actual_batch` 行追加到调用方缓冲（先 `clear`），避免整段 pad 的 `to_vec`
 fn infer_encoded_planes(
     sessions: &mut OnnxSessions,
     planes: &[f32],
     batch: usize,
-) -> Result<EncodedInference, EnginError> {
+    all_logits: &mut Vec<f32>,
+    all_wdl: &mut Vec<f32>,
+    all_moves_left: &mut Vec<f32>,
+) -> Result<(), EnginError> {
     let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
     if planes.len() != batch * plane_len {
         return Err(EnginError::Onnx(format!(
@@ -423,40 +436,57 @@ fn infer_encoded_planes(
             planes.len()
         )));
     }
+    all_logits.clear();
+    all_wdl.clear();
+    all_moves_left.clear();
     if batch == 0 {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+        return Ok(());
     }
-    let mut all_logits = Vec::with_capacity(batch * POLICY_SIZE);
-    let mut all_wdl = Vec::with_capacity(batch * 3);
-    let mut all_moves_left = Vec::with_capacity(batch);
+    all_logits.reserve(batch * POLICY_SIZE);
+    all_wdl.reserve(batch * 3);
+    all_moves_left.reserve(batch);
     let chunk_size = sessions.chunk_size();
     for chunk_start in (0..batch).step_by(chunk_size.min(batch).max(1)) {
         let end = (chunk_start + chunk_size).min(batch);
         let actual_batch = end - chunk_start;
         let run_batch = sessions.run_batch_size(actual_batch);
-        #[cfg(feature = "cuda")]
-        let input = planes[chunk_start * plane_len..end * plane_len].to_vec();
-        #[cfg(feature = "directml")]
-        let input = {
-            let mut input = vec![0.0; run_batch * plane_len];
-            input[..actual_batch * plane_len].copy_from_slice(&planes[chunk_start * plane_len..end * plane_len]);
-            input
+        let session_index = sessions.session_index(run_batch)?;
+        let shape = [run_batch, INPUT_PLANES, BOARD_ROWS, BOARD_COLS];
+        let src = &planes[chunk_start * plane_len..end * plane_len];
+
+        // 先填 scratch（若需要），再 `take` 出来，避免与 `&mut Session` 同时借用 `OnnxSessions`。
+        let mut owned_input = if run_batch == actual_batch {
+            None
+        } else {
+            let need = run_batch * plane_len;
+            let mut scratch = std::mem::take(&mut sessions.input_scratch);
+            if scratch.len() < need {
+                scratch.resize(need, 0.0);
+            }
+            scratch[..src.len()].copy_from_slice(src);
+            scratch[src.len()..need].fill(0.0);
+            Some(scratch)
         };
-        let board = Array4::from_shape_vec((run_batch, INPUT_PLANES, BOARD_ROWS, BOARD_COLS), input)
-            .map_err(|error| EnginError::Onnx(format!("invalid batch input: {error}")))?;
-        let tensor = TensorRef::from_array_view(&board).map_err(onnx_error)?;
-        let outputs = sessions
-            .session_for(run_batch)?
-            .run(ort::inputs!["board" => tensor])
-            .map_err(onnx_error)?;
-        let logits = tensor_output(&outputs, "logits", run_batch, POLICY_SIZE)?;
-        let wdl = tensor_output(&outputs, "value", run_batch, 3)?;
-        let moves_left = tensor_output(&outputs, "moves_left", run_batch, 1)?;
-        all_logits.extend_from_slice(&logits[..actual_batch * POLICY_SIZE]);
-        all_wdl.extend_from_slice(&wdl[..actual_batch * 3]);
-        all_moves_left.extend(moves_left[..actual_batch].iter().copied());
+
+        let input: &[f32] = match owned_input.as_deref() {
+            Some(scratch) => &scratch[..run_batch * plane_len],
+            None => src,
+        };
+        {
+            let tensor = TensorRef::from_array_view((shape, input)).map_err(onnx_error)?;
+            let outputs = sessions.sessions[session_index]
+                .1
+                .run(ort::inputs!["board" => tensor])
+                .map_err(onnx_error)?;
+            append_tensor_rows(&outputs, "logits", run_batch, POLICY_SIZE, actual_batch, all_logits)?;
+            append_tensor_rows(&outputs, "value", run_batch, 3, actual_batch, all_wdl)?;
+            append_tensor_rows(&outputs, "moves_left", run_batch, 1, actual_batch, all_moves_left)?;
+        }
+        if let Some(scratch) = owned_input.take() {
+            sessions.input_scratch = scratch;
+        }
     }
-    Ok((all_logits, all_wdl, all_moves_left))
+    Ok(())
 }
 
 fn validate_model_io(session: &Session) -> Result<(), EnginError> {
@@ -473,22 +503,31 @@ fn validate_model_io(session: &Session) -> Result<(), EnginError> {
     Ok(())
 }
 
-fn tensor_output(
+/// 将输出 tensor 的前 `actual_batch` 行追加到 `dest`，不分配整段 pad 缓冲。
+fn append_tensor_rows(
     outputs: &ort::session::SessionOutputs<'_>,
     name: &str,
-    batch: usize,
+    run_batch: usize,
     width: usize,
-) -> Result<Vec<f32>, EnginError> {
+    actual_batch: usize,
+    dest: &mut Vec<f32>,
+) -> Result<(), EnginError> {
     let value = outputs
         .get(name)
         .ok_or_else(|| EnginError::Onnx(format!("ONNX output missing {name}")))?;
     let (shape, data) = value.try_extract_tensor::<f32>().map_err(onnx_error)?;
-    if **shape != [batch as i64, width as i64] {
+    if **shape != [run_batch as i64, width as i64] {
         return Err(EnginError::Onnx(format!(
-            "{name} shape must be [{batch},{width}], got {shape:?}"
+            "{name} shape must be [{run_batch},{width}], got {shape:?}"
         )));
     }
-    Ok(data.to_vec())
+    if actual_batch > run_batch {
+        return Err(EnginError::Onnx(format!(
+            "{name}: actual_batch {actual_batch} > run_batch {run_batch}"
+        )));
+    }
+    dest.extend_from_slice(&data[..actual_batch * width]);
+    Ok(())
 }
 
 fn onnx_error<T>(error: ort::Error<T>) -> EnginError {
@@ -502,23 +541,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn softmax_is_limited_to_legal_policy_entries() {
-        let a0 = xiangqi_core::Square::parse("a0").unwrap();
-        let a1 = xiangqi_core::Square::parse("a1").unwrap();
-        let a2 = xiangqi_core::Square::parse("a2").unwrap();
-        let mut logits = vec![f32::NEG_INFINITY; POLICY_SIZE];
-        logits[move_to_nn_index(xiangqi_core::Move::new(a0, a1)).unwrap()] = 0.0;
-        logits[move_to_nn_index(xiangqi_core::Move::new(a0, a2)).unwrap()] = 1.0;
-        let policy = softmax_legal_policy(
-            &logits,
-            &[xiangqi_core::Move::new(a0, a1), xiangqi_core::Move::new(a0, a2)],
-        )
-        .unwrap();
-        assert!((policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-        assert!(policy[1] > policy[0]);
-    }
-
-    #[test]
     fn local_x7_onnx_smoke_if_present() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx");
         if !path.is_file() {
@@ -526,7 +548,7 @@ mod tests {
             return;
         }
         let backend = OnnxBackend::from_file(&path).expect("load local x7.onnx");
-        let history = xiangqi_core::PositionHistory::from_positions(vec![
+        let history = PositionHistory::from_positions(vec![
             xiangqi_core::Position::from_fen(xiangqi_core::STARTPOS_FEN).unwrap(),
         ]);
         let legal = history.last().board().generate_legal_moves();
