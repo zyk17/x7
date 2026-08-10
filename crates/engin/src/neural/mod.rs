@@ -231,6 +231,13 @@ pub fn expand_input_planes(planes: &[InputPlane], dest: &mut [f32]) {
     assert_eq!(planes.len(), INPUT_PLANES, "expand expects {INPUT_PLANES} planes");
     assert_eq!(dest.len(), ENCODED_PLANE_FLOATS, "expand dest must be NCHW floats");
     dest.fill(0.0);
+    expand_input_planes_into_zeroed(planes, dest);
+}
+
+/// 与 [`expand_input_planes`] 相同，但假定 `dest` 已全零（供 ORT scratch 一次清零后批量 expand）。
+pub fn expand_input_planes_into_zeroed(planes: &[InputPlane], dest: &mut [f32]) {
+    assert_eq!(planes.len(), INPUT_PLANES, "expand expects {INPUT_PLANES} planes");
+    assert_eq!(dest.len(), ENCODED_PLANE_FLOATS, "expand dest must be NCHW floats");
     for (plane, dest_plane) in planes.iter().zip(dest.chunks_exact_mut(BOARD_SQUARES)) {
         let mut bits = plane.mask;
         let value = plane.value;

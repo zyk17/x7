@@ -19,8 +19,7 @@ use xiangqi_core::{Move, PositionHistory};
 use crate::EnginError;
 use crate::neural::backend::{Backend, EvalPosition, EvalResult};
 use crate::neural::{
-    ENCODED_PLANE_FLOATS, EncodedBatch, FillEmptyHistory, InputPlanes, encode_position_input_planes,
-    eval_result_from_encoded_row, expand_input_planes,
+    EncodedBatch, FillEmptyHistory, InputPlanes, encode_position_input_planes, eval_result_from_encoded_row,
 };
 
 use super::extension::{ExtensionKind, classify_extension, path_terminal_value};
@@ -1328,10 +1327,10 @@ fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>) {
     shared.finish(false);
 }
 
-/// NN：取队列 → 稀疏 expand → 合批推理 → 整批交回 → 继续取。
-/// 不负责局面编码、合法着过滤或 softmax；切行与棋理由 Eval 完成。
+/// NN：取队列 → 稀疏合批推理 → 整批交回 → 继续取。
+/// expand/pad 在 ONNX 输入 scratch 内完成；不负责局面编码、合法着过滤或 softmax。
 fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usize) {
-    let mut packed = Vec::new();
+    let mut samples = Vec::new();
     let mut logits = Vec::new();
     let mut wdl = Vec::new();
     let mut moves_left = Vec::new();
@@ -1371,15 +1370,14 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
             continue;
         }
         let batch = requests.len();
-        packed.clear();
-        packed.resize(batch * ENCODED_PLANE_FLOATS, 0.0);
-        for (index, request) in requests.iter().enumerate() {
-            let offset = index * ENCODED_PLANE_FLOATS;
-            expand_input_planes(&request.planes, &mut packed[offset..offset + ENCODED_PLANE_FLOATS]);
+        samples.clear();
+        samples.reserve(batch);
+        for request in &requests {
+            samples.push(request.planes);
         }
         let infer_result = shared
             .backend
-            .infer_encoded_into(&packed, batch, &mut logits, &mut wdl, &mut moves_left);
+            .infer_input_planes_into(&samples, &mut logits, &mut wdl, &mut moves_left);
         match infer_result {
             Ok(()) => {
                 let output = EncodedBatch::take_from(&mut logits, &mut wdl, &mut moves_left);

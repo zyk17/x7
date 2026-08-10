@@ -1,8 +1,9 @@
 //! ONNX Runtime backend。
 //!
 //! 负责 batch 输入与网络执行。`BackendComputation` 路径仍在此做合法着 softmax；
-//! stream NN worker 只走 `infer_encoded*`，softmax/组装在 Eval。
-//! NN cache 是独立包装层。热路径复用 host scratch；无 DirectML pad 时对 dense planes 零拷贝建 TensorRef。
+//! stream NN worker 只走 `infer_input_planes_into` / `infer_encoded*`，softmax/组装在 Eval。
+//! NN cache 是独立包装层。热路径复用 host `input_scratch`：稀疏路径在 scratch 内 expand+pad；
+//! dense 路径在无 DirectML pad 时可对 planes 零拷贝建 TensorRef。
 
 #[cfg(all(feature = "cuda", feature = "directml"))]
 compile_error!("ONNX runtime build must select either `cuda` or `directml`, not both");
@@ -27,8 +28,8 @@ use ort::value::TensorRef;
 use xiangqi_core::PositionHistory;
 
 use super::{
-    BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLICY_SIZE, encode_position_input_planes,
-    expand_input_planes, softmax_legal_policy,
+    BOARD_COLS, BOARD_ROWS, ENCODED_PLANE_FLOATS, FillEmptyHistory, INPUT_PLANES, InputPlanes, POLICY_SIZE,
+    encode_position_input_planes, expand_input_planes_into_zeroed, softmax_legal_policy,
 };
 
 /// ONNX Runtime backend。
@@ -316,6 +317,17 @@ impl Backend for OnnxBackend {
         let mut sessions = self.sessions.lock().expect("ONNX session lock");
         infer_encoded_planes(&mut sessions, planes, batch, logits, wdl, moves_left)
     }
+
+    fn infer_input_planes_into(
+        &self,
+        samples: &[InputPlanes],
+        logits: &mut Vec<f32>,
+        wdl: &mut Vec<f32>,
+        moves_left: &mut Vec<f32>,
+    ) -> Result<(), EnginError> {
+        let mut sessions = self.sessions.lock().expect("ONNX session lock");
+        infer_input_planes(&mut sessions, samples, logits, wdl, moves_left)
+    }
 }
 
 /// 一次 ONNX batch computation。
@@ -361,25 +373,16 @@ impl BackendComputation for OnnxBackendComputation {
         if entries.is_empty() {
             return Ok(());
         }
-        let plane_len = INPUT_PLANES * BOARD_ROWS * BOARD_COLS;
-        let mut packed = vec![0.0; entries.len() * plane_len];
-        for (index, (_, entry)) in entries.iter().enumerate() {
+        let mut samples = Vec::with_capacity(entries.len());
+        for (_, entry) in &entries {
             let history = PositionHistory::from_positions(entry.positions.clone());
-            let sparse = encode_position_input_planes(&history, FillEmptyHistory::FenOnly);
-            expand_input_planes(&sparse, &mut packed[index * plane_len..(index + 1) * plane_len]);
+            samples.push(encode_position_input_planes(&history, FillEmptyHistory::FenOnly));
         }
         let mut sessions = self.sessions.lock().expect("ONNX session lock");
         let mut logits = Vec::new();
         let mut wdl = Vec::new();
         let mut moves_left = Vec::new();
-        infer_encoded_planes(
-            &mut sessions,
-            &packed,
-            entries.len(),
-            &mut logits,
-            &mut wdl,
-            &mut moves_left,
-        )?;
+        infer_input_planes(&mut sessions, &samples, &mut logits, &mut wdl, &mut moves_left)?;
         let mut results = HashMap::with_capacity(entries.len());
         for (index, (ticket, entry)) in entries.iter().enumerate() {
             let values = &logits[index * POLICY_SIZE..(index + 1) * POLICY_SIZE];
@@ -416,7 +419,64 @@ impl BackendComputation for OnnxBackendComputation {
     }
 }
 
-/// 仅供 ONNX 使用：在预编码 planes 上运行当前发行包的 ONNX session。
+/// 稀疏合批：expand 直接写入常驻 `input_scratch`（含 DirectML pad 清零），再 `Session::run`。
+///
+/// 参考：px0 ONNX `PrepareInputs` 在 ORT 边界 densify；此处额外把 pad 与 expand 合并到同一 scratch，
+/// 去掉 stream 路径上的中间 dense `packed`。
+fn infer_input_planes(
+    sessions: &mut OnnxSessions,
+    samples: &[InputPlanes],
+    all_logits: &mut Vec<f32>,
+    all_wdl: &mut Vec<f32>,
+    all_moves_left: &mut Vec<f32>,
+) -> Result<(), EnginError> {
+    let batch = samples.len();
+    all_logits.clear();
+    all_wdl.clear();
+    all_moves_left.clear();
+    if batch == 0 {
+        return Ok(());
+    }
+    all_logits.reserve(batch * POLICY_SIZE);
+    all_wdl.reserve(batch * 3);
+    all_moves_left.reserve(batch);
+    let plane_len = ENCODED_PLANE_FLOATS;
+    let chunk_size = sessions.chunk_size();
+    for chunk_start in (0..batch).step_by(chunk_size.min(batch).max(1)) {
+        let end = (chunk_start + chunk_size).min(batch);
+        let actual_batch = end - chunk_start;
+        let run_batch = sessions.run_batch_size(actual_batch);
+        let session_index = sessions.session_index(run_batch)?;
+        let shape = [run_batch, INPUT_PLANES, BOARD_ROWS, BOARD_COLS];
+        let need = run_batch * plane_len;
+
+        let mut scratch = std::mem::take(&mut sessions.input_scratch);
+        if scratch.len() < need {
+            scratch.resize(need, 0.0);
+        }
+        scratch[..need].fill(0.0);
+        for (row, sample) in samples[chunk_start..end].iter().enumerate() {
+            let offset = row * plane_len;
+            expand_input_planes_into_zeroed(sample, &mut scratch[offset..offset + plane_len]);
+        }
+
+        {
+            let input = &scratch[..need];
+            let tensor = TensorRef::from_array_view((shape, input)).map_err(onnx_error)?;
+            let outputs = sessions.sessions[session_index]
+                .1
+                .run(ort::inputs!["board" => tensor])
+                .map_err(onnx_error)?;
+            append_tensor_rows(&outputs, "logits", run_batch, POLICY_SIZE, actual_batch, all_logits)?;
+            append_tensor_rows(&outputs, "value", run_batch, 3, actual_batch, all_wdl)?;
+            append_tensor_rows(&outputs, "moves_left", run_batch, 1, actual_batch, all_moves_left)?;
+        }
+        sessions.input_scratch = scratch;
+    }
+    Ok(())
+}
+
+/// 仅供 ONNX 使用：在预编码 dense planes 上运行当前发行包的 ONNX session。
 ///
 /// - `run_batch == actual_batch`：对 `planes` 切片零拷贝建 `TensorRef`
 /// - DirectML pad：写入常驻 `input_scratch`，只拷贝有效样本并清零 pad

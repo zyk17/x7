@@ -11,7 +11,9 @@ use xiangqi_core::{Move, MoveList, Position, PositionHistory};
 use crate::EnginError;
 
 use super::cache::{CachedEval, DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, EvalCache};
-use super::{BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE};
+use super::{
+    BOARD_COLS, BOARD_ROWS, ENCODED_PLANE_FLOATS, INPUT_PLANES, InputPlanes, POLICY_SIZE, expand_input_planes,
+};
 
 /// Backend 能力与推荐 batch 大小。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +131,26 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// stream NN worker：稀疏 `InputPlanes` 合批推理。
+    ///
+    /// 默认实现会先 expand 再走 [`Self::infer_encoded_into`]；ONNX 覆盖为直接写入
+    /// session `input_scratch`（含 DirectML pad），去掉中间 dense `packed`。
+    fn infer_input_planes_into(
+        &self,
+        samples: &[InputPlanes],
+        logits: &mut Vec<f32>,
+        wdl: &mut Vec<f32>,
+        moves_left: &mut Vec<f32>,
+    ) -> Result<(), EnginError> {
+        let batch = samples.len();
+        let mut dense = vec![0.0; batch * ENCODED_PLANE_FLOATS];
+        for (index, sample) in samples.iter().enumerate() {
+            let offset = index * ENCODED_PLANE_FLOATS;
+            expand_input_planes(sample, &mut dense[offset..offset + ENCODED_PLANE_FLOATS]);
+        }
+        self.infer_encoded_into(&dense, batch, logits, wdl, moves_left)
+    }
+
     /// Eval 构造完整 `EvalResult` 后可选地写入 cache。
     fn store_evaluation(&self, _position: &EvalPosition, _result: Arc<EvalResult>) {}
 
@@ -212,6 +234,16 @@ impl Backend for CachingBackend {
         moves_left: &mut Vec<f32>,
     ) -> Result<(), EnginError> {
         self.wrapped.infer_encoded_into(planes, batch, logits, wdl, moves_left)
+    }
+
+    fn infer_input_planes_into(
+        &self,
+        samples: &[InputPlanes],
+        logits: &mut Vec<f32>,
+        wdl: &mut Vec<f32>,
+        moves_left: &mut Vec<f32>,
+    ) -> Result<(), EnginError> {
+        self.wrapped.infer_input_planes_into(samples, logits, wdl, moves_left)
     }
 
     fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {
