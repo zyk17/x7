@@ -1,7 +1,7 @@
 //! 对照 px0 `src/engine.cc:137-250` 的 UCI Engine 生命周期。
 
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -22,6 +22,7 @@ pub struct Engine {
     // UniformBackend。
     backend: Option<Arc<dyn Backend>>,
     graph: Option<SearchGraph>,
+    graph_reaper: GraphReaper,
     worker_pool: Option<Arc<WorkerPool>>,
     next_generation: u64,
     applied_nn_cache_size: Option<u8>,
@@ -43,6 +44,73 @@ struct ActiveSearch {
     watchdog_thread: JoinHandle<()>,
     started: Instant,
     clock_budget: Option<TimeBudget>,
+}
+
+/// 后台回收旧 sibling 图或已被新 position 替换的整张 graph，不占用下一次 `go` 的 UCI 线程。
+///
+/// 走子后的 prune 与新搜索共享 repository，但由 repository topology 锁保证绑定安全；
+/// 无关 position 的 retire 则不与活跃图共享任何 node 或锁。
+struct GraphReaper {
+    sender: Option<crossbeam_channel::Sender<GraphCleanup>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+enum GraphCleanup {
+    Prune(Arc<crate::search::NodeRepository>, crate::search::NodeKey),
+    Retire(Arc<crate::search::NodeRepository>),
+}
+
+impl GraphReaper {
+    fn new() -> Self {
+        let (sender, receiver) = crossbeam_channel::unbounded::<GraphCleanup>();
+        let thread = thread::Builder::new()
+            .name("engin-graph-reaper".into())
+            .spawn(move || {
+                while let Ok(cleanup) = receiver.recv() {
+                    match cleanup {
+                        GraphCleanup::Prune(repository, root) => {
+                            repository.retain_from_root(root);
+                        }
+                        // 正常 reset 已 drain；若还有外部只读 Arc，则保守地交给它最后一次
+                        // drop。常规路径下能独占旧图，按 shard 低干扰释放。
+                        GraphCleanup::Retire(repository) => match Arc::try_unwrap(repository) {
+                            Ok(repository) => repository.release_incrementally(),
+                            Err(repository) => drop(repository),
+                        },
+                    }
+                }
+            })
+            .expect("graph reaper thread starts");
+        Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        }
+    }
+
+    fn retire(&self, repository: Arc<crate::search::NodeRepository>) {
+        self.sender
+            .as_ref()
+            .expect("graph reaper sender lives with engine")
+            .send(GraphCleanup::Retire(repository))
+            .expect("graph reaper thread is alive");
+    }
+
+    fn prune(&self, repository: Arc<crate::search::NodeRepository>, root: crate::search::NodeKey) {
+        self.sender
+            .as_ref()
+            .expect("graph reaper sender lives with engine")
+            .send(GraphCleanup::Prune(repository, root))
+            .expect("graph reaper thread is alive");
+    }
+}
+
+impl Drop for GraphReaper {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// px0 `search.cc` 的 `kUciInfoMinimumFrequencyMs`。
@@ -102,6 +170,7 @@ impl Engine {
         Self {
             backend: None,
             graph: None,
+            graph_reaper: GraphReaper::new(),
             worker_pool: None,
             next_generation: 0,
             applied_nn_cache_size: None,
@@ -217,7 +286,12 @@ impl Engine {
         let history = Arc::new(state.position_history());
         self.abort()?;
         if let Some(graph) = self.graph.as_mut() {
-            graph.reset_to_history_after_drain(Arc::clone(&history))?;
+            if let Some(retired) = graph.reset_to_history_after_drain(Arc::clone(&history))? {
+                self.graph_reaper.retire(retired);
+            }
+            if let Some(root) = graph.take_pending_gc_root() {
+                self.graph_reaper.prune(Arc::clone(graph.repository()), root);
+            }
         } else if self.backend.is_some() {
             self.graph = Some(SearchGraph::new(history));
         }

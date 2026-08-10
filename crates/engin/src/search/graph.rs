@@ -76,9 +76,9 @@ pub struct Edge {
     /// 这条合法 edge 若接入 child 会闭合 shared-Q 图环，则固定保存 child 的首次
     /// 网络预测 U。它与 `child_key` 互斥：前者是 edge-local leaf，后者是共享图边。
     cycle_leaf: OnceLock<ValueDelta>,
-    /// IEEE-754 `f32` 位模式的 policy prior（`f32::to_bits` / `from_bits`）。
-    /// std 没有 `AtomicF32`，故保存为 `AtomicU32`。
-    prior_bits: AtomicU32,
+    /// policy prior 在 node 发布后不再变化；普通不可变 `f32` 即可安全地被所有
+    /// Gather worker 读取，不需要为 PUCT 热路径使用原子加载。
+    prior: f32,
     started: AtomicU32,
     /// 已完成访问和其中 variation-local 终局的实际样本。
     ///
@@ -105,7 +105,7 @@ impl Edge {
             mv,
             child_key: OnceLock::new(),
             cycle_leaf: OnceLock::new(),
-            prior_bits: AtomicU32::new(prior.to_bits()),
+            prior,
             started: AtomicU32::new(0),
             completed: Mutex::new(EdgeStats::default()),
         }
@@ -116,7 +116,7 @@ impl Edge {
     }
 
     pub fn prior(&self) -> f32 {
-        f32::from_bits(self.prior_bits.load(Ordering::Acquire))
+        self.prior
     }
 
     /// LC3 edge N 包含 in-flight visit。GPU 评估未返回时，另存 completed N 才能形成
@@ -373,6 +373,8 @@ type ShardNodes = RwLock<HashMap<NodeKey, Arc<Node>, BuildHasherDefault<NoHashHa
 pub struct NodeRepository {
     /// `NoHashHasher`：`NodeKey` 已经 `hash_cat`，不得再次 hash。
     shards: Box<[ShardNodes]>,
+    /// 只保护 node 创建、edge 绑定和后台 mark/sweep 的拓扑一致性；N/Q 不经过它。
+    topology_lock: RwLock<()>,
     /// 仅序列化“检查新边是否会闭环 + 绑定新边”这一极少发生的操作。正常 PUCT、
     /// reservation 与统计更新均不经过此锁。
     ///
@@ -439,11 +441,17 @@ impl NodeRepository {
         assert!(shard_count > 0, "stream shard count must be non-zero");
         Self {
             shards: (0..shard_count).map(|_| RwLock::new(HashMap::default())).collect(),
+            topology_lock: RwLock::new(()),
             link_lock: Mutex::new(()),
         }
     }
 
     pub fn get_or_insert(&self, key: NodeKey) -> Arc<Node> {
+        let _topology = self.topology_lock.read();
+        self.get_or_insert_unlocked(key)
+    }
+
+    fn get_or_insert_unlocked(&self, key: NodeKey) -> Arc<Node> {
         let shard = &self.shards[self.shard_index(key)];
         if let Some(node) = shard.read().get(&key) {
             return Arc::clone(node);
@@ -453,6 +461,11 @@ impl NodeRepository {
     }
 
     pub fn get(&self, key: NodeKey) -> Option<Arc<Node>> {
+        let _topology = self.topology_lock.read();
+        self.get_unlocked(key)
+    }
+
+    fn get_unlocked(&self, key: NodeKey) -> Option<Arc<Node>> {
         let shard = &self.shards[self.shard_index(key)];
         shard.read().get(&key).cloned()
     }
@@ -464,6 +477,7 @@ impl NodeRepository {
     /// 返回 child 的固定 U，供调用方作为 edge-local leaf 回传。这样保留 board-key
     /// node 复用，却不伪造历史相关的 draw/terminal。
     pub(crate) fn bind_child_or_cut_cycle(&self, parent: NodeKey, edge: &Edge, child: NodeKey) -> ChildLink {
+        let _topology = self.topology_lock.read();
         let _link = self.link_lock.lock();
         if let Some(existing) = edge.child_key() {
             assert_eq!(existing, child, "one edge must keep one child board");
@@ -474,11 +488,12 @@ impl NodeRepository {
         }
         // 新 child 尚未进入 repository 时不可能沿既有图边回到 parent，直接绑定。
         // 这避免绝大多数首次 expansion 的无意义 DFS。
-        let Some(child_node) = self.get(child) else {
+        let Some(child_node) = self.get_unlocked(child) else {
+            self.get_or_insert_unlocked(child);
             edge.bind_child_key(child);
             return ChildLink::Bound;
         };
-        if self.reaches(child, parent) {
+        if self.reaches_unlocked(child, parent) {
             let value = child_node
                 .graph_value()
                 .expect("a reachable graph node must have a base value");
@@ -492,7 +507,7 @@ impl NodeRepository {
     }
 
     /// 新边检查专用 DFS。它只读取已绑定 edge，且只在首次连接 edge 时调用。
-    fn reaches(&self, from: NodeKey, target: NodeKey) -> bool {
+    fn reaches_unlocked(&self, from: NodeKey, target: NodeKey) -> bool {
         let mut pending = vec![from];
         let mut seen: HashSet<NodeKey, BuildHasherDefault<NoHashHasher<u64>>> = HashSet::default();
         while let Some(key) = pending.pop() {
@@ -502,7 +517,7 @@ impl NodeRepository {
             if key == target {
                 return true;
             }
-            let Some(node) = self.get(key) else {
+            let Some(node) = self.get_unlocked(key) else {
                 continue;
             };
             pending.extend(node.edges().iter().filter_map(|edge| edge.child_key()));
@@ -510,25 +525,25 @@ impl NodeRepository {
         false
     }
 
-    fn shard_index(&self, key: NodeKey) -> usize {
-        key.0 as usize & (self.shards.len() - 1)
-    }
-
-    /// 只保留所有 retained root 可达的 graph node。图中 child 可有多个 parent，不能按
-    /// sibling subtree 删除；必须先从根遍历再按 shard 批量回收。
-    pub(crate) fn retain_reachable(&self, roots: impl IntoIterator<Item = NodeKey>) -> usize {
-        let mut pending: Vec<_> = roots.into_iter().collect();
+    /// 以当前 root 为唯一保留根回收不可达图。
+    ///
+    /// GC 持有 topology 写锁，node 创建与 edge 绑定会短暂等待，因而不会删掉刚被
+    /// transposition 接回的 node；统计更新不受此锁影响。参考 LC3 Overview 的
+    /// "Node repository"；LC3 未公开 GC 细节，mark/sweep 是当前单图语义的直接实现。
+    pub(crate) fn retain_from_root(&self, root: NodeKey) -> usize {
+        let _topology = self.topology_lock.write();
+        let _link = self.link_lock.lock();
+        let mut pending = vec![root];
         let mut reachable: HashSet<NodeKey, BuildHasherDefault<NoHashHasher<u64>>> = HashSet::default();
         while let Some(key) = pending.pop() {
             if !reachable.insert(key) {
                 continue;
             }
-            let Some(node) = self.get(key) else {
+            let Some(node) = self.get_unlocked(key) else {
                 continue;
             };
             pending.extend(node.edges().iter().filter_map(|edge| edge.child_key()));
         }
-
         let mut removed = 0;
         for shard in self.shards.iter() {
             let mut nodes = shard.write();
@@ -537,6 +552,10 @@ impl NodeRepository {
             removed += before - nodes.len();
         }
         removed
+    }
+
+    fn shard_index(&self, key: NodeKey) -> usize {
+        key.0 as usize & (self.shards.len() - 1)
     }
 
     /// 检查 `root` 以下的 edge-local reservation 不变量。
@@ -563,6 +582,17 @@ impl NodeRepository {
     pub(crate) fn len(&self) -> usize {
         self.shards.iter().map(|shard| shard.read().len()).sum()
     }
+
+    /// 无关 position 换图后由后台线程逐 shard 释放整张旧图。
+    ///
+    /// 该 repository 已与 Engine 脱离且不再被 worker 使用；逐 shard `yield` 只降低释放
+    /// 峰值，不改变任何活跃图的内容。
+    pub(crate) fn release_incrementally(self) {
+        for shard in self.shards {
+            drop(shard);
+            std::thread::yield_now();
+        }
+    }
 }
 
 impl Default for NodeRepository {
@@ -573,21 +603,15 @@ impl Default for NodeRepository {
 
 // 跨回合复用保留已走根，并回收不再从任一 retained root 可达的 node。
 
-/// 已走着替换当前 root 时回收的 node 数。
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct GcStats {
-    pub removed_nodes: usize,
-}
-
 /// 两次已完成 stream 搜索之间保留的 graph 状态。
 #[derive(Debug)]
 pub struct SearchGraph {
     repository: Arc<NodeRepository>,
-    /// 保留的已走主线：从最早 root 到当前 root。
-    root_keys: Vec<NodeKey>,
-    /// 与 `root_keys` 对齐的完整历史；末项就是当前 root。快照使 UCI 能精确悔棋和
-    /// 复用，不必根据 hash 重建局面。
-    root_histories: Vec<Arc<PositionHistory>>,
+    root_key: NodeKey,
+    /// 当前 root 的完整历史。悔棋由下一条 UCI `position ... moves` 重建，不保留旧
+    /// root 的所有 sibling 图，否则 GC 永远无法回收它们。
+    root_history: Arc<PositionHistory>,
+    gc_pending: bool,
 }
 
 impl SearchGraph {
@@ -595,8 +619,9 @@ impl SearchGraph {
         let root = NodeKey::board(root_history.last().board().hash());
         Self {
             repository: Arc::new(NodeRepository::default()),
-            root_keys: vec![root],
-            root_histories: vec![root_history],
+            root_key: root,
+            root_history,
+            gc_pending: false,
         }
     }
 
@@ -605,18 +630,18 @@ impl SearchGraph {
     }
 
     pub fn root_key(&self) -> NodeKey {
-        *self.root_keys.last().expect("search graph always has a root")
+        self.root_key
     }
 
     pub fn root_history(&self) -> &Arc<PositionHistory> {
-        self.root_histories
-            .last()
-            .expect("search graph always has a root history")
+        &self.root_history
     }
 
     /// 在当前 root 以下的 event 都完成或取消后，推进到一个合法 child。
-    /// 旧 root 留作悔棋根；随后按所有 retained root 的可达性回收。
-    pub fn advance(&mut self, mv: Move) -> Result<GcStats, EnginError> {
+    ///
+    /// 旧 root 留作悔棋；它仍可到达原图的所有已绑定分支，所以同步 DFS 回收不会删掉
+    /// 正常对局中的 node，只会阻塞下一回合。这条路径只更新 root/history。
+    pub fn advance(&mut self, mv: Move) -> Result<(), EnginError> {
         let old_root = self.root_key();
         if !self.repository.graph_is_settled(old_root) {
             return Err(EnginError::PortIncomplete(
@@ -628,15 +653,14 @@ impl SearchGraph {
 
     /// Engine 已停止并 drain worker 后使用的推进路径。
     ///
-    /// Engine 的 `set_position` 已保证 reservation 全部归还；保留 debug
-    /// 断言以防生命周期边界被破坏。参考 LC3 Overview 的 "Node repository" 与
+    /// Engine 的 `set_position` 已保证 reservation 全部归还；此处不再重复全图扫描。
+    /// 参考 LC3 Overview 的 "Node repository" 与
     /// px0 `NodeTree::MakeMove`（`src/search/classic/node.cc:465-483`）。
-    fn advance_after_drain(&mut self, mv: Move) -> Result<GcStats, EnginError> {
-        debug_assert!(self.repository.graph_is_settled(self.root_key()));
+    fn advance_after_drain(&mut self, mv: Move) -> Result<(), EnginError> {
         self.advance_settled(mv)
     }
 
-    fn advance_settled(&mut self, mv: Move) -> Result<GcStats, EnginError> {
+    fn advance_settled(&mut self, mv: Move) -> Result<(), EnginError> {
         if !self.root_history().last().board().is_legal_move(mv) {
             return Err(EnginError::PortIncomplete("search graph advance requires a legal move"));
         }
@@ -645,33 +669,27 @@ impl SearchGraph {
         history.append(mv);
         let new_root = NodeKey::board(history.last().board().hash());
         self.repository.get_or_insert(new_root);
-        self.root_keys.push(new_root);
-        self.root_histories.push(Arc::new(history));
-        Ok(GcStats {
-            removed_nodes: self.repository.retain_reachable(self.root_keys.iter().copied()),
-        })
+        self.root_key = new_root;
+        self.root_history = Arc::new(history);
+        self.gc_pending = true;
+        Ok(())
     }
 
-    /// 返回前一个 retained root，并回收不再能从任一保留 root 到达的 future node。
-    pub fn rewind_one(&mut self) -> Result<bool, EnginError> {
-        if self.root_keys.len() == 1 {
-            return Ok(false);
-        }
-        if !self.repository.graph_is_settled(self.root_key()) {
-            return Err(EnginError::PortIncomplete(
-                "search graph rewind requires settled reservations",
-            ));
-        }
-        self.root_keys.pop();
-        self.root_histories.pop();
-        self.repository.retain_reachable(self.root_keys.iter().copied());
-        Ok(true)
+    /// 取出一次 root 推进请求的后台 mark/sweep 根。
+    pub(crate) fn take_pending_gc_root(&mut self) -> Option<NodeKey> {
+        self.gc_pending.then(|| {
+            self.gc_pending = false;
+            self.root_key
+        })
     }
 
     /// 将可复用图定位到完整 UCI history。已保留前缀复用其 root；无关 history
     /// 创建新 repository。参考 px0 `NodeTree::ResetToPosition`
     /// （`src/search/classic/node.cc:484-520`）。
-    pub fn reset_to_history(&mut self, target: Arc<PositionHistory>) -> Result<GcStats, EnginError> {
+    pub fn reset_to_history(
+        &mut self,
+        target: Arc<PositionHistory>,
+    ) -> Result<Option<Arc<NodeRepository>>, EnginError> {
         if !self.repository.graph_is_settled(self.root_key()) {
             return Err(EnginError::PortIncomplete(
                 "search graph reset requires settled reservations",
@@ -681,10 +699,12 @@ impl SearchGraph {
         self.reset_to_history_settled(target, false)
     }
 
-    /// Engine 的 `position` 路径在调用前已经 abort 并 drain 当前 job，因此无需在
-    /// release 构建重复遍历整个 repository 检查 reservation。
-    pub(crate) fn reset_to_history_after_drain(&mut self, target: Arc<PositionHistory>) -> Result<GcStats, EnginError> {
-        debug_assert!(self.repository.graph_is_settled(self.root_key()));
+    /// Engine 的 `position` 路径在调用前已经 abort 并 drain 当前 job，因此无需重复
+    /// 遍历整个 repository 检查 reservation。
+    pub(crate) fn reset_to_history_after_drain(
+        &mut self,
+        target: Arc<PositionHistory>,
+    ) -> Result<Option<Arc<NodeRepository>>, EnginError> {
         self.reset_to_history_settled(target, true)
     }
 
@@ -692,19 +712,14 @@ impl SearchGraph {
         &mut self,
         target: Arc<PositionHistory>,
         after_drain: bool,
-    ) -> Result<GcStats, EnginError> {
-        if let Some(index) = self.root_histories.iter().position(|history| history == &target) {
-            self.root_keys.truncate(index + 1);
-            self.root_histories.truncate(index + 1);
-            return Ok(GcStats {
-                removed_nodes: self.repository.retain_reachable(self.root_keys.iter().copied()),
-            });
+    ) -> Result<Option<Arc<NodeRepository>>, EnginError> {
+        if self.root_history == target {
+            return Ok(None);
         }
 
         if target.len() > self.root_history().len()
             && target.positions()[..self.root_history().len()] == *self.root_history().positions()
         {
-            let mut stats = GcStats::default();
             while self.root_history().len() < target.len() {
                 let next = target.get(self.root_history().len());
                 let mv = self
@@ -721,21 +736,22 @@ impl SearchGraph {
                     .ok_or(EnginError::PortIncomplete(
                         "search graph reset could not derive legal move",
                     ))?;
-                let advanced = if after_drain {
+                if after_drain {
                     self.advance_after_drain(mv)?
                 } else {
                     self.advance(mv)?
                 };
-                stats.removed_nodes += advanced.removed_nodes;
             }
-            return Ok(stats);
+            return Ok(None);
         }
 
         let root = NodeKey::board(target.last().board().hash());
-        self.repository = Arc::new(NodeRepository::default());
-        self.root_keys = vec![root];
-        self.root_histories = vec![target];
-        Ok(GcStats::default())
+        let retired = std::mem::replace(&mut self.repository, Arc::new(NodeRepository::default()));
+        self.root_key = root;
+        self.root_history = target;
+        self.gc_pending = false;
+        // 已脱离 Engine 的旧 repository 不需要对共享图做 DFS；交给后台释放即可。
+        Ok(Some(retired))
     }
 }
 
@@ -757,7 +773,7 @@ mod graph_tests {
     }
 
     #[test]
-    fn advance_keeps_old_root_and_all_nodes_reachable_from_undo_root() {
+    fn advancing_and_collecting_keeps_only_the_new_root_graph() {
         let mut tree = graph();
         let old_root = tree.root_key();
         let keep = mv("a0", "a1");
@@ -782,29 +798,16 @@ mod graph_tests {
         tree.repository().get_or_insert(dropped_grandchild);
         assert_eq!(tree.repository().len(), 4);
 
-        let stats = tree.advance(keep).expect("advance");
-        assert_eq!(stats.removed_nodes, 0);
-        assert_eq!(tree.repository().len(), 4);
+        tree.advance(keep).expect("advance");
+        let gc_root = tree.take_pending_gc_root().expect("advanced root schedules GC");
+        assert_eq!(tree.repository().retain_from_root(gc_root), 3);
+        assert_eq!(tree.repository().len(), 1);
         assert_eq!(tree.root_key(), kept_child);
         assert_eq!(tree.root_history().len(), 2);
-        assert!(tree.repository().get(old_root).is_some());
+        assert!(tree.repository().get(old_root).is_none());
         assert!(tree.repository().get(kept_child).is_some());
-        assert!(tree.repository().get(dropped_child).is_some());
-        assert!(tree.repository().get(dropped_grandchild).is_some());
-    }
-
-    #[test]
-    fn rewind_reclaims_unretained_future_root() {
-        let mut tree = graph();
-        let old_root = tree.root_key();
-        let played = mv("a0", "a1");
-        tree.advance(played).expect("advance");
-        let played_root = tree.root_key();
-        assert!(tree.rewind_one().expect("rewind"));
-        assert_eq!(tree.root_key(), old_root);
-        assert_eq!(tree.root_history().len(), 1);
-        assert!(tree.repository().get(played_root).is_none());
-        assert!(!tree.rewind_one().expect("root cannot rewind"));
+        assert!(tree.repository().get(dropped_child).is_none());
+        assert!(tree.repository().get(dropped_grandchild).is_none());
     }
 
     #[test]
@@ -822,7 +825,7 @@ mod graph_tests {
     }
 
     #[test]
-    fn reset_to_history_reuses_retained_ancestor_and_continuation() {
+    fn reset_to_old_history_starts_a_fresh_graph_then_replays_continuation() {
         let mut tree = graph();
         let game = GameState::from_fen_moves(STARTPOS_FEN, &["a0a1", "a9a8"]).expect("legal line");
         let first = game.moves[0];
@@ -831,11 +834,14 @@ mod graph_tests {
         let first_history = tree.root_history().clone();
         tree.advance(second).expect("second advance");
 
-        tree.reset_to_history(first_history.clone())
-            .expect("rewind through reset");
+        assert!(
+            tree.reset_to_history(first_history.clone())
+                .expect("reset old history")
+                .is_some()
+        );
         assert_eq!(tree.root_history(), &first_history);
         let target = Arc::new(PositionHistory::from_positions(game.positions()));
-        tree.reset_to_history(target).expect("replay continuation");
+        assert!(tree.reset_to_history(target).expect("replay continuation").is_none());
         assert_eq!(tree.root_history().len(), 3);
     }
 
@@ -846,7 +852,11 @@ mod graph_tests {
         let unrelated = GameState::from_fen_moves(STARTPOS_FEN, &["b0b1"]).expect("other legal line");
         let target = Arc::new(PositionHistory::from_positions(unrelated.positions()));
 
-        tree.reset_to_history(target.clone()).expect("fresh tree");
+        let retired = tree
+            .reset_to_history(target.clone())
+            .expect("fresh tree")
+            .expect("unrelated history retires old repository");
+        assert_eq!(retired.len(), 1);
         assert_eq!(tree.root_history(), &target);
         assert_eq!(tree.repository().len(), 0);
         assert_eq!(tree.root_key(), NodeKey::board(target.last().board().hash()));

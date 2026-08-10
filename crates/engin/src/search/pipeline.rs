@@ -956,7 +956,15 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                 // board-key node 可由历史中已展开的局面复用；重复、长将/长捉和 rule60
                 // 仍只属于当前 variation，不能因 node 已展开而绕过裁决。
                 let depth = event.variation.moves().len();
-                if let Some((wl, draw, plies_left)) = path_terminal_value(event.variation.history(), depth) {
+                // root history 在一个 go 内不可变；已展开 root 的每个 playout 直接借用
+                // 它，避免仅为重复/rule60 检查而复制整条历史。离开 root 后才物化本
+                // event 的私有 history。
+                let terminal = if depth == 0 {
+                    path_terminal_value(event.variation.root_history().as_ref(), 0)
+                } else {
+                    path_terminal_value(event.variation.history(), depth)
+                };
+                if let Some((wl, draw, plies_left)) = terminal {
                     let value = ValueDelta::with_plies_left(wl, draw, plies_left);
                     if event.reservations.is_empty() {
                         shared.root_path_terminal.store(true, Ordering::Release);

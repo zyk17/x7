@@ -19,7 +19,7 @@ mod stats;
 mod time;
 
 pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
-pub use graph::{Edge, EdgeReservation, ExpansionState, GcStats, Node, NodeKey, NodeRepository, SearchGraph};
+pub use graph::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository, SearchGraph};
 #[cfg(feature = "benchmark")]
 pub use pipeline::QueueStats;
 pub(crate) use pipeline::WorkerPool;
