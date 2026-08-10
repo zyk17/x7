@@ -1,10 +1,11 @@
 //! Stream 搜索主线：Gather / Eval / NN / Backprop worker。
 //!
-//! 参考：LC3 Overview 的 "Workers"：
+//! worker 角色划分可参考 LC3 Overview 的 "Workers"：
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 //!
 //! Eval 负责终局、缓存、合法着和编码；NN 线程只对队列中的 tensor 执行 ONNX。
-//! worker 之间只传递 owned event。
+//! worker 之间只传递 owned event。本实现不做 multivisit、prefetch 或 tree-batch
+//! gather；一次 Gather 路径对应一次真实异步 playout。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -31,9 +32,7 @@ const RECEIVE_POLL: Duration = Duration::from_millis(10);
 
 /// 当前 root 的累计 visit 搜索预算。
 ///
-/// `go nodes N` 包含 tree reuse 前已有的 root N。参考 px0 `Search::Search` 的
-/// `initial_visits_` 和 `VisitsStopper`（`classic/search.cc:149,919`，
-/// `classic/stoppers/stoppers.cc:59-69`）；时钟仍只约束本次 job。
+/// `go nodes N` 包含 graph reuse 前已有的 root N；时钟仍只约束本次 job。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SearchLimits {
     pub max_playouts: Option<u64>,
@@ -1008,8 +1007,8 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
     }
 }
 
-/// MCGS 的 path-local 环只在当前 variation 内裁决，不能把历史相关结果写入共享 node。优先复用
-/// px0 风格的 extension 判定；尚未达到 two-fold 门槛的闭环按首版约定视为本地和棋。
+/// MCGS 的 path-local 环只在当前 variation 内裁决，不能把历史相关结果写入共享 node。
+/// 优先复用 extension 判定；尚未达到 two-fold 门槛的闭环按首版约定视为本地和棋。
 fn cycle_value(variation: &mut Variation, mv: Move) -> ValueDelta {
     let mut history = variation.history().clone();
     history.append(mv);

@@ -1,7 +1,11 @@
 # MCGS 研究设计
 
-本文件只属于 `feat/mcgs` 分支。它记录 stream **Monte Carlo Graph Search（MCGS）** 的
-最小实现与研究边界；不会改动正式主线或 worker 生命周期。
+本文件属于 `feat/mcgs` 分支，记录当前正式搜索 **stream Monte Carlo Graph Search（MCGS）**
+的设计边界。它不是 px0/LC3 的等价移植：worker 生命周期、统计回传与 visit 分配以本仓实现为准。
+
+相对早期 px0/Lc0 风格 stream 基线，本实现**没有** multivisit、prefetch 或 tree-batch gather。
+PUCT 使用 edge in-flight reservation 作为 virtual visit（计入 started N，偏转选择）；
+碰撞取消未完成路径的 reservation。
 
 ## 目标
 
@@ -20,17 +24,20 @@ node_key = GraphKey(board)
 相同棋盘从不同 variation 到达时取到同一个 node，因而复用其图结构和统计。这里不另加 transposition
 table：repository 就是唯一的 node store。完整历史不属于 GraphKey，而属于本次 event 的 `Variation`。
 
-参考：
+历史/语义参考（不是兼容目标）：
 
 - LC3 Overview, “Node Repository / Keys / Values”
   <https://lczero.org/dev/lc0/search/lc3/overview/>。
 - LC3 Search Policy, `MakeNodeKey`、`DistributeVisits`、`MakeEdgeDelta` 与
   `UpdateNodeAggregate`
-  <https://lczero.org/dev/lc0/search/lc3/policy/>。
+  <https://lczero.org/dev/lc0/search/lc3/policy/>。本仓未实现 LC3 式 visit distribution /
+  multivisit。
 - 本地 Lc0 `src/search/dag_classic/node.h:614,957-959`：共享 low node 与弱引用表仅作
   DAG 语义参考；不移植 classic worker/GC 结构。
-- 本地 px0 `src/search/dag_classic/{node.h,search.cc}`：与我们的规则和网络边界更接近的 DAG
-  实现参考。它用于理解具体数据布局与回传，不作为 stream worker 模型的移植目标。
+- 本地 px0 `src/search/dag_classic/{node.h,search.cc}`：理解数据布局与回传的历史参考，
+  不是 stream worker 模型的移植目标。
+- 本地 KataGo `C:\Users\Administrator\projects\KataGo`（按需）：如 `docs/GraphSearch.md`、
+  NN cache 与部分搜索细节；不是默认必读，也不承诺行为等价。
 
 ## 统计语义：KataGo 的 idempotent MCGS
 

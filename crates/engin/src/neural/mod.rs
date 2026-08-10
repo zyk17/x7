@@ -1,15 +1,17 @@
-//! px0 `src/neural/encoder.h` / `encoder.cc` 的 classical 编码。
+//! classical NN 编码：`124 x 10 x 9` 输入平面与 `2062` policy 映射。
+//!
+//! 平面布局与 policy 表历史上源于 px0 classical encoder；本模块由 X7 维护。
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use xiangqi_core::{ChessBoard, Move, Position, PositionHistory, startpos_board};
 
-/// px0 classical 输入平面数。
+/// classical 输入平面数（契约 `124x10x9`）。
 pub const INPUT_PLANES: usize = 124;
 pub const BOARD_ROWS: usize = 10;
 pub const BOARD_COLS: usize = 9;
-/// px0 policy 输出维度。
+/// policy 输出维度（契约 `2062`）。
 pub const POLICY_SIZE: usize = 2062;
 pub const MOVE_HISTORY: usize = 8;
 pub const PLANES_PER_BOARD: usize = 15;
@@ -19,7 +21,7 @@ pub mod backend;
 pub mod cache;
 pub mod onnx;
 
-/// px0 `src/neural/encoder.h:42`。
+/// 历史平面填充策略。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FillEmptyHistory {
     No,
@@ -27,14 +29,12 @@ pub enum FillEmptyHistory {
     Always,
 }
 
-/// px0 `EncodePositionForNN` (`src/neural/encoder.cc:118-217`) 的
-/// classical、非 canonical 分支。
+/// 将 PositionHistory 编码为 classical NCHW planes。
 ///
-/// 输出是 NCHW 中单个样本的连续 `[124][10][9]` 数据。搜索只传真实
-/// `PositionHistory`；孤立 FEN 则由调用方构造长度为一的 history，再使用
-/// `FenOnly` 保持 px0 的缺失 history 语义。
+/// 输出是单个样本的连续 `[124][10][9]` 数据。搜索只传真实 `PositionHistory`；
+/// 孤立 FEN 则由调用方构造长度为一的 history，再使用 `FenOnly` 填充缺失历史平面。
 pub fn encode_position_for_nn(history: &PositionHistory, fill: FillEmptyHistory) -> Vec<f32> {
-    assert!(history.len() > 0, "EncodePositionForNN requires a position");
+    assert!(!history.is_empty(), "EncodePositionForNN requires a position");
     let mut planes = vec![0.0; INPUT_PLANES * BOARD_ROWS * BOARD_COLS];
     let current = history.last();
     if current.is_black_to_move() {
@@ -68,8 +68,8 @@ pub fn encode_position_for_nn(history: &PositionHistory, fill: FillEmptyHistory)
     planes
 }
 
-/// px0 `kPackedIdxToNNIdx` / `MoveToNNIndex`
-/// (`src/neural/encoder.cc:229-481`)。表由该 C++ 字面量机械提取，禁止改排序。
+/// 着法到 policy 下标映射。
+/// 表来自固定 2062 词表，禁止改排序。
 pub fn move_to_nn_index(mv: Move) -> Option<usize> {
     static MOVE_INDEX: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
     let index = MOVE_INDEX.get_or_init(|| {

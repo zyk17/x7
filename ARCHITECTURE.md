@@ -19,11 +19,14 @@
 
 ## 参考边界
 
-当前阶段是 px0 的 Rust 重写。参考用于约束实现语义，不能替代项目目标：
+第一版实现参考过 px0 / Lc0 / LC3；**当前仓库是独立的 X7 引擎，不是 px0 的 Rust 重写，也不承诺搜索行为等价**。
 
-- 规则与网络外围按 px0 逐函数对照：`C:\Users\Administrator\projects\px0`。
-- 训练格式与导出参考 pxzero-training：`C:\Users\Administrator\projects\pxzero-training`。
-- stream 按 [LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/) 的公开架构文档实现等价设计；LC3 未公开公式时参考对应 px0 语义，不能标称为源码翻译。
+外部材料只作历史或语义参考，不能替代项目目标：
+
+- 规则、classical 编码、UCI 外围与训练 record 的历史工程参考：`C:\Users\Administrator\projects\px0`、`C:\Users\Administrator\projects\pxzero-training`。
+- stream / MCGS 可参考 [LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/)；本地没有 LC3 源码，不得标称为源码翻译或行为等价。
+- KataGo 按需参考：本地源码 `C:\Users\Administrator\projects\KataGo`（如 `docs/GraphSearch.md`、NN cache、部分搜索细节）；不是每次改搜索都必读，也不承诺行为等价。
+- 相对早期 px0/Lc0 风格 stream 基线，本实现**没有** multivisit、prefetch、tree-batch gather。PUCT 使用 edge in-flight reservation 作为 virtual visit（计入 started N）；碰撞取消未完成路径的 reservation。
 
 ## 当前认识
 
@@ -53,7 +56,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 | `crates/engin/src/search` | stream MCGS；`graph.rs` 直接包含 node、edge、repository 与跨回合 graph reuse | `feat/mcgs` 研究实现 |
 | `crates/engin/src/search/time.rs` | 单一 stream 的固定中性时钟分配 | 已接入 UCI |
 | `crates/engin/src/neural` | 124-plane 编码、policy 映射、ONNX、缓存 | stream 使用的 backend 契约 |
-| `nn/` | px0 record、训练、checkpoint、ONNX 导出 | 独立 Python 子项目 |
+| `nn/` | 训练数据格式沿用 px0 record；训练、checkpoint、ONNX 导出 | 独立 Python 子项目 |
 
 ## 单一搜索
 
@@ -69,7 +72,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
 - Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
-  Engine 启动 job 时按固定中性的 px0 预算转换为不可变 deadline，job drain 后才归还剩余时间。
+  Engine 启动 job 时按固定中性的时间预算（历史上参考 px0 legacy stopper）转换为不可变 deadline，job drain 后才归还剩余时间。
 - graph reuse 只保留当前 root 可达图：确认走子后，旧 root 的 sibling 图由后台 mark/sweep 回收，UCI 可立即启动新
   `go`。完整 `PositionHistory` 仍由 UCI `position ... moves` 提供；悔棋回到旧局面会重新建立搜索 root，不承诺复用
   旧 sibling 子树。后台 GC 以 topology 写锁与 node 创建/edge 绑定同步，避免删掉刚由 transposition 接回的 node。
@@ -77,7 +80,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
   整个旧 repository 同样在后台逐 shard 释放。UCI/Watchdog 已输出最小 info 与一次 bestmove。
 - `MultiPV` 只在 watchdog 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCGS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
-stream 的 selection 使用 px0 PUCT/N-Q-P 语义，不是 LC3 Policy 的正式公式。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.5 / 2000 / 1.347017`，即 `C(0)=1.5`、`C(25k)≈5` 的平缓增长曲线。固定节点诊断中，它相较于常数 e 保留更多次选验证预算，又没有 Base=4k 的早期过度集中；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
+stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 公式，不是 LC3 Policy 的正式公式，也不是 px0 搜索等价实现）。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.5 / 2000 / 1.347017`，即 `C(0)=1.5`、`C(25k)≈5` 的平缓增长曲线。固定节点诊断中，它相较于常数 e 保留更多次选验证预算，又没有 Base=4k 的早期过度集中；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
 
 ## 模型
 
@@ -91,7 +94,7 @@ PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residua
 
 ## 纪律
 
-- px0 路径的新 Rust 函数必须记录连续 px0 参考区间；stream 新函数记录 LC3 URL 与对应标题。
-- 找不到参考语义时记录缺口，不自行添加搜索启发式。
+- 借鉴外部语义时保留来源标注（px0 路径、LC3 URL、KataGo 本地路径/文档等），并写清是历史参考还是本仓已偏离。
+- 允许本仓自研搜索决策；不要把尚未验证的启发式伪装成“外部参考要求”。
 - `position ... moves ...` 必须保留完整历史。
 - stream UCI 持续验证 `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏且恰好一次 `bestmove`；真实 ONNX 回归仅在本地 `data/x7.onnx` 存在时运行。

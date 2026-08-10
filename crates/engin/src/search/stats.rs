@@ -29,8 +29,7 @@ pub struct RootStats {
 
 /// 一条根候选及其从当前行棋方视角得到的统计值。
 ///
-/// 对齐 px0 `GetBestChildrenNoTemperature` / `SendUciInfo`
-/// （`search.cc:241-341`）：MultiPV 仅重排并展示已存在的根边，不改变搜索。
+/// MultiPV 仅重排并展示已存在的根边，不改变搜索。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RootVariation {
     pub wl: f32,
@@ -341,8 +340,7 @@ pub fn best_move(repository: &NodeRepository, root_key: NodeKey, root_is_black: 
     best_move_filtered(repository, root_key, root_is_black, &[])
 }
 
-/// 所选 root edge 的已证明 mate score。`m` 是从该 child 起的 ply 数，对齐 px0
-/// `SendUciInfo`（`search.cc:249-336`）。
+/// 所选 root edge 的已证明 mate score。`m` 是从该 child 起的 ply 数。
 pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_move_filter: &[Move]) -> Option<i32> {
     let root = repository.get(root_key)?;
     if let Some((wl, _, m)) = root.terminal_value() {

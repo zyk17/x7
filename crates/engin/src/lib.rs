@@ -1,4 +1,4 @@
-//! px0 `src/chess/uciloop.*`、`src/engine.*`、`src/search` 的 P2/P3 翻译入口。
+//! UCI 引擎入口：UCI 循环、ONNX backend 与 stream MCGS。
 
 pub mod engine;
 pub mod error;

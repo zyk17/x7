@@ -1,4 +1,4 @@
-//! 对照 px0 `src/engine.cc:137-250` 的 UCI Engine 生命周期。
+//! UCI Engine：拥有 graph、worker pool 与每次搜索 job。
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -16,10 +16,9 @@ use crate::search::{
 use crate::uci_loop::{BestMoveInfo, GoParams, StringUciResponder, ThinkingInfo, UciOutputQueue, Wdl};
 use crate::{EnginError, Options};
 
-/// px0 `Engine` 的 P3 子集：UCI、图、worker 与单次搜索的唯一 owner。
+/// UCI、图、worker 与单次搜索的唯一 owner。
 pub struct Engine {
-    // UCI 进程已启动时 ONNX 初始化仍可能失败；`None` 表示没有可用 backend，刻意不回退到
-    // UniformBackend。
+    // UCI 进程已启动时 ONNX 初始化仍可能失败；`None` 表示没有可用 backend，刻意不回退到 UniformBackend。
     backend: Option<Arc<dyn Backend>>,
     graph: Option<SearchGraph>,
     graph_reaper: GraphReaper,
@@ -113,7 +112,7 @@ impl Drop for GraphReaper {
     }
 }
 
-/// px0 `search.cc` 的 `kUciInfoMinimumFrequencyMs`。
+/// UCI info 最小输出间隔（毫秒）。
 const UCI_INFO_MINIMUM_FREQUENCY: Duration = Duration::from_secs(5);
 
 /// 已完成 job 的最小结果；只在 Engine 的两个线程之间交接。
@@ -157,14 +156,14 @@ struct Completion {
 }
 
 impl Default for Engine {
-    /// Rust adapter for px0 `Engine::Engine` (`src/engine.cc:137-167`)；不另设初始化路径。
+    /// 构造空 Engine；不另设初始化路径。
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Engine {
-    /// px0 `Engine::Engine` (`src/engine.cc:137-152`)：UCI 启动时立即创建空 Engine。
+    /// UCI 启动时立即创建空 Engine。
     /// 正式 ONNX backend 则由首次 `set_position` 中的 `UpdateBackendConfig` 加载。
     pub fn new() -> Self {
         Self {
@@ -206,7 +205,7 @@ impl Engine {
     }
 
     /// 安装新 backend 时丢弃旧图与旧 worker；调用方已先 stop/drain。
-    /// 参考 px0 `Engine::UpdateBackendConfig`（`src/engine.cc:153-167`）。
+    /// 按当前 option 重建或更新 NN backend。
     fn install_backend(&mut self, backend: Arc<dyn Backend>) {
         self.backend = Some(backend);
         self.graph = None;
@@ -215,7 +214,7 @@ impl Engine {
         self.applied_nn_cache_size = None;
     }
 
-    /// px0 `Engine::UpdateBackendConfig`（`src/engine.cc:153-167`）。加载失败时不保留旧权重。
+    /// 加载失败时不保留旧权重。
     fn update_backend_config(&mut self) -> Result<(), EnginError> {
         if !self.manages_weights_file {
             return Ok(());
@@ -250,7 +249,7 @@ impl Engine {
         Ok(())
     }
 
-    /// px0 `Engine::EnsureSearchStopped` (`src/engine.cc:149-151`)；换权重前停止 job。
+    /// 换权重前停止当前 job。
     fn stop_and_drop_backend(&mut self) -> Result<(), EnginError> {
         self.abort()?;
         self.backend = None;
@@ -279,7 +278,7 @@ impl Engine {
         self.set_position(STARTPOS_FEN, &[])
     }
 
-    /// px0 `Engine::SetPosition`：先 stop/drain，再用完整 history 复用或重置图。
+    /// 先 stop/drain，再用完整 history 复用或重置图。
     pub(crate) fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), EnginError> {
         self.update_backend_config()?;
         let state = GameState::from_fen_moves(fen, moves)?;
@@ -299,7 +298,7 @@ impl Engine {
         Ok(())
     }
 
-    /// 检查 stream 已实现的 UCI `go` 子集。参考 px0 `Engine::Go` (`src/engine.cc:205-219`)。
+    /// 检查 stream 已实现的 UCI `go` 子集；未支持项明确拒绝。
     fn validate_go(&self, params: &GoParams) -> Result<(), EnginError> {
         if params.depth.is_some() {
             return Err(EnginError::PortIncomplete("go depth is not supported"));
@@ -360,7 +359,7 @@ impl Engine {
         Ok(())
     }
 
-    /// px0 `StringsToMovelist` (`src/search/classic/wrapper.cc:78-100`) 的根着过滤。
+    /// `go searchmoves` 根着过滤。
     fn root_move_filter(&self, searchmoves: &[String]) -> Result<Vec<Move>, EnginError> {
         let graph = self
             .graph
@@ -571,7 +570,7 @@ fn run_search(
 }
 
 impl RootSnapshot {
-    /// 对齐 px0 `MaybeOutputInfo` 的比较字段；marker 未变化时不生成 PV/MultiPV。
+    /// info 输出门槛：marker 未变化时不生成 PV/MultiPV。
     fn progress(&self, stats: &Stats) -> SearchProgress {
         SearchProgress {
             best_move: best_move_filtered(
@@ -585,7 +584,7 @@ impl RootSnapshot {
         }
     }
 
-    /// 对齐 px0 `Search::SendUciInfo`：同一 root 快照按根边排序输出 MultiPV。
+    /// 同一 root 快照按根边排序输出 MultiPV。
     fn thinking_infos(&self, stats: Stats, started: Instant) -> Vec<ThinkingInfo> {
         let time = started.elapsed().as_millis() as i64;
         let nodes = self.initial_visits.saturating_add(stats.completed_playouts) as i64;
@@ -669,7 +668,7 @@ impl RootSnapshot {
 }
 
 impl PublishedInfo {
-    /// 对齐 px0 `Search::MaybeOutputInfo` (`classic/search.cc:363-383`) 的输出门槛。
+    /// 周期性 info 输出门槛。
     fn should_publish(&self, progress: SearchProgress, time: i64) -> bool {
         progress.best_move.is_some()
             && (self.progress != Some(progress)

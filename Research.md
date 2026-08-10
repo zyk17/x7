@@ -3,6 +3,10 @@
 这里记录已经完成、但未进入正式主线的研究尝试。每条记录只回答：问题是什么、为什么值得试、
 实验如何做、结果是什么、还不能说明什么。它不是待办列表，也不把失败结果包装成结论。
 
+当前正式搜索是独立的 X7 stream MCGS，不是 px0 等价实现。下列实验说明：cache-only
+prefetch，以及“碰撞时额外保留 reservation”的最小 virtual visit 变体未被保留；正式搜索仍保留
+真实异步 playout 的 in-flight reservation 作为 virtual visit（计入 edge started N）。
+
 ## 2026-08-03：cache-only prefetch 与最小 virtual visit
 
 ### 背景
@@ -54,9 +58,10 @@ collision 没有出现一致改善；`middle_30` 与 `evasion_04` 的根部首�
 
 ### 决定
 
-删除 cache-only prefetch、`MaxPrefetch` UCI option、benchmark 参数和碰撞时保留 reservation 的
-最小 virtual visit。正式搜索只保留真实异步 playout 的 reservation：它用于保证每条在途路径的
-完成/取消配平，不额外注入 virtual loss，也不把一次 NN 评估视作多次访问。
+删除 cache-only prefetch、`MaxPrefetch` UCI option、benchmark 参数和碰撞时额外保留
+reservation 的最小 virtual visit 变体。正式搜索仍保留真实异步 playout 的 in-flight
+reservation：它计入 edge started N（PUCT virtual visit），并保证每条在途路径的完成/取消配平；
+不把一次 NN 评估视作多次访问。
 
 ### 尚未排除的解释
 

@@ -8,10 +8,8 @@ use engin::{Engine, StdoutUciResponder, UciLoop};
 
 /// 在 UCI 启动前定位随程序发布的正式 ONNX 权重。
 ///
-/// px0 在 `src/neural/shared_params.cc:43-50` 提供同名 `WeightsFile` option，
-/// 并在 `src/engine.cc:153-167` 从 option 创建 backend。本实现没有权重自动发现或
-/// backend 注册表；发行布局等价为 `engin.exe` 与同目录 `x7.onnx`。当前目录与编译期
-/// 仓库路径仅用于开发期回退，发布布局不依赖它们。
+/// 本实现没有权重自动发现或 backend 注册表；发行布局为 `engin.exe` 与同目录
+/// `x7.onnx`。当前目录与编译期仓库路径仅用于开发期回退。
 fn default_weights_file() -> PathBuf {
     let mut candidates = Vec::new();
     if let Ok(executable) = std::env::current_exe()

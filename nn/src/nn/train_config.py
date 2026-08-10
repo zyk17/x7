@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
-from .model_common import CNN_TRUNK_KIND, TRANSFORMER_TRUNK_KIND
 from typing import Any
 
 import yaml
 
 from nn.px0_kaggle import DEFAULT_PX0_ROOT
 
+from .model_common import CNN_TRUNK_KIND, TRANSFORMER_TRUNK_KIND
+
 
 def _mapping(value: Any, *, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise ValueError(f"{name} 必须是 YAML mapping")
+        raise TypeError(f"{name} 必须是 YAML mapping")
     return value
 
 

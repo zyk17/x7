@@ -4,7 +4,6 @@
 仅用于本地搜索诊断。协议参考 UCI 的 ``uci/isready/position/go`` 生命周期；
 不参与 Rust 引擎、训练或正式基准吞吐。
 """
-
 from __future__ import annotations
 
 import argparse

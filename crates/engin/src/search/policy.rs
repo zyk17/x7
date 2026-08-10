@@ -1,8 +1,8 @@
 //! Stream 的选择参数。
 //!
-//! LC3 Policy 描述 worker/policy 架构，但未公开具体 PUCT 公式。因此在有
-//! stream 原生公式前，PUCT 形状参考 px0。当前默认的常数探索强度由 X7 固定时间
-//! 实验选定；FPU 强度采用小网络基线，LC0 对照值见 px0 `src/search/classic/search.cc:408-433`。
+//! LC3 Policy 描述 worker/policy 架构，但未公开具体 PUCT 公式。本仓 PUCT 形状
+//! 历史上参考过 px0；当前默认探索强度由 X7 固定时间实验选定，FPU 采用小网络
+//! 基线。这不是 px0 classic search 的等价移植。
 
 use crate::utils::fastmath::fast_log;
 
@@ -52,8 +52,9 @@ impl SearchParams {
     }
 }
 
-/// px0 `ComputeCpuct` 形状：常数 `cpuct` 加上随访问数缓慢增长的对数项。
+/// cPUCT：常数项加上随访问数缓慢增长的对数项。
 /// `cpuct_base` 越小，增长越早开始；`cpuct_factor` 控制增长幅度。
+/// 形状历史上参考过常见 PUCT 实现；默认参数由 X7 实验选定。
 pub(crate) fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
     if params.cpuct_factor == 0.0 {
         params.cpuct
@@ -67,11 +68,10 @@ pub(crate) fn get_fpu(repository: &NodeRepository, params: &SearchParams, parent
     -parent_q - params.fpu_reduction * visited_policy(repository, edges).sqrt()
 }
 
-// 未定义并验证的能力不预留字段：OOO evaluation、multi-visit、prefetch 等。
+// 未定义并验证的能力不预留字段：OOO evaluation、multi-visit、prefetch、tree-batch gather 等。
 
-// stream 搜索策略参考 px0 `ComputeCpuct` / `GetFpu` / PUCT edge scoring
-// （`src/search/classic/search.cc:408-433`）。`draw_score` 固定为 0（Q 为走子方视角的
-// 原始 `wl`）；edge visit 计数包含 in-flight reservation（LC3 node structure）。
+// PUCT / FPU / edge scoring 形状历史上参考过常见 MCTS 实现；默认参数与
+// `draw_score=0`、in-flight 计入 edge visit 等约定以本仓 stream 为准。
 
 use std::sync::Arc;
 
@@ -81,8 +81,8 @@ use super::{Edge, Node, NodeRepository};
 
 /// stream backpropagation 使用的紧凑 WDL 更新。
 ///
-/// - `wl_sum` 对应 px0 `wl_`（走子方 / incoming-edge 视角，非 NN 原始 STM）
-/// - `draw_sum` 对应 px0 `d_`
+/// - `wl_sum`：走子方 / incoming-edge 视角（非 NN 原始 STM）
+/// - `draw_sum`：和棋分量
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ValueDelta {
     pub visits: u32,
@@ -145,7 +145,7 @@ impl ValueDelta {
     }
 }
 
-/// stream edge 上的 px0 `Node::GetVisitedPolicy`。
+/// 已访问边的 prior 之和，供 FPU 缩放使用。
 pub(crate) fn visited_policy(repository: &NodeRepository, edges: &[Arc<Edge>]) -> f32 {
     edges
         .iter()

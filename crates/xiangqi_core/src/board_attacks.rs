@@ -1,4 +1,4 @@
-//! px0 `board.cc:123-672` 攻击表与 magic bitboard 初始化。
+//! 攻击表与 magic bitboard 初始化。来源：px0 board.cc。
 
 use std::sync::OnceLock;
 
@@ -341,12 +341,10 @@ fn tables() -> &'static AttackTables {
         .expect("initialize_magic_bitboards must be called before using attacks")
 }
 
-/// px0 `board.cc:619-672`。
 pub fn initialize_magic_bitboards() {
     ATTACK_TABLES.get_or_init(AttackTables::new);
 }
 
-/// px0 `board.cc:563-615`。
 pub fn get_attacks(pt: PieceType, square: Square, pieces: BitBoard) -> BitBoard {
     let s = square.index() as usize;
     let t = tables();

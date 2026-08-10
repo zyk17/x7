@@ -1,6 +1,6 @@
-//! px0 `src/chess` 的 Rust 翻译。
+//! X7 规则核心：棋盘、合法着、FEN、历史与裁判。
 //!
-//! 旧规则核心已删除。这里只接受可追溯到 px0 文件与行区间的实现。
+//! 语义历史上源于 px0 `src/chess`；现由本仓维护。
 
 pub mod bitboard;
 pub mod board;
@@ -19,7 +19,6 @@ pub use gamestate::GameState;
 pub use position::{GameResult, Position, PositionHistory};
 pub use types::{File, Move, MoveList, PieceType, Rank, Square};
 
-/// px0 C++ 侧通过异常报告无效 FEN 或不可达路径；Rust 侧统一为显式错误。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoreError {
     InvalidFen(String),

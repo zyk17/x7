@@ -2,9 +2,9 @@
 
 > 棋力不是来自网络，也不是来自搜索。棋力来自 Prediction 与 Evidence 的协同；Knowledge 负责产生 Prediction，Proof 负责产生新的 Evidence，Decision 在固定时间预算下融合二者，形成最终行动。
 
-这是一个新的中国象棋研究引擎。项目目标是在有限计算资源、固定思考时间下研究上述协同，并只以固定时间 Elo 评估成果；网络架构、搜索算法和硬件分工都是实现选择，不是项目目标。
+这是一个独立的中国象棋研究引擎（X7）。项目目标是在有限计算资源、固定思考时间下研究上述协同，并只以固定时间 Elo 评估成果；网络架构、搜索算法和硬件分工都是实现选择，不是项目目标。
 
-`mcts` 分支固定当前 `master` 的树 MCTS；本分支研究 stream MCGS。两者共用规则、网络与 UCI 外围，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+第一版规则、网络外围、UCI 与训练格式参考过 px0 / Lc0 / LC3 公开文档；**当前正式搜索是本仓的 stream MCGS，不再是 px0 重写，也不承诺与 px0/LC3 行为等价**。相对早期 stream 基线，本实现没有 multivisit、prefetch 或 tree-batch gather。`mcts` 分支可保留树 MCTS；本分支研究 stream MCGS。两者共用规则、网络与 UCI 外围，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 快速运行
 
@@ -35,16 +35,15 @@ CUDA 包。两者不是同一二进制的运行时回退链；CUDA 使用 ORT �
 - `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`MiniBatchSize`、`NNCacheSizePowerOfTwo`、`MultiPV`
 - `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`GatherWorkers`、`EvalWorkers`、`BackpropWorkers`
 
-`MiniBatchSize` 对应 px0/Lc0 的同名 option，范围 `0..=1024`，默认 `0`（由 backend
-建议）。它限制一次 NN 调用最多合并的局面数；较大值通常提高吞吐，却可能因增加在途局面和
+`MiniBatchSize` 沿用常见 UCI 同名 option（历史上与 px0/Lc0 同名），范围 `0..=1024`，默认 `0`
+（由 backend 建议）。它限制一次 NN 调用最多合并的局面数；较大值通常提高吞吐，却可能因增加在途局面和
 collision 降低固定时间棋力。它是引擎生命周期配置：一次 `setoption` 会影响之后启动的每次
 `go`；正在运行的搜索保持其 worker。
 
 `NNCacheSizePowerOfTwo` 对应 KataGo 的同名配置，范围 `0..=48`，默认 `20`，即
 `1,048,576` 个槽（KataGo GTP 默认）。它是按当前棋盘 state key 的直映缓存：索引冲突时新结果替换旧结果，完整
-64 位 key 与合法着数量仍会在命中时校验。它不把完整历史加入 key，和 MCGS 的 board node
-identity、px0 的 NN cache 取舍保持一致。`setoption` 在下一次 `go` 开始前替换缓存表；当前
-搜索继续使用原表。
+64 位 key 与合法着数量仍会在命中时校验。它不把完整历史加入 key，与 MCGS 的 board node
+identity 一致。`setoption` 在下一次 `go` 开始前替换缓存表；当前搜索继续使用原表。
 
 `MultiPV` 是 `1..=500` 的整数，默认 `1`。它只控制每次 `info` 输出的根候选数量：候选沿用
 bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，不改变搜索预算、PUCT 或 worker。
@@ -57,7 +56,7 @@ bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，�
 `BackpropWorkers` 默认分别为 `4`、`4`、`1`，范围均为 `1..=64`。它们与 `MiniBatchSize` 一样是
 引擎生命周期配置：`setoption` 影响之后的每次 `go`，当前 job 始终使用启动时的参数与 worker pool。
 
-时钟使用固定中性的 px0 分配，固定 `MoveOverhead=200ms`，不额外暴露 UCI 调参项。`go movetime`
+时钟使用固定中性的时间分配（历史上参考 px0 legacy stopper 形状），固定 `MoveOverhead=200ms`，不额外暴露 UCI 调参项。`go movetime`
 不可与时钟字段混用；`go depth`、`go mate`、`go ponder` 与 `ponderhit`
 尚无完整语义，会明确拒绝。
 

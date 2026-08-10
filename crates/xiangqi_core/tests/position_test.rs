@@ -1,5 +1,3 @@
-//! px0 `src/chess/position_test.cc` 的 Rust 移植。
-
 use std::sync::Once;
 
 use xiangqi_core::{ChessBoard, GameResult, Position, PositionHistory, initialize_magic_bitboards};

@@ -1,8 +1,8 @@
 //! NN 前的局面分类与终局标记。
 //!
-//! 以 px0 `evaluate_extension`（`search.cc:1913-1959`）为参考，实现 X7 stream 所需的
-//! 将死、重复、two-fold 闭环裁决、子力和 rule60 和棋。终局保存 plies-left `m` 用于排序；
-//! MultiPV/TB 不在范围内。
+//! 将死、重复、two-fold、子力和 rule60 等裁决历史上参考过 px0
+//! `evaluate_extension`；路径依赖终局与 board-key shared node 的分离是本仓 MCGS
+//! 约束。终局保存 plies-left `m` 用于排序。
 
 use xiangqi_core::{GameResult, PositionHistory};
 
@@ -27,7 +27,7 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
     let legal_moves = board.generate_legal_moves();
     if legal_moves.is_empty() {
         // `wl` 按 incoming edge / 上一走子方视角保存。因此无合法着的中国象棋局面对它
-        // 总是胜利。对齐 px0 的 `WHITE_WON` canonical-board 快径
+        // 总是胜利。语义参考自 px0 的 `WHITE_WON` canonical-board 快径
         // （`search.cc:1913-1919`、`node.cc:300-317`）。
         return ExtensionKind::SharedTerminal {
             wl: 1.0,
@@ -54,7 +54,7 @@ pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Op
     let is_root = depth == 0;
     if !is_root {
         if history.last().repetitions() >= 2 {
-            // 对齐 px0 `MakeTerminal(history->RuleJudge())`，勿经绝对颜色转换。
+            // 语义参考自 px0 `MakeTerminal(history->RuleJudge())`，勿经绝对颜色转换。
             let (wl, draw) = rule_judge_wl_for_node(history.rule_judge());
             return Some((wl, draw, 0.0));
         }
@@ -87,8 +87,10 @@ pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Op
     None
 }
 
-/// px0 `search.cc:1940-1958` 的 two-fold chase/check cycle 探测。它只用于严格
-/// board-key DAG 的首次闭环搜索截断，不改变正式 `compute_game_result` 的重复规则。
+/// two-fold chase/check cycle 探测。
+///
+/// 只用于严格 board-key DAG 的首次闭环搜索截断，不改变正式
+/// `compute_game_result` 的重复规则。
 fn two_fold_chase_or_check_cycle(history: &PositionHistory) -> bool {
     let mut idx = history.len() - 1;
     let mut idx2 = idx;

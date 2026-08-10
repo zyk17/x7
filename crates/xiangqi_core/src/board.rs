@@ -1,4 +1,4 @@
-//! px0 `src/chess/board.h:35-146` 与 `board.cc`。
+//! 棋盘表示、FEN 与合法着。来源：px0 board。
 
 use std::sync::OnceLock;
 
@@ -24,7 +24,7 @@ pub struct FenState {
     pub game_ply: u32,
 }
 
-/// px0 `ChessBoard`。棋盘始终以当前行棋方为 `ours` 视角保存。
+/// 棋盘始终以当前行棋方为 `ours` 视角保存。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChessBoard {
     ours: BitBoard,

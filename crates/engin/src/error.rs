@@ -1,4 +1,4 @@
-//! px0 `utils/exception.h` 在 UCI 层的 Rust 映射。
+//! 引擎错误类型。
 
 use xiangqi_core::CoreError;
 

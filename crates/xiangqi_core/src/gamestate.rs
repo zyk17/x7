@@ -1,8 +1,8 @@
-//! px0 `src/chess/gamestate.h:38-47` 与 `gamestate.cc:35-55`、`engine.cc:65-78`。
+//! UCI `GameState`：startpos + moves，供 `position` 命令构建完整历史。
 
 use crate::{CoreError, MoveList, Position, PositionHistory};
 
-/// px0 `GameState` (`gamestate.h:38-46`)。
+/// startpos 与后续着法。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GameState {
     pub startpos: Position,

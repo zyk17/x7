@@ -1,8 +1,6 @@
-//! px0 `src/neural/wrapper.cc:49-172` 的 ONNX Runtime backend。
+//! ONNX Runtime backend。
 //!
-//! 本模块只负责 `NetworkAsBackendComputation` 的 batch 输入、网络执行和
-//! 合法着 softmax。cache 是 px0 `neural/memcache.cc` 的独立包装层，不能在此
-//! 偷偷实现。
+//! 负责 batch 输入、网络执行和合法着 softmax。NN cache 是独立包装层，不在此偷偷实现。
 
 #[cfg(all(feature = "cuda", feature = "directml"))]
 compile_error!("ONNX runtime build must select either `cuda` or `directml`, not both");
@@ -29,7 +27,7 @@ use super::{
     BOARD_COLS, BOARD_ROWS, FillEmptyHistory, INPUT_PLANES, POLICY_SIZE, encode_position_for_nn, move_to_nn_index,
 };
 
-/// px0 `NetworkAsBackend` (`wrapper.cc:49-98`) 的最小 Rust 对应物。
+/// ONNX Runtime backend。
 #[derive(Clone)]
 pub struct OnnxBackend {
     sessions: Arc<Mutex<OnnxSessions>>,
@@ -37,7 +35,7 @@ pub struct OnnxBackend {
     provider: OnnxProvider,
 }
 
-/// px0 ONNX backend 选择配置的 provider，并通过 `NetworkAsBackend` 报告实际 CPU
+/// ONNX backend 选择配置的 provider，并报告实际 CPU
 /// 能力（`src/neural/backends/onnx/network_onnx.cc:140-176`、
 /// `src/neural/wrapper.cc:49-68`）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,7 +143,7 @@ impl OnnxSessions {
 }
 
 impl OnnxBackend {
-    /// px0 `NetworkAsBackendFactory::Create` (`wrapper.cc:177-195`) 的本地权重入口。
+    /// 从本地权重文件创建 ONNX backend。
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, EnginError> {
         let (sessions, provider) = create_sessions(path.as_ref())?;
         validate_model_io(sessions.validation_session())?;
@@ -248,7 +246,7 @@ fn validate_cuda_session(session: &mut Session) -> Result<(), EnginError> {
     Ok(())
 }
 
-/// px0 `network_onnx.cc:629-677,810-838,878-901`：固定形状 DirectML session。
+/// 固定形状 DirectML / CUDA session。
 #[cfg(feature = "directml")]
 fn create_direct_ml_sessions(path: &Path) -> Result<Vec<(usize, Session)>, EnginError> {
     let mut sessions = Vec::with_capacity(DML_BATCH_STEPS);
@@ -297,7 +295,7 @@ impl Backend for OnnxBackend {
     }
 }
 
-/// px0 `NetworkAsBackendComputation` (`wrapper.cc:100-172`)。
+/// 一次 ONNX batch computation。
 struct OnnxBackendComputation {
     sessions: Arc<Mutex<OnnxSessions>>,
     state: Mutex<OnnxComputationState>,
@@ -385,7 +383,7 @@ impl BackendComputation for OnnxBackendComputation {
     }
 }
 
-/// px0 `NetworkAsBackendComputation::SoftmaxPolicy` (`wrapper.cc:135-164`)。
+/// 对合法着做 softmax，得到 policy 概率。
 pub fn softmax_legal_policy(logits: &[f32], legal_moves: &[xiangqi_core::Move]) -> Result<Vec<f32>, EnginError> {
     let mut selected = Vec::with_capacity(legal_moves.len());
     let mut maximum = f32::NEG_INFINITY;

@@ -1,8 +1,7 @@
-//! px0 `src/chess/bitboard.h:31-174` 与 `utils/bititer.h:39-121`。
+//! Bitboard 与位迭代。来源：px0 bitboard / bititer。
 
 use crate::types::{File, Rank, Square};
 
-/// px0 `bititer.h:78-89`。
 pub fn mirror_board(bits: u128) -> u128 {
     const SEQ1: u128 = 0x00001FFFFFFFFFFF;
     const SEQ2: u128 = (0x00000000000000FFu128 << 64) | 0x8000000007FC0000;
@@ -145,7 +144,6 @@ impl IntoIterator for BitBoard {
     }
 }
 
-/// px0 `bititer.h:94-110`。
 pub struct BitBoardIter {
     value: u128,
 }

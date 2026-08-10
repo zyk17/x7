@@ -1,7 +1,7 @@
 //! Engine 生命周期的 UCI option。
 //!
-//! 对照 px0 `src/engine.h` 的 `OptionsDict`：`Engine` 持有 option，搜索在
-//! 启动 job 时读取需要的快照。
+//! `Engine` 持有 option，搜索在启动 job 时读取快照。option 名称与常见 UCI/引擎
+//! 习惯对齐；不是 px0 `OptionsDict` 的翻译层。
 
 use crate::neural::cache::{DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, MAX_NN_CACHE_SIZE_POWER_OF_TWO};
 use crate::search::SearchParams;

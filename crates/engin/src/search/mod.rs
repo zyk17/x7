@@ -1,12 +1,13 @@
-//! LC3 风格的流式搜索。
+//! X7 stream MCGS。
 //!
-//! 设计参考（本地没有 LC3 源码）：
+//! 架构形状可参考 LC3 公开文档（本地没有 LC3 源码）：
 //! - <https://lczero.org/dev/lc0/search/lc3/overview/>
 //! - <https://lczero.org/dev/lc0/search/lc3/policy/>
 //! - <https://lczero.org/dev/lc0/search/lc3/glossary/>
 //!
-//! 本模块拥有 MCGS 图与 worker 生命周期。LC3 未公开公式时，选择和最终着法使用
-//! 有文档的 px0 PUCT / N-Q-P 语义。
+//! 本模块拥有 MCGS 图与 worker 生命周期。相对早期 px0/Lc0 stream 基线，这里没有
+//! multivisit、prefetch 或 tree-batch gather。选择公式历史上参考过 px0 PUCT /
+//! N-Q-P，默认参数与图统计语义以本仓为准，不是 px0/LC3 等价实现。
 
 use xiangqi_core::GameResult;
 
@@ -33,8 +34,10 @@ pub use stats::{
 };
 pub(crate) use time::{TimeBudget, TimeManager};
 
-/// px0 `FetchSingleNodeResult`：`eval->q = -eval->q`（`search.cc:2129`）。NN WDL
-/// 按 side-to-move 表示；node 统计按 incoming-edge / 走子方视角表示，对齐 px0 `Node::wl_`。
+/// 将 NN 的 side-to-move WDL 转为 node / incoming-edge 视角：取反。
+///
+/// 历史语义参考：px0 `FetchSingleNodeResult` 的 `eval->q = -eval->q`，以及
+/// `Node::wl_` 的走子方视角约定。
 pub(crate) fn network_wl_to_node(stm_wl: f32) -> f32 {
     -stm_wl
 }
@@ -56,11 +59,12 @@ pub(crate) fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (
     (-stm_wl, draw)
 }
 
-/// px0 `Node::MakeTerminal(RuleJudge())`：`WHITE_WON`→`+1`，`BLACK_WON`→`-1`。
+/// 将 `rule_judge` 结果转为 node / incoming-edge `(wl, d)`：
+/// `WHITE_WON`→`+1`，`BLACK_WON`→`-1`。
 ///
 /// `rule_judge` 的胜负枚举已是 node / incoming-edge 视角（与 `checkThem`/`checkUs`
 /// 绑定），**不要**再按 `is_black_to_move` 当绝对颜色转换，否则白方行棋时的长将/长捉
-/// 符号会反转。
+/// 符号会反转。历史语义参考：px0 `Node::MakeTerminal(RuleJudge())`。
 pub(crate) fn rule_judge_wl_for_node(result: GameResult) -> (f32, f32) {
     match result {
         GameResult::WhiteWon => (1.0, 0.0),

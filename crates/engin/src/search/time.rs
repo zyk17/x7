@@ -1,8 +1,7 @@
 //! UCI 时钟预算。
 //!
-//! 参考 px0 `src/search/classic/stoppers/legacy.cc:37-174`。stream 只需要在
-//! 搜索启动时取得 deadline、在 drain 后归还未用时间，因此不保留 px0 的通用
-//! 停止链或可调进攻/保守倍率。
+//! 分配形状历史上参考过 px0 legacy stopper；stream 只在搜索启动时取得 deadline、
+//! 在 drain 后归还未用时间，不保留通用停止链或可调进攻/保守倍率。
 
 use std::time::{Duration, Instant};
 
@@ -105,7 +104,7 @@ impl TimeBudget {
     }
 }
 
-/// px0 `ComputeEstimatedMovesToGo`（`legacy.cc:43-61`）。
+/// 估计剩余着数，供时钟分配使用。
 fn estimated_moves_to_go(ply: u32) -> f32 {
     let current_move = ply as f32 / 2.0;
     DEFAULT_MIDPOINT

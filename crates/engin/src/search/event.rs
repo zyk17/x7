@@ -1,6 +1,7 @@
-//! LC3 风格流水线 worker 之间传递的 owned event。
+//! stream 流水线 worker 之间传递的 owned event。
 //!
-//! 参考：LC3 Overview 的 “Workers” 与 Glossary 的 “Variation”：
+//! 术语可参考 LC3 Overview 的 “Workers” 与 Glossary 的 “Variation”；event 必须
+//! owned，并携带完整 root history / variation / generation / reservation。
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 //! <https://lczero.org/dev/lc0/search/lc3/glossary/>
 
@@ -198,7 +199,7 @@ pub struct BackpropEvent {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackpropResult {
     pub completed_playouts: u32,
-    /// 已完成叶子深度之和，root 记为深度一。对齐 px0 `cum_depth_` 的计数方式
+    /// 已完成叶子深度之和，root 记为深度一。语义参考自 `cum_depth_` 的计数方式
     /// （`search.cc:2157-2167`）。
     pub completed_depth: u64,
     pub max_depth: u64,

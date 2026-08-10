@@ -1,9 +1,8 @@
 //! stream 搜索的分片 node repository 与 edge-local reservation。
 //!
-//! 参考：LC3 Overview 的 “Node repository” 与 “Node structure”：
-//! <https://lczero.org/dev/lc0/search/lc3/overview/>
-//!
 //! MCGS 使用 board key：相同棋盘（含行棋方）共享 node；走法统计仍留在 parent edge。
+//! repository 角色可参考 LC3 Overview 的 “Node repository”；统计语义见 `MCGS.md`。
+//! <https://lczero.org/dev/lc0/search/lc3/overview/>
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -654,8 +653,6 @@ impl SearchGraph {
     /// Engine 已停止并 drain worker 后使用的推进路径。
     ///
     /// Engine 的 `set_position` 已保证 reservation 全部归还；此处不再重复全图扫描。
-    /// 参考 LC3 Overview 的 "Node repository" 与
-    /// px0 `NodeTree::MakeMove`（`src/search/classic/node.cc:465-483`）。
     fn advance_after_drain(&mut self, mv: Move) -> Result<(), EnginError> {
         self.advance_settled(mv)
     }
@@ -684,8 +681,7 @@ impl SearchGraph {
     }
 
     /// 将可复用图定位到完整 UCI history。已保留前缀复用其 root；无关 history
-    /// 创建新 repository。参考 px0 `NodeTree::ResetToPosition`
-    /// （`src/search/classic/node.cc:484-520`）。
+    /// 创建新 repository。
     pub fn reset_to_history(
         &mut self,
         target: Arc<PositionHistory>,

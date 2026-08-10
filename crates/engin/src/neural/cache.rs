@@ -1,9 +1,11 @@
 //! NN cache 存储。
 //!
-//! key 与 MCGS 的 board node identity 同步。px0 `neural/memcache.cc:38-45` 同样不
-//! hash 完整 history；本实现进一步不纳入 `Position::repetitions`，以复用同一 board node。
-//! 容量与替换方式对齐 KataGo `neuralnet/nneval.cpp:1273-1339`：固定 `2^N` 直映表，
-//! 索引碰撞时新结果直接替换旧结果。
+//! key 与 MCGS 的 board node identity 同步：不 hash 完整 history，也不纳入
+//! `Position::repetitions`，以便复用同一 board node。容量与替换方式对齐 KataGo
+//! 风格：固定 `2^N` 直映表，索引碰撞时新结果直接替换旧结果。
+//!
+//! 历史参考：px0 `neural/memcache.cc` 同样不把完整 history 放进 key；KataGo
+//! `neuralnet/nneval.cpp` 的直映表替换策略。
 
 use std::sync::Arc;
 
@@ -16,7 +18,7 @@ pub const DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO: u8 = 20;
 /// KataGo `setup.cpp` 对该配置接受 `0..=48`。超大值仍受实际可分配内存约束。
 pub const MAX_NN_CACHE_SIZE_POWER_OF_TWO: u8 = 48;
 
-/// px0 `CachedValue` (`src/neural/memcache.cc:48-55`) 的 Rust 所有权版本。
+/// cache 中保存的评估结果。
 #[derive(Clone, Debug)]
 pub(crate) struct CachedEval {
     pub result: Arc<EvalResult>,
@@ -61,7 +63,7 @@ impl EvalCache {
         Arc::clone(&self.slots.read())
     }
 
-    /// px0 `MemCache::GetCachedEvaluation` / collision guard
+    /// 查找 cache；key 冲突时校验完整 key / 合法着数。
     /// （`memcache.cc:130-150`）。空合法着列表可接受缓存结果；否则只有相同 policy
     /// 长度才安全。
     pub(crate) fn get(&self, key: u64, requested_moves: usize) -> Option<Arc<EvalResult>> {

@@ -1,4 +1,7 @@
-//! px0 `src/neural/backend.h:45-138` 的 P3/P4 后端边界（无 ONNX）。
+//! NN backend 边界：属性、computation、cache 与评估结果。
+//!
+//! 接口形状历史上参考过 px0 `src/neural/backend.h`；正式推理走 ONNX，测试可用
+//! `UniformBackend`。这不是 task-worker 时代的 backend 翻译层。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -10,7 +13,7 @@ use crate::EnginError;
 use super::cache::{CachedEval, DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, EvalCache};
 use super::{BOARD_COLS, BOARD_ROWS, INPUT_PLANES, POLICY_SIZE};
 
-/// px0 `BackendAttributes` (`src/neural/backend.h:45-52`)。
+/// Backend 能力与推荐 batch 大小。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendAttributes {
     pub has_mlh: bool,
@@ -34,7 +37,7 @@ impl Default for BackendAttributes {
     }
 }
 
-/// px0 `EvalResult` / backend 评估输出子集。
+/// 单次局面评估输出：policy、WDL、moves-left。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EvalResult {
     /// 当前行棋方的胜率减负率。
@@ -52,10 +55,9 @@ pub struct EvalResult {
 /// 批量原始网络输出：policy logits、WDL 概率、moves-left。
 pub type EncodedInference = (Vec<f32>, Vec<f32>, Vec<f32>);
 
-/// px0 `EvalPosition` (`src/neural/backend.h:62-65`) 的所有权版本。
+/// 一次评估请求：当前局面序列 + 合法着（仅编码用，不含规则裁决历史）。
 ///
-/// P4 computation 会跨 `ComputeBlocking()` 保存请求；因此 Rust 不保存 C++ 的
-/// `span` 借用。规则历史不属于 NN 后端输入，保持与 px0 一样只传 positions。
+/// computation 会跨 `compute_blocking()` 保存请求，因此使用 owned positions。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvalPosition {
     pub positions: Vec<Position>,
@@ -70,7 +72,7 @@ impl EvalPosition {
     }
 }
 
-/// px0 `BackendComputation::AddInputResult` (`backend.h:69-73`)。
+/// `add_input` 的结果：入队评估，或立刻命中 cache。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddInputResult {
     EnqueuedForEval,
@@ -79,16 +81,13 @@ pub enum AddInputResult {
 
 /// 一个 computation 内的结果槽位。
 ///
-/// 对应 px0 由 `EvalResultPtr` 指向的外部结果内存；Rust 使用 ticket 在
-/// `compute_blocking()` 后取回所有权结果。
+/// Rust 使用 ticket 在 `compute_blocking()` 后取回所有权结果。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvalTicket(pub usize);
 
-/// px0 `BackendComputation` (`src/neural/backend.h:75-87`)。
+/// 一次可合批的 backend computation。
 ///
-/// `SearchWorker::ProcessPickedTask` 可由多个 px0 task worker 调用 `AddInput`
-/// （`search.cc:1423-1462`）。因此 Rust 实现将可变 batch state 置于内部锁之后，
-/// 而不要求 `&mut self`。
+/// 可变 batch state 放在内部锁之后，不要求 `&mut self`。
 pub trait BackendComputation: Send + Sync {
     fn used_batch_size(&self) -> usize;
     fn add_input(&self, position: EvalPosition) -> Result<(AddInputResult, EvalTicket), EnginError>;
@@ -96,17 +95,14 @@ pub trait BackendComputation: Send + Sync {
     fn take_result(&self, ticket: EvalTicket) -> Result<Arc<EvalResult>, EnginError>;
 }
 
-/// px0 `Backend` 评估边界（P3 单线程 + P4 batch）。
+/// Backend 评估边界：属性、cache、encoded inference 与 computation。
 pub trait Backend: Send + Sync {
     fn evaluate(&self, history: &PositionHistory, legal_moves: &[Move]) -> Arc<EvalResult>;
 
-    /// px0 `Backend::GetAttributes` (`src/neural/backend.h:85`)。
     fn attributes(&self) -> BackendAttributes;
 
-    /// px0 `Backend::CreateComputation` (`src/neural/backend.h:86`)。
     fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError>;
 
-    /// px0 `Backend::GetCachedEvaluation` (`src/neural/backend.h:95-97`)。
     fn cached_evaluation(&self, _position: &EvalPosition) -> Option<Arc<EvalResult>> {
         None
     }
@@ -117,20 +113,17 @@ pub trait Backend: Send + Sync {
         Err(EnginError::PortIncomplete("backend has no encoded inference"))
     }
 
-    /// Eval 构造完整 `EvalResult` 后可选地写入 MemCache。
+    /// Eval 构造完整 `EvalResult` 后可选地写入 cache。
     fn store_evaluation(&self, _position: &EvalPosition, _result: Arc<EvalResult>) {}
 
-    /// px0 `CachingBackend::ClearCache` (`src/neural/memcache.h:34-38`).
-    /// 非缓存 backend 刻意保留此空实现。
+    /// 非缓存 backend 的空实现。
     fn clear_cache(&self) {}
 
-    /// KataGo `nnCacheSizePowerOfTwo`：缓存容量为 `2^N` 个直映槽。
+    /// 缓存容量为 `2^N` 个直映槽。
     fn set_cache_size_power_of_two(&self, _size_power_of_two: u8) {}
 }
 
-/// px0 `CachingBackend` / `MemCache`（`src/neural/memcache.h:34-45`、
-/// `memcache.cc:58-190`）。缓存查找、batch miss 转发和计算后的插入由此 wrapper 而非
-/// ONNX 实现负责。
+/// 带 NN cache 的 backend 包装：查找、batch miss 转发与插入由此层负责，不在 ONNX 内实现。
 pub struct CachingBackend {
     wrapped: Arc<dyn Backend>,
     cache: Arc<EvalCache>,
@@ -215,7 +208,7 @@ impl Backend for CachingBackend {
     }
 }
 
-/// 一个 px0 `MemCacheComputation::Entry`（`memcache.cc:109-120`）。
+/// cache computation 中的一个待评估条目。
 struct CacheEntry {
     outer_ticket: EvalTicket,
     inner_ticket: EvalTicket,
@@ -306,7 +299,7 @@ impl BackendComputation for CachingBackendComputation {
     }
 }
 
-/// px0 `UniformBackend` 的 P4 batch 实现（测试/对拍用）。
+/// 测试用均匀 policy computation。
 struct UniformBackendComputation {
     backend: UniformBackend,
     state: Mutex<UniformComputationState>,
@@ -375,7 +368,7 @@ impl BackendComputation for UniformBackendComputation {
     }
 }
 
-/// 测试用：均匀 policy + 固定 WDL，复用正式 px0 风格 NN cache 容器。
+/// 测试用：均匀 policy + 固定 WDL，复用正式 NN cache 容器。
 #[derive(Clone, Debug)]
 pub struct UniformBackend {
     pub wl: f32,
@@ -527,7 +520,7 @@ mod tests {
         assert_eq!(moves_left, vec![17.0, 17.0]);
     }
 
-    /// px0 `MemCacheComputation::AddInput/ComputeBlocking`
+    /// cache miss 入队，命中则立刻返回。
     /// （`memcache.cc:101-129`）：cache hit 跳过被包装的 batch；不同合法着数量是
     /// collision-safe miss。
     #[test]

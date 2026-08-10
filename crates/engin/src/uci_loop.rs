@@ -1,4 +1,7 @@
-//! px0 `src/chess/uciloop.h:42-127` 与 `uciloop.cc:45-337`。
+//! UCI 协议解析与输出。
+//!
+//! 命令形状与 info 字段历史上参考过 px0 `uciloop`；本模块由 X7 维护，未支持的
+//! 命令必须明确拒绝。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -8,7 +11,7 @@ use xiangqi_core::STARTPOS_FEN;
 use crate::error::EnginError;
 use crate::{Engine, Options};
 
-/// px0 `BestMoveInfo`。
+/// bestmove（及可选 ponder）输出。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BestMoveInfo {
     pub bestmove: xiangqi_core::Move,
@@ -24,7 +27,7 @@ impl BestMoveInfo {
     }
 }
 
-/// px0 `ThinkingInfo::WDL`。
+/// UCI info 中的 WDL 三分量。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Wdl {
     pub w: i32,
@@ -32,7 +35,7 @@ pub struct Wdl {
     pub l: i32,
 }
 
-/// px0 `ThinkingInfo`。
+/// UCI `info` 行字段。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThinkingInfo {
     pub depth: i32,
@@ -50,7 +53,7 @@ pub struct ThinkingInfo {
 }
 
 impl Default for ThinkingInfo {
-    /// px0 `ThinkingInfo` field defaults (`callbacks.h:58-101`)。
+    /// 未出现字段保持默认哨兵值（负数 / None）。
     fn default() -> Self {
         Self {
             depth: -1,
@@ -69,7 +72,7 @@ impl Default for ThinkingInfo {
     }
 }
 
-/// px0 `GoParams` (`uciloop.h:42-55`)。
+/// UCI `go` 参数。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GoParams {
     pub wtime: Option<i64>,
@@ -86,23 +89,21 @@ pub struct GoParams {
     pub ponder: bool,
 }
 
-/// px0 `UciResponder` (`callbacks.h:143-148`)。
+/// UCI 输出回调。
 pub trait UciResponder {
     fn output_best_move(&mut self, info: &BestMoveInfo);
     fn output_thinking_info(&mut self, infos: &[ThinkingInfo]);
 }
 
-/// px0 `StringUciResponder` 发送边界（`uciloop.h:57-73`）。
+/// 以原始字符串发送 UCI 响应的边界。
 pub trait StringUciResponder: UciResponder {
     fn send_raw_responses(&mut self, responses: &[String]);
     fn set_options(&mut self, options: Options);
 
-    /// px0 `StringUciResponder::SendRawResponse` (`uciloop.cc:270-272`)。
     fn send_raw_response(&mut self, response: &str) {
         self.send_raw_responses(&[response.to_string()]);
     }
 
-    /// px0 `StringUciResponder::SendId` (`uciloop.cc:274-277`)。
     fn send_id(&mut self, version: &str) {
         self.send_raw_response(&format!("id name x7 v{version}"));
         self.send_raw_response("id author aaa");
@@ -149,7 +150,7 @@ impl UciOutputQueue {
     }
 }
 
-/// px0 `UciLoop` (`uciloop.h:101-118`)。
+/// UCI 主循环：解析命令并驱动 Engine。
 pub struct UciLoop<'a> {
     pub responder: &'a mut dyn StringUciResponder,
     pub engine: &'a mut Engine,
@@ -157,7 +158,7 @@ pub struct UciLoop<'a> {
 }
 
 impl<'a> UciLoop<'a> {
-    /// px0 `UciLoop::UciLoop` (`uciloop.cc:170-175`)。
+    /// 绑定 responder 与 engine。
     pub fn new(responder: &'a mut dyn StringUciResponder, engine: &'a mut Engine) -> Self {
         responder.set_options(engine.options().clone());
         let output = Arc::new(UciOutputQueue::default());
@@ -169,7 +170,7 @@ impl<'a> UciLoop<'a> {
         }
     }
 
-    /// px0 `UciLoop::DispatchCommand` (`uciloop.cc:178-254`)。
+    /// 分发已解析的 UCI 命令。
     pub fn dispatch_command(
         &mut self,
         command: &str,
@@ -263,7 +264,7 @@ impl<'a> UciLoop<'a> {
         Ok(true)
     }
 
-    /// px0 `UciLoop::ProcessLine` (`uciloop.cc:256-261`)。
+    /// 处理一行 UCI 输入；返回 false 表示 quit。
     pub fn process_line(&mut self, line: &str, version: &str) -> Result<bool, EnginError> {
         let (command, params) = parse_command(line)?;
         if command.is_empty() {
@@ -279,7 +280,7 @@ impl<'a> UciLoop<'a> {
 }
 
 impl Drop for UciLoop<'_> {
-    /// px0 `UciLoop::~UciLoop` (`uciloop.cc:176`).
+    /// 退出前确保搜索已停止。
     fn drop(&mut self) {
         let _ = self.engine.stop();
         self.engine.set_output_queue(None);
@@ -287,7 +288,7 @@ impl Drop for UciLoop<'_> {
     }
 }
 
-/// px0 `ParseCommand` (`uciloop.cc:81-135`)。
+/// 将一行 UCI 文本解析为 command + kv。
 pub fn parse_command(line: &str) -> Result<(String, HashMap<String, String>), EnginError> {
     // PowerShell 管道会在第一行附带 UTF-8 BOM；把它视为传输层前缀而非 UCI token。
     let line = line.trim_start_matches('\u{feff}');
@@ -336,12 +337,12 @@ pub fn parse_command(line: &str) -> Result<(String, HashMap<String, String>), En
     Ok((command_token, params))
 }
 
-/// px0 `GetOrEmpty`（`uciloop.cc:137-143`）：缺 key 时返回空串借用，避免无谓 `String` 拷贝。
+/// 缺 key 时返回空串借用，避免无谓 `String` 拷贝。
 pub fn get_or_empty<'a>(params: &'a HashMap<String, String>, key: &str) -> &'a str {
     params.get(key).map(String::as_str).unwrap_or("")
 }
 
-/// px0 `GetNumeric` (`uciloop.cc:145-162`)。
+/// 读取数值型 UCI 参数。
 pub fn get_numeric(params: &HashMap<String, String>, key: &str) -> Result<i32, EnginError> {
     let Some(value) = params.get(key) else {
         return Err(EnginError::Uci("Unexpected error".into()));
@@ -354,12 +355,12 @@ pub fn get_numeric(params: &HashMap<String, String>, key: &str) -> Result<i32, E
         .map_err(|_| EnginError::Uci(format!("invalid value {value}")))
 }
 
-/// px0 `ContainsKey` (`uciloop.cc:164-167`)。
+/// 判断命令是否包含指定 key。
 pub fn contains_key(params: &HashMap<String, String>, key: &str) -> bool {
     params.contains_key(key)
 }
 
-/// px0 `StringUciResponder::OutputBestMove` (`uciloop.cc:279-287`)。
+/// 格式化 `bestmove` 行。
 pub fn format_best_move(info: &BestMoveInfo) -> String {
     let mut res = format!("bestmove {}", info.bestmove);
     if !info.ponder.is_null() {
@@ -368,7 +369,7 @@ pub fn format_best_move(info: &BestMoveInfo) -> String {
     res
 }
 
-/// px0 `StringUciResponder::OutputThinkingInfo` (`uciloop.cc:289-327`)。
+/// 格式化 `info` 行。
 pub fn format_thinking_info(info: &ThinkingInfo, options: &Options) -> String {
     let mut res = String::from("info");
     if info.depth >= 0 {
@@ -423,7 +424,7 @@ pub struct VecUciResponder {
     pub options: Options,
 }
 
-/// px0 `StdoutUciResponder` (`uciloop.h:120-123`、`uciloop.cc:329-337`)。
+/// 直接写 stdout 的 UCI responder。
 #[derive(Clone, Debug, Default)]
 pub struct StdoutUciResponder {
     pub options: Options,
@@ -572,7 +573,7 @@ fn parse_setoption(line: &str) -> Result<HashMap<String, String>, EnginError> {
     Ok(params)
 }
 
-/// px0 `ParseCommand` 从左到右扫描 `setoption` token（`uciloop.cc:109-118`）。
+/// 从左到右扫描 `setoption` token。
 fn token_offset(text: &str, needle: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut start = 0;
