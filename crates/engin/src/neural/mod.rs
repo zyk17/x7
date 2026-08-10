@@ -38,10 +38,7 @@ pub struct InputPlane {
 
 impl Default for InputPlane {
     fn default() -> Self {
-        Self {
-            mask: 0,
-            value: 1.0,
-        }
+        Self { mask: 0, value: 1.0 }
     }
 }
 

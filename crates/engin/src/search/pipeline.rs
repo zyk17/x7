@@ -1377,10 +1377,9 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
             let offset = index * ENCODED_PLANE_FLOATS;
             expand_input_planes(&request.planes, &mut packed[offset..offset + ENCODED_PLANE_FLOATS]);
         }
-        let infer_result =
-            shared
-                .backend
-                .infer_encoded_into(&packed, batch, &mut logits, &mut wdl, &mut moves_left);
+        let infer_result = shared
+            .backend
+            .infer_encoded_into(&packed, batch, &mut logits, &mut wdl, &mut moves_left);
         match infer_result {
             Ok(()) => {
                 let output = EncodedBatch::take_from(&mut logits, &mut wdl, &mut moves_left);
