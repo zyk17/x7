@@ -310,7 +310,7 @@ impl Node {
         );
         // px0 在 policy 初始化后调用 `Node::SortEdges`（`node.cc:291-297`）。
         let mut edges = edges;
-        edges.sort_unstable_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal));
+        edges.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
         let edges: Arc<[Arc<Edge>]> = edges
             .into_iter()
             .map(|(mv, prior)| Arc::new(Edge::new(mv, prior)))

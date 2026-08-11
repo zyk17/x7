@@ -122,48 +122,73 @@ fn is_visited_terminal(edge: &Edge, child: Option<&Node>) -> bool {
     child.is_some_and(|node| node.expansion_state() == ExpansionState::Terminal && edge.completed_visits() > 0)
 }
 
-fn edge_is_better(
-    repository: &NodeRepository,
-    left: &Arc<Edge>,
-    left_child: Option<&Node>,
-    right: &Arc<Edge>,
-    right_child: Option<&Node>,
-) -> bool {
-    let left_rank = best_edge_rank(left, left_child);
-    let right_rank = best_edge_rank(right, right_child);
-    if left_rank != right_rank {
-        return left_rank > right_rank;
+/// 一次性快照排名键，保证 `sort` 全序；避免并发回写 N/Q 时 `sort_by` 比较器不一致而 panic。
+#[derive(Clone, Copy)]
+struct EdgeRankKey {
+    rank: BestEdgeRank,
+    is_draw_terminal: bool,
+    plies: f32,
+    visits: u32,
+    q: f32,
+    prior: f32,
+}
+
+impl PartialEq for EdgeRankKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
     }
-    // 如果和棋找最短的
-    if left_rank == BestEdgeRank::NonTerminal
-        && is_visited_terminal(left, left_child)
-        && is_visited_terminal(right, right_child)
-    {
-        let left_m = terminal_plies(left_child.expect("visited terminal child"));
-        let right_m = terminal_plies(right_child.expect("visited terminal child"));
-        if (left_m - right_m).abs() > f32::EPSILON {
-            return left_m < right_m;
+}
+
+impl Eq for EdgeRankKey {}
+
+impl Ord for EdgeRankKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.rank.cmp(&other.rank) {
+            Ordering::Equal => {}
+            non_eq => return non_eq,
+        }
+        if self.rank == BestEdgeRank::NonTerminal && self.is_draw_terminal && other.is_draw_terminal {
+            match other.plies.total_cmp(&self.plies) {
+                Ordering::Equal => {}
+                non_eq => return non_eq,
+            }
+        }
+        if self.rank == BestEdgeRank::NonTerminal {
+            return self
+                .visits
+                .cmp(&other.visits)
+                .then_with(|| self.q.total_cmp(&other.q))
+                .then_with(|| self.prior.total_cmp(&other.prior));
+        }
+        if self.rank == BestEdgeRank::TerminalWin {
+            other.plies.total_cmp(&self.plies)
+        } else {
+            self.plies.total_cmp(&other.plies)
         }
     }
-    if left_rank == BestEdgeRank::NonTerminal {
-        let left_n = left.completed_visits();
-        let right_n = right.completed_visits();
-        if left_n != right_n {
-            return left_n > right_n;
-        }
-        let left_q = edge_q_for_ranking(repository, left);
-        let right_q = edge_q_for_ranking(repository, right);
-        if (left_q - right_q).abs() > f32::EPSILON {
-            return left_q > right_q;
-        }
-        return left.prior() > right.prior();
+}
+
+impl PartialOrd for EdgeRankKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
-    if left_rank == BestEdgeRank::TerminalWin {
-        terminal_plies(left_child.expect("terminal winning child"))
-            < terminal_plies(right_child.expect("terminal winning child"))
-    } else {
-        terminal_plies(left_child.expect("terminal losing child"))
-            > terminal_plies(right_child.expect("terminal losing child"))
+}
+
+fn edge_rank_key(repository: &NodeRepository, edge: &Arc<Edge>, child: Option<&Node>) -> EdgeRankKey {
+    let rank = best_edge_rank(edge, child);
+    let is_draw_terminal = rank == BestEdgeRank::NonTerminal && is_visited_terminal(edge, child);
+    let plies = match rank {
+        BestEdgeRank::TerminalWin | BestEdgeRank::TerminalLoss => terminal_plies(child.expect("terminal child")),
+        BestEdgeRank::NonTerminal if is_draw_terminal => terminal_plies(child.expect("visited terminal child")),
+        BestEdgeRank::NonTerminal => 0.0,
+    };
+    EdgeRankKey {
+        rank,
+        is_draw_terminal,
+        plies,
+        visits: edge.completed_visits(),
+        q: edge_q_for_ranking(repository, edge),
+        prior: edge.prior(),
     }
 }
 
@@ -191,20 +216,16 @@ fn ranked_root_edges(
         .edges()
         .iter()
         .filter(|edge| root_move_filter.is_empty() || root_move_filter.contains(&edge.mv()))
-        .map(|edge| (Arc::clone(edge), edge_child(repository, edge)))
+        .map(|edge| {
+            let child = edge_child(repository, edge);
+            let key = edge_rank_key(repository, edge, child.as_deref());
+            (Arc::clone(edge), child, key)
+        })
         .collect();
     if root.completed_visits() > 0 {
-        candidates.sort_by(|(left, left_child), (right, right_child)| {
-            if edge_is_better(repository, left, left_child.as_deref(), right, right_child.as_deref()) {
-                Ordering::Less
-            } else if edge_is_better(repository, right, right_child.as_deref(), left, left_child.as_deref()) {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
-            }
-        });
+        candidates.sort_unstable_by(|left, right| right.2.cmp(&left.2));
     }
-    candidates
+    candidates.into_iter().map(|(edge, child, _)| (edge, child)).collect()
 }
 
 fn mate_from_terminal(child: &Node) -> Option<i32> {
