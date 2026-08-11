@@ -196,10 +196,10 @@ fn first_filtered_move(edges: &[Arc<Edge>], root_move_filter: &[Move]) -> Option
     if !root_move_filter.is_empty() {
         return root_move_filter
             .iter()
-            .find(|mv| edges.iter().any(|edge| edge.mv() == **mv))
+            .find(|mv| edges.iter().any(|edge| edge.mv() == **mv && !edge.topology_pruned()))
             .copied();
     }
-    edges.first().map(|edge| edge.mv())
+    edges.iter().find(|edge| !edge.topology_pruned()).map(|edge| edge.mv())
 }
 
 fn ranked_root_edges(
@@ -215,6 +215,7 @@ fn ranked_root_edges(
     let mut candidates: Vec<_> = root
         .edges()
         .iter()
+        .filter(|edge| !edge.topology_pruned())
         .filter(|edge| root_move_filter.is_empty() || root_move_filter.contains(&edge.mv()))
         .map(|edge| {
             let child = edge_child(repository, edge);
@@ -334,7 +335,7 @@ fn best_edge_absolute(repository: &NodeRepository, root_key: NodeKey, root_move_
         };
     }
     // 尚无 completed visit 时，edge list 已从合法着生成。返回已验证的 searchmove，
-    // 或第一条合法 edge。
+    // 或第一条未被 topology prune 的合法 edge。
     if root.completed_visits() == 0 {
         return first_filtered_move(&edges, root_move_filter);
     }
@@ -601,6 +602,41 @@ mod tests {
             best_move_filtered(&repo, root_key, false, &filter).expect("fallback"),
             mv("b0", "b1")
         );
+    }
+
+    #[test]
+    fn root_output_skips_topology_pruned_edges() {
+        use crate::search::{NodeKey, NodeRepository};
+
+        fn mv(from: &str, to: &str) -> Move {
+            Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
+        }
+
+        let repo = NodeRepository::default();
+        let root_key = NodeKey::board(5);
+        let child_key = NodeKey::board(6);
+        let root = repo.get_or_insert(root_key);
+        assert!(root.try_begin_evaluation());
+        let pruned = mv("a0", "a1");
+        let usable = mv("b0", "b1");
+        root.publish_edges(vec![(pruned, 0.9), (usable, 0.1)]);
+
+        let child = repo.get_or_insert(child_key);
+        assert!(child.try_begin_evaluation());
+        child.publish_edges(vec![(mv("c0", "c1"), 1.0)]);
+        child.edges()[0].bind_child_key(root_key);
+
+        let root_edges = root.edges();
+        let pruned_edge = root_edges.iter().find(|edge| edge.mv() == pruned).expect("pruned edge");
+        assert!(matches!(
+            repo.bind_child_or_cut_cycle(root_key, pruned_edge, child_key),
+            crate::search::graph::ChildLink::TopologyPruned
+        ));
+
+        assert_eq!(best_move(&repo, root_key, false), Some(usable));
+        let variations = root_variations(&repo, root_key, false, &[], 2);
+        assert_eq!(variations.len(), 1);
+        assert_eq!(variations[0].pv, vec![usable]);
     }
 
     #[test]

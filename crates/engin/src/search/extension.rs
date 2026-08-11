@@ -58,19 +58,6 @@ pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Op
             let (wl, draw) = rule_judge_wl_for_node(history.rule_judge());
             return Some((wl, draw, 0.0));
         }
-        // board-key 图不能在第一次闭环后继续扩展为带环图。这里是搜索截断，
-        // 不是正式实战的重复门槛：普通重复按和棋，长将/长捉按 RuleJudge 裁决。
-        if history.last().repetitions() == 1 {
-            let plies_left = history.last().cycle_length() as f32;
-            let result = history.rule_judge();
-            if result == GameResult::Draw
-                || matches!(result, GameResult::WhiteWon | GameResult::BlackWon)
-                    && two_fold_chase_or_check_cycle(history)
-            {
-                let (wl, draw) = rule_judge_wl_for_node(result);
-                return Some((wl, draw, plies_left));
-            }
-        }
         if history.last().rule60_ply() >= 120 {
             return Some((0.0, 1.0, 0.0));
         }
@@ -85,32 +72,6 @@ pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Op
         }
     }
     None
-}
-
-/// two-fold chase/check cycle 探测。
-///
-/// 只用于严格 board-key DAG 的首次闭环搜索截断，不改变正式
-/// `compute_game_result` 的重复规则。
-fn two_fold_chase_or_check_cycle(history: &PositionHistory) -> bool {
-    let mut idx = history.len() - 1;
-    let mut idx2 = idx;
-    while idx2 > 0 {
-        idx2 -= 1;
-        if history.get(idx2).board() == history.last().board() {
-            break;
-        }
-    }
-    if idx2 == 0 || history.get(idx - 1).board() != history.get(idx2 - 1).board() {
-        return false;
-    }
-    idx -= 1;
-    while idx2 != idx {
-        idx2 += 1;
-        if history.get(idx2).repetitions() > 0 {
-            break;
-        }
-    }
-    idx2 == idx
 }
 
 #[cfg(test)]
@@ -153,9 +114,9 @@ mod tests {
         ));
     }
 
-    /// 严格 board-key DAG 在首次闭环时必须截断；长将方不能被当作和棋。
+    /// 首次重复进入 ContinuationTree 继续搜索；只有第二次重复才由 RuleJudge 裁决。
     #[test]
-    fn first_perpetual_check_cycle_is_a_path_terminal() {
+    fn first_perpetual_check_cycle_remains_evaluable() {
         let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
         let mut history = PositionHistory::default();
         history.reset(board, 2, 30);
@@ -169,14 +130,7 @@ mod tests {
 
         let depth = history.len().saturating_sub(1).max(1);
         assert_eq!(history.rule_judge(), GameResult::WhiteWon);
-        assert_eq!(
-            classify_extension(&history, depth),
-            ExtensionKind::PathTerminal {
-                wl: 1.0,
-                draw: 0.0,
-                plies_left: 4.0,
-            }
-        );
+        assert_eq!(classify_extension(&history, depth), ExtensionKind::Evaluate);
     }
 
     #[test]

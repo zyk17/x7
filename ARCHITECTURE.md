@@ -67,7 +67,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 
 ## Stream
 
-- repository 是一个 64 分片的 key-value map。MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。重复与 rule60 等路径终局只在 variation 内裁决，不创建重复 node，也不标记 shared node；每次结果作为实际入边的一次 local 样本，不能由首次路径永久覆盖。首次绑定 edge 时若 DFS 发现会形成 shared-Q 图环，则不绑定，并将 child 的固定 NN `U` 作为该 edge 的 local leaf；这不是规则和棋裁决。
+- repository 是一个 64 分片的 key-value map。普通 MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。真实 variation 第一次重复时不接回 shared graph，而是以该重复局面为根进入纯 `ContinuationTree`：其 key 纳入自最近零化着以来的规则 history，树内不换位合并，只复用按棋盘索引的 NN cache；第三次出现同一局面才由 `RuleJudge` 终局。首次绑定普通 shared edge 若 DFS 发现会形成 shared-Q 图环，则永久标为 topology-pruned 并从 PUCT 排除，不写 N/Q，也不伪装成棋规和棋。这是为保持 shared-Q 无环的 X7 结构近似，须由残局回归与 Elo 验证。
 - NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
 - Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、稀疏合批推理，并以整批 `EncodedBatch` 交回。
@@ -80,7 +80,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
   整个旧 repository 同样在后台逐 shard 释放。UCI/Watchdog 已输出最小 info 与一次 bestmove。
 - `MultiPV` 只在 watchdog 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCGS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
-stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 公式，不是 LC3 Policy 的正式公式，也不是 px0 搜索等价实现）。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.5 / 2000 / 1.347017`，即 `C(0)=1.5`、`C(25k)≈5` 的平缓增长曲线。固定节点诊断中，它相较于常数 e 保留更多次选验证预算，又没有 Base=4k 的早期过度集中；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
+stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 公式，不是 LC3 Policy 的正式公式，也不是 px0 搜索等价实现）。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.0 / 2000 / 1.226202`。非根 `C(0)=1`、`C(50k)≈5`；根固定额外 `+0.75`，即 `C_root(0)=1.75`、`C_root(50k)≈5.75`。根的较高初值用于及早验证根候选，两者共用同一对数增长项；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
 
 ## 模型
 

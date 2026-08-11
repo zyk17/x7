@@ -156,10 +156,10 @@ Elo 验证，不能写成“精确状态合并”。
 ## Gather、event 与回传
 
 tree 版可以由 `parent_key.child(move)` 得到 child key。图版必须从 event 的 variation 重建 child
-position，再计算 `GraphKey(child_position.board())`。当前 event 保持最小的
+position，再计算普通 `GraphKey(child_position.board())`。当前 event 保持最小的
 `node_path + reservations`：两者的同一索引顺序表达本次实际走过的 parent edge；正常 path 比
-reservation 多一个 leaf node，环边不加入重复 child node，因而两者长度相同。Edge 自己绑定
-`child_key`，所以不需要再引入 `PathStep` 结构。
+reservation 多一个 leaf node。首次真实重复则额外记录一个 ContinuationTree entry：该 entry edge
+不绑定 child，回传时把树根当前 value 作为它的 edge-local 样本。无需引入 `PathStep` 结构。
 
 一次回传有两件不同的事，不能混为一谈：
 
@@ -171,32 +171,31 @@ reservation 多一个 leaf node，环边不加入重复 child node，因而两�
 variation 中出现两次，不能无限下降，也不能把一次 evidence 重复写入 edge；这属于环处理，而不是
 普通 backprop。
 
-## 环与重复：第一版的硬边界
+## 环、真实重复与 ContinuationTree
 
-图允许跨分支汇合，但 shared-Q 的幂等重算不能读成循环依赖。Gather 必须维护本 event 的
-visited board keys；此外 repository 在**首次绑定一条 edge** 时做一次 DFS：若候选 child 已经
-沿既有图边可达 parent，则不绑定这条会闭环的 edge。该 DFS 不在正常 PUCT 热路径运行，且用一把
-很小的链接锁包住“检查 + 绑定”，避免两个 worker 同时穿透检查而新建二元环。
+普通图允许跨分支汇合，但 shared-Q 的幂等重算不能形成循环依赖。repository 只在**首次绑定普通
+shared edge**时做 DFS：若 candidate child 已能沿既有图边到达 parent，则这条 edge 会闭合 shared-Q
+拓扑环。它被永久标记 `TopologyPruned`，此后 PUCT 完全跳过它；当前 reservation 直接取消，不产生
+N/Q/local-leaf。该 DFS 只读已有 node/edge，并由短链接锁包住“检查 + 标记/绑定”。
 
-这不是重复裁决。截断 edge 仍代表一个合法、但无法安全接入 shared-Q 图的走法：它以 candidate
-child 首次网络预测 `U(child)` 作为这一次 edge-local leaf sample 完成，然后不建立 child link。
-因此既不会把非重复局面伪装成和棋，也不会让 `Q(B)` 与 `Q(D)` 在 `B ↔ D` 中递归读取。设计取
-KataGo `cpp/search/search.cpp:1426-1445` 对 graph-path cycle 的截断作为参照；KataGo 的累计统计
-语义与本项目不同，故 X7 选择固定 U leaf 而不是其“加一次 parent edge visit 后结束”的方式。
+若一个非根 shared node 的所有边都已如此过滤，它作为 graph 边界结束本次 playout：只把该 node 自己
+已有的 U/Q 回传给进入它的实际入边；被过滤 edge 仍不获得 N/Q。这避免 fixed-playout 在无候选 node
+崩溃，也不把任意被过滤着伪造成已搜索结果。
 
-实现只在 candidate child 已存在于 repository 时 DFS：新 child 不可能沿既有图边回到 parent，直接绑定。
-被截断的 edge 缓存固定 `U(child)`，以后再次被选中不再遍历。两项均不改变规则裁决或 edge-local 统计；若
-基准显示这类 edge 仍是热点，才考虑更细的 cut 统计，不提前引入索引或 parent 表。
+这不是棋规裁决，而是 X7 的结构近似：绝大多数这类绕路只改变 rule60 并拉长 moves-left，不能安全接入
+idempotent shared-Q。它必须保留为可复查决策；若实战证明长将、长捉或 rule60 的差异不能忽略，再改为
+更严格模型，不把该边悄悄当成 draw 或 NN leaf。
 
-path-local 闭环仍按以下规则处理：
+候选 child 的 board 已在**当前 variation**出现时，优先于上述拓扑检查按真实 repetition 处理：
 
-候选 child 的 board key 已在本 path 出现时，一律视为 **repetition**，而非 collision 或普通 graph edge。
-worker 在私有 `PositionHistory` 上先调用既有 px0 风格 extension/rule judge；若首次闭环尚未达到
-two-fold 的正式裁决门槛，首版按“已重复但未能归责”记为本地和棋，保证图不会无界下降。repetition、
-two-fold 与 rule60 都绝不创建第二个 shared node，也绝不写入已存在 node 的 global terminal/proof；结果作为
-**这一次** `parent → move` 的 edge-local terminal 样本完成。相同 board edge 可以由不同 history 到达，
-所以不能 first-writer-wins：edge action Q 是其所有本地终局样本与其余访问读取的 shared child Q 的加权组合。
-这是有意识的上下文近似，仍须用 px0 的 two-fold / `RuleJudge` 用例验证方向。
+1. 走出该边后的节点就是 `ContinuationTree` 根，即此 variation 的第一次重复局面；入边不绑定 shared graph。
+2. ContinuationTree 的每个 key 包含当前 board 与自最近零化着以来的完整规则 history，因此树内不做
+   transposition merge；唯一共享资源是按 board key 的 NN cache。
+3. 第一次重复（`repetitions == 1`）继续正常 PUCT / NN evaluation。树内再次出现相同局面后
+   `repetitions >= 2`，才调用 `RuleJudge` 得到 path-local terminal。
+
+这样 shared graph 始终无环，而真实循环仍有足够路径历史交给棋规裁判；ContinuationTree 不反向连接
+shared graph，也不会在跨回合 GC 中作为共享子图保留。
 
 ## 跨回合复用与 GC
 
@@ -331,7 +330,7 @@ shared child Q 的位置及其后的 edge N/Q，而不是先修改 PUCT 或图�
 
 ## 当前结论
 
-MCGS 不是“加一个 TT”。当前实现已切换 board-key、edge-local N、幂等回传、edge-local 路径终局样本、首次绑定 edge 的 DFS 闭环截断、可达 GC 与防环 PV。
+MCGS 不是“加一个 TT”。当前实现已切换普通 board-key、edge-local N、幂等回传、真实重复的 ContinuationTree、首次绑定 edge 的 DFS topology prune、可达 GC 与防环 PV。
 它仍是 board-key 的上下文近似，不是严格 state 合并。下一步评估 reuse/stop 边界、唯一 state 数、NN eval 数、
 稳定性与 Elo；合并率或 EPS 上升本身不是采用理由。
 

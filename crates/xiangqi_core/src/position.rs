@@ -325,6 +325,27 @@ impl PositionHistory {
         hash_cat(hash, self.last().rule60_ply as u64)
     }
 
+    /// 自最近一次零化着起的规则 history fingerprint。仅用于搜索在图闭环处创建局部
+    /// 续搜树；不进入普通 board-key、NN cache 或热路径。零化着以前的局面不可能与
+    /// 当前局面形成重复，且连将/长捉计数也已归零，故不必人为阻止这类树内复用。
+    pub fn rule_context_hash(&self) -> u64 {
+        let first = self
+            .positions
+            .iter()
+            .rposition(|position| position.rule60_ply == 0)
+            .unwrap_or(0);
+        let positions = &self.positions[first..];
+        let mut hash = positions.len() as u64;
+        for position in positions {
+            hash = hash_cat(hash, position.board.hash());
+            hash = hash_cat(hash, position.rule60_ply as u64);
+            hash = hash_cat(hash, position.us_check as u64);
+            hash = hash_cat(hash, position.them_check as u64);
+            hash = hash_cat(hash, position.repetitions as u64);
+        }
+        hash
+    }
+
     fn compute_last_move_repetitions(&self) -> (u32, u32) {
         let last = self.last();
         if last.rule60_ply < 4 {
@@ -348,5 +369,24 @@ impl PositionHistory {
 
     pub fn is_black_to_move(&self) -> bool {
         self.last().is_black_to_move()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Position, PositionHistory};
+    use crate::ChessBoard;
+
+    #[test]
+    fn rule_context_hash_ignores_history_before_the_last_zeroing_move() {
+        let (first, _) = ChessBoard::from_fen("4k4/9/9/9/9/9/9/9/9/4K4 w - - 0 1").expect("first board");
+        let (other, _) = ChessBoard::from_fen("4k4/9/9/9/9/9/9/9/R8/4K4 w - - 0 1").expect("other board");
+        let zero = Position::new(first.clone(), 0, 10);
+        let suffix = Position::new(first, 1, 11);
+
+        let left = PositionHistory::from_positions(vec![Position::new(other, 7, 2), zero.clone(), suffix.clone()]);
+        let right = PositionHistory::from_positions(vec![Position::new(suffix.board.clone(), 23, 8), zero, suffix]);
+
+        assert_eq!(left.rule_context_hash(), right.rule_context_hash());
     }
 }

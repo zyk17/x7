@@ -1,6 +1,7 @@
 //! stream 搜索的分片 node repository 与 edge-local reservation。
 //!
-//! MCGS 使用 board key：相同棋盘（含行棋方）共享 node；走法统计仍留在 parent edge。
+//! 普通 MCGS 使用 board key：相同棋盘（含行棋方）共享 node；真实重复后进入的
+//! ContinuationTree 改用带规则 history 的 key。走法统计始终留在 parent edge。
 //! repository 角色可参考 LC3 Overview 的 “Node repository”；统计语义见 `MCGS.md`。
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 
@@ -11,23 +12,27 @@ use std::sync::{Arc, OnceLock};
 
 use nohash_hasher::{IsEnabled, NoHashHasher};
 use parking_lot::{Mutex, RwLock};
-use xiangqi_core::{Move, PositionHistory};
+use xiangqi_core::{Move, PositionHistory, hashcat::hash_cat};
 
 use crate::EnginError;
 
 use super::ValueDelta;
 
-/// repository 的标识。MCGS 只以当前棋盘（含行棋方）划分 node；历史规则仍由 event
-/// 的 variation 在 path-local 层面裁决。
+/// repository 的标识。普通 MCGS node 只以当前棋盘（含行棋方）划分；ContinuationTree
+/// node 额外纳入规则 history。历史终局仍由 event variation 的私有 history 裁决。
 ///
 /// `u64` 已由 `hash_cat` 混合。分片 map 使用 `nohash_hasher::NoHashHasher`，直接
 /// 以此值为 bucket index，不再进行第二次 hash。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
-pub struct NodeKey(u64);
+pub struct NodeKey {
+    hash: u64,
+    board: u64,
+    context: Option<u64>,
+}
 
 impl Hash for NodeKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.0);
+        state.write_u64(self.hash);
     }
 }
 
@@ -37,7 +42,24 @@ impl IsEnabled for NodeKey {}
 impl NodeKey {
     /// MCGS 的共享 state identity：只由当前棋盘（含行棋方）决定。
     pub const fn board(board_hash: u64) -> Self {
-        Self(board_hash)
+        Self {
+            hash: board_hash,
+            board: board_hash,
+            context: None,
+        }
+    }
+
+    /// 图闭环处的纯树形续搜 node。相同棋盘但规则 history 不同，不共享 N/Q。
+    pub fn continuation(board_hash: u64, context: u64) -> Self {
+        Self {
+            hash: hash_cat(hash_cat(board_hash, context), 1),
+            board: board_hash,
+            context: Some(context),
+        }
+    }
+
+    pub const fn is_continuation(self) -> bool {
+        self.context.is_some()
     }
 }
 
@@ -72,9 +94,9 @@ pub struct Edge {
     /// MCGS 中 move 指向的共享 board node。首次沿此 edge 下降时绑定；同一 parent
     /// board 与 move 必然导向同一 child board。KataGo GraphSearch 的 action/state 分离。
     child_key: OnceLock<NodeKey>,
-    /// 这条合法 edge 若接入 child 会闭合 shared-Q 图环，则固定保存 child 的首次
-    /// 网络预测 U。它与 `child_key` 互斥：前者是 edge-local leaf，后者是共享图边。
-    cycle_leaf: OnceLock<ValueDelta>,
+    /// 若接入 child 会闭合 shared-Q 图环，此合法着不参与本 graph 的 PUCT。它不是
+    /// 规则裁决；真实 variation 重复由 ContinuationTree 继续搜索。
+    topology_pruned: OnceLock<()>,
     /// policy prior 在 node 发布后不再变化；普通不可变 `f32` 即可安全地被所有
     /// Gather worker 读取，不需要为 PUCT 热路径使用原子加载。
     prior: f32,
@@ -103,7 +125,7 @@ impl Edge {
         Self {
             mv,
             child_key: OnceLock::new(),
-            cycle_leaf: OnceLock::new(),
+            topology_pruned: OnceLock::new(),
             prior,
             started: AtomicU32::new(0),
             completed: Mutex::new(EdgeStats::default()),
@@ -160,12 +182,12 @@ impl Edge {
         self.child_key.get().copied()
     }
 
-    pub(crate) fn cycle_leaf(&self) -> Option<ValueDelta> {
-        self.cycle_leaf.get().copied()
+    pub(crate) fn topology_pruned(&self) -> bool {
+        self.topology_pruned.get().is_some()
     }
 
     pub fn bind_child_key(&self, key: NodeKey) {
-        assert!(self.cycle_leaf.get().is_none(), "cycle-cut edge cannot bind a child");
+        assert!(!self.topology_pruned(), "topology-pruned edge cannot bind a child");
         if let Err(existing) = self.child_key.set(key) {
             assert_eq!(existing, key, "one edge must keep one child board");
         }
@@ -253,11 +275,6 @@ impl Node {
         }
     }
 
-    /// 首次网络预测 U。图边若会闭合 Q 依赖环时，调用方把它作为本 edge 的一次
-    /// 固定叶子样本，而不连接 child；因此不会把同一份统计重新读回自身。
-    pub(crate) fn graph_value(&self) -> Option<ValueDelta> {
-        *self.graph_value.lock()
-    }
     pub fn completed_visits(&self) -> u32 {
         self.stats.lock().visits
     }
@@ -387,9 +404,7 @@ pub struct NodeRepository {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ChildLink {
     Bound,
-    /// 不绑定会形成图环的 edge。值是 child 首次 NN 预测 U，作为本 edge 的固定
-    /// local leaf sample；这不是重复/和棋裁决。
-    Cycle(ValueDelta),
+    TopologyPruned,
 }
 
 impl NodeRepository {
@@ -472,9 +487,8 @@ impl NodeRepository {
     /// 原子地检查并绑定一条此前未绑定的 graph edge。
     ///
     /// 若 `child` 已能沿已绑定 edge 到达 `parent`，再连接 `parent -> child` 会让
-    /// `recompute_graph_node` 的 shared Q 产生循环依赖。此时不把 edge 接入图，而是
-    /// 返回 child 的固定 U，供调用方作为 edge-local leaf 回传。这样保留 board-key
-    /// node 复用，却不伪造历史相关的 draw/terminal。
+    /// `recompute_graph_node` 的 shared Q 产生循环依赖。此时永久过滤这条 edge；它
+    /// 不是棋规终局，调用方取消本次 reservation 后继续选择其他 edge。
     pub(crate) fn bind_child_or_cut_cycle(&self, parent: NodeKey, edge: &Edge, child: NodeKey) -> ChildLink {
         let _topology = self.topology_lock.read();
         let _link = self.link_lock.lock();
@@ -482,24 +496,21 @@ impl NodeRepository {
             assert_eq!(existing, child, "one edge must keep one child board");
             return ChildLink::Bound;
         }
-        if let Some(value) = edge.cycle_leaf() {
-            return ChildLink::Cycle(value);
+        if edge.topology_pruned() {
+            return ChildLink::TopologyPruned;
         }
         // 新 child 尚未进入 repository 时不可能沿既有图边回到 parent，直接绑定。
         // 这避免绝大多数首次 expansion 的无意义 DFS。
-        let Some(child_node) = self.get_unlocked(child) else {
+        if self.get_unlocked(child).is_none() {
             self.get_or_insert_unlocked(child);
             edge.bind_child_key(child);
             return ChildLink::Bound;
-        };
+        }
         if self.reaches_unlocked(child, parent) {
-            let value = child_node
-                .graph_value()
-                .expect("a reachable graph node must have a base value");
-            edge.cycle_leaf
-                .set(value)
+            edge.topology_pruned
+                .set(())
                 .expect("cycle-cut edge is initialized once under link lock");
-            return ChildLink::Cycle(value);
+            return ChildLink::TopologyPruned;
         }
         edge.bind_child_key(child);
         ChildLink::Bound
@@ -554,7 +565,7 @@ impl NodeRepository {
     }
 
     fn shard_index(&self, key: NodeKey) -> usize {
-        key.0 as usize & (self.shards.len() - 1)
+        key.hash as usize & (self.shards.len() - 1)
     }
 
     /// 检查 `root` 以下的 edge-local reservation 不变量。
@@ -913,10 +924,9 @@ mod repository_tests {
     }
 
     #[test]
-    fn new_edge_that_would_close_a_graph_cycle_stays_a_local_leaf() {
-        // A -> B -> D 与 A -> C -> D 合并后，D -> B 必须不连接；否则 B/D 的 Q
-        // 会互相依赖。参考 KataGo `cpp/search/search.cpp:1426-1445` 的 cycle 截断，
-        // 但这里不把非重复局面伪装成 draw，而使用 B 的固定网络 U。
+    fn new_edge_that_would_close_a_graph_cycle_is_permanently_pruned() {
+        // A -> B -> D 与 A -> C -> D 合并后，D -> B 会让 B/D 的 Q 互相依赖。
+        // 这不是棋规重复；X7 直接将该 edge 排除在 shared 图之外。
         let repo = NodeRepository::default();
         let a = NodeKey::board(10);
         let b = NodeKey::board(11);
@@ -960,15 +970,14 @@ mod repository_tests {
         let d_node = repo.get(d).expect("D node");
         let d_edges = d_node.edges();
         let d_edge = &d_edges[0];
-        let ChildLink::Cycle(value) = repo.bind_child_or_cut_cycle(d, d_edge, b) else {
+        let ChildLink::TopologyPruned = repo.bind_child_or_cut_cycle(d, d_edge, b) else {
             panic!("D -> B must be cut")
         };
-        assert_eq!(value, ValueDelta::one(0.25, 0.0));
         assert!(d_edge.child_key().is_none());
-        assert_eq!(d_edge.cycle_leaf(), Some(value));
+        assert!(d_edge.topology_pruned());
         assert!(matches!(
             repo.bind_child_or_cut_cycle(d, d_edge, b),
-            ChildLink::Cycle(reused) if reused == value
+            ChildLink::TopologyPruned
         ));
     }
 

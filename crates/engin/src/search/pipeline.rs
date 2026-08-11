@@ -26,7 +26,7 @@ use super::extension::{ExtensionKind, classify_extension, path_terminal_value};
 use super::graph::ChildLink;
 use super::{
     BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGeneration, SearchGraph,
-    SearchParams, ValueDelta, Variation, network_wl_to_node, select_edge_from_node,
+    SearchParams, ValueDelta, network_wl_to_node, select_edge_from_node,
 };
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
@@ -979,45 +979,47 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                 // 路径上的 node；因此每次再次访问本 node 前都要按最新 child Q 重算。
                 // 参考 KataGo `docs/GraphSearch.md` “Stale Q Values”。
                 shared.repository.recompute_graph_node(event.node_key);
-                let edge_index = select_edge_from_node(
+                let Some(edge_index) = select_edge_from_node(
                     &shared.repository,
                     node.as_ref(),
                     depth,
                     &shared.params,
                     &shared.root_move_filter,
-                )
-                .expect("expanded stream node must have an edge");
-                let reservation = node.reserve_edge(edge_index).expect("selected stream edge");
-                let graph_child = event.variation.child_board_key(reservation.mv());
-                if event.node_path().contains(&graph_child) || event.variation.returns_to_root_history(graph_child) {
-                    let value = cycle_value(&mut event.variation, reservation.mv());
-                    shared.send_backprop(BackpropEvent::local_leaf(event.descend_cycle(reservation), value));
+                ) else {
+                    // 所有合法着都可能已被 topology prune。它们本身仍保持 N=0；
+                    // 不能伪造其中任一 edge 的结果。对已有入边而言，该 node 的 U/Q
+                    // 就是此 shared-DAG 边界的叶子值，正常回传即可。
+                    if event.reservations.is_empty() {
+                        shared.root_path_terminal.store(true, Ordering::Release);
+                        shared.finish(true);
+                    } else {
+                        shared.send_backprop(BackpropEvent::evaluation(event));
+                    }
                     return;
+                };
+                let reservation = node.reserve_edge(edge_index).expect("selected stream edge");
+                if !event.node_key.is_continuation() && event.repeats_in_history(reservation.mv()) {
+                    let child = event.variation.continuation_child_key(reservation.mv());
+                    shared.repository.get_or_insert(child);
+                    event = event.descend_continuation(child, reservation);
+                    continue;
                 }
+                let child = if event.node_key.is_continuation() {
+                    event.variation.continuation_child_key(reservation.mv())
+                } else {
+                    event.variation.child_board_key(reservation.mv())
+                };
                 match shared
                     .repository
-                    .bind_child_or_cut_cycle(event.node_key, &node.edges()[edge_index], graph_child)
+                    .bind_child_or_cut_cycle(event.node_key, &node.edges()[edge_index], child)
                 {
-                    ChildLink::Bound => event = event.descend(graph_child, reservation),
-                    ChildLink::Cycle(value) => {
-                        shared.send_backprop(BackpropEvent::local_leaf(event.descend_cycle(reservation), value));
-                        return;
-                    }
+                    ChildLink::Bound => event = event.descend(child, reservation),
+                    // 拓扑闭环不是棋规重复。永久过滤该边并取消这次尝试，随后在同一
+                    // node 重新按 PUCT 选边；`select_edge` 会跳过已过滤 edge。
+                    ChildLink::TopologyPruned => reservation.cancel(),
                 }
             }
         }
-    }
-}
-
-/// MCGS 的 path-local 环只在当前 variation 内裁决，不能把历史相关结果写入共享 node。
-/// 优先复用 extension 判定；尚未达到 two-fold 门槛的闭环按首版约定视为本地和棋。
-fn cycle_value(variation: &mut Variation, mv: Move) -> ValueDelta {
-    let mut history = variation.history().clone();
-    history.append(mv);
-    match classify_extension(&history, variation.moves().len() + 1) {
-        ExtensionKind::SharedTerminal { wl, draw, plies_left }
-        | ExtensionKind::PathTerminal { wl, draw, plies_left } => ValueDelta::with_plies_left(wl, draw, plies_left),
-        ExtensionKind::Evaluate => ValueDelta::with_plies_left(0.0, 1.0, 0.0),
     }
 }
 
@@ -1504,7 +1506,7 @@ mod tests {
 
     use crossbeam_channel::bounded;
     use parking_lot::{Condvar, Mutex};
-    use xiangqi_core::{ChessBoard, GameState, Move, PositionHistory, STARTPOS_FEN, Square};
+    use xiangqi_core::{ChessBoard, GameState, Move, Position, PositionHistory, STARTPOS_FEN, Square};
 
     use super::{NodeEvent, Search, SearchConfig, SearchLimits, Shared};
     use crate::EnginError;
@@ -1774,14 +1776,15 @@ mod tests {
     }
 
     #[test]
-    fn gather_cuts_a_global_graph_cycle_to_an_edge_local_nn_leaf() {
-        // 以真实 Gather/Backprop 路径覆盖：root -> child 若接上 child -> root 的既有
-        // 图边会闭环。它必须完成 root edge 的 reservation，但不能绑定 child。
+    fn gather_prunes_a_global_graph_cycle_and_tries_the_next_edge() {
+        // 真实 Gather 路径：root -> child 若接上 child -> root 的既有图边会闭环。
+        // 该 edge 不记 N/Q，并在本 node 继续选择下一条可用 edge。
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
         let tree = SearchGraph::new(Arc::clone(&history));
         let root_key = tree.root_key();
         let mv = history.last().board().parse_move("b2b3").expect("legal root move");
+        let fallback = history.last().board().parse_move("g3g4").expect("legal fallback move");
         let child_key = NodeEvent::root(SearchGeneration(41), Arc::clone(&history))
             .variation
             .child_board_key(mv);
@@ -1789,7 +1792,7 @@ mod tests {
         let root = tree.repository().get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         root.set_graph_value(ValueDelta::one(0.0, 0.0));
-        root.publish_edges(vec![(mv, 1.0)]);
+        root.publish_edges(vec![(mv, 0.9), (fallback, 0.1)]);
 
         let child = tree.repository().get_or_insert(child_key);
         assert!(child.try_begin_evaluation());
@@ -1806,12 +1809,105 @@ mod tests {
             &tree,
             SearchConfig::default(),
         );
-        let stats = search.run_playouts(1).expect("cycle-cut playout");
+        let stats = search.run_playouts(1).expect("cycle-pruned playout");
         let root_edge = &root.edges()[0];
         assert_eq!(stats.completed_playouts, 1);
-        assert_eq!(root_edge.completed_visits(), 1);
+        assert_eq!(root_edge.completed_visits(), 0);
         assert_eq!(root_edge.child_key(), None);
-        assert_eq!(root_edge.cycle_leaf(), Some(ValueDelta::one(0.4, 0.0)));
+        assert!(root_edge.topology_pruned());
+        assert_eq!(root.edges()[1].completed_visits(), 1);
+        search.stop_and_finish();
+    }
+
+    #[test]
+    fn all_topology_pruned_children_finish_at_the_shared_node_value() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(PositionHistory::from_positions(state.positions()));
+        let tree = SearchGraph::new(Arc::clone(&history));
+        let root_key = tree.root_key();
+        let first = history.last().board().parse_move("b2b3").expect("legal first move");
+        let child_key = NodeEvent::root(SearchGeneration(43), Arc::clone(&history))
+            .variation
+            .child_board_key(first);
+        let child_position = Position::after(history.last(), first);
+        let reply = child_position.board().parse_move("b9b8").expect("legal reply");
+        let grandchild = Position::after(&child_position, reply);
+        let grandchild_key = crate::search::NodeKey::board(grandchild.board().hash());
+
+        let root = tree.repository().get_or_insert(root_key);
+        assert!(root.try_begin_evaluation());
+        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.publish_edges(vec![(first, 1.0)]);
+        root.edges()[0].bind_child_key(child_key);
+
+        let child = tree.repository().get_or_insert(child_key);
+        assert!(child.try_begin_evaluation());
+        child.set_graph_value(ValueDelta::one(0.4, 0.0));
+        child.publish_edges(vec![(reply, 1.0)]);
+
+        let grandchild_node = tree.repository().get_or_insert(grandchild_key);
+        assert!(grandchild_node.try_begin_evaluation());
+        grandchild_node.set_graph_value(ValueDelta::one(0.2, 0.0));
+        grandchild_node.publish_edges(vec![(
+            Move::new(Square::parse("c0").unwrap(), Square::parse("c1").unwrap()),
+            1.0,
+        )]);
+        grandchild_node.edges()[0].bind_child_key(child_key);
+
+        let mut search = Search::new_with_graph(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(43),
+            &tree,
+            SearchConfig::default(),
+        );
+        let stats = search.run_playouts(1).expect("topology boundary playout");
+
+        assert_eq!(stats.completed_playouts, 1);
+        assert!(child.edges()[0].topology_pruned());
+        assert_eq!(child.edges()[0].completed_visits(), 0);
+        assert_eq!(root.edges()[0].completed_visits(), 1);
+        assert!((root.q() + 0.2).abs() < f32::EPSILON);
+        search.stop_and_finish();
+    }
+
+    #[test]
+    fn gather_enters_continuation_tree_on_the_first_real_repetition() {
+        let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
+        let mut history = PositionHistory::default();
+        history.reset(board, 2, 30);
+        for text in ["d9e9", "d2e2", "e9d9", "e2d2"] {
+            let mv = history.last().board().parse_move(text).expect(text);
+            history.append(mv);
+        }
+        let history = Arc::new(history);
+        let tree = SearchGraph::new(Arc::clone(&history));
+        let root = tree.repository().get_or_insert(tree.root_key());
+        let mv = history.last().board().parse_move("d9e9").expect("repeat move");
+        let mut event = NodeEvent::root(SearchGeneration(42), Arc::clone(&history));
+        assert!(event.repeats_in_history(mv));
+        let continuation = event.variation.continuation_child_key(mv);
+
+        assert!(root.try_begin_evaluation());
+        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.publish_edges(vec![(mv, 1.0)]);
+        let mut search = Search::new_with_graph(
+            Arc::new(UniformBackend::default()),
+            SearchGeneration(42),
+            &tree,
+            SearchConfig::default(),
+        );
+        let stats = search.run_playouts(1).expect("continuation playout");
+
+        assert_eq!(stats.completed_playouts, 1);
+        assert_eq!(root.edges()[0].completed_visits(), 1);
+        assert!(root.edges()[0].child_key().is_none());
+        assert_eq!(
+            tree.repository()
+                .get(continuation)
+                .expect("continuation root")
+                .expansion_state(),
+            ExpansionState::Expanded
+        );
         search.stop_and_finish();
     }
 

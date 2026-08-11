@@ -21,10 +21,11 @@ pub struct SearchParams {
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            // 固定节点诊断后采用的中性曲线：C(0)=1.5，C(25k)≈5。
-            cpuct: 1.5,
+            // 非根 C(0)=1、C(50k)≈5；根固定额外 +0.75。
+            cpuct: 1.0,
             cpuct_base: 2_000.0,
-            cpuct_factor: 1.347_017,
+            // 以 fast_log(26) 校准，使非根 C(50k)≈5。
+            cpuct_factor: 1.226_202,
             // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
             fpu_reduction: 0.200,
         }
@@ -53,14 +54,14 @@ impl SearchParams {
 }
 
 /// cPUCT：常数项加上随访问数缓慢增长的对数项。
+///
+/// 根的初值固定比非根高 `0.75`，使根候选较早获得验证；两者使用同一增长项。
+/// 默认参数下根 `C(0)=1.75`、`C(50k)≈5.75`，非根 `C(0)=1`、`C(50k)≈5`。
 /// `cpuct_base` 越小，增长越早开始；`cpuct_factor` 控制增长幅度。
 /// 形状历史上参考过常见 PUCT 实现；默认参数由 X7 实验选定。
-pub(crate) fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
-    if params.cpuct_factor == 0.0 {
-        params.cpuct
-    } else {
-        params.cpuct + params.cpuct_factor * fast_log((visits as f32 + params.cpuct_base) / params.cpuct_base)
-    }
+pub(crate) fn compute_cpuct(params: SearchParams, visits: u32, is_root: bool) -> f32 {
+    let initial = params.cpuct + if is_root { 0.75 } else { 0.0 };
+    initial + params.cpuct_factor * fast_log((visits as f32 + params.cpuct_base) / params.cpuct_base)
 }
 
 /// reduction 越大，未知 edge 的 FPU 越低，越晚获得首次选择。
@@ -203,12 +204,17 @@ pub fn select_edge(
     }
     let is_root = depth == 0;
     let children_visits = parent_completed_visits.saturating_sub(1);
-    let cpuct = compute_cpuct(*params, parent_completed_visits);
+    let cpuct = compute_cpuct(*params, parent_completed_visits, is_root);
     let u_coeff = cpuct * (children_visits.max(1) as f32).sqrt();
     let fpu = get_fpu(repository, params, parent_q, edges);
     let mut best: Option<(usize, f32)> = None;
     let filter_root_moves = is_root && !root_move_filter.is_empty();
     for (index, edge) in edges.iter().enumerate() {
+        // 这条合法着会闭合 shared-Q 图环，已被 repository 永久排除。它不是
+        // history 终局，也不应继续占用 PUCT / reservation。
+        if edge.topology_pruned() {
+            continue;
+        }
         if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
             continue;
         }
@@ -259,11 +265,14 @@ mod tests {
     #[test]
     fn defaults_use_the_selected_constant_cpuct() {
         let params = SearchParams::default();
-        assert_eq!(params.cpuct, 1.5);
+        assert_eq!(params.cpuct, 1.0);
         assert_eq!(params.cpuct_base, 2_000.0);
-        assert_eq!(params.cpuct_factor, 1.347_017);
+        assert_eq!(params.cpuct_factor, 1.226_202);
         assert_eq!(params.fpu_reduction, 0.200);
-        assert_eq!(compute_cpuct(params, 0), params.cpuct);
+        assert_eq!(compute_cpuct(params, 0, false), params.cpuct);
+        assert_eq!(compute_cpuct(params, 0, true), 1.75);
+        assert!((compute_cpuct(params, 50_000, false) - 5.0).abs() < 0.000_01);
+        assert!((compute_cpuct(params, 50_000, true) - 5.75).abs() < 0.000_01);
     }
 
     #[test]
@@ -273,7 +282,8 @@ mod tests {
             cpuct_factor: 0.0,
             ..SearchParams::default()
         };
-        assert_eq!(compute_cpuct(params, 10_000), 1.25);
+        assert_eq!(compute_cpuct(params, 10_000, false), 1.25);
+        assert_eq!(compute_cpuct(params, 10_000, true), 2.0);
     }
 
     #[test]
