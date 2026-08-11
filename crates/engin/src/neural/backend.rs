@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use xiangqi_core::{MoveList, Position};
+use xiangqi_core::Position;
 
 use crate::EnginError;
 
@@ -51,18 +51,23 @@ pub struct EvalResult {
     pub policies: Vec<f32>,
 }
 
-/// 一次评估请求：当前局面序列 + 合法着（仅编码用，不含规则裁决历史）。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EvalPosition {
-    pub positions: Vec<Position>,
-    pub legal_moves: MoveList,
+/// NN cache 的完整命中校验：当前棋盘与合法着数量。
+///
+/// 完整 history 只用于输入编码和规则裁决；cache 不读取它，不能因此在热路径复制。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvalCacheKey {
+    board: u64,
+    num_moves: usize,
 }
 
-impl EvalPosition {
+impl EvalCacheKey {
     /// 与 MCGS `NodeKey::board` 一致的 state key。NN cache 刻意只按当前棋盘复用，
     /// 不纳入完整 history 或 `Position::repetitions`；这是为了与 graph node 一致的取舍。
-    pub(crate) fn board_key(&self) -> u64 {
-        self.positions.last().map_or(0, |position| position.board().hash())
+    pub fn new(position: &Position, num_moves: usize) -> Self {
+        Self {
+            board: position.board().hash(),
+            num_moves,
+        }
     }
 }
 
@@ -70,7 +75,7 @@ impl EvalPosition {
 pub trait Backend: Send + Sync {
     fn attributes(&self) -> BackendAttributes;
 
-    fn cached_evaluation(&self, _position: &EvalPosition) -> Option<Arc<EvalResult>> {
+    fn cached_evaluation(&self, _key: EvalCacheKey) -> Option<Arc<EvalResult>> {
         None
     }
 
@@ -84,7 +89,7 @@ pub trait Backend: Send + Sync {
     ) -> Result<(), EnginError>;
 
     /// Eval 构造完整 `EvalResult` 后可选地写入 cache。
-    fn store_evaluation(&self, _position: &EvalPosition, _result: Arc<EvalResult>) {}
+    fn store_evaluation(&self, _key: EvalCacheKey, _result: Arc<EvalResult>) {}
 
     /// 非缓存 backend 的空实现。
     fn clear_cache(&self) {}
@@ -111,12 +116,8 @@ impl CachingBackend {
         }
     }
 
-    fn cache_key(position: &EvalPosition) -> u64 {
-        position.board_key()
-    }
-
-    fn cached(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
-        self.cache.get(Self::cache_key(position), position.legal_moves.len())
+    fn cached(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
+        self.cache.get(key.board, key.num_moves)
     }
 
     fn resize_cache(&self, size_power_of_two: u8) {
@@ -129,8 +130,8 @@ impl Backend for CachingBackend {
         self.wrapped.attributes()
     }
 
-    fn cached_evaluation(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
-        self.cached(position)
+    fn cached_evaluation(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
+        self.cached(key)
     }
 
     fn infer_input_planes_into(
@@ -143,12 +144,12 @@ impl Backend for CachingBackend {
         self.wrapped.infer_input_planes_into(samples, logits, wdl, moves_left)
     }
 
-    fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {
+    fn store_evaluation(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
         self.cache.insert(
-            Self::cache_key(position),
+            key.board,
             CachedEval {
                 result,
-                num_moves: position.legal_moves.len(),
+                num_moves: key.num_moves,
             },
         );
     }
@@ -185,10 +186,6 @@ impl Default for UniformBackend {
 }
 
 impl UniformBackend {
-    fn cache_key(position: &EvalPosition) -> u64 {
-        position.board_key()
-    }
-
     pub fn with_wdl(wl: f32, d: f32, plies_left: f32) -> Self {
         Self {
             wl,
@@ -200,10 +197,8 @@ impl UniformBackend {
 }
 
 impl Backend for UniformBackend {
-    fn cached_evaluation(&self, position: &EvalPosition) -> Option<Arc<EvalResult>> {
-        let key = Self::cache_key(position);
-        let requested_moves = position.legal_moves.len();
-        self.cache.get(key, requested_moves)
+    fn cached_evaluation(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
+        self.cache.get(key.board, key.num_moves)
     }
 
     fn attributes(&self) -> BackendAttributes {
@@ -231,8 +226,8 @@ impl Backend for UniformBackend {
         Ok(())
     }
 
-    fn store_evaluation(&self, position: &EvalPosition, result: Arc<EvalResult>) {
-        self.store_cache(position, result);
+    fn store_evaluation(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
+        self.store_cache(key, result);
     }
 
     fn clear_cache(&self) {
@@ -245,13 +240,12 @@ impl Backend for UniformBackend {
 }
 
 impl UniformBackend {
-    pub fn store_cache(&self, position: &EvalPosition, result: Arc<EvalResult>) {
-        let key = Self::cache_key(position);
+    pub fn store_cache(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
         self.cache.insert(
-            key,
+            key.board,
             CachedEval {
                 result,
-                num_moves: position.legal_moves.len(),
+                num_moves: key.num_moves,
             },
         );
     }
@@ -261,15 +255,12 @@ impl UniformBackend {
 mod tests {
     use std::sync::Arc;
 
-    use xiangqi_core::{Move, STARTPOS_FEN};
+    use xiangqi_core::STARTPOS_FEN;
 
     use super::*;
 
-    fn startpos_request(num_moves: usize) -> EvalPosition {
-        EvalPosition {
-            positions: vec![Position::from_fen(STARTPOS_FEN).expect("startpos")],
-            legal_moves: vec![Move::NULL; num_moves],
-        }
+    fn startpos_key(num_moves: usize) -> EvalCacheKey {
+        EvalCacheKey::new(&Position::from_fen(STARTPOS_FEN).expect("startpos"), num_moves)
     }
 
     #[test]
@@ -291,30 +282,30 @@ mod tests {
     #[test]
     fn caching_backend_returns_hits_only_after_completed_batch_and_checks_move_count() {
         let backend = CachingBackend::new(Box::new(UniformBackend::default()));
-        let request = startpos_request(2);
-        assert!(backend.cached_evaluation(&request).is_none());
-        backend.store_evaluation(&request, Arc::new(EvalResult::default()));
-        assert!(backend.cached_evaluation(&request).is_some());
-        assert!(backend.cached_evaluation(&startpos_request(1)).is_none());
+        let request = startpos_key(2);
+        assert!(backend.cached_evaluation(request).is_none());
+        backend.store_evaluation(request, Arc::new(EvalResult::default()));
+        assert!(backend.cached_evaluation(request).is_some());
+        assert!(backend.cached_evaluation(startpos_key(1)).is_none());
     }
 
     #[test]
     fn caching_backend_new_game_clear_boundary_removes_completed_entries() {
         let backend = CachingBackend::new(Box::new(UniformBackend::default()));
-        let request = startpos_request(1);
-        backend.store_evaluation(&request, Arc::new(EvalResult::default()));
-        assert!(backend.cached_evaluation(&startpos_request(1)).is_some());
+        let request = startpos_key(1);
+        backend.store_evaluation(request, Arc::new(EvalResult::default()));
+        assert!(backend.cached_evaluation(startpos_key(1)).is_some());
 
         backend.clear_cache();
-        assert!(backend.cached_evaluation(&startpos_request(1)).is_none());
+        assert!(backend.cached_evaluation(startpos_key(1)).is_none());
     }
 
     #[test]
     fn caching_backend_can_use_a_single_cache_slot() {
         let backend = CachingBackend::new(Box::new(UniformBackend::default()));
         backend.set_cache_size_power_of_two(0);
-        let request = startpos_request(1);
-        backend.store_evaluation(&request, Arc::new(EvalResult::default()));
-        assert!(backend.cached_evaluation(&startpos_request(1)).is_some());
+        let request = startpos_key(1);
+        backend.store_evaluation(request, Arc::new(EvalResult::default()));
+        assert!(backend.cached_evaluation(startpos_key(1)).is_some());
     }
 }

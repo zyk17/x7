@@ -75,6 +75,7 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $bundle "trt_cache") -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $releaseDir "engin.exe") -Destination (Join-Path $bundle "engin.exe") -Force
     Copy-Item -LiteralPath $model -Destination (Join-Path $bundle "x7.onnx") -Force
+    Copy-Item -LiteralPath (Join-Path $repoRoot "TRT-README.txt") -Destination (Join-Path $bundle "TRT-README.txt") -Force
     foreach ($name in $ortFiles) {
         Copy-Item -LiteralPath (Join-Path $releaseDir $name) -Destination $bundle -Force
     }
@@ -85,6 +86,7 @@ try {
     $manifest = [ordered]@{
         engine = "engin.exe"
         model = "x7.onnx"
+        readme = "TRT-README.txt"
         execution_provider = "TensorrtExecutionProvider"
         onnx_runtime = "Microsoft.ML.OnnxRuntime.Gpu.Windows (CUDA13 package with TensorRT EP)"
         tensorrt_abi = "nvinfer_10.dll (TensorRT 10.x)"

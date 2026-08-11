@@ -17,7 +17,7 @@ use parking_lot::{Condvar, Mutex};
 use xiangqi_core::{Move, PositionHistory};
 
 use crate::EnginError;
-use crate::neural::backend::{Backend, EvalPosition, EvalResult};
+use crate::neural::backend::{Backend, EvalCacheKey, EvalResult};
 use crate::neural::{
     EncodedBatch, FillEmptyHistory, InputPlanes, encode_position_input_planes, eval_result_from_encoded_row,
 };
@@ -1049,7 +1049,7 @@ struct WaitingNn {
     event: NodeEvent,
     node: Arc<Node>,
     legal_moves: Vec<xiangqi_core::Move>,
-    input: EvalPosition,
+    cache_key: EvalCacheKey,
     reply: Receiver<NnReply>,
 }
 
@@ -1205,11 +1205,8 @@ fn handle_eval_event(
         }
         ExtensionKind::Evaluate => {
             let legal_moves = history.last().board().generate_legal_moves();
-            let input = EvalPosition {
-                positions: history.positions().to_vec(),
-                legal_moves: legal_moves.clone(),
-            };
-            if let Some(eval) = shared.backend.cached_evaluation(&input) {
+            let cache_key = EvalCacheKey::new(history.last(), legal_moves.len());
+            if let Some(eval) = shared.backend.cached_evaluation(cache_key) {
                 shared.cache_hits.fetch_add(1, Ordering::AcqRel);
                 return publish_eval(shared, event, node, legal_moves, eval);
             }
@@ -1236,7 +1233,7 @@ fn handle_eval_event(
                 event,
                 node,
                 legal_moves,
-                input,
+                cache_key,
                 reply: reply_rx,
             });
             Ok(())
@@ -1272,7 +1269,7 @@ fn complete_nn_item(shared: &Shared, item: WaitingNn, batch: Arc<EncodedBatch>, 
             return Err(error);
         }
     };
-    shared.backend.store_evaluation(&item.input, Arc::clone(&eval));
+    shared.backend.store_evaluation(item.cache_key, Arc::clone(&eval));
     publish_eval(shared, item.event, item.node, item.legal_moves, eval)
 }
 
