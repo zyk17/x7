@@ -17,10 +17,13 @@ position startpos
 go nodes 1000
 ```
 
-本机开发默认构建 DirectML。NVIDIA 线为 TensorRT：`scripts/build-tensorrt.ps1`（脚本头部固定本机
-ORT / CUDA / TensorRT 路径，换机器改那几行即可）。ORT GPU 包需带 TensorRT EP，且 TensorRT **必须是 10.x**
-（`nvinfer_10.dll`）；不要装 TRT 11。本机另需 CUDA 13 / cuDNN 9。发行时显式选择两种互斥包：
-`build-directml.ps1` 与 `build-tensorrt.ps1`，二者不是同一二进制的运行时回退链。
+本机开发默认构建 DirectML。NVIDIA 线为 TensorRT：开发用
+`cargo run -p engin --release --no-default-features --features tensorrt`（必须
+`--no-default-features`，否则会叠上默认 DirectML）；打包用 `scripts/build-tensorrt.ps1`
+（脚本头部固定本机 ORT / CUDA / TensorRT 路径，换机器改那几行即可）。ORT GPU 包需带
+TensorRT EP，且 TensorRT **必须是 10.x**（`nvinfer_10.dll`）；不要装 TRT 11。本机另需
+CUDA 13 / cuDNN 9。发行时显式选择两种互斥包：`build-directml.ps1` 与 `build-tensorrt.ps1`，
+二者不是同一二进制的运行时回退链。
 
 ## UCI 范围
 

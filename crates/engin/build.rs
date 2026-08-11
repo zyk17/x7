@@ -23,7 +23,11 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"));
     let nvcc = cuda.join("bin/nvcc.exe");
-    assert!(nvcc.is_file(), "nvcc missing: {} (set CUDA_PATH / X7_CUDA_PATH)", nvcc.display());
+    assert!(
+        nvcc.is_file(),
+        "nvcc missing: {} (set CUDA_PATH / X7_CUDA_PATH)",
+        nvcc.display()
+    );
 
     let obj = out_dir.join("onnx_kernels.obj");
     let mut cmd = Command::new(&nvcc);
@@ -41,8 +45,7 @@ fn main() {
     ]);
     // nvcc 需要 cl.exe；本机默认 VS 18 MSVC，可用 X7_MSVC_BIN 覆盖。
     let msvc_bin = env::var("X7_MSVC_BIN").unwrap_or_else(|_| {
-        r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64"
-            .into()
+        r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64".into()
     });
     let mut path = env::var_os("PATH").unwrap_or_default();
     let mut prefixed = std::ffi::OsString::from(&msvc_bin);

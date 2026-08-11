@@ -12,12 +12,7 @@ unsafe extern "C" {
     fn x7_cuda_stream_synchronize(stream: *mut c_void) -> i32;
     fn x7_cuda_malloc(out: *mut *mut c_void, bytes: usize) -> i32;
     fn x7_cuda_free(ptr: *mut c_void) -> i32;
-    fn x7_cuda_memcpy_h2d_async(
-        dst: *mut c_void,
-        src: *const c_void,
-        bytes: usize,
-        stream: *mut c_void,
-    ) -> i32;
+    fn x7_cuda_memcpy_h2d_async(dst: *mut c_void, src: *const c_void, bytes: usize, stream: *mut c_void) -> i32;
     fn x7_expand_planes_f32(output: *mut f32, packed: *const c_void, n: u32, stream: *mut c_void) -> i32;
 }
 

@@ -3,7 +3,10 @@
 //! DirectML：host expand + `Session::run`。TensorRT：GPU expand + IoBinding。
 
 #[cfg(all(feature = "tensorrt", feature = "directml"))]
-compile_error!("ONNX runtime build must select either `tensorrt` or `directml`, not both");
+compile_error!(
+    "enable exactly one EP: DirectML is default; for TensorRT use \
+     `--no-default-features --features tensorrt`"
+);
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -25,9 +28,9 @@ use ort::ep::{DirectML, directml::PerformancePreference};
 #[cfg(feature = "tensorrt")]
 use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::Session;
+use ort::value::TensorRef;
 #[cfg(feature = "tensorrt")]
 use ort::value::{Shape, Tensor, TensorRefMut};
-use ort::value::TensorRef;
 use xiangqi_core::PositionHistory;
 
 use super::{
@@ -149,7 +152,11 @@ impl OnnxSessions {
     fn chunk_size(&self) -> usize {
         #[cfg(feature = "tensorrt")]
         {
-            usize::MAX
+            if self.trt_gpu.is_some() {
+                TRT_MAX_BATCH
+            } else {
+                usize::MAX
+            }
         }
         #[cfg(feature = "directml")]
         {
@@ -264,22 +271,9 @@ fn recommended_batch_size(provider: OnnxProvider) -> usize {
     }
 }
 
-#[cfg(feature = "tensorrt")]
-fn maximum_batch_size(provider: OnnxProvider) -> usize {
-    if provider == OnnxProvider::TensorRt {
-        TRT_MAX_BATCH
-    } else {
-        1024
-    }
-}
-
-#[cfg(feature = "directml")]
-fn maximum_batch_size(provider: OnnxProvider) -> usize {
-    if provider == OnnxProvider::DirectMl {
-        DML_MAX_BATCH
-    } else {
-        1024
-    }
+/// UCI `MiniBatchSize` 硬顶与 option spin 对齐；单次 ORT run 仍按 provider 内部分块。
+fn maximum_batch_size(_provider: OnnxProvider) -> usize {
+    1024
 }
 
 /// ORT TensorRT EP：动态 batch、engine cache、user compute stream（px0 TRT 选项语义）。
@@ -523,7 +517,19 @@ fn infer_input_planes(
     #[cfg(feature = "tensorrt")]
     if let Some(gpu) = sessions.trt_gpu.as_mut() {
         let session = &mut sessions.sessions[0].1;
-        return infer_input_planes_trt(session, gpu, samples, all_logits, all_wdl, all_moves_left);
+        let chunk = gpu.max_batch.max(1);
+        for chunk_start in (0..batch).step_by(chunk) {
+            let end = (chunk_start + chunk).min(batch);
+            infer_input_planes_trt(
+                session,
+                gpu,
+                &samples[chunk_start..end],
+                all_logits,
+                all_wdl,
+                all_moves_left,
+            )?;
+        }
+        return Ok(());
     }
 
     let plane_len = ENCODED_PLANE_FLOATS;
@@ -584,7 +590,8 @@ fn infer_input_planes_trt(
     let board = unsafe {
         // ORT 不拥有 dense_dev；Session/IoBinding 须先于 CudaStream 销毁（OnnxSessions 字段序保证）。
         TensorRefMut::<f32>::from_raw(
-            MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default).map_err(onnx_error)?,
+            MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)
+                .map_err(onnx_error)?,
             gpu.dense_dev.as_ptr(),
             Shape::new([batch as i64, INPUT_PLANES as i64, BOARD_ROWS as i64, BOARD_COLS as i64]),
         )
@@ -595,13 +602,19 @@ fn infer_input_planes_trt(
     let mut binding = session.create_binding().map_err(onnx_error)?;
     binding.bind_input("board", &board).map_err(onnx_error)?;
     binding
-        .bind_output("logits", Tensor::<f32>::new(&allocator, [batch, POLICY_SIZE]).map_err(onnx_error)?)
+        .bind_output(
+            "logits",
+            Tensor::<f32>::new(&allocator, [batch, POLICY_SIZE]).map_err(onnx_error)?,
+        )
         .map_err(onnx_error)?;
     binding
         .bind_output("value", Tensor::<f32>::new(&allocator, [batch, 3]).map_err(onnx_error)?)
         .map_err(onnx_error)?;
     binding
-        .bind_output("moves_left", Tensor::<f32>::new(&allocator, [batch, 1]).map_err(onnx_error)?)
+        .bind_output(
+            "moves_left",
+            Tensor::<f32>::new(&allocator, [batch, 1]).map_err(onnx_error)?,
+        )
         .map_err(onnx_error)?;
     let outputs = session.run_binding(&binding).map_err(onnx_error)?;
     binding.synchronize_outputs().map_err(onnx_error)?;

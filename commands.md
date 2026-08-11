@@ -257,6 +257,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1 `
 CUDA 已改为 TensorRT 专用备用包，需要 CUDA 13（含 nvcc）、cuDNN 9、TensorRT 10（`nvinfer_10.dll`）。
 路径写在 `scripts/build-tensorrt.ps1` 与 `crates/engin/build.rs` 头部（`CUDA_PATH` / `X7_MSVC_BIN` 可覆盖）。
 
+开发构建（必须关掉默认 `directml`，否则 feature 互斥）：
+
+```powershell
+cargo run -p engin --release --no-default-features --features tensorrt
+```
+
+打包：
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-tensorrt.ps1
 ```
