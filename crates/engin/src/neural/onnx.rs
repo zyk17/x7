@@ -18,7 +18,7 @@ use crate::neural::backend::{
     EvalTicket,
 };
 #[cfg(feature = "tensorrt")]
-use crate::neural::cuda_trt::{CudaStream, DeviceBuffer, expand_planes_async};
+use crate::neural::cuda_trt::{CudaStream, DeviceBuffer, download_device_async, expand_planes_async};
 #[cfg(feature = "tensorrt")]
 use ndarray::Array4;
 #[cfg(feature = "tensorrt")]
@@ -30,7 +30,7 @@ use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, Memory
 use ort::session::Session;
 use ort::value::TensorRef;
 #[cfg(feature = "tensorrt")]
-use ort::value::{Shape, Tensor, TensorRefMut};
+use ort::value::{Shape, Tensor, TensorRefMut, TensorValueType};
 use xiangqi_core::PositionHistory;
 
 use super::{
@@ -82,26 +82,74 @@ const DML_BATCH_STEPS: usize = 4;
 #[cfg(feature = "directml")]
 const DML_MAX_BATCH: usize = DML_BATCH_STEP * DML_BATCH_STEPS;
 
+/// TensorRT GPU 状态。
+///
+/// 字段声明顺序 = drop 顺序：先释放输出 Tensor，再 Allocator（其 Arc 可能拖住 Session），
+/// `stream` 必须最后销毁（ORT TRT 仍可能引用 user compute stream）。
 #[cfg(feature = "tensorrt")]
 struct TrtGpu {
-    stream: CudaStream,
+    logits: Option<Tensor<f32>>,
+    value: Option<Tensor<f32>>,
+    moves_left: Option<Tensor<f32>>,
+    allocator: Allocator,
     sparse_host: Vec<u8>,
     sparse_dev: DeviceBuffer,
     dense_dev: DeviceBuffer,
+    logits_host: Vec<f32>,
+    value_host: Vec<f32>,
+    moves_left_host: Vec<f32>,
+    /// 与 `logits/value/moves_left` 对应的 batch；0 表示需重建。
+    out_batch: usize,
     max_batch: usize,
+    stream: CudaStream,
 }
 
 #[cfg(feature = "tensorrt")]
 impl TrtGpu {
-    fn new(stream: CudaStream, max_batch: usize) -> Result<Self, EnginError> {
+    fn new(stream: CudaStream, allocator: Allocator, max_batch: usize) -> Result<Self, EnginError> {
         let n = max_batch * INPUT_PLANES;
         Ok(Self {
-            stream,
+            logits: None,
+            value: None,
+            moves_left: None,
+            allocator,
             sparse_host: Vec::new(),
             sparse_dev: DeviceBuffer::new(n * (size_of::<u128>() + size_of::<f32>()))?,
             dense_dev: DeviceBuffer::new(max_batch * ENCODED_PLANE_FLOATS * size_of::<f32>())?,
+            logits_host: Vec::new(),
+            value_host: Vec::new(),
+            moves_left_host: Vec::new(),
+            out_batch: 0,
             max_batch,
+            stream,
         })
+    }
+
+    fn take_outputs(&mut self, batch: usize) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>), EnginError> {
+        if self.out_batch != batch || self.logits.is_none() || self.value.is_none() || self.moves_left.is_none() {
+            self.logits = Some(Tensor::<f32>::new(&self.allocator, [batch, POLICY_SIZE]).map_err(onnx_error)?);
+            self.value = Some(Tensor::<f32>::new(&self.allocator, [batch, 3]).map_err(onnx_error)?);
+            self.moves_left = Some(Tensor::<f32>::new(&self.allocator, [batch, 1]).map_err(onnx_error)?);
+            self.out_batch = batch;
+        }
+        Ok((
+            self.logits.take().expect("logits"),
+            self.value.take().expect("value"),
+            self.moves_left.take().expect("moves_left"),
+        ))
+    }
+
+    fn put_outputs(&mut self, logits: Tensor<f32>, value: Tensor<f32>, moves_left: Tensor<f32>) {
+        self.logits = Some(logits);
+        self.value = Some(value);
+        self.moves_left = Some(moves_left);
+    }
+
+    fn clear_outputs(&mut self) {
+        self.logits = None;
+        self.value = None;
+        self.moves_left = None;
+        self.out_batch = 0;
     }
 }
 
@@ -309,7 +357,15 @@ fn create_tensorrt_sessions(path: &Path) -> Result<OnnxSessions, EnginError> {
         .commit_from_file(path)
         .map_err(onnx_error)?;
     validate_tensorrt_session(&mut session)?;
-    Ok(OnnxSessions::tensor_rt(session, TrtGpu::new(stream, TRT_MAX_BATCH)?))
+    let allocator = Allocator::new(
+        &session,
+        MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default).map_err(onnx_error)?,
+    )
+    .map_err(onnx_error)?;
+    Ok(OnnxSessions::tensor_rt(
+        session,
+        TrtGpu::new(stream, allocator, TRT_MAX_BATCH)?,
+    ))
 }
 
 #[cfg(feature = "tensorrt")]
@@ -588,7 +644,7 @@ fn infer_input_planes_trt(
     gpu.stream.sync()?;
 
     let board = unsafe {
-        // ORT 不拥有 dense_dev；Session/IoBinding 须先于 CudaStream 销毁（OnnxSessions 字段序保证）。
+        // ORT 不拥有 dense_dev；见 TrtGpu 字段序（stream 最后销毁）。
         TensorRefMut::<f32>::from_raw(
             MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)
                 .map_err(onnx_error)?,
@@ -598,30 +654,79 @@ fn infer_input_planes_trt(
     }
     .map_err(onnx_error)?;
 
-    let allocator = Allocator::default();
-    let mut binding = session.create_binding().map_err(onnx_error)?;
-    binding.bind_input("board", &board).map_err(onnx_error)?;
-    binding
-        .bind_output(
-            "logits",
-            Tensor::<f32>::new(&allocator, [batch, POLICY_SIZE]).map_err(onnx_error)?,
-        )
-        .map_err(onnx_error)?;
-    binding
-        .bind_output("value", Tensor::<f32>::new(&allocator, [batch, 3]).map_err(onnx_error)?)
-        .map_err(onnx_error)?;
-    binding
-        .bind_output(
-            "moves_left",
-            Tensor::<f32>::new(&allocator, [batch, 1]).map_err(onnx_error)?,
-        )
-        .map_err(onnx_error)?;
-    let outputs = session.run_binding(&binding).map_err(onnx_error)?;
-    binding.synchronize_outputs().map_err(onnx_error)?;
-    append_tensor_rows(&outputs, "logits", batch, POLICY_SIZE, batch, all_logits)?;
-    append_tensor_rows(&outputs, "value", batch, 3, batch, all_wdl)?;
-    append_tensor_rows(&outputs, "moves_left", batch, 1, batch, all_moves_left)?;
-    Ok(())
+    let (logits_t, value_t, mlh_t) = gpu.take_outputs(batch)?;
+    let restored = (|| -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>), EnginError> {
+        let mut binding = session.create_binding().map_err(onnx_error)?;
+        binding.bind_input("board", &board).map_err(onnx_error)?;
+        binding.bind_output("logits", logits_t).map_err(onnx_error)?;
+        binding.bind_output("value", value_t).map_err(onnx_error)?;
+        binding.bind_output("moves_left", mlh_t).map_err(onnx_error)?;
+        let mut outputs = session.run_binding(&binding).map_err(onnx_error)?;
+        binding.synchronize_outputs().map_err(onnx_error)?;
+
+        gpu.logits_host.resize(batch * POLICY_SIZE, 0.0);
+        gpu.value_host.resize(batch * 3, 0.0);
+        gpu.moves_left_host.resize(batch, 0.0);
+        {
+            let logits = outputs
+                .get("logits")
+                .ok_or_else(|| EnginError::Onnx("missing logits".into()))?
+                .downcast_ref::<TensorValueType<f32>>()
+                .map_err(onnx_error)?;
+            let value = outputs
+                .get("value")
+                .ok_or_else(|| EnginError::Onnx("missing value".into()))?
+                .downcast_ref::<TensorValueType<f32>>()
+                .map_err(onnx_error)?;
+            let mlh = outputs
+                .get("moves_left")
+                .ok_or_else(|| EnginError::Onnx("missing moves_left".into()))?
+                .downcast_ref::<TensorValueType<f32>>()
+                .map_err(onnx_error)?;
+            download_device_async(f32_bytes_mut(&mut gpu.logits_host), logits.data_ptr(), &gpu.stream)?;
+            download_device_async(f32_bytes_mut(&mut gpu.value_host), value.data_ptr(), &gpu.stream)?;
+            download_device_async(f32_bytes_mut(&mut gpu.moves_left_host), mlh.data_ptr(), &gpu.stream)?;
+            gpu.stream.sync()?;
+        }
+
+        all_logits.extend_from_slice(&gpu.logits_host);
+        all_wdl.extend_from_slice(&gpu.value_host);
+        all_moves_left.extend_from_slice(&gpu.moves_left_host);
+
+        let logits_t = outputs
+            .remove("logits")
+            .ok_or_else(|| EnginError::Onnx("missing logits".into()))?
+            .downcast::<TensorValueType<f32>>()
+            .map_err(onnx_error)?;
+        let value_t = outputs
+            .remove("value")
+            .ok_or_else(|| EnginError::Onnx("missing value".into()))?
+            .downcast::<TensorValueType<f32>>()
+            .map_err(onnx_error)?;
+        let mlh_t = outputs
+            .remove("moves_left")
+            .ok_or_else(|| EnginError::Onnx("missing moves_left".into()))?
+            .downcast::<TensorValueType<f32>>()
+            .map_err(onnx_error)?;
+        Ok((logits_t, value_t, mlh_t))
+    })();
+    match restored {
+        Ok((logits_t, value_t, mlh_t)) => {
+            gpu.put_outputs(logits_t, value_t, mlh_t);
+            Ok(())
+        }
+        Err(error) => {
+            // take 之后失败：tensor 已随 binding/outputs drop；下次重建。
+            gpu.clear_outputs();
+            Err(error)
+        }
+    }
+}
+
+#[cfg(feature = "tensorrt")]
+fn f32_bytes_mut(values: &mut [f32]) -> &mut [u8] {
+    let len = values.len() * size_of::<f32>();
+    unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), len) }
 }
 
 #[cfg(feature = "tensorrt")]

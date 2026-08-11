@@ -13,6 +13,7 @@ unsafe extern "C" {
     fn x7_cuda_malloc(out: *mut *mut c_void, bytes: usize) -> i32;
     fn x7_cuda_free(ptr: *mut c_void) -> i32;
     fn x7_cuda_memcpy_h2d_async(dst: *mut c_void, src: *const c_void, bytes: usize, stream: *mut c_void) -> i32;
+    fn x7_cuda_memcpy_d2h_async(dst: *mut c_void, src: *const c_void, bytes: usize, stream: *mut c_void) -> i32;
     fn x7_expand_planes_f32(output: *mut f32, packed: *const c_void, n: u32, stream: *mut c_void) -> i32;
 }
 
@@ -92,5 +93,13 @@ pub fn expand_planes_async(
     check(
         unsafe { x7_expand_planes_f32(dense.ptr.cast(), sparse.ptr, n_planes, stream.as_ptr()) },
         "expand",
+    )
+}
+
+/// 从任意 device 指针异步 D2H（ORT 输出 Tensor 的 data_ptr）。
+pub fn download_device_async(dst: &mut [u8], src: *const c_void, stream: &CudaStream) -> Result<(), EnginError> {
+    check(
+        unsafe { x7_cuda_memcpy_d2h_async(dst.as_mut_ptr().cast(), src as *mut c_void, dst.len(), stream.as_ptr()) },
+        "D2H",
     )
 }

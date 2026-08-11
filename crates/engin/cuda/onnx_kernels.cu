@@ -101,6 +101,11 @@ extern "C" int x7_cuda_memcpy_h2d_async(void* dst, const void* src, size_t bytes
                                           static_cast<cudaStream_t>(stream)));
 }
 
+extern "C" int x7_cuda_memcpy_d2h_async(void* dst, const void* src, size_t bytes, void* stream) {
+  return static_cast<int>(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost,
+                                          static_cast<cudaStream_t>(stream)));
+}
+
 extern "C" int x7_expand_planes_f32(float* output, const void* packed, unsigned n,
                                     void* stream) {
   constexpr unsigned bits_per_thread = 2;
