@@ -195,7 +195,9 @@ idempotent shared-Q。它必须保留为可复查决策；若实战证明长将�
    `repetitions >= 2`，才调用 `RuleJudge` 得到 path-local terminal。
 
 这样 shared graph 始终无环，而真实循环仍有足够路径历史交给棋规裁判；ContinuationTree 不反向连接
-shared graph，也不会在跨回合 GC 中作为共享子图保留。
+shared graph。若当前完整 history 自最近零化着以来已经出现重复，下一回合的 root 仍使用与该历史对应的
+contextual key；因此可达 GC 会保留这棵局部树及其 descendants。零化着清空重复上下文后，root 自然
+回到普通 board graph。普通 graph 与 ContinuationTree 始终只共享 NN cache，不共享 N/Q。
 
 ## 跨回合复用与 GC
 

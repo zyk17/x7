@@ -110,11 +110,7 @@ pub struct NodeEvent {
 
 impl NodeEvent {
     pub fn root(generation: SearchGeneration, root_history: Arc<PositionHistory>) -> Self {
-        Self::at_root(
-            generation,
-            NodeKey::board(root_history.last().board().hash()),
-            root_history,
-        )
+        Self::at_root(generation, NodeKey::for_history(root_history.as_ref()), root_history)
     }
 
     pub fn at_root(generation: SearchGeneration, root_key: NodeKey, root_history: Arc<PositionHistory>) -> Self {
@@ -483,6 +479,58 @@ mod tests {
         assert!(edge.child_key().is_none());
         assert_eq!(node.completed_visits(), 2);
         assert!((node.q() + 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn continuation_tree_updates_inside_then_samples_its_root_at_the_shard_entry() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let root = NodeEvent::root(
+            SearchGeneration(12),
+            Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
+        );
+        let repository = NodeRepository::default();
+        let shard = repository.get_or_insert(root.node_key);
+        assert!(shard.try_begin_evaluation());
+        let entry_move = Move::new(
+            xiangqi_core::Square::parse("b2").expect("b2"),
+            xiangqi_core::Square::parse("b3").expect("b3"),
+        );
+        shard.publish_edges(vec![(entry_move, 1.0)]);
+        shard.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+
+        let continuation_key = NodeKey::continuation(42, 99);
+        let continuation = repository.get_or_insert(continuation_key);
+        assert!(continuation.try_begin_evaluation());
+        let inside_move = Move::new(
+            xiangqi_core::Square::parse("c2").expect("c2"),
+            xiangqi_core::Square::parse("c3").expect("c3"),
+        );
+        continuation.publish_edges(vec![(inside_move, 1.0)]);
+        continuation.set_graph_value(crate::search::ValueDelta::with_plies_left(0.4, 0.0, 2.0));
+
+        let leaf_key = NodeKey::continuation(43, 100);
+        let leaf = repository.get_or_insert(leaf_key);
+        leaf.set_graph_value(crate::search::ValueDelta::with_plies_left(0.8, 0.0, 3.0));
+        continuation.edges()[0].bind_child_key(leaf_key);
+
+        let event = root
+            .descend_continuation(continuation_key, shard.reserve_edge(0).expect("entry edge"))
+            .descend(leaf_key, continuation.reserve_edge(0).expect("inside edge"));
+        BackpropEvent::complete_batch([BackpropEvent::evaluation(event)], &repository);
+
+        // 树内：leaf 的 +0.8 先按换手传给 continuation；base +0.4 与该一次
+        // child visit 平均后为 -0.2。进入树的普通 Shard edge 再只采样这个
+        // contextual root 的当前值，不绑定它为 shared child。
+        assert_eq!(leaf.completed_visits(), 1);
+        assert!((leaf.q() - 0.8).abs() < f32::EPSILON);
+        assert_eq!(continuation.edges()[0].completed_visits(), 1);
+        assert_eq!(continuation.completed_visits(), 2);
+        assert!((continuation.q() + 0.2).abs() < f32::EPSILON);
+        assert_eq!(shard.edges()[0].completed_visits(), 1);
+        assert!(shard.edges()[0].child_key().is_none());
+        assert!((shard.edges()[0].completed_stats().local_leaf.q() + 0.2).abs() < f32::EPSILON);
+        assert_eq!(shard.completed_visits(), 2);
+        assert!((shard.q() - 0.1).abs() < f32::EPSILON);
     }
 
     #[test]

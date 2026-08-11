@@ -67,7 +67,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 
 ## Stream
 
-- repository 是一个 64 分片的 key-value map。普通 MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。真实 variation 第一次重复时不接回 shared graph，而是以该重复局面为根进入纯 `ContinuationTree`：其 key 纳入自最近零化着以来的规则 history，树内不换位合并，只复用按棋盘索引的 NN cache；第三次出现同一局面才由 `RuleJudge` 终局。首次绑定普通 shared edge 若 DFS 发现会形成 shared-Q 图环，则永久标为 topology-pruned 并从 PUCT 排除，不写 N/Q，也不伪装成棋规和棋。这是为保持 shared-Q 无环的 X7 结构近似，须由残局回归与 Elo 验证。
+- repository 是一个 64 分片的 key-value map。普通 MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。真实 variation 第一次重复时不接回 shared graph，而是以该重复局面为根进入纯 `ContinuationTree`：其 key 纳入自最近零化着以来的规则 history，树内不换位合并，只复用按棋盘索引的 NN cache；该重复上下文持续到下一次零化着，故跨回合 root 继续使用与完整 history 对应的 contextual key 并保留局部树；第三次出现同一局面才由 `RuleJudge` 终局。首次绑定普通 shared edge 若 DFS 发现会形成 shared-Q 图环，则永久标为 topology-pruned 并从 PUCT 排除，不写 N/Q，也不伪装成棋规和棋。这是为保持 shared-Q 无环的 X7 结构近似，须由残局回归与 Elo 验证。
 - NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
 - Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、稀疏合批推理，并以整批 `EncodedBatch` 交回。

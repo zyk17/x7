@@ -58,6 +58,21 @@ impl NodeKey {
         }
     }
 
+    /// 当前 history 应使用的 repository identity。
+    ///
+    /// 普通 MCGS 只按 board 共享。一次真实重复出现后，到下一次零化着之前的
+    /// variation 都必须留在 ContinuationTree：否则跨回合重新落回 board node，
+    /// 已积累的 edge N/Q 会被无意义地丢弃，且会再次与无历史的 shared-Q 混用。
+    /// 零化着（吃子或兵走）会清空重复规则上下文，随后自然回到普通 board graph。
+    pub fn for_history(history: &PositionHistory) -> Self {
+        let board_hash = history.last().board().hash();
+        if history.did_repeat_since_last_zeroing_move() {
+            Self::continuation(board_hash, history.rule_context_hash())
+        } else {
+            Self::board(board_hash)
+        }
+    }
+
     pub const fn is_continuation(self) -> bool {
         self.context.is_some()
     }
@@ -626,7 +641,7 @@ pub struct SearchGraph {
 
 impl SearchGraph {
     pub fn new(root_history: Arc<PositionHistory>) -> Self {
-        let root = NodeKey::board(root_history.last().board().hash());
+        let root = NodeKey::for_history(root_history.as_ref());
         Self {
             repository: Arc::new(NodeRepository::default()),
             root_key: root,
@@ -675,7 +690,7 @@ impl SearchGraph {
 
         let mut history = self.root_history().as_ref().clone();
         history.append(mv);
-        let new_root = NodeKey::board(history.last().board().hash());
+        let new_root = NodeKey::for_history(&history);
         self.repository.get_or_insert(new_root);
         self.root_key = new_root;
         self.root_history = Arc::new(history);
@@ -752,7 +767,7 @@ impl SearchGraph {
             return Ok(None);
         }
 
-        let root = NodeKey::board(target.last().board().hash());
+        let root = NodeKey::for_history(target.as_ref());
         let retired = std::mem::replace(&mut self.repository, Arc::new(NodeRepository::default()));
         self.root_key = root;
         self.root_history = target;
@@ -769,6 +784,7 @@ mod graph_tests {
     use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN, Square};
 
     use super::{NodeKey, SearchGraph};
+    use crate::search::Variation;
 
     fn mv(from: &str, to: &str) -> Move {
         Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
@@ -777,6 +793,18 @@ mod graph_tests {
     fn graph() -> SearchGraph {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         SearchGraph::new(Arc::new(PositionHistory::from_positions(state.positions())))
+    }
+
+    fn repeated_history() -> Arc<PositionHistory> {
+        let (board, _) = xiangqi_core::ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
+        let mut history = PositionHistory::default();
+        history.reset(board, 2, 30);
+        for text in ["d9e9", "d2e2", "e9d9", "e2d2"] {
+            let mv = history.last().board().parse_move(text).expect(text);
+            history.append(mv);
+        }
+        assert!(history.did_repeat_since_last_zeroing_move());
+        Arc::new(history)
     }
 
     #[test]
@@ -829,6 +857,40 @@ mod graph_tests {
         assert!(tree.advance(played).is_err());
         reservation.cancel();
         assert!(tree.advance(played).is_ok());
+    }
+
+    #[test]
+    fn repeated_history_keeps_continuation_tree_across_turns() {
+        let history = repeated_history();
+        let mut graph = SearchGraph::new(Arc::clone(&history));
+        let root = NodeKey::for_history(history.as_ref());
+        assert!(root.is_continuation());
+        assert_eq!(graph.root_key(), root);
+
+        let mv = history.last().board().parse_move("d9e9").expect("legal move");
+        let mut variation = Variation::root(Arc::clone(&history));
+        let expected_child = variation.continuation_child_key(mv);
+        let root_node = graph.repository().get_or_insert(root);
+        assert!(root_node.try_begin_evaluation());
+        root_node.publish_edges(vec![(mv, 1.0)]);
+        root_node.edges()[0].bind_child_key(expected_child);
+        let child_node = graph.repository().get_or_insert(expected_child);
+        child_node.set_graph_value(crate::search::ValueDelta::one(0.6, 0.0));
+        graph.repository().recompute_graph_node(expected_child);
+
+        graph.advance(mv).expect("advance contextual root");
+        let gc_root = graph.take_pending_gc_root().expect("advance schedules GC");
+        assert_eq!(graph.repository().retain_from_root(gc_root), 1);
+
+        assert!(graph.root_key().is_continuation());
+        assert_eq!(graph.root_key(), expected_child);
+        let retained = graph
+            .repository()
+            .get(expected_child)
+            .expect("retained contextual root");
+        assert_eq!(retained.completed_visits(), 1);
+        assert!((retained.q() - 0.6).abs() < f32::EPSILON);
+        assert_eq!(NodeKey::for_history(graph.root_history().as_ref()), expected_child);
     }
 
     #[test]
