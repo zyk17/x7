@@ -89,7 +89,7 @@ impl EncodedBatch {
         Ok(())
     }
 
-    /// 为下一轮 `infer_encoded_into` 预留下一轮容量。
+    /// 为下一轮稀疏 batch 推理预留容量。
     pub fn reserve_scratch(logits: &mut Vec<f32>, wdl: &mut Vec<f32>, moves_left: &mut Vec<f32>, batch: usize) {
         logits.reserve(batch * POLICY_SIZE);
         wdl.reserve(batch * 3);
@@ -181,7 +181,7 @@ fn sanitize_stream_value(wdl: &[f32], moves_left: f32) -> Result<([f32; 3], f32)
 
 /// 将合批原始输出的一行转为可缓存的正式 `EvalResult`。
 ///
-/// 参考：px0 `BackendComputation` 的统一结果路径（`src/neural/backend.h:75-87`）。
+/// stream NN worker 的统一结果组装路径。
 pub fn eval_result_from_encoded_row(
     batch: &EncodedBatch,
     row: usize,

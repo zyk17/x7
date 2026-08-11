@@ -1,7 +1,3 @@
-param(
-    [switch]$EmbedTensorRtLibs
-)
-
 $ErrorActionPreference = "Stop"
 
 if ($env:OS -ne "Windows_NT") {
@@ -21,9 +17,9 @@ $trtLibs = "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\s
 # 1) 与 DirectML 互斥，不要混进同一目录。
 # 2) ORT TensorRT EP 依赖 nvinfer_10.dll（TRT 10）；不要用 TRT 11。
 # 3) 发行物带 ORT：onnxruntime / providers_shared / providers_tensorrt（建议同带 providers_cuda）。
-# 4) CUDA/cuDNN/TRT 默认靠 PATH；-EmbedTensorRtLibs 只嵌入核心 TRT DLL（不含巨大的 builder_resource_*）。
+# 4) 包内带完整 TensorRT DLL；CUDA/cuDNN 仍由用户环境提供。
 # 5) trt_cache 只带空目录；engine 由用户首跑按本机 GPU 构建，不要跨卡复用。
-# 6) 嵌入 TRT DLL 前确认 NVIDIA 再分发许可。
+# 6) 发行前确认 NVIDIA 再分发许可。
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $model = (Resolve-Path -LiteralPath (Join-Path $repoRoot "data\x7.onnx")).Path
@@ -42,6 +38,10 @@ foreach ($dir in @($ortNative, $cudaBin, $trtLibs)) {
 }
 if (-not (Test-Path -LiteralPath (Join-Path $trtLibs "nvinfer_10.dll"))) {
     throw "Expected nvinfer_10.dll under `$trtLibs (TRT 10 ABI)."
+}
+$trtFiles = @(Get-ChildItem -LiteralPath $trtLibs -Filter "*.dll" -File)
+if ($trtFiles.Count -eq 0) {
+    throw "No TensorRT DLLs found under `$trtLibs."
 }
 foreach ($name in $ortFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $ortNative $name))) {
@@ -78,16 +78,8 @@ try {
     foreach ($name in $ortFiles) {
         Copy-Item -LiteralPath (Join-Path $releaseDir $name) -Destination $bundle -Force
     }
-
-    if ($EmbedTensorRtLibs) {
-        foreach ($name in @(
-                "nvinfer_10.dll",
-                "nvinfer_plugin_10.dll",
-                "nvonnxparser_10.dll"
-            )) {
-            Copy-Item -LiteralPath (Join-Path $trtLibs $name) -Destination (Join-Path $bundle $name) -Force
-        }
-        Write-Host "Embedded core TensorRT 10 runtime DLLs (builder_resource_* not copied)."
+    foreach ($file in $trtFiles) {
+        Copy-Item -LiteralPath $file.FullName -Destination $bundle -Force
     }
 
     $manifest = [ordered]@{
@@ -96,11 +88,12 @@ try {
         execution_provider = "TensorrtExecutionProvider"
         onnx_runtime = "Microsoft.ML.OnnxRuntime.Gpu.Windows (CUDA13 package with TensorRT EP)"
         tensorrt_abi = "nvinfer_10.dll (TensorRT 10.x)"
-        runtime_requirement = "CUDA 13 + cuDNN 9 + TensorRT 10 on PATH (or -EmbedTensorRtLibs)"
+        runtime_requirement = "CUDA 13 + cuDNN 9 on PATH; TensorRT 10 DLLs are bundled"
         notes = @(
             "Do not mix with DirectML bundle",
             "trt_cache ships empty; end users build engines on first run for their GPU",
-            "ORT TensorRT provider ABI must match nvinfer_10, not nvinfer_11"
+            "ORT TensorRT provider ABI is nvinfer_10 (TensorRT 10.x)",
+            "Bundle includes all DLLs from the configured tensorrt_libs directory"
         )
         files = @(Get-ChildItem -LiteralPath $bundle -File | ForEach-Object {
                 [ordered]@{

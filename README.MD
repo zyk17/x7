@@ -22,7 +22,8 @@ go nodes 1000
 `--no-default-features`，否则会叠上默认 DirectML）；打包用 `scripts/build-tensorrt.ps1`
 （脚本头部固定本机 ORT / CUDA / TensorRT 路径，换机器改那几行即可）。ORT GPU 包需带
 TensorRT EP，且 TensorRT **必须是 10.x**（`nvinfer_10.dll`）；不要装 TRT 11。本机另需
-CUDA 13 / cuDNN 9。发行时显式选择两种互斥包：`build-directml.ps1` 与 `build-tensorrt.ps1`，
+CUDA 13 / cuDNN 9。TensorRT 包会复制配置 `tensorrt_libs` 目录中的全部 DLL（包括
+`nvinfer_builder_resource_*`），因此目标机无需再单独安装 TensorRT。发行时显式选择两种互斥包：`build-directml.ps1` 与 `build-tensorrt.ps1`，
 二者不是同一二进制的运行时回退链。
 
 ## UCI 范围

@@ -269,5 +269,6 @@ cargo run -p engin --release --no-default-features --features tensorrt
 powershell -ExecutionPolicy Bypass -File .\scripts\build-tensorrt.ps1
 ```
 
-它输出到 `bundle-tensorrt\`；TensorRT 与 DirectML 是两份互斥包，不构成运行时回退链。
+它输出到 `bundle-tensorrt\`，并复制配置 `tensorrt_libs` 目录的全部 DLL（包括
+`nvinfer_builder_resource_*`）；目标机仍须提供 CUDA 13 / cuDNN 9。TensorRT 与 DirectML 是两份互斥包，不构成运行时回退链。
 发行包里的 `trt_cache` 保持为空；engine 由用户首跑按本机 GPU 构建。

@@ -73,7 +73,7 @@ pub struct Stats {
     pub network_evaluations: u64,
     /// 正常 Eval 命中的 NN cache 次数。
     pub cache_hits: u64,
-    /// 本次搜索观察到的最大 `BackendComputation` batch。
+    /// 本次搜索观察到的最大 NN batch。
     pub network_batch_size_max: u64,
     #[cfg(feature = "benchmark")]
     pub peak_in_flight: u64,
@@ -1511,54 +1511,50 @@ mod tests {
 
     use super::{NodeEvent, Search, SearchConfig, SearchLimits, Shared};
     use crate::EnginError;
-    use crate::neural::backend::{
-        Backend, BackendAttributes, BackendComputation, EncodedInference, EvalResult, UniformBackend,
-    };
+    use crate::neural::backend::{Backend, BackendAttributes, UniformBackend};
     use crate::search::{
         ExpansionState, NodeRepository, SearchGeneration, SearchGraph, SearchParams, ValueDelta, best_move, root_stats,
     };
 
-    struct FailingComputationBackend;
+    struct FailingInferenceBackend;
 
     struct InvalidValueBackend;
 
-    impl Backend for FailingComputationBackend {
-        fn evaluate(&self, _history: &PositionHistory, _legal_moves: &[Move]) -> Arc<EvalResult> {
-            unreachable!("stream worker must use encoded inference")
-        }
-
+    impl Backend for FailingInferenceBackend {
         fn attributes(&self) -> BackendAttributes {
             BackendAttributes::default()
         }
 
-        fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
-            Err(EnginError::Onnx("test computation failure".to_owned()))
-        }
-
-        fn infer_encoded(&self, _planes: &[f32], _batch: usize) -> Result<EncodedInference, EnginError> {
+        fn infer_input_planes_into(
+            &self,
+            _samples: &[crate::neural::InputPlanes],
+            _logits: &mut Vec<f32>,
+            _wdl: &mut Vec<f32>,
+            _moves_left: &mut Vec<f32>,
+        ) -> Result<(), EnginError> {
             Err(EnginError::Onnx("test computation failure".to_owned()))
         }
     }
 
     impl Backend for InvalidValueBackend {
-        fn evaluate(&self, _history: &PositionHistory, _legal_moves: &[Move]) -> Arc<EvalResult> {
-            unreachable!("stream worker must use encoded inference")
-        }
-
         fn attributes(&self) -> BackendAttributes {
             BackendAttributes::default()
         }
 
-        fn create_computation(&self) -> Result<Box<dyn BackendComputation>, EnginError> {
-            Err(EnginError::Onnx("test computation failure".to_owned()))
-        }
-
-        fn infer_encoded(&self, _planes: &[f32], batch: usize) -> Result<EncodedInference, EnginError> {
-            Ok((
-                vec![0.0; batch * crate::neural::POLICY_SIZE],
-                (0..batch).flat_map(|_| [f32::NAN, 0.0, 0.0]).collect(),
-                vec![0.0; batch],
-            ))
+        fn infer_input_planes_into(
+            &self,
+            samples: &[crate::neural::InputPlanes],
+            logits: &mut Vec<f32>,
+            wdl: &mut Vec<f32>,
+            moves_left: &mut Vec<f32>,
+        ) -> Result<(), EnginError> {
+            logits.clear();
+            logits.resize(samples.len() * crate::neural::POLICY_SIZE, 0.0);
+            wdl.clear();
+            wdl.extend((0..samples.len()).flat_map(|_| [f32::NAN, 0.0, 0.0]));
+            moves_left.clear();
+            moves_left.resize(samples.len(), 0.0);
+            Ok(())
         }
     }
 
@@ -1885,7 +1881,7 @@ mod tests {
     #[test]
     fn nn_inference_failure_drains_claimed_events() {
         let mut pipeline = Search::new(
-            Arc::new(FailingComputationBackend),
+            Arc::new(FailingInferenceBackend),
             SearchGeneration(28),
             startpos_history(),
             SearchConfig::default(),

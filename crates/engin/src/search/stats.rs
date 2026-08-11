@@ -1,6 +1,6 @@
 //! 只读的 stream root 统计、bestmove 与 principal variation。
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -223,7 +223,7 @@ fn ranked_root_edges(
         })
         .collect();
     if root.completed_visits() > 0 {
-        candidates.sort_unstable_by(|left, right| right.2.cmp(&left.2));
+        candidates.sort_unstable_by_key(|candidate| Reverse(candidate.2));
     }
     candidates.into_iter().map(|(edge, child, _)| (edge, child)).collect()
 }
