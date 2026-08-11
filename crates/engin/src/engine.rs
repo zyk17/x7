@@ -528,13 +528,16 @@ impl Engine {
         self.wait()
     }
 
-    /// 替换 position 或 backend 时取消输出但完整 drain reservation。
+    /// 替换 position / backend / 新 `go` 时取消输出并 drain；丢弃上一局结果，避免失败毒化下一条命令。
     fn abort(&mut self) -> Result<(), EnginError> {
         if let Some(active) = &self.active {
             *active.publish_output.lock() = false;
             active.control.request_stop();
         }
-        self.wait()
+        if let Err(error) = self.wait() {
+            eprintln!("info string abort drain ignored previous search error: {error}");
+        }
+        Ok(())
     }
 
     /// UCI loop 安装自己的输出队列；Engine 不提供嵌入式 library callback。

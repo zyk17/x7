@@ -85,8 +85,8 @@ stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 �
 ## 模型
 
 正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。Eval 编码产出与 px0 同系的稀疏
-`InputPlane{mask,value}`；进 ORT 前再 CPU expand 为 dense NCHW（对齐 px0 ONNX 非 CUDA
-分支）。CNN 对照基线为
+`InputPlane{mask,value}`。DirectML：host expand 后 `Session::run`；TensorRT：GPU expand + IoBinding。
+CNN 对照基线为
 `width=384`、`blocks=15`、`bottleneck_channels=192`，带两次 Global Broadcast。v3 开始试验
 PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residual scale、LayerNorm、FFN 与 from-to policy，
 默认 `width=512`、`blocks=12`、`heads=16`、`ffn=768`。v3 使用 PX0/Lc0 AttentionBody

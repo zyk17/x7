@@ -17,13 +17,10 @@ position startpos
 go nodes 1000
 ```
 
-本机开发默认构建 DirectML。CUDA 保留为 NVIDIA 专用备用构建：`scripts/build-cuda.ps1` 默认从
-`C:\projects\onnxruntime-cuda13\windows\runtimes\win-x64\native` 读取官方 ONNX Runtime 1.28 的 CUDA
-DLL，复制到 `target/debug`、`target/release` 与 CUDA bundle；要换目录直接修改脚本中的路径。
-本机仍需提供 CUDA 13 / cuDNN 9。
-发行时显式选择两种互斥包：`build-directml.ps1` 构建通用 DirectML 包，`build-cuda.ps1` 构建 NVIDIA
-CUDA 包。两者不是同一二进制的运行时回退链；CUDA 使用 ORT 的 `prefer_nhwc=1`，但当前端到端
-吞吐仍不及 DirectML。
+本机开发默认构建 DirectML。NVIDIA 线为 TensorRT：`scripts/build-tensorrt.ps1`（脚本头部固定本机
+ORT / CUDA / TensorRT 路径，换机器改那几行即可）。ORT GPU 包需带 TensorRT EP，且 TensorRT **必须是 10.x**
+（`nvinfer_10.dll`）；不要装 TRT 11。本机另需 CUDA 13 / cuDNN 9。发行时显式选择两种互斥包：
+`build-directml.ps1` 与 `build-tensorrt.ps1`，二者不是同一二进制的运行时回退链。
 
 ## UCI 范围
 
@@ -148,5 +145,5 @@ cargo fmt --check
 cargo test -p engin --lib
 cargo clippy -p engin --all-targets -- -D warnings
 powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1
-powershell -ExecutionPolicy Bypass -File .\scripts\build-cuda.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build-tensorrt.ps1
 ```

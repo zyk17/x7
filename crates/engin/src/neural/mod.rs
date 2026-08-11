@@ -1,7 +1,7 @@
 //! classical NN 编码：`124 x 10 x 9` 输入平面与 `2062` policy 映射。
 //!
 //! 平面布局与 policy 表历史上源于 px0 classical encoder；本模块由 X7 维护。
-//! 热路径保持 px0 同系稀疏 `InputPlane`（mask + value），进 ORT 前再 CPU expand 为 dense NCHW。
+//! 热路径保持稀疏 `InputPlane`；DirectML 在 host expand，TensorRT 在 GPU expand。
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -58,6 +58,8 @@ pub type InputPlanes = [InputPlane; INPUT_PLANES];
 
 pub mod backend;
 pub mod cache;
+#[cfg(feature = "tensorrt")]
+pub mod cuda_trt;
 pub mod onnx;
 
 /// 一次合批推理的原始输出：完整 policy logits / WDL / moves-left。
@@ -141,6 +143,42 @@ pub fn softmax_legal_policy(logits: &[f32], legal_moves: &[Move]) -> Result<Vec<
     Ok(selected)
 }
 
+/// TensorRT FP16 等 EP 数值噪声容差：允许轻微越界后再 clamp + 归一。
+const STREAM_WDL_LOOSE: f32 = 0.05;
+const STREAM_MOVES_LEFT_LOOSE: f32 = 1.0;
+
+/// 将 EP 原始 WDL / moves_left 收敛为契约内数值；真正坏值仍硬失败并带明细。
+fn sanitize_stream_value(wdl: &[f32], moves_left: f32) -> Result<([f32; 3], f32), EnginError> {
+    if wdl.len() != 3 {
+        return Err(EnginError::Onnx(format!("stream nn wdl width {} != 3", wdl.len())));
+    }
+    if !wdl.iter().all(|value| value.is_finite()) || !moves_left.is_finite() {
+        return Err(EnginError::Onnx(format!(
+            "stream nn values are invalid: wdl={wdl:?} moves_left={moves_left}"
+        )));
+    }
+    if wdl
+        .iter()
+        .any(|value| *value < -STREAM_WDL_LOOSE || *value > 1.0 + STREAM_WDL_LOOSE)
+        || moves_left < -STREAM_MOVES_LEFT_LOOSE
+    {
+        return Err(EnginError::Onnx(format!(
+            "stream nn values are invalid: wdl={wdl:?} moves_left={moves_left}"
+        )));
+    }
+    let mut normalized = [wdl[0].max(0.0), wdl[1].max(0.0), wdl[2].max(0.0)];
+    let sum = normalized[0] + normalized[1] + normalized[2];
+    if sum <= 1e-3 {
+        return Err(EnginError::Onnx(format!(
+            "stream nn values are invalid: wdl={wdl:?} moves_left={moves_left}"
+        )));
+    }
+    normalized[0] /= sum;
+    normalized[1] /= sum;
+    normalized[2] /= sum;
+    Ok((normalized, moves_left.max(0.0)))
+}
+
 /// 将合批原始输出的一行转为可缓存的正式 `EvalResult`。
 ///
 /// 参考：px0 `BackendComputation` 的统一结果路径（`src/neural/backend.h:75-87`）。
@@ -162,13 +200,7 @@ pub fn eval_result_from_encoded_row(
         .get(row)
         .ok_or(EnginError::PortIncomplete("stream nn moves_left row"))?;
     let policies = softmax_legal_policy(logits, legal_moves)?;
-    if !wdl.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value))
-        || (wdl.iter().sum::<f32>() - 1.0).abs() > 1e-3
-        || !moves_left.is_finite()
-        || moves_left < 0.0
-    {
-        return Err(EnginError::Onnx("stream nn values are invalid".into()));
-    }
+    let (wdl, moves_left) = sanitize_stream_value(wdl, moves_left)?;
     Ok(Arc::new(EvalResult {
         wl: wdl[0] - wdl[2],
         d: wdl[1],
@@ -305,6 +337,16 @@ mod tests {
     use xiangqi_core::{GameState, Position};
 
     use super::*;
+
+    #[test]
+    fn sanitize_stream_value_renormalizes_fp16_noise() {
+        let (wdl, moves_left) = sanitize_stream_value(&[0.41, 0.30, 0.28], -0.25).expect("soft noise");
+        assert!((wdl[0] + wdl[1] + wdl[2] - 1.0).abs() < 1e-6);
+        assert_eq!(moves_left, 0.0);
+        assert!(sanitize_stream_value(&[f32::NAN, 0.0, 0.0], 1.0).is_err());
+        assert!(sanitize_stream_value(&[2.0, 0.0, 0.0], 1.0).is_err());
+        assert!(sanitize_stream_value(&[0.4, 0.3, 0.3], -2.0).is_err());
+    }
 
     #[test]
     fn sparse_expand_matches_dense_encode() {

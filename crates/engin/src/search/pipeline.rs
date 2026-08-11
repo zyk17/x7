@@ -184,10 +184,11 @@ impl SearchConfig {
     /// Fills `0` sentinels from the backend; returns concrete queue/batch sizes.
     fn resolve(&self, backend: &dyn Backend) -> ResolvedSearchConfig {
         let recommended = backend.attributes().recommended_batch_size.max(1);
+        let maximum = backend.attributes().maximum_batch_size.max(1);
         let eval_batch_size = if self.eval_batch_size == 0 {
             recommended
         } else {
-            self.eval_batch_size
+            self.eval_batch_size.min(maximum)
         };
         let queue_capacity = if self.queue_capacity == 0 {
             (eval_batch_size.saturating_mul(64)).max(4096)
@@ -1906,8 +1907,13 @@ mod tests {
         );
 
         let error = pipeline.run_playouts(1).expect_err("invalid network values must fail");
-
-        assert_eq!(error, EnginError::Onnx("stream nn values are invalid".into()));
+        match error {
+            EnginError::Onnx(message) => assert!(
+                message.starts_with("stream nn values are invalid"),
+                "unexpected onnx error: {message}"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
         assert_eq!(pipeline.stats().completed_playouts, 0);
         pipeline.stop_and_finish();
     }

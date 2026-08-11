@@ -1,12 +1,9 @@
 //! ONNX Runtime backend。
 //!
-//! 负责 batch 输入与网络执行。`BackendComputation` 路径仍在此做合法着 softmax；
-//! stream NN worker 只走 `infer_input_planes_into` / `infer_encoded*`，softmax/组装在 Eval。
-//! NN cache 是独立包装层。热路径复用 host `input_scratch`：稀疏路径在 scratch 内 expand+pad；
-//! dense 路径在无 DirectML pad 时可对 planes 零拷贝建 TensorRef。
+//! DirectML：host expand + `Session::run`。TensorRT：GPU expand + IoBinding。
 
-#[cfg(all(feature = "cuda", feature = "directml"))]
-compile_error!("ONNX runtime build must select either `cuda` or `directml`, not both");
+#[cfg(all(feature = "tensorrt", feature = "directml"))]
+compile_error!("ONNX runtime build must select either `tensorrt` or `directml`, not both");
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,13 +14,19 @@ use crate::neural::backend::{
     AddInputResult, Backend, BackendAttributes, BackendComputation, EncodedInference, EvalPosition, EvalResult,
     EvalTicket,
 };
-#[cfg(feature = "cuda")]
+#[cfg(feature = "tensorrt")]
+use crate::neural::cuda_trt::{CudaStream, DeviceBuffer, expand_planes_async};
+#[cfg(feature = "tensorrt")]
 use ndarray::Array4;
-#[cfg(feature = "cuda")]
-use ort::ep::{CUDA, cuda::ConvAlgorithmSearch};
+#[cfg(feature = "tensorrt")]
+use ort::ep::TensorRT;
 #[cfg(feature = "directml")]
 use ort::ep::{DirectML, directml::PerformancePreference};
+#[cfg(feature = "tensorrt")]
+use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::Session;
+#[cfg(feature = "tensorrt")]
+use ort::value::{Shape, Tensor, TensorRefMut};
 use ort::value::TensorRef;
 use xiangqi_core::PositionHistory;
 
@@ -45,8 +48,8 @@ pub struct OnnxBackend {
 /// `src/neural/wrapper.cc:49-68`）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnnxProvider {
-    #[cfg(feature = "cuda")]
-    Cuda,
+    #[cfg(feature = "tensorrt")]
+    TensorRt,
     #[cfg(feature = "directml")]
     DirectMl,
     Cpu,
@@ -55,8 +58,8 @@ pub enum OnnxProvider {
 impl OnnxProvider {
     pub const fn name(self) -> &'static str {
         match self {
-            #[cfg(feature = "cuda")]
-            Self::Cuda => "CUDAExecutionProvider",
+            #[cfg(feature = "tensorrt")]
+            Self::TensorRt => "TensorrtExecutionProvider",
             #[cfg(feature = "directml")]
             Self::DirectMl => "DmlExecutionProvider",
             Self::Cpu => "CPUExecutionProvider",
@@ -64,8 +67,11 @@ impl OnnxProvider {
     }
 }
 
-#[cfg(feature = "cuda")]
-const CUDA_RECOMMENDED_BATCH: usize = 256;
+#[cfg(feature = "tensorrt")]
+const TRT_PROFILE_MIN_BATCH: usize = 1;
+/// recommended / opt / max 对齐 stream 稳态合批。
+#[cfg(feature = "tensorrt")]
+const TRT_MAX_BATCH: usize = 256;
 #[cfg(feature = "directml")]
 const DML_BATCH_STEP: usize = 16;
 #[cfg(feature = "directml")]
@@ -73,13 +79,37 @@ const DML_BATCH_STEPS: usize = 4;
 #[cfg(feature = "directml")]
 const DML_MAX_BATCH: usize = DML_BATCH_STEP * DML_BATCH_STEPS;
 
-/// CUDA 使用一个动态 batch session；DirectML 使用固定形状 session 集合。
+#[cfg(feature = "tensorrt")]
+struct TrtGpu {
+    stream: CudaStream,
+    sparse_host: Vec<u8>,
+    sparse_dev: DeviceBuffer,
+    dense_dev: DeviceBuffer,
+    max_batch: usize,
+}
+
+#[cfg(feature = "tensorrt")]
+impl TrtGpu {
+    fn new(stream: CudaStream, max_batch: usize) -> Result<Self, EnginError> {
+        let n = max_batch * INPUT_PLANES;
+        Ok(Self {
+            stream,
+            sparse_host: Vec::new(),
+            sparse_dev: DeviceBuffer::new(n * (size_of::<u128>() + size_of::<f32>()))?,
+            dense_dev: DeviceBuffer::new(max_batch * ENCODED_PLANE_FLOATS * size_of::<f32>())?,
+            max_batch,
+        })
+    }
+}
+
+/// TensorRT：单动态 batch session；DirectML：固定形状 session 集。
 struct OnnxSessions {
     #[cfg(feature = "directml")]
     provider: OnnxProvider,
     sessions: Vec<(usize, Session)>,
-    /// DirectML pad / 偶发 owned 输入的常驻 host scratch；容量按需增长，跨次 `run` 复用。
     input_scratch: Vec<f32>,
+    #[cfg(feature = "tensorrt")]
+    trt_gpu: Option<TrtGpu>,
 }
 
 impl OnnxSessions {
@@ -89,6 +119,17 @@ impl OnnxSessions {
             provider: OnnxProvider::Cpu,
             sessions: vec![(usize::MAX, session)],
             input_scratch: Vec::new(),
+            #[cfg(feature = "tensorrt")]
+            trt_gpu: None,
+        }
+    }
+
+    #[cfg(feature = "tensorrt")]
+    fn tensor_rt(session: Session, gpu: TrtGpu) -> Self {
+        Self {
+            sessions: vec![(usize::MAX, session)],
+            input_scratch: Vec::new(),
+            trt_gpu: Some(gpu),
         }
     }
 
@@ -106,7 +147,7 @@ impl OnnxSessions {
     }
 
     fn chunk_size(&self) -> usize {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "tensorrt")]
         {
             usize::MAX
         }
@@ -121,7 +162,7 @@ impl OnnxSessions {
     }
 
     fn run_batch_size(&self, entries: usize) -> usize {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "tensorrt")]
         {
             entries
         }
@@ -136,7 +177,7 @@ impl OnnxSessions {
     }
 
     fn session_index(&self, batch_size: usize) -> Result<usize, EnginError> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "tensorrt")]
         let expected = usize::MAX;
         #[cfg(feature = "directml")]
         let expected = if self.provider == OnnxProvider::DirectMl {
@@ -164,7 +205,7 @@ impl OnnxBackend {
                 runs_on_cpu: provider == OnnxProvider::Cpu,
                 suggested_num_search_threads: 1,
                 recommended_batch_size: recommended_batch_size(provider),
-                maximum_batch_size: 1024,
+                maximum_batch_size: maximum_batch_size(provider),
             },
             provider,
         })
@@ -175,19 +216,16 @@ impl OnnxBackend {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "tensorrt")]
 fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginError> {
-    match create_cuda_session(path).and_then(|mut session| {
-        validate_cuda_session(&mut session)?;
-        Ok(session)
-    }) {
-        Ok(session) => Ok((OnnxSessions::single(session), OnnxProvider::Cuda)),
-        Err(cuda_error) => {
+    match create_tensorrt_sessions(path) {
+        Ok(sessions) => Ok((sessions, OnnxProvider::TensorRt)),
+        Err(trt_error) => {
             let session = Session::builder()
                 .map_err(onnx_error)?
                 .commit_from_file(path)
                 .map_err(onnx_error)?;
-            eprintln!("ONNX CUDA unavailable; using CPUExecutionProvider: {cuda_error}");
+            eprintln!("ONNX TensorRT unavailable; using CPUExecutionProvider: {trt_error}");
             Ok((OnnxSessions::single(session), OnnxProvider::Cpu))
         }
     }
@@ -208,10 +246,10 @@ fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginErr
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "tensorrt")]
 fn recommended_batch_size(provider: OnnxProvider) -> usize {
-    if provider == OnnxProvider::Cuda {
-        CUDA_RECOMMENDED_BATCH
+    if provider == OnnxProvider::TensorRt {
+        TRT_MAX_BATCH
     } else {
         256
     }
@@ -226,36 +264,80 @@ fn recommended_batch_size(provider: OnnxProvider) -> usize {
     }
 }
 
-/// ORT CUDA EP 使用动态输入形状；heuristic 避免首次加载为卷积算法做完整穷举。
-/// 参考：ORT CUDA EP `cudnn_conv_algo_search` 文档。
-#[cfg(feature = "cuda")]
-fn create_cuda_session(path: &Path) -> Result<Session, EnginError> {
-    Session::builder()
-        .map_err(onnx_error)?
-        .with_execution_providers([CUDA::default()
-            .with_device_id(0)
-            .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
-            // ORT CUDA EP：卷积网络在 Tensor Core GPU 上优先 NHWC；本机 A/B 有收益。
-            // https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#prefer_nhwc
-            .with_prefer_nhwc(true)
-            .build()
-            .error_on_failure()])
-        .map_err(onnx_error)?
-        .commit_from_file(path)
-        .map_err(onnx_error)
+#[cfg(feature = "tensorrt")]
+fn maximum_batch_size(provider: OnnxProvider) -> usize {
+    if provider == OnnxProvider::TensorRt {
+        TRT_MAX_BATCH
+    } else {
+        1024
+    }
 }
 
-/// CUDA EP 注册成功不代表首个 kernel 能在当前 GPU 架构执行。启动时以一个最小输入
-/// 提前验证，避免搜索线程在第一批推理时崩溃；参考 ORT CUDA EP 的运行时兼容要求。
-#[cfg(feature = "cuda")]
-fn validate_cuda_session(session: &mut Session) -> Result<(), EnginError> {
+#[cfg(feature = "directml")]
+fn maximum_batch_size(provider: OnnxProvider) -> usize {
+    if provider == OnnxProvider::DirectMl {
+        DML_MAX_BATCH
+    } else {
+        1024
+    }
+}
+
+/// ORT TensorRT EP：动态 batch、engine cache、user compute stream（px0 TRT 选项语义）。
+#[cfg(feature = "tensorrt")]
+fn create_tensorrt_sessions(path: &Path) -> Result<OnnxSessions, EnginError> {
+    let stream = CudaStream::new()?;
+    let cache_dir = trt_cache_dir()?;
+    let board = format!("board:{TRT_PROFILE_MIN_BATCH}x{INPUT_PLANES}x{BOARD_ROWS}x{BOARD_COLS}");
+    let board_opt = format!("board:{TRT_MAX_BATCH}x{INPUT_PLANES}x{BOARD_ROWS}x{BOARD_COLS}");
+    let board_max = format!("board:{TRT_MAX_BATCH}x{INPUT_PLANES}x{BOARD_ROWS}x{BOARD_COLS}");
+    let mut session = Session::builder()
+        .map_err(onnx_error)?
+        .with_execution_providers([unsafe {
+            TensorRT::default()
+                .with_device_id(0)
+                .with_fp16(true)
+                .with_builder_optimization_level(5)
+                .with_engine_cache(true)
+                .with_engine_cache_path(cache_dir.to_string_lossy())
+                .with_timing_cache(true)
+                .with_timing_cache_path(cache_dir.to_string_lossy())
+                .with_force_sequential_engine_build(true)
+                .with_context_memory_sharing(true)
+                .with_layer_norm_fp32_fallback(true)
+                .with_profile_min_shapes(&board)
+                .with_profile_opt_shapes(&board_opt)
+                .with_profile_max_shapes(&board_max)
+                .with_compute_stream(stream.as_ptr().cast())
+                .build()
+                .error_on_failure()
+        }])
+        .map_err(onnx_error)?
+        .commit_from_file(path)
+        .map_err(onnx_error)?;
+    validate_tensorrt_session(&mut session)?;
+    Ok(OnnxSessions::tensor_rt(session, TrtGpu::new(stream, TRT_MAX_BATCH)?))
+}
+
+#[cfg(feature = "tensorrt")]
+fn trt_cache_dir() -> Result<std::path::PathBuf, EnginError> {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("trt_cache")))
+        .unwrap_or_else(|| Path::new("trt_cache").to_path_buf());
+    std::fs::create_dir_all(&dir).map_err(|error| EnginError::Onnx(format!("create trt_cache: {error}")))?;
+    Ok(dir)
+}
+
+/// TensorRT EP 注册成功不代表首个 engine 能构建/执行；启动时以最小输入验证。
+#[cfg(feature = "tensorrt")]
+fn validate_tensorrt_session(session: &mut Session) -> Result<(), EnginError> {
     let board = Array4::<f32>::zeros((1, INPUT_PLANES, BOARD_ROWS, BOARD_COLS));
     let tensor = TensorRef::from_array_view(&board).map_err(onnx_error)?;
     session.run(ort::inputs!["board" => tensor]).map_err(onnx_error)?;
     Ok(())
 }
 
-/// 固定形状 DirectML / CUDA session。
+/// 固定形状 DirectML session。
 #[cfg(feature = "directml")]
 fn create_direct_ml_sessions(path: &Path) -> Result<Vec<(usize, Session)>, EnginError> {
     let mut sessions = Vec::with_capacity(DML_BATCH_STEPS);
@@ -419,10 +501,7 @@ impl BackendComputation for OnnxBackendComputation {
     }
 }
 
-/// 稀疏合批：expand 直接写入常驻 `input_scratch`（含 DirectML pad 清零），再 `Session::run`。
-///
-/// 参考：px0 ONNX `PrepareInputs` 在 ORT 边界 densify；此处额外把 pad 与 expand 合并到同一 scratch，
-/// 去掉 stream 路径上的中间 dense `packed`。
+/// 稀疏合批推理。
 fn infer_input_planes(
     sessions: &mut OnnxSessions,
     samples: &[InputPlanes],
@@ -440,6 +519,13 @@ fn infer_input_planes(
     all_logits.reserve(batch * POLICY_SIZE);
     all_wdl.reserve(batch * 3);
     all_moves_left.reserve(batch);
+
+    #[cfg(feature = "tensorrt")]
+    if let Some(gpu) = sessions.trt_gpu.as_mut() {
+        let session = &mut sessions.sessions[0].1;
+        return infer_input_planes_trt(session, gpu, samples, all_logits, all_wdl, all_moves_left);
+    }
+
     let plane_len = ENCODED_PLANE_FLOATS;
     let chunk_size = sessions.chunk_size();
     for chunk_start in (0..batch).step_by(chunk_size.min(batch).max(1)) {
@@ -474,6 +560,68 @@ fn infer_input_planes(
         sessions.input_scratch = scratch;
     }
     Ok(())
+}
+
+#[cfg(feature = "tensorrt")]
+fn infer_input_planes_trt(
+    session: &mut Session,
+    gpu: &mut TrtGpu,
+    samples: &[InputPlanes],
+    all_logits: &mut Vec<f32>,
+    all_wdl: &mut Vec<f32>,
+    all_moves_left: &mut Vec<f32>,
+) -> Result<(), EnginError> {
+    let batch = samples.len();
+    if batch > gpu.max_batch {
+        return Err(EnginError::Onnx(format!("TRT batch {batch} > {}", gpu.max_batch)));
+    }
+    pack_sparse_planes(samples, &mut gpu.sparse_host);
+    let n_planes = (batch * INPUT_PLANES) as u32;
+    gpu.sparse_dev.upload_async(&gpu.sparse_host, &gpu.stream)?;
+    expand_planes_async(&gpu.dense_dev, &gpu.sparse_dev, n_planes, &gpu.stream)?;
+    gpu.stream.sync()?;
+
+    let board = unsafe {
+        // ORT 不拥有 dense_dev；Session/IoBinding 须先于 CudaStream 销毁（OnnxSessions 字段序保证）。
+        TensorRefMut::<f32>::from_raw(
+            MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default).map_err(onnx_error)?,
+            gpu.dense_dev.as_ptr(),
+            Shape::new([batch as i64, INPUT_PLANES as i64, BOARD_ROWS as i64, BOARD_COLS as i64]),
+        )
+    }
+    .map_err(onnx_error)?;
+
+    let allocator = Allocator::default();
+    let mut binding = session.create_binding().map_err(onnx_error)?;
+    binding.bind_input("board", &board).map_err(onnx_error)?;
+    binding
+        .bind_output("logits", Tensor::<f32>::new(&allocator, [batch, POLICY_SIZE]).map_err(onnx_error)?)
+        .map_err(onnx_error)?;
+    binding
+        .bind_output("value", Tensor::<f32>::new(&allocator, [batch, 3]).map_err(onnx_error)?)
+        .map_err(onnx_error)?;
+    binding
+        .bind_output("moves_left", Tensor::<f32>::new(&allocator, [batch, 1]).map_err(onnx_error)?)
+        .map_err(onnx_error)?;
+    let outputs = session.run_binding(&binding).map_err(onnx_error)?;
+    binding.synchronize_outputs().map_err(onnx_error)?;
+    append_tensor_rows(&outputs, "logits", batch, POLICY_SIZE, batch, all_logits)?;
+    append_tensor_rows(&outputs, "value", batch, 3, batch, all_wdl)?;
+    append_tensor_rows(&outputs, "moves_left", batch, 1, batch, all_moves_left)?;
+    Ok(())
+}
+
+#[cfg(feature = "tensorrt")]
+fn pack_sparse_planes(samples: &[InputPlanes], dest: &mut Vec<u8>) {
+    let n = samples.len() * INPUT_PLANES;
+    dest.clear();
+    dest.reserve(n * (size_of::<u128>() + size_of::<f32>()));
+    for plane in samples.iter().flat_map(|sample| sample.iter()) {
+        dest.extend_from_slice(&plane.mask.to_le_bytes());
+    }
+    for plane in samples.iter().flat_map(|sample| sample.iter()) {
+        dest.extend_from_slice(&plane.value.to_le_bytes());
+    }
 }
 
 /// 仅供 ONNX 使用：在预编码 dense planes 上运行当前发行包的 ONNX session。
