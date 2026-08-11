@@ -1,8 +1,9 @@
-//! TensorRT 用 CUDA：stream、device buffer、sparse→dense expand。
+//! TensorRT 用 CUDA：stream、device/pinned buffer、sparse→dense expand。
 //! Kernel 对齐 px0 `onnx_kernels.cu`（128-bit mask + 90 格）。
 
 use std::ffi::c_void;
 use std::ptr;
+use std::slice;
 
 use crate::EnginError;
 
@@ -12,6 +13,8 @@ unsafe extern "C" {
     fn x7_cuda_stream_synchronize(stream: *mut c_void) -> i32;
     fn x7_cuda_malloc(out: *mut *mut c_void, bytes: usize) -> i32;
     fn x7_cuda_free(ptr: *mut c_void) -> i32;
+    fn x7_cuda_host_alloc(out: *mut *mut c_void, bytes: usize, flags: i32) -> i32;
+    fn x7_cuda_host_free(ptr: *mut c_void) -> i32;
     fn x7_cuda_memcpy_h2d_async(dst: *mut c_void, src: *const c_void, bytes: usize, stream: *mut c_void) -> i32;
     fn x7_cuda_memcpy_d2h_async(dst: *mut c_void, src: *const c_void, bytes: usize, stream: *mut c_void) -> i32;
     fn x7_expand_planes_f32(output: *mut f32, packed: *const c_void, n: u32, stream: *mut c_void) -> i32;
@@ -83,6 +86,42 @@ impl Drop for DeviceBuffer {
 }
 
 unsafe impl Send for DeviceBuffer {}
+
+/// `cudaHostAlloc` 钉扎缓冲；`write_combined` 仅适合 CPU 写、H2D 读。
+pub struct PinnedBuffer {
+    ptr: *mut c_void,
+    bytes: usize,
+}
+
+impl PinnedBuffer {
+    pub fn new(bytes: usize, write_combined: bool) -> Result<Self, EnginError> {
+        let mut ptr = ptr::null_mut();
+        let flags = if write_combined { 1 } else { 0 };
+        check(unsafe { x7_cuda_host_alloc(&mut ptr, bytes, flags) }, "host_alloc")?;
+        Ok(Self { ptr, bytes })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.ptr.cast(), self.bytes) }
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr.cast(), self.bytes) }
+    }
+
+    pub fn as_f32(&self) -> &[f32] {
+        let n = self.bytes / size_of::<f32>();
+        unsafe { slice::from_raw_parts(self.ptr.cast(), n) }
+    }
+}
+
+impl Drop for PinnedBuffer {
+    fn drop(&mut self) {
+        let _ = unsafe { x7_cuda_host_free(self.ptr) };
+    }
+}
+
+unsafe impl Send for PinnedBuffer {}
 
 pub fn expand_planes_async(
     dense: &DeviceBuffer,

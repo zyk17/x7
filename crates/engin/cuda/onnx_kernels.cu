@@ -96,6 +96,21 @@ extern "C" int x7_cuda_free(void* ptr) {
   return static_cast<int>(cudaFree(ptr));
 }
 
+extern "C" int x7_cuda_host_alloc(void** ptr_out, size_t bytes, int flags) {
+  unsigned cuda_flags = cudaHostAllocDefault;
+  if (flags == 1) {
+    cuda_flags = cudaHostAllocWriteCombined;
+  }
+  return static_cast<int>(cudaHostAlloc(ptr_out, bytes, cuda_flags));
+}
+
+extern "C" int x7_cuda_host_free(void* ptr) {
+  if (ptr == nullptr) {
+    return 0;
+  }
+  return static_cast<int>(cudaFreeHost(ptr));
+}
+
 extern "C" int x7_cuda_memcpy_h2d_async(void* dst, const void* src, size_t bytes, void* stream) {
   return static_cast<int>(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
                                           static_cast<cudaStream_t>(stream)));

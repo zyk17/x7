@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""将 checkpoint 导出为正式 ONNX：FP16 trunk，FP32 input/heads/outputs。"""
+"""将 checkpoint 导出为正式 ONNX：FP16 trunk，FP32 input/heads/outputs。
+
+mixed-fp16 说明（ORT TensorRT）：
+- 图内 trunk 权重 FP16，heads FP32，两端用 Cast 隔开；I/O 保持 FLOAT。
+- ORT `trt_fp16_enable` 开的是弱类型 BuilderFlag::kFP16，不是「让已有 FP16 权重生效」。
+- 不要把 LayerNorm 单独 .float()：ORT LayerNormalization 要求激活与权重同 dtype，
+  否则加载失败。数值保护靠引擎侧 `trt_layer_norm_fp32_fallback`。
+"""
 
 from __future__ import annotations
 

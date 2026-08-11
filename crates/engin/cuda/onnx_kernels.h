@@ -15,6 +15,10 @@ int x7_cuda_stream_synchronize(void* stream);
 int x7_cuda_malloc(void** ptr_out, size_t bytes);
 int x7_cuda_free(void* ptr);
 
+/* flags: 0 = default pinned; 1 = write-combined (H2D source). */
+int x7_cuda_host_alloc(void** ptr_out, size_t bytes, int flags);
+int x7_cuda_host_free(void* ptr);
+
 int x7_cuda_memcpy_h2d_async(void* dst, const void* src, size_t bytes, void* stream);
 int x7_cuda_memcpy_d2h_async(void* dst, const void* src, size_t bytes, void* stream);
 

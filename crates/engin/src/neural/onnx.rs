@@ -18,7 +18,7 @@ use crate::neural::backend::{
     EvalTicket,
 };
 #[cfg(feature = "tensorrt")]
-use crate::neural::cuda_trt::{CudaStream, DeviceBuffer, download_device_async, expand_planes_async};
+use crate::neural::cuda_trt::{CudaStream, DeviceBuffer, PinnedBuffer, download_device_async, expand_planes_async};
 #[cfg(feature = "tensorrt")]
 use ndarray::Array4;
 #[cfg(feature = "tensorrt")]
@@ -92,12 +92,13 @@ struct TrtGpu {
     value: Option<Tensor<f32>>,
     moves_left: Option<Tensor<f32>>,
     allocator: Allocator,
-    sparse_host: Vec<u8>,
+    /// write-combined：CPU 只写、H2D 读。
+    sparse_host: PinnedBuffer,
     sparse_dev: DeviceBuffer,
     dense_dev: DeviceBuffer,
-    logits_host: Vec<f32>,
-    value_host: Vec<f32>,
-    moves_left_host: Vec<f32>,
+    logits_host: PinnedBuffer,
+    value_host: PinnedBuffer,
+    moves_left_host: PinnedBuffer,
     /// 与 `logits/value/moves_left` 对应的 batch；0 表示需重建。
     out_batch: usize,
     max_batch: usize,
@@ -108,17 +109,18 @@ struct TrtGpu {
 impl TrtGpu {
     fn new(stream: CudaStream, allocator: Allocator, max_batch: usize) -> Result<Self, EnginError> {
         let n = max_batch * INPUT_PLANES;
+        let sparse_bytes = n * (size_of::<u128>() + size_of::<f32>());
         Ok(Self {
             logits: None,
             value: None,
             moves_left: None,
             allocator,
-            sparse_host: Vec::new(),
-            sparse_dev: DeviceBuffer::new(n * (size_of::<u128>() + size_of::<f32>()))?,
+            sparse_host: PinnedBuffer::new(sparse_bytes, true)?,
+            sparse_dev: DeviceBuffer::new(sparse_bytes)?,
             dense_dev: DeviceBuffer::new(max_batch * ENCODED_PLANE_FLOATS * size_of::<f32>())?,
-            logits_host: Vec::new(),
-            value_host: Vec::new(),
-            moves_left_host: Vec::new(),
+            logits_host: PinnedBuffer::new(max_batch * POLICY_SIZE * size_of::<f32>(), false)?,
+            value_host: PinnedBuffer::new(max_batch * 3 * size_of::<f32>(), false)?,
+            moves_left_host: PinnedBuffer::new(max_batch * size_of::<f32>(), false)?,
             out_batch: 0,
             max_batch,
             stream,
@@ -324,7 +326,15 @@ fn maximum_batch_size(_provider: OnnxProvider) -> usize {
     1024
 }
 
-/// ORT TensorRT EP：动态 batch、engine cache、user compute stream（px0 TRT 选项语义）。
+/// ORT TensorRT EP：选项语义对齐 px0 `network_onnx.cc` TRT 段，并适配 X7 mixed-fp16 图。
+///
+/// - `builder_optimization_level=5` ↔ px0 `optimize` 钳到 0..5 后的 builder 等级
+/// - 默认 **开** `trt_fp16_enable`：ORT 在关 fp16 时走 STRONGLY_TYPED，开时走弱类型
+///   `BuilderFlag::kFP16`。X7 图已是 FP16 trunk + FP32 heads，但本栈关 EP-fp16 实测
+///   吞吐差约 3×；px0 能默认关是因为其 ONNX 是**整网统一 FP16**，形态不同。
+/// - `layer_norm_fp32_fallback`：弱类型下保护 LN（仅 `fp16_enable` 时生效）
+/// - 不设 `max_workspace_size`：与 px0 / KataGo 一样走 TRT 设备默认
+/// - 不启用 `cuda_graph`：动态 batch 下 ORT 要求 shape 固定，曾出现均匀 policy
 #[cfg(feature = "tensorrt")]
 fn create_tensorrt_sessions(path: &Path) -> Result<OnnxSessions, EnginError> {
     let stream = CudaStream::new()?;
@@ -637,11 +647,12 @@ fn infer_input_planes_trt(
     if batch > gpu.max_batch {
         return Err(EnginError::Onnx(format!("TRT batch {batch} > {}", gpu.max_batch)));
     }
-    pack_sparse_planes(samples, &mut gpu.sparse_host);
+    let sparse_bytes = pack_sparse_planes(samples, gpu.sparse_host.as_bytes_mut())?;
     let n_planes = (batch * INPUT_PLANES) as u32;
-    gpu.sparse_dev.upload_async(&gpu.sparse_host, &gpu.stream)?;
+    // user compute stream：expand → TRT → D2H 同流串联，expand 后不必 sync。
+    gpu.sparse_dev
+        .upload_async(&gpu.sparse_host.as_bytes()[..sparse_bytes], &gpu.stream)?;
     expand_planes_async(&gpu.dense_dev, &gpu.sparse_dev, n_planes, &gpu.stream)?;
-    gpu.stream.sync()?;
 
     let board = unsafe {
         // ORT 不拥有 dense_dev；见 TrtGpu 字段序（stream 最后销毁）。
@@ -662,11 +673,11 @@ fn infer_input_planes_trt(
         binding.bind_output("value", value_t).map_err(onnx_error)?;
         binding.bind_output("moves_left", mlh_t).map_err(onnx_error)?;
         let mut outputs = session.run_binding(&binding).map_err(onnx_error)?;
-        binding.synchronize_outputs().map_err(onnx_error)?;
+        // user compute stream：TRT 与 D2H 同流；末尾一次 sync 即可，不必 synchronize_outputs。
 
-        gpu.logits_host.resize(batch * POLICY_SIZE, 0.0);
-        gpu.value_host.resize(batch * 3, 0.0);
-        gpu.moves_left_host.resize(batch, 0.0);
+        let logits_bytes = batch * POLICY_SIZE * size_of::<f32>();
+        let value_bytes = batch * 3 * size_of::<f32>();
+        let mlh_bytes = batch * size_of::<f32>();
         {
             let logits = outputs
                 .get("logits")
@@ -683,15 +694,27 @@ fn infer_input_planes_trt(
                 .ok_or_else(|| EnginError::Onnx("missing moves_left".into()))?
                 .downcast_ref::<TensorValueType<f32>>()
                 .map_err(onnx_error)?;
-            download_device_async(f32_bytes_mut(&mut gpu.logits_host), logits.data_ptr(), &gpu.stream)?;
-            download_device_async(f32_bytes_mut(&mut gpu.value_host), value.data_ptr(), &gpu.stream)?;
-            download_device_async(f32_bytes_mut(&mut gpu.moves_left_host), mlh.data_ptr(), &gpu.stream)?;
+            download_device_async(
+                &mut gpu.logits_host.as_bytes_mut()[..logits_bytes],
+                logits.data_ptr(),
+                &gpu.stream,
+            )?;
+            download_device_async(
+                &mut gpu.value_host.as_bytes_mut()[..value_bytes],
+                value.data_ptr(),
+                &gpu.stream,
+            )?;
+            download_device_async(
+                &mut gpu.moves_left_host.as_bytes_mut()[..mlh_bytes],
+                mlh.data_ptr(),
+                &gpu.stream,
+            )?;
             gpu.stream.sync()?;
         }
 
-        all_logits.extend_from_slice(&gpu.logits_host);
-        all_wdl.extend_from_slice(&gpu.value_host);
-        all_moves_left.extend_from_slice(&gpu.moves_left_host);
+        all_logits.extend_from_slice(&gpu.logits_host.as_f32()[..batch * POLICY_SIZE]);
+        all_wdl.extend_from_slice(&gpu.value_host.as_f32()[..batch * 3]);
+        all_moves_left.extend_from_slice(&gpu.moves_left_host.as_f32()[..batch]);
 
         let logits_t = outputs
             .remove("logits")
@@ -724,22 +747,29 @@ fn infer_input_planes_trt(
 }
 
 #[cfg(feature = "tensorrt")]
-fn f32_bytes_mut(values: &mut [f32]) -> &mut [u8] {
-    let len = values.len() * size_of::<f32>();
-    unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), len) }
-}
-
-#[cfg(feature = "tensorrt")]
-fn pack_sparse_planes(samples: &[InputPlanes], dest: &mut Vec<u8>) {
+fn pack_sparse_planes(samples: &[InputPlanes], dest: &mut [u8]) -> Result<usize, EnginError> {
     let n = samples.len() * INPUT_PLANES;
-    dest.clear();
-    dest.reserve(n * (size_of::<u128>() + size_of::<f32>()));
-    for plane in samples.iter().flat_map(|sample| sample.iter()) {
-        dest.extend_from_slice(&plane.mask.to_le_bytes());
+    let need = n * (size_of::<u128>() + size_of::<f32>());
+    if dest.len() < need {
+        return Err(EnginError::Onnx(format!(
+            "sparse host too small: need {need}, have {}",
+            dest.len()
+        )));
     }
-    for plane in samples.iter().flat_map(|sample| sample.iter()) {
-        dest.extend_from_slice(&plane.value.to_le_bytes());
+    let (mask_bytes, value_bytes) = dest[..need].split_at_mut(n * size_of::<u128>());
+    for (slot, plane) in mask_bytes
+        .chunks_exact_mut(size_of::<u128>())
+        .zip(samples.iter().flat_map(|s| s.iter()))
+    {
+        slot.copy_from_slice(&plane.mask.to_le_bytes());
     }
+    for (slot, plane) in value_bytes
+        .chunks_exact_mut(size_of::<f32>())
+        .zip(samples.iter().flat_map(|s| s.iter()))
+    {
+        slot.copy_from_slice(&plane.value.to_le_bytes());
+    }
+    Ok(need)
 }
 
 /// 仅供 ONNX 使用：在预编码 dense planes 上运行当前发行包的 ONNX session。
