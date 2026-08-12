@@ -423,12 +423,7 @@ impl Engine {
         };
         let started = Instant::now();
         let clock_budget = if params.movetime.is_none() {
-            let position = self
-                .position
-                .as_ref()
-                .expect("validated search position")
-                .current_position();
-            self.time_manager.budget(params, &position)
+            self.time_manager.budget(params, graph.root_history().last())
         } else {
             None
         };
