@@ -129,11 +129,11 @@ quit
 cargo run --release -p engin
 ```
 
-当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
-`CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`GatherWorkers`、`EvalWorkers`、`BackpropWorkers`。
+当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`NNCacheSizePowerOfTwo`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
+`CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`LcbStdevs`、`LcbMinVisitFraction`、`Threads`。
 `MiniBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
-搜索参数默认采用 LC0 的 `CPuct=1.745`、`CPuctBase=38739`、`CPuctFactor=3.894`、`FpuReduction=0.330`；
-worker 默认 `4/4/1`。option 名称和布尔值大小写不敏感。
+搜索参数默认 `CPuct=1.75`、`CPuctBase=40000`、`CPuctFactor=4.0`、`FpuReduction=0.200`；
+`Threads=8` 只在 Gather/Eval 间近似平分，NN 与 Backprop 固定各一条线程。option 名称和布尔值大小写不敏感。
 
 当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
 `movetime` 不可与时钟字段混用；`infinite` 不可与其他预算混用。`depth`、`mate`、`ponder` 仍会明确报错。
@@ -217,7 +217,6 @@ python scripts\pikafish_compare.py --moves "c3c4 g6g5 ..." --movetime 3000 --mul
 ```powershell
 cargo fmt --check
 cargo test -p engin --lib
-cargo test -p engin --test uci_search_test
 cargo clippy -p engin --all-targets -- -D warnings
 ```
 

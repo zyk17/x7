@@ -796,14 +796,30 @@ impl Search {
     /// cancel before returning, so root snapshots never observe a leaked edge
     /// reservation.
     pub fn run_with_limits(&self, limits: SearchLimits) -> Result<Stats, EnginError> {
+        self.run_with_limits_reporting(limits, None, |_| {})
+    }
+
+    /// 与 `run_with_limits` 相同，但在不 drain 在途流水线的前提下定期归还一次 owner
+    /// 控制权。UCI owner 用它判断是否需要输出 `info`；搜索层不解释输出语义。
+    pub(crate) fn run_with_limits_reporting(
+        &self,
+        limits: SearchLimits,
+        report_interval: Option<Duration>,
+        mut report: impl FnMut(Stats),
+    ) -> Result<Stats, EnginError> {
         let target = limits.max_playouts.unwrap_or(u64::MAX);
         let max_in_flight = self.max_in_flight;
+        let mut next_report = report_interval.and_then(|interval| Instant::now().checked_add(interval));
         while !self.is_stopping()
             && !limits.is_exhausted(
                 self.initial_visits.saturating_add(self.stats().completed_playouts),
                 target,
             )
         {
+            if next_report.is_some_and(|deadline| Instant::now() >= deadline) {
+                report(self.stats());
+                next_report = report_interval.and_then(|interval| Instant::now().checked_add(interval));
+            }
             let root_state = self
                 .shared
                 .repository
@@ -811,6 +827,10 @@ impl Search {
                 .map(|root| root.expansion_state());
             if root_state == Some(ExpansionState::Terminal) || self.shared.root_path_terminal.load(Ordering::Acquire) {
                 break;
+            }
+            if root_state == Some(ExpansionState::Evaluating) {
+                self.wait_until_outstanding_below_until(1, next_report)?;
+                continue;
             }
             if root_state != Some(ExpansionState::Expanded) {
                 // 启动阶段：root 展开前一次只提交一个 playout。
@@ -820,7 +840,7 @@ impl Search {
                     }
                     return Err(error);
                 }
-                self.wait_for_idle()?;
+                self.wait_until_outstanding_below_until(1, next_report)?;
                 continue;
             }
             let outstanding = self.shared.outstanding.load(Ordering::Acquire);
@@ -835,11 +855,11 @@ impl Search {
                     break;
                 }
                 // 让已有 in-flight 工作完成至预算；不要继续提交而超出预算。
-                self.wait_until_outstanding_below(outstanding)?;
+                self.wait_until_outstanding_below_until(outstanding, next_report)?;
                 continue;
             }
             if outstanding >= max_in_flight {
-                self.wait_until_outstanding_below(max_in_flight)?;
+                self.wait_until_outstanding_below_until(max_in_flight, next_report)?;
                 continue;
             }
             if let Err(error) = self.submit_playout() {
@@ -864,6 +884,29 @@ impl Search {
         let mut guard = self.shared.idle_lock.lock();
         while self.shared.outstanding.load(Ordering::Acquire) >= limit && self.shared.error.lock().is_none() {
             self.shared.idle.wait(&mut guard);
+        }
+        if let Some(error) = self.shared.error.lock().clone() {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 等到 in-flight 降到阈值以下，或到达 owner 要求的报告时刻。超时不是搜索状态，
+    /// 调用方下一轮会继续同一条 stream；只有最终 drain 才调用无 deadline 的版本。
+    fn wait_until_outstanding_below_until(&self, limit: usize, deadline: Option<Instant>) -> Result<(), EnginError> {
+        let mut guard = self.shared.idle_lock.lock();
+        while self.shared.outstanding.load(Ordering::Acquire) >= limit && self.shared.error.lock().is_none() {
+            let Some(deadline) = deadline else {
+                self.shared.idle.wait(&mut guard);
+                continue;
+            };
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            self.shared
+                .idle
+                .wait_for(&mut guard, deadline.saturating_duration_since(now));
         }
         if let Some(error) = self.shared.error.lock().clone() {
             return Err(error);

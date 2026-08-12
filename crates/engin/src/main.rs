@@ -1,10 +1,8 @@
 //! stream 搜索的 UCI stdin/stdout 入口。
 use std::io::{self, BufRead};
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::time::Duration;
 
-use engin::{Engine, StdoutUciResponder, UciLoop};
+use engin::{Engine, UciLoop};
 
 /// 在 UCI 启动前定位随程序发布的正式 ONNX 权重。
 ///
@@ -27,32 +25,25 @@ fn default_weights_file() -> PathBuf {
 }
 
 fn main() {
-    let mut responder = StdoutUciResponder::default();
     let mut engine = Engine::new();
     // 首个 `position` 命令初始化 ONNX backend；Engine 本身已经在上一行创建。
     engine
         .set_option("WeightsFile", &default_weights_file().to_string_lossy())
         .expect("default UCI options must be valid");
-    let mut uci = UciLoop::new(&mut responder, &mut engine);
+    let mut uci = UciLoop::new(&mut engine);
 
-    // GUI 等待有限 `go` 的结果且不再输入时，watchdog 的回调仍必须输出到 stdout。
-    let (input_tx, input_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            if input_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    loop {
-        match input_rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(Ok(line)) => match uci.process_line(&line, env!("CARGO_PKG_VERSION")) {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => eprintln!("UCI error: {error}"),
-            },
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => uci.flush_output(),
+    eprintln!(
+        "\x1b[31m\n  ██╗  ██╗███████╗\n  ╚██╗██╔╝╚════██║\n   ╚███╔╝     ██╔╝\n   ██╔██╗    ██╔╝\n  ██╔╝ ██╗   ██║\n  ╚═╝  ╚═╝   ╚═╝\x1b[0m\n"
+    );
+
+    for line in io::stdin().lock().lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        match uci.process_line(&line) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => eprintln!("UCI error: {error}"),
         }
     }
 }

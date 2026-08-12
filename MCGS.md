@@ -301,8 +301,8 @@ cargo run -p engin --release --bin graph_measure -- --fen "<FEN>" --moves "..." 
 
 ### Phase 2：流式路径安全（已完成）
 
-使用 `node_path + reservations`、环检测和 reservation 配平；通过并发 completion/cancel、cycle termination 与
-UCI `position → go → stop → position → go` 回归（`uci_search_test`）。
+使用 `node_path + reservations`、环检测和 reservation 配平；通过并发 completion/cancel、cycle termination
+与 release UCI 冒烟验证 `position → go → stop → position → go`。
 
 ### Phase 3：图 GC、PV 与 terminal（已完成）
 

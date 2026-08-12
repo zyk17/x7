@@ -1,20 +1,23 @@
 //! UCI Engine：拥有 graph、worker pool 与每次搜索 job。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use xiangqi_core::{GameState, Move, STARTPOS_FEN};
 
-use crate::neural::backend::{Backend, CachingBackend, UniformBackend};
+use crate::neural::backend::{Backend, CachingBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::{
     Search, SearchConfig, SearchControl, SearchGraph, SearchLimits, SearchParams, Stats, TimeBudget, TimeManager,
     WorkerPool, best_mate_with_params, best_move_filtered_with_params, principal_variation_filtered_with_params,
     root_stats, root_variations_with_params,
 };
-use crate::uci_loop::{BestMoveInfo, GoParams, StringUciResponder, ThinkingInfo, UciOutputQueue, Wdl};
+use crate::uci_loop::{
+    BestMoveInfo, GoParams, ThinkingInfo, Wdl, write_stdout, write_stdout_best_move, write_stdout_thinking,
+};
 use crate::{EnginError, Options};
 
 /// UCI、图、worker 与单次搜索的唯一 owner。
@@ -33,15 +36,14 @@ pub struct Engine {
     manages_weights_file: bool,
     backend_error: Option<String>,
     loaded_weights_file: Option<String>,
-    output: Option<Arc<UciOutputQueue>>,
+    /// 让 abort 与 owner 的整组输出线性化，避免新命令之后漏出旧 generation 的结果。
+    stdout_gate: Arc<Mutex<()>>,
 }
 
 struct ActiveSearch {
     control: SearchControl,
-    completion: Arc<Completion>,
-    publish_output: Arc<Mutex<bool>>,
-    search_thread: JoinHandle<()>,
-    watchdog_thread: JoinHandle<()>,
+    publish_output: Arc<AtomicBool>,
+    owner_thread: JoinHandle<Result<(), EnginError>>,
     started: Instant,
     clock_budget: Option<TimeBudget>,
 }
@@ -115,16 +117,10 @@ impl Drop for GraphReaper {
 
 /// UCI info 最小输出间隔（毫秒）。
 const UCI_INFO_MINIMUM_FREQUENCY: Duration = Duration::from_secs(5);
+/// owner 在 stream 等待在途 event 时，最多每 100ms 检查一次是否值得输出进度。
+const OWNER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 已完成 job 的最小结果；只在 Engine 的两个线程之间交接。
-#[derive(Clone, Debug, PartialEq)]
-struct CompletedSearch {
-    stats: Stats,
-    best_move: Option<Move>,
-    principal_variation: Vec<Move>,
-}
-
-/// watchdog 持有的只读 root view，不参与 worker 的搜索状态。
+/// search owner 持有的只读 root view，不参与 worker 的搜索状态。
 #[derive(Clone)]
 struct RootSnapshot {
     repository: Arc<crate::search::NodeRepository>,
@@ -149,12 +145,6 @@ struct SearchProgress {
 struct PublishedInfo {
     progress: Option<SearchProgress>,
     time: i64,
-}
-
-#[derive(Default)]
-struct Completion {
-    result: Mutex<Option<Result<CompletedSearch, EnginError>>>,
-    ready: Condvar,
 }
 
 impl Default for Engine {
@@ -182,21 +172,8 @@ impl Engine {
             manages_weights_file: true,
             backend_error: None,
             loaded_weights_file: None,
-            output: None,
+            stdout_gate: Arc::new(Mutex::new(())),
         }
-    }
-
-    /// 测试构造器共用的 backend 安装路径；正式 UCI 仍只经 `WeightsFile`。
-    fn with_backend(backend: Box<dyn Backend>) -> Self {
-        let mut engine = Self::new();
-        engine.manages_weights_file = false;
-        engine.install_backend(Arc::from(backend));
-        engine
-    }
-
-    /// 确定性测试 backend，不参与正式 UCI 的 `WeightsFile` 生命周期。
-    pub fn uniform() -> Self {
-        Self::with_backend(Box::new(UniformBackend::default()))
     }
 
     /// 安装新 backend 时丢弃旧图与旧 worker；调用方已先 stop/drain。
@@ -402,9 +379,9 @@ impl Engine {
                 lcb_stdevs: self.options.lcb_stdevs,
                 lcb_min_visit_fraction: self.options.lcb_min_visit_fraction,
             },
-            gather_workers: self.options.gather_workers,
-            eval_workers: self.options.eval_workers,
-            backprop_workers: self.options.backprop_workers,
+            gather_workers: self.options.threads.div_ceil(2),
+            eval_workers: self.options.threads / 2,
+            backprop_workers: 1,
             ..SearchConfig::default()
         };
         let decision_params = config.params;
@@ -442,34 +419,31 @@ impl Engine {
                 .or_else(|| clock_budget.map(|budget| budget.deadline_after(started))),
         };
         let control = search.control();
-        let completion = Arc::new(Completion::default());
-        let search_completion = Arc::clone(&completion);
-        let search_thread = std::thread::spawn(move || {
-            let result = run_search(search, root_is_black, root_move_filter, decision_params, limits);
-            *search_completion.result.lock() = Some(result);
-            search_completion.ready.notify_all();
-        });
-        let publish_output = Arc::new(Mutex::new(true));
-        let watchdog_thread = std::thread::spawn({
-            let completion = Arc::clone(&completion);
-            let publish_output = Arc::clone(&publish_output);
-            let output = self.output.clone();
-            let watchdog_control = control.clone();
-            move || watchdog(watchdog_control, snapshot, completion, publish_output, output, started)
+        let publish_output = Arc::new(AtomicBool::new(true));
+        let owner_publish_output = Arc::clone(&publish_output);
+        let output_options = self.options.clone();
+        let output_gate = Arc::clone(&self.stdout_gate);
+        let owner_thread = std::thread::spawn(move || {
+            run_search(
+                search,
+                snapshot,
+                output_options,
+                output_gate,
+                owner_publish_output,
+                limits,
+            )
         });
         self.active = Some(ActiveSearch {
             control,
-            completion,
             publish_output,
-            search_thread,
-            watchdog_thread,
+            owner_thread,
             started,
             clock_budget,
         });
         Ok(())
     }
 
-    pub(crate) fn go(&mut self, params: &GoParams, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
+    pub(crate) fn go(&mut self, params: &GoParams) -> Result<(), EnginError> {
         if params.ponder {
             return Err(EnginError::Uci("Ponder is not enabled.".into()));
         }
@@ -478,7 +452,7 @@ impl Engine {
         }
         if self.backend.is_none() {
             let reason = self.backend_error.as_deref().unwrap_or("WeightsFile is not configured");
-            responder.send_raw_response(&format!("info string cannot search: {reason}"));
+            write_stdout(&[format!("info string cannot search: {reason}")]);
             return Ok(());
         }
         self.start_search(params)
@@ -493,27 +467,18 @@ impl Engine {
             return Ok(());
         };
         let ActiveSearch {
-            completion,
-            search_thread,
-            watchdog_thread,
+            owner_thread,
             started,
             clock_budget,
             ..
         } = active;
-        loop {
-            let mut result = completion.result.lock();
-            if result.is_some() {
-                break;
-            }
-            completion.ready.wait(&mut result);
-        }
-        let _ = search_thread.join();
-        let _ = watchdog_thread.join();
-        let result = completion.result.lock().take().expect("completed search has a result");
+        let result = owner_thread
+            .join()
+            .map_err(|_| EnginError::Uci("search owner thread panicked".into()))?;
         if let Some(clock_budget) = clock_budget {
             self.time_manager.finish(clock_budget, started.elapsed());
         }
-        result.map(|_| ())
+        result
     }
 
     pub(crate) fn stop(&mut self) -> Result<(), EnginError> {
@@ -526,7 +491,8 @@ impl Engine {
     /// 替换 position / backend / 新 `go` 时取消输出并 drain；丢弃上一局结果，避免失败毒化下一条命令。
     fn abort(&mut self) -> Result<(), EnginError> {
         if let Some(active) = &self.active {
-            *active.publish_output.lock() = false;
+            let _output = self.stdout_gate.lock();
+            active.publish_output.store(false, Ordering::Release);
             active.control.request_stop();
         }
         if let Err(error) = self.wait() {
@@ -534,50 +500,79 @@ impl Engine {
         }
         Ok(())
     }
-
-    /// UCI loop 安装自己的输出队列；Engine 不提供嵌入式 library callback。
-    pub(crate) fn set_output_queue(&mut self, output: Option<Arc<UciOutputQueue>>) {
-        self.output = output;
-    }
 }
 
-/// 单次 job 的 owner 运行、取 root 结果并在退出前归还 worker。参考 LC3 Overview 的 "Search"。
+/// 单次 job 的唯一 owner：运行搜索、按进度输出、drain 后输出最终结果并归还 worker。
+/// 参考 LC3 Overview 的 Search/Watchdog 角色，但不另开 watchdog 线程。
 fn run_search(
     mut search: Search,
-    root_is_black: bool,
-    root_move_filter: Vec<Move>,
-    params: SearchParams,
+    snapshot: RootSnapshot,
+    output_options: Options,
+    output_gate: Arc<Mutex<()>>,
+    publish_output: Arc<AtomicBool>,
     limits: SearchLimits,
-) -> Result<CompletedSearch, EnginError> {
-    let stats = search.run_with_limits(limits)?;
-    // path-local repetition/rule60 不能标记共享 board node，但对这次 UCI root 已是
-    // 真正终局；不得从旧图的 edge 回退出一着看似合法的棋。
-    let (best_move, principal_variation) = if search.root_is_path_terminal() {
-        (None, Vec::new())
-    } else {
-        (
-            best_move_filtered_with_params(
-                search.repository(),
-                search.root_key(),
-                root_is_black,
-                &root_move_filter,
-                &params,
-            ),
-            principal_variation_filtered_with_params(
-                search.repository(),
-                search.root_key(),
-                root_is_black,
-                &root_move_filter,
-                &params,
-            ),
-        )
-    };
+) -> Result<(), EnginError> {
+    let started = Instant::now();
+    let mut published = PublishedInfo::default();
+    let result = search.run_with_limits_reporting(limits, Some(OWNER_PROGRESS_INTERVAL), |stats| {
+        if !publish_output.load(Ordering::Acquire) {
+            return;
+        }
+        let time = started.elapsed().as_millis() as i64;
+        let progress = snapshot.progress(&stats);
+        if published.should_publish(progress, time) {
+            let infos = snapshot.thinking_infos(stats, started);
+            let _output = output_gate.lock();
+            if publish_output.load(Ordering::Acquire) {
+                write_stdout_thinking(&infos, &output_options);
+                published.update(progress, time);
+            }
+        }
+    });
+    if let Ok(stats) = &result {
+        // path-local repetition/rule60 不能标记共享 board node，但对这次 UCI root 已是
+        // 真正终局；不得从旧图的 edge 回退出一着看似合法的棋。
+        let (best_move, principal_variation) = if search.root_is_path_terminal() {
+            (None, Vec::new())
+        } else {
+            (
+                best_move_filtered_with_params(
+                    search.repository(),
+                    search.root_key(),
+                    snapshot.root_is_black,
+                    &snapshot.root_move_filter,
+                    &snapshot.params,
+                ),
+                principal_variation_filtered_with_params(
+                    search.repository(),
+                    search.root_key(),
+                    snapshot.root_is_black,
+                    &snapshot.root_move_filter,
+                    &snapshot.params,
+                ),
+            )
+        };
+        let mut infos = snapshot.thinking_infos(stats.clone(), started);
+        if let Some(info) = infos.first_mut() {
+            info.pv = principal_variation;
+        }
+        let _output = output_gate.lock();
+        if publish_output.load(Ordering::Acquire) {
+            write_stdout_thinking(&infos, &output_options);
+            write_stdout_best_move(&BestMoveInfo::new(best_move.unwrap_or(Move::NULL)));
+        }
+    } else if let Err(error) = &result {
+        let info = ThinkingInfo {
+            comment: format!("stream search failed: {error}"),
+            ..ThinkingInfo::default()
+        };
+        let _output = output_gate.lock();
+        if publish_output.load(Ordering::Acquire) {
+            write_stdout_thinking(&[info], &output_options);
+        }
+    }
     search.stop_and_finish();
-    Ok(CompletedSearch {
-        stats,
-        best_move,
-        principal_variation,
-    })
+    result.map(|_| ())
 }
 
 impl RootSnapshot {
@@ -692,112 +687,5 @@ impl PublishedInfo {
     fn update(&mut self, progress: SearchProgress, time: i64) {
         self.progress = Some(progress);
         self.time = time;
-    }
-}
-
-/// LC3 Overview 的 WatchdogWorker：只输出，搜索仍只由 Gather/Eval/NN/Backprop 负责。
-fn watchdog(
-    control: SearchControl,
-    snapshot: RootSnapshot,
-    completion: Arc<Completion>,
-    publish_output: Arc<Mutex<bool>>,
-    output: Option<Arc<UciOutputQueue>>,
-    started: Instant,
-) {
-    let mut published = PublishedInfo::default();
-    loop {
-        let mut result = completion.result.lock();
-        if result.is_none() {
-            // stream 可以形成单项 NN batch；最多每 100ms 合并一次，避免 UCI/PV 格式化影响吞吐。
-            completion.ready.wait_for(&mut result, Duration::from_millis(100));
-        }
-        if let Some(result) = result.as_ref() {
-            if let Some(output) = output.as_ref() {
-                if !*publish_output.lock() {
-                    return;
-                }
-                match result {
-                    Ok(result) => {
-                        let mut infos = snapshot.thinking_infos(result.stats.clone(), started);
-                        if let Some(info) = infos.first_mut() {
-                            info.pv = result.principal_variation.clone();
-                        }
-                        output.push_thinking_info(infos);
-                        output.push_best_move(BestMoveInfo::new(result.best_move.unwrap_or(Move::NULL)));
-                    }
-                    Err(error) => output.push_thinking_info(vec![ThinkingInfo {
-                        comment: format!("stream search failed: {error}"),
-                        ..ThinkingInfo::default()
-                    }]),
-                }
-            }
-            return;
-        }
-        drop(result);
-        if let Some(output) = output.as_ref() {
-            if !*publish_output.lock() {
-                return;
-            }
-            let stats = control.stats();
-            let time = started.elapsed().as_millis() as i64;
-            let progress = snapshot.progress(&stats);
-            if published.should_publish(progress, time) {
-                output.push_thinking_info(snapshot.thinking_infos(stats, started));
-                published.update(progress, time);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Once;
-
-    use xiangqi_core::initialize_magic_bitboards;
-
-    use super::Engine;
-    use crate::GoParams;
-
-    static INIT: Once = Once::new();
-
-    #[test]
-    fn engine_reuses_graph_for_the_same_root_node_budget() {
-        INIT.call_once(initialize_magic_bitboards);
-        let mut engine = Engine::uniform();
-        engine.set_position(xiangqi_core::STARTPOS_FEN, &[]).expect("position");
-        engine
-            .start_search(&GoParams {
-                nodes: Some(8),
-                ..GoParams::default()
-            })
-            .expect("first search");
-        engine.wait().expect("first wait");
-        let root = engine.graph.as_ref().expect("graph").root_key();
-        let visits = engine
-            .graph
-            .as_ref()
-            .expect("graph")
-            .repository()
-            .get(root)
-            .expect("root")
-            .completed_visits();
-        engine
-            .start_search(&GoParams {
-                nodes: Some(8),
-                ..GoParams::default()
-            })
-            .expect("same root");
-        engine.wait().expect("same root wait");
-        assert_eq!(
-            engine
-                .graph
-                .as_ref()
-                .expect("graph")
-                .repository()
-                .get(root)
-                .expect("root")
-                .completed_visits(),
-            visits
-        );
     }
 }

@@ -28,10 +28,8 @@ pub struct Options {
     /// 根最终 Decision 的 LCB 参数；不参与 PUCT。
     pub lcb_stdevs: f32,
     pub lcb_min_visit_fraction: f32,
-    /// 三类 stream worker 的常驻线程数。
-    pub gather_workers: usize,
-    pub eval_workers: usize,
-    pub backprop_workers: usize,
+    /// UCI `Threads` 只分配 Gather + Eval；Backprop 和 NN 各固定一条线程。
+    pub threads: usize,
 }
 
 impl Default for Options {
@@ -50,9 +48,7 @@ impl Default for Options {
             fpu_reduction: search.fpu_reduction,
             lcb_stdevs: search.lcb_stdevs,
             lcb_min_visit_fraction: search.lcb_min_visit_fraction,
-            gather_workers: 4,
-            eval_workers: 4,
-            backprop_workers: 1,
+            threads: 8,
         }
     }
 }
@@ -80,18 +76,7 @@ impl Options {
                 "option name LcbMinVisitFraction type string default {}",
                 self.lcb_min_visit_fraction
             ),
-            format!(
-                "option name GatherWorkers type spin default {} min 1 max 64",
-                self.gather_workers
-            ),
-            format!(
-                "option name EvalWorkers type spin default {} min 1 max 64",
-                self.eval_workers
-            ),
-            format!(
-                "option name BackpropWorkers type spin default {} min 1 max 64",
-                self.backprop_workers
-            ),
+            format!("option name Threads type spin default {} min 2 max 128", self.threads),
             format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
@@ -148,9 +133,7 @@ impl Options {
             "lcbminvisitfraction" => {
                 self.lcb_min_visit_fraction = parse_unit_interval_float("LcbMinVisitFraction", value)?
             }
-            "gatherworkers" => self.gather_workers = parse_worker_count(name, value)?,
-            "evalworkers" => self.eval_workers = parse_worker_count(name, value)?,
-            "backpropworkers" => self.backprop_workers = parse_worker_count(name, value)?,
+            "threads" => self.threads = parse_thread_count(value)?,
             _ => return Err(crate::EnginError::Uci(format!("Unknown option: {name}"))),
         }
         Ok(())
@@ -185,12 +168,12 @@ fn parse_positive_float(name: &str, value: &str) -> Result<f32, crate::EnginErro
     Ok(value)
 }
 
-fn parse_worker_count(name: &str, value: &str) -> Result<usize, crate::EnginError> {
+fn parse_thread_count(value: &str) -> Result<usize, crate::EnginError> {
     let value = value
         .parse::<usize>()
-        .map_err(|_| crate::EnginError::Uci(format!("{name} must be an integer within [1, 64]")))?;
-    if !(1..=64).contains(&value) {
-        return Err(crate::EnginError::Uci(format!("{name} must be within [1, 64]")));
+        .map_err(|_| crate::EnginError::Uci("Threads must be an integer within [2, 128]".into()))?;
+    if !(2..=128).contains(&value) {
+        return Err(crate::EnginError::Uci("Threads must be within [2, 128]".into()));
     }
     Ok(value)
 }

@@ -33,7 +33,7 @@ CUDA 13 / cuDNN 9。TensorRT 包会复制配置 `tensorrt_libs` 目录中的全�
 - `go nodes`、`go movetime`、`go wtime/btime/winc/binc/movestogo`、`go infinite`、`go searchmoves`
 - `stop`、`ucinewgame`、`quit`
 - `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`MiniBatchSize`、`NNCacheSizePowerOfTwo`、`MultiPV`
-- `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`LcbStdevs`、`LcbMinVisitFraction`、`GatherWorkers`、`EvalWorkers`、`BackpropWorkers`
+- `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`LcbStdevs`、`LcbMinVisitFraction`、`Threads`
 
 `MiniBatchSize` 沿用常见 UCI 同名 option（历史上与 px0/Lc0 同名），范围 `0..=1024`，默认 `0`
 （由 backend 建议）。它限制一次 NN 调用最多合并的局面数；较大值通常提高吞吐，却可能因增加在途局面和
@@ -52,9 +52,7 @@ bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，�
 共用同一条 cPUCT 曲线，`C(0)=1.75`，不再维护根专用参数；`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度。
 三者仍可作为一个整体实验，但默认不再扩散扫描。`FpuReduction`（默认 `0.200`）控制未访问边相对 parent Q
 的降幅；小网络可能有系统性偏差，故降低未知候选的首次入场门槛。LC0 对照值 `0.330` 与原 X7
-基线 `CPuct=1.0`、`FpuReduction=0.220` 保留为实验参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`GatherWorkers`、`EvalWorkers`、
-`BackpropWorkers` 默认分别为 `4`、`4`、`1`，范围均为 `1..=64`。它们与 `MiniBatchSize` 一样是
-引擎生命周期配置：`setoption` 影响之后的每次 `go`，当前 job 始终使用启动时的参数与 worker pool。
+基线 `CPuct=1.0`、`FpuReduction=0.220` 保留为实验参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`Threads` 默认 `8`，只在 Gather 和 Eval 间近似平分（默认 `4/4`）；NN 与 Backprop 固定各一条线程，不计入该值。范围为 `2..=128`。它与 `MiniBatchSize` 一样是引擎生命周期配置：`setoption` 影响之后的每次 `go`，当前 job 始终使用启动时的参数与 worker pool。
 
 `LcbStdevs=5.0`、`LcbMinVisitFraction=0.15` 只影响根的最终 Decision，不参与 PUCT 或 visit 分配。
 根候选先按既有终局/N/Q/P 排名确定访问门槛；达到 N 第一候选 15% 的非终局候选再按 `Q - k·标准误`
@@ -139,7 +137,7 @@ Pikafish 的 `score cp` 是对照分数；stream 的 `Q` 是未校准的网络�
 | 目录 | 职责 |
 | --- | --- |
 | `crates/xiangqi_core` | 唯一的规则真相：棋盘、合法着、FEN、历史与裁判。 |
-| `crates/engin` | UCI、ONNX 外围、stream 搜索、watchdog 与时钟管理。 |
+| `crates/engin` | UCI、ONNX 外围、stream 搜索与时钟管理。 |
 | `nn` | 训练、权重处理与 ONNX 导出；不进入搜索热路径。 |
 
 架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)，已完成研究尝试见

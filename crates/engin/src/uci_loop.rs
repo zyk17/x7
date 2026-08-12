@@ -4,7 +4,6 @@
 //! 命令必须明确拒绝。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use xiangqi_core::STARTPOS_FEN;
 
@@ -89,105 +88,31 @@ pub struct GoParams {
     pub ponder: bool,
 }
 
-/// UCI 输出回调。
-pub trait UciResponder {
-    fn output_best_move(&mut self, info: &BestMoveInfo);
-    fn output_thinking_info(&mut self, infos: &[ThinkingInfo]);
-}
-
-/// 以原始字符串发送 UCI 响应的边界。
-pub trait StringUciResponder: UciResponder {
-    fn send_raw_responses(&mut self, responses: &[String]);
-    fn set_options(&mut self, options: Options);
-
-    fn send_raw_response(&mut self, response: &str) {
-        self.send_raw_responses(&[response.to_string()]);
-    }
-
-    fn send_id(&mut self, version: &str) {
-        self.send_raw_response(&format!("id name x7 v{version}"));
-        self.send_raw_response("id author aaa");
-        self.send_raw_response("");
-    }
-}
-
-/// watchdog 到 UCI 主线程的输出队列。主线程是唯一格式化、写 stdout 的 owner。
-#[derive(Default)]
-pub(crate) struct UciOutputQueue {
-    events: Mutex<Vec<UciOutput>>,
-}
-
-enum UciOutput {
-    BestMove(BestMoveInfo),
-    Thinking(Vec<ThinkingInfo>),
-}
-
-impl UciOutputQueue {
-    /// watchdog 放入一条 bestmove，UCI 主线程随后统一输出。
-    pub(crate) fn push_best_move(&self, info: BestMoveInfo) {
-        self.events
-            .lock()
-            .expect("uci output queue lock")
-            .push(UciOutput::BestMove(info));
-    }
-
-    /// watchdog 放入一组 info，UCI 主线程随后统一输出。
-    pub(crate) fn push_thinking_info(&self, infos: Vec<ThinkingInfo>) {
-        self.events
-            .lock()
-            .expect("uci output queue lock")
-            .push(UciOutput::Thinking(infos));
-    }
-
-    fn flush(&self, responder: &mut dyn UciResponder) {
-        let events = std::mem::take(&mut *self.events.lock().expect("uci output queue lock"));
-        for event in events {
-            match event {
-                UciOutput::BestMove(info) => responder.output_best_move(&info),
-                UciOutput::Thinking(infos) => responder.output_thinking_info(&infos),
-            }
-        }
-    }
-}
-
 /// UCI 主循环：解析命令并驱动 Engine。
 pub struct UciLoop<'a> {
-    pub responder: &'a mut dyn StringUciResponder,
-    pub engine: &'a mut Engine,
-    output: Arc<UciOutputQueue>,
+    engine: &'a mut Engine,
 }
 
 impl<'a> UciLoop<'a> {
-    /// 绑定 responder 与 engine。
-    pub fn new(responder: &'a mut dyn StringUciResponder, engine: &'a mut Engine) -> Self {
-        responder.set_options(engine.options().clone());
-        let output = Arc::new(UciOutputQueue::default());
-        engine.set_output_queue(Some(Arc::clone(&output)));
-        Self {
-            responder,
-            engine,
-            output,
-        }
+    pub fn new(engine: &'a mut Engine) -> Self {
+        Self { engine }
     }
 
-    /// 分发已解析的 UCI 命令。
-    pub fn dispatch_command(
-        &mut self,
-        command: &str,
-        params: &HashMap<String, String>,
-        version: &str,
-    ) -> Result<bool, EnginError> {
+    fn dispatch_command(&mut self, command: &str, params: &HashMap<String, String>) -> Result<bool, EnginError> {
         match command {
             "uci" => {
-                self.responder.send_id(version);
-                for option in self.engine.options().list_options_uci() {
-                    self.responder.send_raw_response(&option);
-                }
-                self.responder.send_raw_response("uciok");
+                let mut response = vec![
+                    format!("id name x7 v{}", env!("CARGO_PKG_VERSION")),
+                    "id author 777".into(),
+                    String::new(),
+                ];
+                response.extend(self.engine.options().list_options_uci());
+                response.push("uciok".into());
+                write_stdout(&response);
             }
             "isready" => {
                 self.engine.ensure_ready()?;
-                self.responder.send_raw_response("readyok");
+                write_stdout(&["readyok".into()]);
             }
             "setoption" => {
                 if get_or_empty(params, "name").is_empty() {
@@ -195,7 +120,6 @@ impl<'a> UciLoop<'a> {
                 }
                 self.engine
                     .set_option(get_or_empty(params, "name"), get_or_empty(params, "value"))?;
-                self.responder.set_options(self.engine.options().clone());
             }
             "ucinewgame" => self.engine.new_game()?,
             "position" => {
@@ -252,7 +176,7 @@ impl<'a> UciLoop<'a> {
                 ucigooption!(mate, i32);
                 ucigooption!(nodes, i32);
                 ucigooption!(movetime);
-                self.engine.go(&go_params, self.responder)?;
+                self.engine.go(&go_params)?;
             }
             "wait" => self.engine.wait()?,
             "stop" => self.engine.stop()?,
@@ -260,22 +184,16 @@ impl<'a> UciLoop<'a> {
             "quit" => return Ok(false),
             _ => return Err(EnginError::Uci(format!("Unknown command: {command}"))),
         }
-        self.flush_output();
         Ok(true)
     }
 
     /// 处理一行 UCI 输入；返回 false 表示 quit。
-    pub fn process_line(&mut self, line: &str, version: &str) -> Result<bool, EnginError> {
+    pub fn process_line(&mut self, line: &str) -> Result<bool, EnginError> {
         let (command, params) = parse_command(line)?;
         if command.is_empty() {
             return Ok(true);
         }
-        self.dispatch_command(&command, &params, version)
-    }
-
-    /// 即使没有新 UCI 命令，也会 flush watchdog 已写入的输出队列。
-    pub fn flush_output(&mut self) {
-        self.output.flush(self.responder);
+        self.dispatch_command(&command, &params)
     }
 }
 
@@ -283,8 +201,6 @@ impl Drop for UciLoop<'_> {
     /// 退出前确保搜索已停止。
     fn drop(&mut self) {
         let _ = self.engine.stop();
-        self.engine.set_output_queue(None);
-        self.flush_output();
     }
 }
 
@@ -417,73 +333,26 @@ pub fn format_thinking_info(info: &ThinkingInfo, options: &Options) -> String {
     res
 }
 
-/// 收集 stdout 响应用于 transcript 测试。
-#[derive(Clone, Debug, Default)]
-pub struct VecUciResponder {
-    pub responses: Vec<String>,
-    pub options: Options,
+/// 主线程与 search owner 共用的 stdout 边界。一次调用持有同一把 stdout 锁，避免
+/// `info` / `bestmove` 与同步 UCI 回复交织成半行。
+pub(crate) fn write_stdout(responses: &[String]) {
+    use std::io::{self, Write};
+
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    for response in responses {
+        let _ = writeln!(lock, "{response}");
+    }
+    let _ = lock.flush();
 }
 
-/// 直接写 stdout 的 UCI responder。
-#[derive(Clone, Debug, Default)]
-pub struct StdoutUciResponder {
-    pub options: Options,
+pub(crate) fn write_stdout_thinking(infos: &[ThinkingInfo], options: &Options) {
+    let lines: Vec<_> = infos.iter().map(|info| format_thinking_info(info, options)).collect();
+    write_stdout(&lines);
 }
 
-impl UciResponder for StdoutUciResponder {
-    fn output_best_move(&mut self, info: &BestMoveInfo) {
-        self.send_raw_response(&format_best_move(info));
-    }
-
-    fn output_thinking_info(&mut self, infos: &[ThinkingInfo]) {
-        let lines: Vec<String> = infos
-            .iter()
-            .map(|info| format_thinking_info(info, &self.options))
-            .collect();
-        self.send_raw_responses(&lines);
-    }
-}
-
-impl StringUciResponder for StdoutUciResponder {
-    fn send_raw_responses(&mut self, responses: &[String]) {
-        use std::io::{self, Write};
-        let stdout = io::stdout();
-        let mut lock = stdout.lock();
-        for response in responses {
-            let _ = writeln!(lock, "{response}");
-        }
-        // UCI GUI 通常经 pipe 读取 stdout；换行不会像终端一样自动刷新。必须在本次
-        // responder 调用结束前送出 `bestmove`，否则搜索已结束却会被外层误认为超时。
-        let _ = lock.flush();
-    }
-
-    fn set_options(&mut self, options: Options) {
-        self.options = options;
-    }
-}
-
-impl UciResponder for VecUciResponder {
-    fn output_best_move(&mut self, info: &BestMoveInfo) {
-        self.send_raw_response(&format_best_move(info));
-    }
-
-    fn output_thinking_info(&mut self, infos: &[ThinkingInfo]) {
-        let lines: Vec<String> = infos
-            .iter()
-            .map(|info| format_thinking_info(info, &self.options))
-            .collect();
-        self.send_raw_responses(&lines);
-    }
-}
-
-impl StringUciResponder for VecUciResponder {
-    fn send_raw_responses(&mut self, responses: &[String]) {
-        self.responses.extend_from_slice(responses);
-    }
-
-    fn set_options(&mut self, options: Options) {
-        self.options = options;
-    }
+pub(crate) fn write_stdout_best_move(info: &BestMoveInfo) {
+    write_stdout(&[format_best_move(info)]);
 }
 
 fn is_known_command(command: &str) -> bool {
@@ -597,14 +466,7 @@ fn token_offset(text: &str, needle: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::Wdl;
     use super::*;
-    use std::sync::Once;
-    use xiangqi_core::{Move, Square, initialize_magic_bitboards};
-
-    static INIT: Once = Once::new();
-
-    fn ensure_init() {
-        INIT.call_once(initialize_magic_bitboards);
-    }
+    use xiangqi_core::{Move, Square};
 
     #[test]
     fn parse_position_startpos_moves() {
@@ -685,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn search_options_accept_puct_params_and_worker_counts() {
+    fn search_options_accept_puct_params_and_threads() {
         let mut options = Options::default();
         options.set_uci_option("cpuct", "1.5").expect("cpuct");
         options.set_uci_option("CPUctBase", "20000").expect("cpuct base");
@@ -695,11 +557,7 @@ mod tests {
         options
             .set_uci_option("lcbminvisitfraction", "0.2")
             .expect("lcb visit fraction");
-        options.set_uci_option("GatherWorkers", "2").expect("gather workers");
-        options.set_uci_option("EvalWorkers", "3").expect("eval workers");
-        options
-            .set_uci_option("BackpropWorkers", "2")
-            .expect("backprop workers");
+        options.set_uci_option("threads", "7").expect("threads");
         options
             .set_uci_option("nncachesizepoweroftwo", "20")
             .expect("cache size power");
@@ -710,48 +568,16 @@ mod tests {
         assert_eq!(options.lcb_stdevs, 4.0);
         assert_eq!(options.lcb_min_visit_fraction, 0.2);
         assert_eq!(options.nn_cache_size_power_of_two, 20);
-        assert_eq!(
-            (options.gather_workers, options.eval_workers, options.backprop_workers),
-            (2, 3, 2)
-        );
+        assert_eq!(options.threads, 7);
         assert!(options.set_uci_option("CPuct", "NaN").is_err());
         assert!(options.set_uci_option("CPuctBase", "0").is_err());
         assert!(options.set_uci_option("CPuctFactor", "NaN").is_err());
         assert!(options.set_uci_option("FpuReduction", "-0.1").is_err());
         assert!(options.set_uci_option("LcbStdevs", "NaN").is_err());
         assert!(options.set_uci_option("LcbMinVisitFraction", "1.1").is_err());
-        assert!(options.set_uci_option("GatherWorkers", "0").is_err());
-        assert!(options.set_uci_option("EvalWorkers", "65").is_err());
+        assert!(options.set_uci_option("Threads", "1").is_err());
+        assert!(options.set_uci_option("Threads", "129").is_err());
         assert!(options.set_uci_option("NNCacheSizePowerOfTwo", "49").is_err());
-    }
-
-    #[test]
-    fn uci_transcript() {
-        ensure_init();
-        let mut engine = Engine::uniform();
-        let mut responder = VecUciResponder::default();
-        let mut uci = UciLoop::new(&mut responder, &mut engine);
-        assert!(uci.process_line("uci", "1.2.3").expect("uci"));
-        assert!(uci.process_line("isready", "1.2.3").expect("isready"));
-        assert!(
-            uci.process_line("position startpos moves h2h4", "1.2.3")
-                .expect("position")
-        );
-        drop(uci);
-        assert_eq!(responder.responses[0], "id name x7 v1.2.3");
-        assert_eq!(responder.responses.last().unwrap(), "readyok");
-    }
-
-    #[test]
-    fn responder_observes_updated_options_and_registration_lifecycle() {
-        let mut engine = Engine::uniform();
-        let mut responder = VecUciResponder::default();
-        {
-            let mut uci = UciLoop::new(&mut responder, &mut engine);
-            uci.process_line("setoption name UCI_ShowWDL value true", "0.0.0")
-                .expect("setoption");
-        }
-        assert!(responder.options.show_wdl);
     }
 
     #[test]

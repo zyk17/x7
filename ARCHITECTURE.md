@@ -70,15 +70,15 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 - repository 是一个 64 分片的 key-value map。普通 MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。真实 variation 第一次重复时不接回 shared graph，而是以该重复局面为根进入纯 `ContinuationTree`：其 key 纳入自最近零化着以来的规则 history，树内不换位合并，只复用按棋盘索引的 NN cache；该重复上下文持续到下一次零化着，故跨回合 root 继续使用与完整 history 对应的 contextual key 并保留局部树；第三次出现同一局面才由 `RuleJudge` 终局。首次绑定普通 shared edge 若 DFS 发现会形成 shared-Q 图环，则永久标为 topology-pruned 并从 PUCT 排除，不写 N/Q，也不伪装成棋规和棋。这是为保持 shared-Q 无环的 X7 结构近似，须由残局回归与 Elo 验证。
 - NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
-- Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、稀疏合批推理，并以整批 `EncodedBatch` 交回。
+- Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；UCI `Threads` 只在 Gather/Eval 间近似平分，NN 与 Backprop 固定各一条线程，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、稀疏合批推理，并以整批 `EncodedBatch` 交回。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
   Engine 启动 job 时按固定中性的时间预算（历史上参考 px0 legacy stopper）转换为不可变 deadline，job drain 后才归还剩余时间。
 - graph reuse 只保留当前 root 可达图：确认走子后，旧 root 的 sibling 图由后台 mark/sweep 回收，UCI 可立即启动新
   `go`。完整 `PositionHistory` 仍由 UCI `position ... moves` 提供；悔棋回到旧局面会重新建立搜索 root，不承诺复用
   旧 sibling 子树。后台 GC 以 topology 写锁与 node 创建/edge 绑定同步，避免删掉刚由 transposition 接回的 node。
   当前不做 edge 入度引用计数：多父图下仍须维护解绑，且“从当前 root 可达”才是保留语义。无关 `position` 换图时，
-  整个旧 repository 同样在后台逐 shard 释放。UCI/Watchdog 已输出最小 info 与一次 bestmove。
-- `MultiPV` 只在 watchdog 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCGS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
+  整个旧 repository 同样在后台逐 shard 释放。search owner 已输出最小 info 与一次 bestmove。
+- `MultiPV` 只在 search owner 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCGS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
 stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 公式，不是 LC3 Policy 的正式公式，也不是 px0 搜索等价实现）。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.75 / 40000 / 4.0`。所有 node 共用一条对数 cPUCT 曲线，`C(0)=1.75`、`C(50k)≈5`，不维护根专用初值或参数。`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。
 
@@ -101,4 +101,4 @@ PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residua
 - 借鉴外部语义时保留来源标注（px0 路径、LC3 URL、KataGo 本地路径/文档等），并写清是历史参考还是本仓已偏离。
 - 允许本仓自研搜索决策；不要把尚未验证的启发式伪装成“外部参考要求”。
 - `position ... moves ...` 必须保留完整历史。
-- stream UCI 持续验证 `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏且恰好一次 `bestmove`（`uci_search_test`）。
+- stream UCI 的运行边界是 `position -> go -> stop -> position -> go`：旧 generation 必须不再输出，所有 reservation 必须在 drain 后归还，正常 `go` 恰好输出一次 `bestmove`。
