@@ -30,6 +30,18 @@ name = "graph_shape"
 path = "src/bin/graph_shape.rs"
 required-features = ["benchmark"]
 
+[[bin]]
+name = "graph_measure"
+path = "src/bin/graph_measure.rs"
+
+[[bin]]
+name = "nn_eval"
+path = "src/bin/nn_eval.rs"
+
+[[bin]]
+name = "search_benchmark"
+path = "src/bin/search_benchmark.rs"
+
 [dependencies]
 crossbeam-channel = "0.5"
 ndarray = "0.17"

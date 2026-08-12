@@ -121,7 +121,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let legal = history.last().board().generate_legal_moves();
     println!(
         "fen={} moves={} side={} legal={}",
-        args.fen,
+        state.current_position().to_fen(),
         if args.moves.is_empty() {
             "-".to_owned()
         } else {
