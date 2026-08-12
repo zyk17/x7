@@ -25,8 +25,8 @@ use crate::neural::{
 use super::extension::{ExtensionKind, classify_extension, path_terminal_value};
 use super::graph::ChildLink;
 use super::{
-    BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGraph,
-    SearchParams, ValueDelta, network_wl_to_node, select_edge_from_node,
+    BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGraph, SearchParams, ValueDelta,
+    network_wl_to_node, select_edge_from_node,
 };
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
@@ -1511,9 +1511,7 @@ mod tests {
     use super::{NodeEvent, Search, SearchConfig, SearchLimits, Shared};
     use crate::EnginError;
     use crate::neural::backend::{Backend, BackendAttributes, UniformBackend};
-    use crate::search::{
-        ExpansionState, NodeRepository, SearchGraph, SearchParams, ValueDelta, best_move, root_stats,
-    };
+    use crate::search::{ExpansionState, NodeRepository, SearchGraph, SearchParams, ValueDelta, best_move, root_stats};
 
     struct FailingInferenceBackend;
 
@@ -1761,12 +1759,8 @@ mod tests {
         root.publish_edges(legal.iter().map(|&mv| (mv, 1.0 / legal.len() as f32)).collect());
         root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
 
-        let mut search = Search::new_with_graph(
-            Arc::new(UniformBackend::default()),
-            27,
-            &tree,
-            SearchConfig::default(),
-        );
+        let mut search =
+            Search::new_with_graph(Arc::new(UniformBackend::default()), 27, &tree, SearchConfig::default());
         let stats = search.run_playouts(1).expect("path terminal root");
 
         assert_eq!(stats.completed_playouts, 1);
@@ -1785,9 +1779,7 @@ mod tests {
         let root_key = tree.root_key();
         let mv = history.last().board().parse_move("b2b3").expect("legal root move");
         let fallback = history.last().board().parse_move("g3g4").expect("legal fallback move");
-        let child_key = NodeEvent::root(41, Arc::clone(&history))
-            .variation
-            .child_board_key(mv);
+        let child_key = NodeEvent::root(41, Arc::clone(&history)).variation.child_board_key(mv);
 
         let root = tree.repository().get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
@@ -1803,12 +1795,8 @@ mod tests {
         )]);
         child.edges()[0].bind_child_key(root_key);
 
-        let mut search = Search::new_with_graph(
-            Arc::new(UniformBackend::default()),
-            41,
-            &tree,
-            SearchConfig::default(),
-        );
+        let mut search =
+            Search::new_with_graph(Arc::new(UniformBackend::default()), 41, &tree, SearchConfig::default());
         let stats = search.run_playouts(1).expect("cycle-pruned playout");
         let root_edge = &root.edges()[0];
         assert_eq!(stats.completed_playouts, 1);
@@ -1854,12 +1842,8 @@ mod tests {
         )]);
         grandchild_node.edges()[0].bind_child_key(child_key);
 
-        let mut search = Search::new_with_graph(
-            Arc::new(UniformBackend::default()),
-            43,
-            &tree,
-            SearchConfig::default(),
-        );
+        let mut search =
+            Search::new_with_graph(Arc::new(UniformBackend::default()), 43, &tree, SearchConfig::default());
         let stats = search.run_playouts(1).expect("topology boundary playout");
 
         assert_eq!(stats.completed_playouts, 1);
@@ -1892,12 +1876,8 @@ mod tests {
         assert!(root.try_begin_evaluation());
         root.set_graph_value(ValueDelta::one(0.0, 0.0));
         root.publish_edges(vec![(mv, 1.0)]);
-        let mut search = Search::new_with_graph(
-            Arc::new(UniformBackend::default()),
-            42,
-            &tree,
-            SearchConfig::default(),
-        );
+        let mut search =
+            Search::new_with_graph(Arc::new(UniformBackend::default()), 42, &tree, SearchConfig::default());
         let stats = search.run_playouts(1).expect("continuation playout");
 
         assert_eq!(stats.completed_playouts, 1);
@@ -2073,12 +2053,7 @@ mod tests {
         let mut tree = super::SearchGraph::new(history);
         let backend = Arc::new(UniformBackend::default()) as Arc<dyn Backend>;
 
-        let mut first = Search::new_with_graph(
-            Arc::clone(&backend),
-            29,
-            &tree,
-            SearchConfig::default(),
-        );
+        let mut first = Search::new_with_graph(Arc::clone(&backend), 29, &tree, SearchConfig::default());
         first.run_playouts(16).expect("first search");
         let old_root = tree.root_key();
         let played = best_move(first.repository(), first.root_key(), false).expect("best move");

@@ -426,8 +426,8 @@ mod tests {
             .get_or_insert(child_key)
             .set_graph_value(crate::search::ValueDelta::one(0.3, 0.3));
         let first = first.descend(child_key, root_node.reserve_edge(0).expect("first edge"));
-        let second = NodeEvent::root(1, root_history)
-            .descend(child_key, root_node.reserve_edge(0).expect("second edge"));
+        let second =
+            NodeEvent::root(1, root_history).descend(child_key, root_node.reserve_edge(0).expect("second edge"));
 
         let result = BackpropEvent::complete_batch(
             [BackpropEvent::evaluation(first), BackpropEvent::evaluation(second)],
@@ -580,8 +580,8 @@ mod tests {
         root.edges()[0].bind_child_key(child_key);
 
         for value in [0.6, -0.2] {
-            let event = NodeEvent::root(4, Arc::clone(&history))
-                .descend(child_key, root.reserve_edge(0).expect("edge"));
+            let event =
+                NodeEvent::root(4, Arc::clone(&history)).descend(child_key, root.reserve_edge(0).expect("edge"));
             BackpropEvent::complete_batch(
                 [BackpropEvent::local_leaf(
                     event.discard_leaf_node(),
