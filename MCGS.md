@@ -300,13 +300,12 @@ cargo run -p engin --release --bin graph_measure -- --fen "<FEN>" --moves "..." 
 ### Phase 2：流式路径安全（已完成）
 
 使用 `node_path + reservations`、环检测和 reservation 配平；通过并发 completion/cancel、cycle termination 与
-真实 ONNX `position → go → stop → position → go` 回归。
+UCI `position → go → stop → position → go` 回归（`uci_search_test`）。
 
 ### Phase 3：图 GC、PV 与 terminal（已完成）
 
 改为 retained-root reachability GC；PV/graph-shape 防环；明确 history-dependent terminal 的局部语义。
-本地真实 ONNX 已通过 `position → go → stop → position → go` 回归；在此基础上才能开始固定时间 Elo
-比较。
+流式路径与 UCI 生命周期回归已通过；在此基础上才能开始固定时间 Elo 比较。
 
 ### Phase 4：评估
 

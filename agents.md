@@ -2,7 +2,7 @@
 
 ## 开始前
 
-依次阅读：`README.MD`、`ARCHITECTURE.md`、`agents.md`；按需阅读 `MCGS.md`、`Research.md`、`commands.md`。
+依次阅读：`README.MD`、`ARCHITECTURE.md`、`agents.md`；按需阅读 `MCGS.md`、`Research.md`、`commands.md`。延后低优先级项见 `NextStep.md`。
 
 ## 工程共识
 
@@ -32,4 +32,4 @@
 ## 参考与文档
 
 - 沿用或借鉴外部语义时，在注释里保留来源（px0 路径、LC3 URL、KataGo 本地路径/文档等），并标明是历史/语义参考还是本仓已偏离。
-- 稳定文档：`README.MD`、`ARCHITECTURE.md`、`agents.md`；专题：`MCGS.md`、`Research.md`、`commands.md`。不要新增长期未合并的 `temp*.md` 记录。
+- 稳定文档：`README.MD`、`ARCHITECTURE.md`、`agents.md`；专题：`MCGS.md`、`Research.md`、`commands.md`；延后项：`NextStep.md`。不要新增长期未合并的 `temp*.md` 记录。

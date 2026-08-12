@@ -99,4 +99,4 @@ PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residua
 - 借鉴外部语义时保留来源标注（px0 路径、LC3 URL、KataGo 本地路径/文档等），并写清是历史参考还是本仓已偏离。
 - 允许本仓自研搜索决策；不要把尚未验证的启发式伪装成“外部参考要求”。
 - `position ... moves ...` 必须保留完整历史。
-- stream UCI 持续验证 `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏且恰好一次 `bestmove`；真实 ONNX 回归仅在本地 `data/x7.onnx` 存在时运行。
+- stream UCI 持续验证 `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏且恰好一次 `bestmove`（`uci_search_test`）。

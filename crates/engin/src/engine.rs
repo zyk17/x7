@@ -192,13 +192,6 @@ impl Engine {
         engine
     }
 
-    /// 显式 ONNX 构造，正式 UCI 启动仍经 `new` + `WeightsFile`。
-    pub fn from_onnx_file(path: impl AsRef<std::path::Path>) -> Result<Self, EnginError> {
-        Ok(Self::with_backend(Box::new(CachingBackend::new(Box::new(
-            OnnxBackend::from_file(path)?,
-        )))))
-    }
-
     /// 确定性测试 backend，不参与正式 UCI 的 `WeightsFile` 生命周期。
     pub fn uniform() -> Self {
         Self::with_backend(Box::new(UniformBackend::default()))
