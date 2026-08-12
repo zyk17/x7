@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use engin::neural::backend::{Backend, CachingBackend};
 use engin::neural::onnx::OnnxBackend;
-use engin::search::{QueueStats, Search, SearchConfig, SearchGeneration, SearchLimits, Stats, root_stats};
+use engin::search::{QueueStats, Search, SearchConfig, SearchLimits, Stats, root_stats};
 use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
 struct Args {
@@ -292,7 +292,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let mut search = Search::new(
                             backend,
-                            SearchGeneration(generation),
+                            generation,
                             Arc::clone(&history),
                             SearchConfig {
                                 eval_batch_size: target_batch,

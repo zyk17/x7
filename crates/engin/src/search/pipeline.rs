@@ -25,7 +25,7 @@ use crate::neural::{
 use super::extension::{ExtensionKind, classify_extension, path_terminal_value};
 use super::graph::ChildLink;
 use super::{
-    BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGeneration, SearchGraph,
+    BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGraph,
     SearchParams, ValueDelta, network_wl_to_node, select_edge_from_node,
 };
 
@@ -392,7 +392,7 @@ impl Drop for WorkerPool {
 struct Shared {
     backend: Arc<dyn Backend>,
     repository: Arc<NodeRepository>,
-    generation: SearchGeneration,
+    generation: u64,
     params: SearchParams,
     root_move_filter: Vec<Move>,
     /// 当前 root 的 history 已裁决结束，但不能污染同 board 的共享 node。
@@ -595,7 +595,7 @@ pub struct Search {
 impl Search {
     pub fn new(
         backend: Arc<dyn Backend>,
-        generation: SearchGeneration,
+        generation: u64,
         root_history: Arc<PositionHistory>,
         config: SearchConfig,
     ) -> Self {
@@ -606,7 +606,7 @@ impl Search {
     /// 从保留图创建独立搜索；该搜索自己创建、销毁 worker pool。
     pub fn new_with_graph(
         backend: Arc<dyn Backend>,
-        generation: SearchGeneration,
+        generation: u64,
         graph: &SearchGraph,
         config: SearchConfig,
     ) -> Self {
@@ -616,7 +616,7 @@ impl Search {
 
     pub(crate) fn new_with_graph_in_pool(
         backend: Arc<dyn Backend>,
-        generation: SearchGeneration,
+        generation: u64,
         graph: &SearchGraph,
         config: SearchConfig,
         worker_pool: Arc<WorkerPool>,
@@ -1512,7 +1512,7 @@ mod tests {
     use crate::EnginError;
     use crate::neural::backend::{Backend, BackendAttributes, UniformBackend};
     use crate::search::{
-        ExpansionState, NodeRepository, SearchGeneration, SearchGraph, SearchParams, ValueDelta, best_move, root_stats,
+        ExpansionState, NodeRepository, SearchGraph, SearchParams, ValueDelta, best_move, root_stats,
     };
 
     struct FailingInferenceBackend;
@@ -1566,7 +1566,7 @@ mod tests {
     fn search_completes_batched_playouts_and_returns_workers() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(21),
+            21,
             startpos_history(),
             SearchConfig {
                 root_move_filter: Vec::new(),
@@ -1595,7 +1595,7 @@ mod tests {
     fn benchmark_telemetry_reports_pipeline_handoffs() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(22),
+            22,
             startpos_history(),
             SearchConfig::default(),
         );
@@ -1614,7 +1614,7 @@ mod tests {
     fn stop_and_finish_drains_in_flight_reservations() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(22),
+            22,
             startpos_history(),
             SearchConfig {
                 root_move_filter: Vec::new(),
@@ -1643,7 +1643,7 @@ mod tests {
     fn bounded_gather_queue_backpressures_without_failing_submission() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(23),
+            23,
             startpos_history(),
             SearchConfig {
                 root_move_filter: Vec::new(),
@@ -1666,7 +1666,7 @@ mod tests {
     fn requested_stop_returns_partial_stats_and_releases_reservations() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(24),
+            24,
             startpos_history(),
             SearchConfig {
                 root_move_filter: Vec::new(),
@@ -1701,7 +1701,7 @@ mod tests {
     fn expired_deadline_submits_no_new_playout() {
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(25),
+            25,
             startpos_history(),
             SearchConfig::default(),
         );
@@ -1722,7 +1722,7 @@ mod tests {
             .expect("checkmated root");
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(26),
+            26,
             Arc::new(PositionHistory::from_positions(state.positions())),
             SearchConfig::default(),
         );
@@ -1763,7 +1763,7 @@ mod tests {
 
         let mut search = Search::new_with_graph(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(27),
+            27,
             &tree,
             SearchConfig::default(),
         );
@@ -1785,7 +1785,7 @@ mod tests {
         let root_key = tree.root_key();
         let mv = history.last().board().parse_move("b2b3").expect("legal root move");
         let fallback = history.last().board().parse_move("g3g4").expect("legal fallback move");
-        let child_key = NodeEvent::root(SearchGeneration(41), Arc::clone(&history))
+        let child_key = NodeEvent::root(41, Arc::clone(&history))
             .variation
             .child_board_key(mv);
 
@@ -1805,7 +1805,7 @@ mod tests {
 
         let mut search = Search::new_with_graph(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(41),
+            41,
             &tree,
             SearchConfig::default(),
         );
@@ -1826,7 +1826,7 @@ mod tests {
         let tree = SearchGraph::new(Arc::clone(&history));
         let root_key = tree.root_key();
         let first = history.last().board().parse_move("b2b3").expect("legal first move");
-        let child_key = NodeEvent::root(SearchGeneration(43), Arc::clone(&history))
+        let child_key = NodeEvent::root(43, Arc::clone(&history))
             .variation
             .child_board_key(first);
         let child_position = Position::after(history.last(), first);
@@ -1856,7 +1856,7 @@ mod tests {
 
         let mut search = Search::new_with_graph(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(43),
+            43,
             &tree,
             SearchConfig::default(),
         );
@@ -1883,7 +1883,7 @@ mod tests {
         let tree = SearchGraph::new(Arc::clone(&history));
         let root = tree.repository().get_or_insert(tree.root_key());
         let mv = history.last().board().parse_move("d9e9").expect("repeat move");
-        let mut event = NodeEvent::root(SearchGeneration(42), Arc::clone(&history));
+        let mut event = NodeEvent::root(42, Arc::clone(&history));
         assert!(event.repeats_in_history(mv));
         let continuation = event.variation.continuation_child_key(mv);
 
@@ -1892,7 +1892,7 @@ mod tests {
         root.publish_edges(vec![(mv, 1.0)]);
         let mut search = Search::new_with_graph(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(42),
+            42,
             &tree,
             SearchConfig::default(),
         );
@@ -1917,7 +1917,7 @@ mod tests {
             GameState::from_fen_moves("4k4/9/9/9/9/9/9/9/R8/4K4 w - - 120 1", &[] as &[&str]).expect("rule60 root");
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(26),
+            26,
             Arc::new(PositionHistory::from_positions(state.positions())),
             SearchConfig::default(),
         );
@@ -1942,7 +1942,7 @@ mod tests {
         let count = 64;
         let mut workers = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(27),
+            27,
             startpos_history(),
             SearchConfig {
                 root_move_filter: Vec::new(),
@@ -1975,7 +1975,7 @@ mod tests {
     fn nn_inference_failure_drains_claimed_events() {
         let mut pipeline = Search::new(
             Arc::new(FailingInferenceBackend),
-            SearchGeneration(28),
+            28,
             startpos_history(),
             SearchConfig::default(),
         );
@@ -1990,7 +1990,7 @@ mod tests {
     fn invalid_nn_values_fail_without_leaking_the_claimed_event() {
         let mut pipeline = Search::new(
             Arc::new(InvalidValueBackend),
-            SearchGeneration(29),
+            29,
             startpos_history(),
             SearchConfig::default(),
         );
@@ -2021,7 +2021,7 @@ mod tests {
         let shared = Shared {
             backend: Arc::new(UniformBackend::default()),
             repository,
-            generation: SearchGeneration(30),
+            generation: 30,
             params: SearchParams::default(),
             root_move_filter: Vec::new(),
             root_path_terminal: AtomicBool::new(false),
@@ -2058,7 +2058,7 @@ mod tests {
             backprop_tx,
         };
 
-        shared.send_eval(NodeEvent::root(SearchGeneration(30), history));
+        shared.send_eval(NodeEvent::root(30, history));
 
         assert_eq!(root.expansion_state(), ExpansionState::Unexpanded);
         assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);
@@ -2073,7 +2073,7 @@ mod tests {
 
         let mut first = Search::new_with_graph(
             Arc::clone(&backend),
-            SearchGeneration(29),
+            29,
             &tree,
             SearchConfig::default(),
         );
@@ -2085,7 +2085,7 @@ mod tests {
         tree.advance(played).expect("advance retained tree");
         assert!(tree.repository().get(old_root).is_some());
 
-        let mut second = Search::new_with_graph(backend, SearchGeneration(30), &tree, SearchConfig::default());
+        let mut second = Search::new_with_graph(backend, 30, &tree, SearchConfig::default());
         second.run_playouts(8).expect("reused search");
         let root = second.repository().get(second.root_key()).expect("reused root");
         assert!(root.edges().iter().all(|edge| edge.visits() == edge.completed_visits()));

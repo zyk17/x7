@@ -439,7 +439,7 @@ mod tests {
 
     use super::{best_mate, best_move, best_move_filtered, principal_variation, root_stats, root_variations};
     use crate::neural::backend::UniformBackend;
-    use crate::search::{Search, SearchConfig, SearchGeneration};
+    use crate::search::{Search, SearchConfig};
 
     #[test]
     fn root_snapshot_reports_completed_and_in_flight_visits_separately() {
@@ -448,7 +448,7 @@ mod tests {
         let root_is_black = history.is_black_to_move();
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(31),
+            31,
             history,
             SearchConfig::default(),
         );
@@ -478,7 +478,7 @@ mod tests {
         let root_is_black = history.is_black_to_move();
         let mut pipeline = Search::new(
             Arc::new(UniformBackend::default()),
-            SearchGeneration(2),
+            2,
             history,
             SearchConfig::default(),
         );

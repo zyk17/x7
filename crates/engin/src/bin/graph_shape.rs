@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use engin::neural::backend::Backend;
 use engin::neural::onnx::OnnxBackend;
-use engin::search::{NodeKey, NodeRepository, Search, SearchConfig, SearchGeneration, SearchParams};
+use engin::search::{NodeKey, NodeRepository, Search, SearchConfig, SearchParams};
 use xiangqi_core::{GameState, Move, STARTPOS_FEN};
 
 struct Args {
@@ -289,7 +289,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let backend = OnnxBackend::from_file(&args.onnx)?;
     let mut search = Search::new(
         Arc::new(backend) as Arc<dyn Backend>,
-        SearchGeneration(1),
+        1,
         history,
         SearchConfig {
             params: SearchParams {

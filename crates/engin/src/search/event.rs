@@ -13,13 +13,6 @@ use xiangqi_core::{Move, Position, PositionHistory};
 
 use super::{EdgeReservation, NodeKey, ValueDelta};
 
-/// 拒绝 `position`、`ucinewgame` 或替换 `go` 之后残留的旧 event。
-///
-/// 一个 event 只属于一次流式搜索。x7 为每次 UCI 搜索分配单调递增 generation，
-/// 不让旧 event 更新新的 root。
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct SearchGeneration(pub u64);
-
 /// root history 加上从 root 到 repository node 的走法。
 ///
 /// 中国象棋重复局面和 rule60 依赖历史，因此 event 不能只保存棋盘 hash。root history
@@ -97,7 +90,9 @@ impl Variation {
 /// 有界 worker 队列发送。
 #[derive(Debug)]
 pub struct NodeEvent {
-    pub generation: SearchGeneration,
+    /// 拒绝 `position` / `ucinewgame` / 替换 `go` 之后残留的旧 event。
+    /// 每次 UCI 搜索单调递增，旧 event 不得更新新的 root。
+    pub generation: u64,
     pub node_key: NodeKey,
     node_path: Vec<NodeKey>,
     /// `(入边 reservation 索引, ContinuationTree 根 key)`。正常 path 为 `None`。
@@ -109,11 +104,11 @@ pub struct NodeEvent {
 }
 
 impl NodeEvent {
-    pub fn root(generation: SearchGeneration, root_history: Arc<PositionHistory>) -> Self {
+    pub fn root(generation: u64, root_history: Arc<PositionHistory>) -> Self {
         Self::at_root(generation, NodeKey::for_history(root_history.as_ref()), root_history)
     }
 
-    pub fn at_root(generation: SearchGeneration, root_key: NodeKey, root_history: Arc<PositionHistory>) -> Self {
+    pub fn at_root(generation: u64, root_key: NodeKey, root_history: Arc<PositionHistory>) -> Self {
         Self {
             generation,
             node_key: root_key,
@@ -321,14 +316,14 @@ mod tests {
 
     use xiangqi_core::{GameState, Move, STARTPOS_FEN};
 
-    use super::{BackpropEvent, NodeEvent, SearchGeneration};
+    use super::{BackpropEvent, NodeEvent};
     use crate::search::{NodeKey, NodeRepository};
 
     #[test]
     fn variation_keeps_root_history_and_owns_its_path() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let mut root = NodeEvent::root(
-            SearchGeneration(7),
+            7,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
         // 先物化 cached history，再下行；`push` 必须同步追加而不是重新回放。
@@ -343,7 +338,7 @@ mod tests {
 
         assert_eq!(next.variation.moves(), &[mv]);
         assert_eq!(next.variation.root_history().len(), root_history_len);
-        assert_eq!(next.generation, SearchGeneration(7));
+        assert_eq!(next.generation, 7);
         let mut expected = xiangqi_core::PositionHistory::from_positions(state.positions());
         expected.append(mv);
         assert_eq!(next.variation.history().last().hash(), expected.last().hash());
@@ -359,7 +354,7 @@ mod tests {
             history.append(mv);
         }
         let history = Arc::new(history);
-        let mut event = NodeEvent::root(SearchGeneration(8), Arc::clone(&history));
+        let mut event = NodeEvent::root(8, Arc::clone(&history));
         let mv = event
             .variation
             .position
@@ -378,7 +373,7 @@ mod tests {
     fn backprop_completes_every_reservation_with_alternating_value() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let root = NodeEvent::root(
-            SearchGeneration(1),
+            1,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
         let repository = NodeRepository::default();
@@ -416,7 +411,7 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let root_history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
         let repository = NodeRepository::default();
-        let first = NodeEvent::root(SearchGeneration(1), Arc::clone(&root_history));
+        let first = NodeEvent::root(1, Arc::clone(&root_history));
         let root_node = repository.get_or_insert(first.node_key);
         assert!(root_node.try_begin_evaluation());
         let mv = Move::new(
@@ -431,7 +426,7 @@ mod tests {
             .get_or_insert(child_key)
             .set_graph_value(crate::search::ValueDelta::one(0.3, 0.3));
         let first = first.descend(child_key, root_node.reserve_edge(0).expect("first edge"));
-        let second = NodeEvent::root(SearchGeneration(1), root_history)
+        let second = NodeEvent::root(1, root_history)
             .descend(child_key, root_node.reserve_edge(0).expect("second edge"));
 
         let result = BackpropEvent::complete_batch(
@@ -456,7 +451,7 @@ mod tests {
     fn continuation_tree_backprop_keeps_its_value_local_to_the_entry_edge() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let root = NodeEvent::root(
-            SearchGeneration(2),
+            2,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
         let repository = NodeRepository::default();
@@ -485,7 +480,7 @@ mod tests {
     fn continuation_tree_updates_inside_then_samples_its_root_at_the_shard_entry() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let root = NodeEvent::root(
-            SearchGeneration(12),
+            12,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
         let repository = NodeRepository::default();
@@ -537,7 +532,7 @@ mod tests {
     fn path_terminal_at_continuation_root_uses_its_local_rule_value() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let root = NodeEvent::root(
-            SearchGeneration(9),
+            9,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
         let repository = NodeRepository::default();
@@ -572,7 +567,7 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
         let repository = NodeRepository::default();
-        let root_key = NodeEvent::root(SearchGeneration(4), Arc::clone(&history)).node_key;
+        let root_key = NodeEvent::root(4, Arc::clone(&history)).node_key;
         let root = repository.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         let mv = Move::new(
@@ -585,7 +580,7 @@ mod tests {
         root.edges()[0].bind_child_key(child_key);
 
         for value in [0.6, -0.2] {
-            let event = NodeEvent::root(SearchGeneration(4), Arc::clone(&history))
+            let event = NodeEvent::root(4, Arc::clone(&history))
                 .descend(child_key, root.reserve_edge(0).expect("edge"));
             BackpropEvent::complete_batch(
                 [BackpropEvent::local_leaf(
@@ -605,7 +600,7 @@ mod tests {
     fn path_terminal_discards_its_unshared_leaf_before_backprop() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let root_history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
-        let root_event = NodeEvent::root(SearchGeneration(3), root_history);
+        let root_event = NodeEvent::root(3, root_history);
         let repository = NodeRepository::default();
         let root = repository.get_or_insert(root_event.node_key);
         assert!(root.try_begin_evaluation());
