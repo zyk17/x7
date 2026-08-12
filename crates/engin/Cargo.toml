@@ -7,8 +7,8 @@ publish = false
 default-run = "engin"
 
 [features]
-# 本机开发默认 TensorRT；DirectML 发行包由独立脚本显式构建，二者不混入同一二进制。
-default = ["tensorrt"]
+# 日常开发默认 DirectML；大节点实验才显式切 TensorRT，二者不混入同一二进制。
+default = ["directml"]
 directml = ["ort/directml", "ort/download-binaries", "ort/copy-dylibs", "ort/tls-native"]
 # NVIDIA 线：ORT TensorRT EP。需 CUDA 13（nvcc）+ cuDNN 9 + TensorRT 10。
 tensorrt = ["ort/tensorrt", "ort/load-dynamic", "ort/api-24"]

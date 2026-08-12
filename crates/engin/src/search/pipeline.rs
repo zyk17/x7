@@ -1875,14 +1875,16 @@ mod tests {
         let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
         let mut history = PositionHistory::default();
         history.reset(board, 2, 30);
-        for text in ["d9e9", "d2e2", "e9d9", "e2d2"] {
+        // 前三步尚未重复；第四步才回到初始局面。这样 root 仍是 shared
+        // board node，才能验证首次重复不把它的入边绑定到 shared graph。
+        for text in ["d9e9", "d2e2", "e9d9"] {
             let mv = history.last().board().parse_move(text).expect(text);
             history.append(mv);
         }
         let history = Arc::new(history);
         let tree = SearchGraph::new(Arc::clone(&history));
         let root = tree.repository().get_or_insert(tree.root_key());
-        let mv = history.last().board().parse_move("d9e9").expect("repeat move");
+        let mv = history.last().board().parse_move("e2d2").expect("repeat move");
         let mut event = NodeEvent::root(42, Arc::clone(&history));
         assert!(event.repeats_in_history(mv));
         let continuation = event.variation.continuation_child_key(mv);

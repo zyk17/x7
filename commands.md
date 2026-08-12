@@ -207,6 +207,9 @@ cargo run --release -p engin --bin nn_eval -- --onnx data\x7.onnx --bench 20
 python scripts\pikafish_compare.py --moves "c3c4 g6g5 ..." --movetime 3000 --multipv 3
 ```
 
+脚本固定设置 Pikafish `Threads=4`、`Hash=512 MB`；不要把其原始默认的 `1` thread、`16 MB`
+当作搜索质量对照。
+
 ## 11. 质量检查
 
 在仓库根目录执行：
@@ -254,13 +257,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1 `
   -BundleDir C:\dist\x7-directml
 ```
 
-本机开发默认使用 TensorRT，需要 CUDA 13（含 nvcc）、cuDNN 9、TensorRT 10（`nvinfer_10.dll`）。
-路径写在 `scripts/build-tensorrt.ps1` 与 `crates/engin/build.rs` 头部（`CUDA_PATH` / `X7_MSVC_BIN` 可覆盖）。
+本机日常开发默认使用 DirectML。大量 playout 的 benchmark 才显式使用 TensorRT；它需要 CUDA 13（含
+nvcc）、cuDNN 9、TensorRT 10（`nvinfer_10.dll`）。路径写在 `scripts/build-tensorrt.ps1` 与
+`crates/engin/build.rs` 头部（`CUDA_PATH` / `X7_MSVC_BIN` 可覆盖）。
 
 开发构建：
 
 ```powershell
 cargo run -p engin --release
+
+# 大节点 benchmark：显式切 TensorRT。
+cargo run -p engin --release --no-default-features --features tensorrt --bin search_benchmark -- --playouts 25000
 ```
 
 打包：

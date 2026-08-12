@@ -17,8 +17,8 @@ position startpos
 go nodes 1000
 ```
 
-本机开发默认构建 TensorRT。DirectML 是通用发行线：开发/打包时显式使用
-`--no-default-features --features directml` 或 `scripts/build-directml.ps1`。TensorRT 打包用 `scripts/build-tensorrt.ps1`
+本机日常开发默认构建 DirectML，也是通用发行线；打包使用 `scripts/build-directml.ps1`。大节点
+benchmark 才显式使用 `--no-default-features --features tensorrt`。TensorRT 打包用 `scripts/build-tensorrt.ps1`
 （脚本头部固定本机 ORT / CUDA / TensorRT 路径，换机器改那几行即可）。ORT GPU 包需带
 TensorRT EP，且 TensorRT **必须是 10.x**（`nvinfer_10.dll`）；不要装 TRT 11。本机另需
 CUDA 13 / cuDNN 9。TensorRT 包会复制配置 `tensorrt_libs` 目录中的全部 DLL（包括
@@ -48,9 +48,8 @@ identity 一致。`setoption` 在下一次 `go` 开始前替换缓存表；当�
 `MultiPV` 是 `1..=500` 的整数，默认 `1`。它只控制每次 `info` 输出的根候选数量：候选沿用
 bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，不改变搜索预算、PUCT 或 worker。
 
-`CPuct`、`CPuctBase`、`CPuctFactor` 默认分别为 `1.0`、`2000`、`1.226202`。非根
-`C(0)=1.0`，在 `50k` completed visits 时约为 `5`；根固定额外 `+0.75`，即
-`C_root(0)=1.75`、`C_root(50k)≈5.75`。`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度。
+`CPuct`、`CPuctBase`、`CPuctFactor` 默认分别为 `1.75`、`40000`、`4.0`。所有 node
+共用同一条 cPUCT 曲线，`C(0)=1.75`，不再维护根专用参数；`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度。
 三者仍可作为一个整体实验，但默认不再扩散扫描。`FpuReduction`（默认 `0.200`）控制未访问边相对 parent Q
 的降幅；小网络可能有系统性偏差，故降低未知候选的首次入场门槛。LC0 对照值 `0.330` 与原 X7
 基线 `CPuct=1.0`、`FpuReduction=0.220` 保留为实验参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`GatherWorkers`、`EvalWorkers`、

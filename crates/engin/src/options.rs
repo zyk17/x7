@@ -18,7 +18,7 @@ pub struct Options {
     pub mini_batch_size: usize,
     /// UCI `NNCacheSizePowerOfTwo`：NN cache 固定保存 `2^N` 个直映槽。
     pub nn_cache_size_power_of_two: u8,
-    /// UCI `CPuct`：非根 PUCT 的初始探索系数；根固定额外加 `0.75`。
+    /// UCI `CPuct`：所有节点共用的 PUCT 初始探索系数。
     pub cpuct: f32,
     /// UCI `CPuctBase`/`CPuctFactor`：PUCT 随访问数增长的形状。
     pub cpuct_base: f32,
