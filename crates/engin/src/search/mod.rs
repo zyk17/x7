@@ -26,11 +26,13 @@ pub use pipeline::QueueStats;
 pub(crate) use pipeline::WorkerPool;
 pub use pipeline::{Search, SearchConfig, SearchControl, SearchLimits, Stats};
 pub use policy::{SearchParams, ValueDelta, select_edge, select_edge_from_node};
-pub(crate) use stats::best_mate;
-pub(crate) use stats::root_variations;
 pub use stats::{
     RootEdgeStats, RootStats, best_move, best_move_filtered, principal_variation, principal_variation_filtered,
     root_stats,
+};
+pub(crate) use stats::{
+    best_mate_with_params, best_move_filtered_with_params, principal_variation_filtered_with_params,
+    root_variations_with_params,
 };
 pub(crate) use time::{TimeBudget, TimeManager};
 

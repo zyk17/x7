@@ -16,6 +16,10 @@ pub struct SearchParams {
     pub cpuct_base: f32,   // 增长何时开始。更小 → 更早、更快变宽；更大 → 更久保持利用 Q。
     pub cpuct_factor: f32, // 增长幅度。更大 → 后期更强地向 PUCT/P 分流；更小 → 后期更容易让已验证的高 Q 分支继续积累 N。
     pub fpu_reduction: f32,
+    /// 根最终选边的 LCB 半径倍数；0 表示退回既有 N→Q→P 排名。
+    pub lcb_stdevs: f32,
+    /// LCB 候选至少须达到 N 第一候选的这一 completed-N 比例。
+    pub lcb_min_visit_fraction: f32,
 }
 
 impl Default for SearchParams {
@@ -27,6 +31,9 @@ impl Default for SearchParams {
             cpuct_factor: 4.0,
             // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
             fpu_reduction: 0.200,
+            // KataGo 搜索参数的经验起点；只用于根最终 Decision，不参与 PUCT。
+            lcb_stdevs: 5.0,
+            lcb_min_visit_fraction: 0.15,
         }
     }
 }
@@ -48,6 +55,14 @@ impl SearchParams {
         assert!(
             self.fpu_reduction.is_finite() && self.fpu_reduction >= 0.0,
             "stream FPU reduction must be finite and non-negative"
+        );
+        assert!(
+            self.lcb_stdevs.is_finite() && self.lcb_stdevs >= 0.0,
+            "stream LCB stdevs must be finite and non-negative"
+        );
+        assert!(
+            self.lcb_min_visit_fraction.is_finite() && (0.0..=1.0).contains(&self.lcb_min_visit_fraction),
+            "stream LCB minimum visit fraction must be within [0, 1]"
         );
     }
 }
@@ -86,6 +101,8 @@ use super::{Edge, Node, NodeRepository};
 pub struct ValueDelta {
     pub visits: u32,
     pub wl_sum: f32,
+    /// `wl²` 聚合。仅用于根 LCB 的 value dispersion，不参与 Q / PUCT。
+    pub wl_sq_sum: f32,
     pub draw_sum: f32,
     pub m_sum: f32,
 }
@@ -97,6 +114,7 @@ impl ValueDelta {
         Self {
             visits: 1,
             wl_sum: wl,
+            wl_sq_sum: wl * wl,
             draw_sum: draw,
             m_sum: 0.0,
         }
@@ -114,6 +132,7 @@ impl ValueDelta {
         Self {
             visits: self.visits,
             wl_sum: -self.wl_sum,
+            wl_sq_sum: self.wl_sq_sum,
             draw_sum: self.draw_sum,
             m_sum: self.m_sum,
         }
@@ -130,6 +149,7 @@ impl ValueDelta {
         Self {
             visits: self.visits + other.visits,
             wl_sum: self.wl_sum + other.wl_sum,
+            wl_sq_sum: self.wl_sq_sum + other.wl_sq_sum,
             draw_sum: self.draw_sum + other.draw_sum,
             m_sum: self.m_sum + other.m_sum,
         }
@@ -267,6 +287,8 @@ mod tests {
         assert_eq!(params.cpuct_base, 40_000.0);
         assert_eq!(params.cpuct_factor, 4.0);
         assert_eq!(params.fpu_reduction, 0.200);
+        assert_eq!(params.lcb_stdevs, 5.0);
+        assert_eq!(params.lcb_min_visit_fraction, 0.15);
         assert_eq!(compute_cpuct(params, 0), params.cpuct);
         // `fast_log` 是热路径近似；默认曲线在 50k 时接近设计目标 5。
         assert!((compute_cpuct(params, 50_000) - 5.0).abs() < 0.05);

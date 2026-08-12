@@ -691,6 +691,10 @@ mod tests {
         options.set_uci_option("CPUctBase", "20000").expect("cpuct base");
         options.set_uci_option("cpuctfactor", "2.5").expect("cpuct factor");
         options.set_uci_option("fpureduction", "0.35").expect("fpu reduction");
+        options.set_uci_option("LCBSTDEVS", "4").expect("lcb stdevs");
+        options
+            .set_uci_option("lcbminvisitfraction", "0.2")
+            .expect("lcb visit fraction");
         options.set_uci_option("GatherWorkers", "2").expect("gather workers");
         options.set_uci_option("EvalWorkers", "3").expect("eval workers");
         options
@@ -703,6 +707,8 @@ mod tests {
         assert_eq!(options.cpuct_base, 20_000.0);
         assert_eq!(options.cpuct_factor, 2.5);
         assert_eq!(options.fpu_reduction, 0.35);
+        assert_eq!(options.lcb_stdevs, 4.0);
+        assert_eq!(options.lcb_min_visit_fraction, 0.2);
         assert_eq!(options.nn_cache_size_power_of_two, 20);
         assert_eq!(
             (options.gather_workers, options.eval_workers, options.backprop_workers),
@@ -712,6 +718,8 @@ mod tests {
         assert!(options.set_uci_option("CPuctBase", "0").is_err());
         assert!(options.set_uci_option("CPuctFactor", "NaN").is_err());
         assert!(options.set_uci_option("FpuReduction", "-0.1").is_err());
+        assert!(options.set_uci_option("LcbStdevs", "NaN").is_err());
+        assert!(options.set_uci_option("LcbMinVisitFraction", "1.1").is_err());
         assert!(options.set_uci_option("GatherWorkers", "0").is_err());
         assert!(options.set_uci_option("EvalWorkers", "65").is_err());
         assert!(options.set_uci_option("NNCacheSizePowerOfTwo", "49").is_err());

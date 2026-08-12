@@ -33,7 +33,7 @@ CUDA 13 / cuDNN 9。TensorRT 包会复制配置 `tensorrt_libs` 目录中的全�
 - `go nodes`、`go movetime`、`go wtime/btime/winc/binc/movestogo`、`go infinite`、`go searchmoves`
 - `stop`、`ucinewgame`、`quit`
 - `UCI_ShowWDL`、`UCI_ShowEPS`、`WeightsFile`、`MiniBatchSize`、`NNCacheSizePowerOfTwo`、`MultiPV`
-- `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`GatherWorkers`、`EvalWorkers`、`BackpropWorkers`
+- `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`LcbStdevs`、`LcbMinVisitFraction`、`GatherWorkers`、`EvalWorkers`、`BackpropWorkers`
 
 `MiniBatchSize` 沿用常见 UCI 同名 option（历史上与 px0/Lc0 同名），范围 `0..=1024`，默认 `0`
 （由 backend 建议）。它限制一次 NN 调用最多合并的局面数；较大值通常提高吞吐，却可能因增加在途局面和
@@ -55,6 +55,11 @@ bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，�
 基线 `CPuct=1.0`、`FpuReduction=0.220` 保留为实验参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`GatherWorkers`、`EvalWorkers`、
 `BackpropWorkers` 默认分别为 `4`、`4`、`1`，范围均为 `1..=64`。它们与 `MiniBatchSize` 一样是
 引擎生命周期配置：`setoption` 影响之后的每次 `go`，当前 job 始终使用启动时的参数与 worker pool。
+
+`LcbStdevs=5.0`、`LcbMinVisitFraction=0.15` 只影响根的最终 Decision，不参与 PUCT 或 visit 分配。
+根候选先按既有终局/N/Q/P 排名确定访问门槛；达到 N 第一候选 15% 的非终局候选再按 `Q - k·标准误`
+比较。`LcbStdevs=0` 可退回既有 N-first。二阶矩遵循 MCGS shared-Q 的幂等重算，故这是 X7 对
+KataGo LCB 思路的简化借鉴，不是其围棋 utility/weight 公式的移植。
 
 时钟使用固定中性的时间分配（历史上参考 px0 legacy stopper 形状），固定 `MoveOverhead=200ms`，不额外暴露 UCI 调参项。`go movetime`
 不可与时钟字段混用；`go depth`、`go mate`、`go ponder` 与 `ponderhit`

@@ -10,8 +10,9 @@ use xiangqi_core::{GameState, Move, STARTPOS_FEN};
 use crate::neural::backend::{Backend, CachingBackend, UniformBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::{
-    Search, SearchConfig, SearchControl, SearchGraph, SearchLimits, SearchParams, Stats, TimeBudget,
-    TimeManager, WorkerPool, best_mate, best_move_filtered, principal_variation_filtered, root_stats, root_variations,
+    Search, SearchConfig, SearchControl, SearchGraph, SearchLimits, SearchParams, Stats, TimeBudget, TimeManager,
+    WorkerPool, best_mate_with_params, best_move_filtered_with_params, principal_variation_filtered_with_params,
+    root_stats, root_variations_with_params,
 };
 use crate::uci_loop::{BestMoveInfo, GoParams, StringUciResponder, ThinkingInfo, UciOutputQueue, Wdl};
 use crate::{EnginError, Options};
@@ -132,6 +133,7 @@ struct RootSnapshot {
     root_is_black: bool,
     root_move_filter: Vec<Move>,
     multi_pv: usize,
+    params: SearchParams,
 }
 
 /// 仅用于判断是否值得构造完整 UCI `info` 的 root marker。
@@ -397,12 +399,15 @@ impl Engine {
                 cpuct_base: self.options.cpuct_base,
                 cpuct_factor: self.options.cpuct_factor,
                 fpu_reduction: self.options.fpu_reduction,
+                lcb_stdevs: self.options.lcb_stdevs,
+                lcb_min_visit_fraction: self.options.lcb_min_visit_fraction,
             },
             gather_workers: self.options.gather_workers,
             eval_workers: self.options.eval_workers,
             backprop_workers: self.options.backprop_workers,
             ..SearchConfig::default()
         };
+        let decision_params = config.params;
         let pool = match self.worker_pool.as_ref() {
             Some(pool) if pool.matches_config(backend.as_ref(), &config) => Arc::clone(pool),
             _ => {
@@ -413,8 +418,7 @@ impl Engine {
         };
         let graph = self.graph.as_ref().expect("position creates a graph with a backend");
         let root_is_black = graph.root_history().last().is_black_to_move();
-        let search =
-            Search::new_with_graph_in_pool(backend, self.next_generation, graph, config, pool);
+        let search = Search::new_with_graph_in_pool(backend, self.next_generation, graph, config, pool);
         let snapshot = RootSnapshot {
             repository: Arc::clone(search.repository()),
             root_key: search.root_key(),
@@ -422,6 +426,7 @@ impl Engine {
             root_is_black,
             root_move_filter: root_move_filter.clone(),
             multi_pv: self.options.multi_pv,
+            params: decision_params,
         };
         let started = Instant::now();
         let clock_budget = if params.movetime.is_none() {
@@ -440,7 +445,7 @@ impl Engine {
         let completion = Arc::new(Completion::default());
         let search_completion = Arc::clone(&completion);
         let search_thread = std::thread::spawn(move || {
-            let result = run_search(search, root_is_black, root_move_filter, limits);
+            let result = run_search(search, root_is_black, root_move_filter, decision_params, limits);
             *search_completion.result.lock() = Some(result);
             search_completion.ready.notify_all();
         });
@@ -541,6 +546,7 @@ fn run_search(
     mut search: Search,
     root_is_black: bool,
     root_move_filter: Vec<Move>,
+    params: SearchParams,
     limits: SearchLimits,
 ) -> Result<CompletedSearch, EnginError> {
     let stats = search.run_with_limits(limits)?;
@@ -550,8 +556,20 @@ fn run_search(
         (None, Vec::new())
     } else {
         (
-            best_move_filtered(search.repository(), search.root_key(), root_is_black, &root_move_filter),
-            principal_variation_filtered(search.repository(), search.root_key(), root_is_black, &root_move_filter),
+            best_move_filtered_with_params(
+                search.repository(),
+                search.root_key(),
+                root_is_black,
+                &root_move_filter,
+                &params,
+            ),
+            principal_variation_filtered_with_params(
+                search.repository(),
+                search.root_key(),
+                root_is_black,
+                &root_move_filter,
+                &params,
+            ),
         )
     };
     search.stop_and_finish();
@@ -566,11 +584,12 @@ impl RootSnapshot {
     /// info 输出门槛：marker 未变化时不生成 PV/MultiPV。
     fn progress(&self, stats: &Stats) -> SearchProgress {
         SearchProgress {
-            best_move: best_move_filtered(
+            best_move: best_move_filtered_with_params(
                 &self.repository,
                 self.root_key,
                 self.root_is_black,
                 &self.root_move_filter,
+                &self.params,
             ),
             depth: stats.average_depth.min(i32::MAX as u64) as i32,
             seldepth: stats.max_depth.min(i32::MAX as u64) as i32,
@@ -605,17 +624,18 @@ impl RootSnapshot {
         };
         let wl = (-root.q).clamp(-1.0, 1.0);
         let draw = root.draw.clamp(0.0, 1.0);
-        let variations = root_variations(
+        let variations = root_variations_with_params(
             &self.repository,
             self.root_key,
             self.root_is_black,
             &self.root_move_filter,
             self.multi_pv,
+            &self.params,
         );
         if variations.is_empty() {
             let win = ((1.0 - draw + wl) * 0.5).clamp(0.0, 1.0);
             let loss = ((1.0 - draw - wl) * 0.5).clamp(0.0, 1.0);
-            let mate = best_mate(&self.repository, self.root_key, &self.root_move_filter);
+            let mate = best_mate_with_params(&self.repository, self.root_key, &self.root_move_filter, &self.params);
             return vec![ThinkingInfo {
                 mate,
                 score: mate.is_none().then_some((wl * 1000.0).round() as i32),
@@ -624,11 +644,12 @@ impl RootSnapshot {
                     d: (draw * 1000.0).round() as i32,
                     l: (loss * 1000.0).round() as i32,
                 }),
-                pv: principal_variation_filtered(
+                pv: principal_variation_filtered_with_params(
                     &self.repository,
                     self.root_key,
                     self.root_is_black,
                     &self.root_move_filter,
+                    &self.params,
                 ),
                 ..common
             }];

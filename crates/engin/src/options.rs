@@ -25,6 +25,9 @@ pub struct Options {
     pub cpuct_factor: f32,
     /// UCI `FpuReduction`：未访问边相对 parent Q 的 FPU 降幅。
     pub fpu_reduction: f32,
+    /// 根最终 Decision 的 LCB 参数；不参与 PUCT。
+    pub lcb_stdevs: f32,
+    pub lcb_min_visit_fraction: f32,
     /// 三类 stream worker 的常驻线程数。
     pub gather_workers: usize,
     pub eval_workers: usize,
@@ -45,6 +48,8 @@ impl Default for Options {
             cpuct_base: search.cpuct_base,
             cpuct_factor: search.cpuct_factor,
             fpu_reduction: search.fpu_reduction,
+            lcb_stdevs: search.lcb_stdevs,
+            lcb_min_visit_fraction: search.lcb_min_visit_fraction,
             gather_workers: 4,
             eval_workers: 4,
             backprop_workers: 1,
@@ -70,6 +75,11 @@ impl Options {
             format!("option name CPuctBase type string default {}", self.cpuct_base),
             format!("option name CPuctFactor type string default {}", self.cpuct_factor),
             format!("option name FpuReduction type string default {}", self.fpu_reduction),
+            format!("option name LcbStdevs type string default {}", self.lcb_stdevs),
+            format!(
+                "option name LcbMinVisitFraction type string default {}",
+                self.lcb_min_visit_fraction
+            ),
             format!(
                 "option name GatherWorkers type spin default {} min 1 max 64",
                 self.gather_workers
@@ -134,6 +144,10 @@ impl Options {
             "cpuctfactor" => self.cpuct_factor = parse_non_negative_float("CPuctFactor", value)?,
             "cpuct" => self.cpuct = parse_non_negative_float("CPuct", value)?,
             "fpureduction" => self.fpu_reduction = parse_non_negative_float("FpuReduction", value)?,
+            "lcbstdevs" => self.lcb_stdevs = parse_non_negative_float("LcbStdevs", value)?,
+            "lcbminvisitfraction" => {
+                self.lcb_min_visit_fraction = parse_unit_interval_float("LcbMinVisitFraction", value)?
+            }
             "gatherworkers" => self.gather_workers = parse_worker_count(name, value)?,
             "evalworkers" => self.eval_workers = parse_worker_count(name, value)?,
             "backpropworkers" => self.backprop_workers = parse_worker_count(name, value)?,
@@ -151,6 +165,14 @@ fn parse_non_negative_float(name: &str, value: &str) -> Result<f32, crate::Engin
         return Err(crate::EnginError::Uci(format!(
             "{name} must be a finite non-negative number"
         )));
+    }
+    Ok(value)
+}
+
+fn parse_unit_interval_float(name: &str, value: &str) -> Result<f32, crate::EnginError> {
+    let value = parse_non_negative_float(name, value)?;
+    if value > 1.0 {
+        return Err(crate::EnginError::Uci(format!("{name} must be within [0, 1]")));
     }
     Ok(value)
 }

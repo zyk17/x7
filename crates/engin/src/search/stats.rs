@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use xiangqi_core::Move;
 
-use super::{Edge, ExpansionState, Node, NodeKey, NodeRepository};
+use super::{Edge, ExpansionState, Node, NodeKey, NodeRepository, SearchParams};
 
 /// 一个 root edge 快照。`started_visits` 包含 in-flight；Q 只使用 completed 值。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -71,6 +71,43 @@ fn edge_value(repository: &NodeRepository, edge: &Edge) -> f32 {
         .and_then(|key| repository.get(key))
         .map_or(0.0, |node| node.q() * propagated as f32);
     (stats.local_leaf.wl_sum + child_value) / stats.visits as f32
+}
+
+/// root edge 当前 action value 的一、二阶矩。shared child 的二阶矩遵循与 Q 相同的
+/// MCGS 幂等重算；edge N 仍严格只算实际从该 root action 走入的次数。
+fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32, u32)> {
+    let stats = edge.completed_stats();
+    if stats.visits == 0 {
+        return None;
+    }
+    let propagated = stats.visits.saturating_sub(stats.local_leaf.visits);
+    let (child_q, child_q_sq) = if propagated == 0 {
+        (0.0, 0.0)
+    } else {
+        let child = edge.child_key().and_then(|key| repository.get(key))?;
+        let (q, _, _, q_sq) = child.value_moments_snapshot();
+        (q, q_sq)
+    };
+    let visits = stats.visits as f32;
+    Some((
+        (stats.local_leaf.wl_sum + child_q * propagated as f32) / visits,
+        (stats.local_leaf.wl_sq_sum + child_q_sq * propagated as f32) / visits,
+        stats.visits,
+    ))
+}
+
+/// X7 的最小 root LCB：以 edge 的实际完成次数为样本量，并对极小样本加入有界
+/// utility 方差先验。形状参考 KataGo
+/// `cpp/search/searchhelpers.cpp::getSelfUtilityLCBAndRadius`，但不复制其围棋 utility、
+/// 权重或 play-selection 机制。
+fn edge_lcb(repository: &NodeRepository, edge: &Edge, stdevs: f32) -> Option<f32> {
+    let (q, q_sq, visits) = edge_q_moments(repository, edge)?;
+    let weight = visits as f32;
+    let prior_weight = 1.0 / (weight * weight);
+    let adjusted_sq = (q_sq * weight + (q_sq.max(q * q) + 1.0) * prior_weight) / (weight + prior_weight);
+    let effective_samples = (weight + prior_weight).powi(2) / (weight + prior_weight * prior_weight);
+    let variance = (adjusted_sq - q * q).max(0.0);
+    Some(q - stdevs * (variance / effective_samples).sqrt())
 }
 
 fn edge_child(repository: &NodeRepository, edge: &Edge) -> Option<Arc<Node>> {
@@ -206,6 +243,7 @@ fn ranked_root_edges(
     repository: &NodeRepository,
     root_key: NodeKey,
     root_move_filter: &[Move],
+    params: &SearchParams,
 ) -> Vec<(Arc<Edge>, Option<Arc<Node>>)> {
     // px0 `GetBestChildrenNoTemperature`（`search.cc:241`）：复用 bestmove 的根边
     // 排名，只改变展示顺序，不重新选择或分配 visit。
@@ -225,6 +263,34 @@ fn ranked_root_edges(
         .collect();
     if root.completed_visits() > 0 {
         candidates.sort_unstable_by_key(|candidate| Reverse(candidate.2));
+    }
+    if params.lcb_stdevs > 0.0 {
+        let Some((_, _, best_key)) = candidates.first() else {
+            return Vec::new();
+        };
+        if best_key.rank == BestEdgeRank::NonTerminal {
+            let min_visits = best_key.visits as f32 * params.lcb_min_visit_fraction;
+            let mut best_lcb: Option<(usize, f32)> = None;
+            for (index, (edge, _child, key)) in candidates.iter().enumerate() {
+                if key.rank != BestEdgeRank::NonTerminal
+                    || key.is_draw_terminal
+                    || key.visits == 0
+                    || (key.visits as f32) < min_visits
+                {
+                    continue;
+                }
+                let Some(lcb) = edge_lcb(repository, edge, params.lcb_stdevs) else {
+                    continue;
+                };
+                if best_lcb.is_none_or(|(_, current)| lcb > current) {
+                    best_lcb = Some((index, lcb));
+                }
+            }
+            if let Some((index, _)) = best_lcb {
+                let selected = candidates.remove(index);
+                candidates.insert(0, selected);
+            }
+        }
     }
     candidates.into_iter().map(|(edge, child, _)| (edge, child)).collect()
 }
@@ -285,12 +351,13 @@ fn principal_variation_from_root_edge(
     pv
 }
 
-pub(crate) fn root_variations(
+pub(crate) fn root_variations_with_params(
     repository: &NodeRepository,
     root_key: NodeKey,
     root_is_black: bool,
     root_move_filter: &[Move],
     max_pv: usize,
+    params: &SearchParams,
 ) -> Vec<RootVariation> {
     // px0 `SendUciInfo` 的 root-edge WDL/Q 默认值（`search.cc:269-341`）。
     let Some(root) = repository.get(root_key) else {
@@ -298,7 +365,7 @@ pub(crate) fn root_variations(
     };
     let default_wl = (-root.q()).clamp(-1.0, 1.0);
     let default_draw = root.draw().clamp(0.0, 1.0);
-    ranked_root_edges(repository, root_key, root_move_filter)
+    ranked_root_edges(repository, root_key, root_move_filter, params)
         .into_iter()
         .take(max_pv)
         .map(|(edge, child)| {
@@ -339,11 +406,35 @@ fn best_edge_absolute(repository: &NodeRepository, root_key: NodeKey, root_move_
     if root.completed_visits() == 0 {
         return first_filtered_move(&edges, root_move_filter);
     }
-    ranked_root_edges(repository, root_key, root_move_filter)
+    ranked_root_edges(
+        repository,
+        root_key,
+        root_move_filter,
+        &SearchParams {
+            lcb_stdevs: 0.0,
+            ..SearchParams::default()
+        },
+    )
+    .into_iter()
+    .next()
+    .map(|(edge, _)| edge.mv())
+    .or_else(|| first_filtered_move(&edges, root_move_filter))
+}
+
+fn best_root_edge_absolute(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_move_filter: &[Move],
+    params: &SearchParams,
+) -> Option<Move> {
+    let root = repository.get(root_key)?;
+    if root.edges().is_empty() || root.completed_visits() == 0 {
+        return best_edge_absolute(repository, root_key, root_move_filter);
+    }
+    ranked_root_edges(repository, root_key, root_move_filter, params)
         .into_iter()
         .next()
         .map(|(edge, _)| edge.mv())
-        .or_else(|| first_filtered_move(&edges, root_move_filter))
 }
 
 /// 带可选 `go searchmoves` filter 的 bestmove（px0 `root_move_filter_`）。
@@ -355,7 +446,23 @@ pub fn best_move_filtered(
     root_is_black: bool,
     root_move_filter: &[Move],
 ) -> Option<Move> {
-    best_edge_absolute(repository, root_key, root_move_filter).map(|mv| orient_move(mv, root_is_black))
+    best_move_filtered_with_params(
+        repository,
+        root_key,
+        root_is_black,
+        root_move_filter,
+        &SearchParams::default(),
+    )
+}
+
+pub(crate) fn best_move_filtered_with_params(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_is_black: bool,
+    root_move_filter: &[Move],
+    params: &SearchParams,
+) -> Option<Move> {
+    best_root_edge_absolute(repository, root_key, root_move_filter, params).map(|mv| orient_move(mv, root_is_black))
 }
 
 pub fn best_move(repository: &NodeRepository, root_key: NodeKey, root_is_black: bool) -> Option<Move> {
@@ -363,7 +470,12 @@ pub fn best_move(repository: &NodeRepository, root_key: NodeKey, root_is_black: 
 }
 
 /// 所选 root edge 的已证明 mate score。`m` 是从该 child 起的 ply 数。
-pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_move_filter: &[Move]) -> Option<i32> {
+pub(crate) fn best_mate_with_params(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_move_filter: &[Move],
+    params: &SearchParams,
+) -> Option<i32> {
     let root = repository.get(root_key)?;
     if let Some((wl, _, m)) = root.terminal_value() {
         return (wl != 0.0).then(|| {
@@ -371,7 +483,7 @@ pub(crate) fn best_mate(repository: &NodeRepository, root_key: NodeKey, root_mov
             if wl < 0.0 { distance } else { -distance }
         });
     }
-    let mv = best_edge_absolute(repository, root_key, root_move_filter)?;
+    let mv = best_root_edge_absolute(repository, root_key, root_move_filter, params)?;
     let child = repository
         .get(root_key)?
         .edges()
@@ -395,6 +507,22 @@ pub fn principal_variation_filtered(
     root_is_black: bool,
     root_move_filter: &[Move],
 ) -> Vec<Move> {
+    principal_variation_filtered_with_params(
+        repository,
+        root_key,
+        root_is_black,
+        root_move_filter,
+        &SearchParams::default(),
+    )
+}
+
+pub(crate) fn principal_variation_filtered_with_params(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_is_black: bool,
+    root_move_filter: &[Move],
+    params: &SearchParams,
+) -> Vec<Move> {
     let mut pv = Vec::new();
     let mut key = root_key;
     let mut seen = HashSet::new();
@@ -409,8 +537,14 @@ pub fn principal_variation_filtered(
         if node.expansion_state() != ExpansionState::Expanded {
             break;
         }
-        let filter = if pv.is_empty() { root_move_filter } else { &[] };
-        let Some(abs_mv) = best_edge_absolute(repository, key, filter) else {
+        let first = pv.is_empty();
+        let filter = if first { root_move_filter } else { &[] };
+        let selected = if first {
+            best_root_edge_absolute(repository, key, filter, params)
+        } else {
+            best_edge_absolute(repository, key, filter)
+        };
+        let Some(abs_mv) = selected else {
             break;
         };
         if abs_mv.is_null() {
@@ -437,9 +571,12 @@ mod tests {
 
     use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN, Square};
 
-    use super::{best_mate, best_move, best_move_filtered, principal_variation, root_stats, root_variations};
+    use super::{
+        best_mate_with_params, best_move, best_move_filtered, best_move_filtered_with_params, edge_value,
+        principal_variation, root_stats, root_variations_with_params,
+    };
     use crate::neural::backend::UniformBackend;
-    use crate::search::{Search, SearchConfig};
+    use crate::search::{NodeKey, NodeRepository, Search, SearchConfig, SearchParams, ValueDelta};
 
     #[test]
     fn root_snapshot_reports_completed_and_in_flight_visits_separately() {
@@ -476,12 +613,7 @@ mod tests {
             .expect("checkmate fen");
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
         let root_is_black = history.is_black_to_move();
-        let mut pipeline = Search::new(
-            Arc::new(UniformBackend::default()),
-            2,
-            history,
-            SearchConfig::default(),
-        );
+        let mut pipeline = Search::new(Arc::new(UniformBackend::default()), 2, history, SearchConfig::default());
         pipeline.run_playouts(1).expect("terminal");
         assert_eq!(
             best_move(pipeline.repository(), pipeline.root_key(), root_is_black),
@@ -489,6 +621,92 @@ mod tests {
         );
         assert!(principal_variation(pipeline.repository(), pipeline.root_key(), root_is_black).is_empty());
         pipeline.stop_and_finish();
+    }
+
+    #[test]
+    fn root_lcb_can_choose_a_well_visited_higher_q_challenger() {
+        let repo = NodeRepository::default();
+        let root_key = NodeKey::board(1);
+        let root = repo.get_or_insert(root_key);
+        let first = Move::new(Square::parse("a0").unwrap(), Square::parse("a1").unwrap());
+        let challenger = Move::new(Square::parse("b0").unwrap(), Square::parse("b1").unwrap());
+        assert!(root.try_begin_evaluation());
+        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.publish_edges(vec![(first, 0.8), (challenger, 0.2)]);
+
+        let edges = root.edges();
+        for (index, (key, value, visits)) in [(NodeKey::board(2), 0.20, 100), (NodeKey::board(3), 0.25, 20)]
+            .into_iter()
+            .enumerate()
+        {
+            let child = repo.get_or_insert(key);
+            child.set_graph_value(ValueDelta::one(value, 0.0));
+            repo.recompute_graph_node(key);
+            edges[index].bind_child_key(key);
+            for _ in 0..visits {
+                root.reserve_edge(index).unwrap().complete();
+            }
+        }
+        repo.recompute_graph_node(root_key);
+
+        let params = SearchParams::default();
+        assert_eq!(
+            best_move_filtered_with_params(&repo, root_key, false, &[], &params),
+            Some(challenger),
+            "LCB may overturn N-first only after the challenger reaches the visit threshold"
+        );
+
+        let n_first = SearchParams {
+            lcb_stdevs: 0.0,
+            ..params
+        };
+        assert_eq!(
+            best_move_filtered_with_params(&repo, root_key, false, &[], &n_first),
+            Some(first),
+            "zero LCB stdevs retains N-first"
+        );
+        let too_few_visits = SearchParams {
+            lcb_min_visit_fraction: 0.21,
+            ..params
+        };
+        assert_eq!(
+            best_move_filtered_with_params(&repo, root_key, false, &[], &too_few_visits),
+            Some(first),
+            "a challenger below the minimum visit fraction cannot replace N-first"
+        );
+    }
+
+    #[test]
+    fn root_lcb_penalizes_an_unstable_action_value() {
+        let repo = NodeRepository::default();
+        let root_key = NodeKey::board(10);
+        let root = repo.get_or_insert(root_key);
+        let noisy = Move::new(Square::parse("a0").unwrap(), Square::parse("a1").unwrap());
+        let stable = Move::new(Square::parse("b0").unwrap(), Square::parse("b1").unwrap());
+        assert!(root.try_begin_evaluation());
+        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.publish_edges(vec![(noisy, 0.8), (stable, 0.2)]);
+
+        let edges = root.edges();
+        for index in 0..100 {
+            let value = if index % 2 == 0 { 0.9 } else { -0.3 };
+            root.reserve_edge(0)
+                .unwrap()
+                .complete_local_leaf(ValueDelta::one(value, 0.0));
+        }
+        for _ in 0..20 {
+            root.reserve_edge(1)
+                .unwrap()
+                .complete_local_leaf(ValueDelta::one(0.25, 0.0));
+        }
+        repo.recompute_graph_node(root_key);
+
+        assert!(edge_value(&repo, &edges[0]) > edge_value(&repo, &edges[1]));
+        assert_eq!(
+            best_move_filtered_with_params(&repo, root_key, false, &[], &SearchParams::default()),
+            Some(stable),
+            "LCB uses wl_sq_sum to prefer the lower-variance action"
+        );
     }
 
     #[test]
@@ -569,7 +787,10 @@ mod tests {
         assert!(child.try_begin_evaluation());
         child.mark_terminal(1.0, 0.0, 3.0);
 
-        assert_eq!(best_mate(&repository, root_key, &[]), Some(2));
+        assert_eq!(
+            best_mate_with_params(&repository, root_key, &[], &SearchParams::default()),
+            Some(2)
+        );
     }
 
     #[test]
@@ -581,7 +802,10 @@ mod tests {
         assert!(root.try_begin_evaluation());
         root.mark_terminal(1.0, 0.0, 0.0);
 
-        assert_eq!(best_mate(&repository, NodeKey::board(100), &[]), Some(-1));
+        assert_eq!(
+            best_mate_with_params(&repository, NodeKey::board(100), &[], &SearchParams::default()),
+            Some(-1)
+        );
     }
 
     #[test]
@@ -634,7 +858,7 @@ mod tests {
         ));
 
         assert_eq!(best_move(&repo, root_key, false), Some(usable));
-        let variations = root_variations(&repo, root_key, false, &[], 2);
+        let variations = root_variations_with_params(&repo, root_key, false, &[], 2, &SearchParams::default());
         assert_eq!(variations.len(), 1);
         assert_eq!(variations[0].pv, vec![usable]);
     }
@@ -669,7 +893,7 @@ mod tests {
         }
         repository.recompute_graph_node(root_key);
 
-        let variations = root_variations(&repository, root_key, false, &[], 2);
+        let variations = root_variations_with_params(&repository, root_key, false, &[], 2, &SearchParams::default());
         assert_eq!(variations.len(), 2);
         assert_eq!(variations[0].pv, vec![second]);
         assert_eq!(variations[1].pv, vec![first]);

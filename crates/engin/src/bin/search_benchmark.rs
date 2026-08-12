@@ -24,13 +24,16 @@ struct Args {
     cpuct_bases: Vec<f32>,
     cpuct_factors: Vec<f32>,
     fpu_reduction: f32,
+    lcb_stdevs: f32,
+    lcb_min_visit_fraction: f32,
     root_top: usize,
 }
 
 fn usage() -> &'static str {
     "usage: search_benchmark [--onnx data/x7.onnx] [--fen \"...\"] [--moves \"c3c4 h7h3 ...\"] [--playouts 2048] \\
      [--trace 128,256,512] [--track g6g9,i0g0] [--searchmoves \"g6g9 i0g0\"] [--cpuct 1.0,1.745] \\
-     [--cpuct-base 20000,38739] [--cpuct-factor 2.5,3.894] [--fpu-reduction 0.330] [--root-top 8]"
+     [--cpuct-base 20000,38739] [--cpuct-factor 2.5,3.894] [--fpu-reduction 0.330] \\
+     [--lcb-stdevs 5] [--lcb-min-visit-fraction 0.15] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -46,6 +49,8 @@ fn parse_args() -> Result<Args, String> {
     let mut cpuct_bases = vec![defaults.cpuct_base];
     let mut cpuct_factors = vec![defaults.cpuct_factor];
     let mut fpu_reduction = defaults.fpu_reduction;
+    let mut lcb_stdevs = defaults.lcb_stdevs;
+    let mut lcb_min_visit_fraction = defaults.lcb_min_visit_fraction;
     let mut root_top = 8;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -99,6 +104,23 @@ fn parse_args() -> Result<Args, String> {
                     false,
                 )?
             }
+            "--lcb-stdevs" => {
+                lcb_stdevs = parse_float(
+                    "--lcb-stdevs",
+                    &args.next().ok_or("--lcb-stdevs requires a number")?,
+                    false,
+                )?
+            }
+            "--lcb-min-visit-fraction" => {
+                lcb_min_visit_fraction = parse_float(
+                    "--lcb-min-visit-fraction",
+                    &args.next().ok_or("--lcb-min-visit-fraction requires a number")?,
+                    false,
+                )?;
+                if lcb_min_visit_fraction > 1.0 {
+                    return Err("--lcb-min-visit-fraction must not exceed 1".into());
+                }
+            }
             "--root-top" => {
                 root_top = args
                     .next()
@@ -128,6 +150,8 @@ fn parse_args() -> Result<Args, String> {
         cpuct_bases,
         cpuct_factors,
         fpu_reduction,
+        lcb_stdevs,
+        lcb_min_visit_fraction,
         root_top,
     })
 }
@@ -264,14 +288,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let filter = root_filter(&history, &args.searchmoves)?;
     let backend = OnnxBackend::from_file(&args.onnx)?;
     println!(
-        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3}",
+        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3} lcb_stdevs={:.3} lcb_min_visit_fraction={:.3}",
         args.onnx.display(),
         backend.provider().name(),
         args.playouts,
         args.cpucts,
         args.cpuct_bases,
         args.cpuct_factors,
-        args.fpu_reduction
+        args.fpu_reduction,
+        args.lcb_stdevs,
+        args.lcb_min_visit_fraction,
     );
     println!("note: fresh graph; worker=4/4/1; batch uses backend default; trace drains at each milestone");
     let mut generation = 0;
@@ -284,10 +310,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cpuct_base,
                     cpuct_factor,
                     fpu_reduction: args.fpu_reduction,
+                    lcb_stdevs: args.lcb_stdevs,
+                    lcb_min_visit_fraction: args.lcb_min_visit_fraction,
                 };
                 println!(
-                    "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3}",
-                    args.fpu_reduction
+                    "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3} lcb={:.3}/{:.3}",
+                    args.fpu_reduction, args.lcb_stdevs, args.lcb_min_visit_fraction
                 );
                 let mut search = Search::new(
                     Arc::new(OnnxBackend::from_file(&args.onnx)?) as Arc<dyn Backend>,

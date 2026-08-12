@@ -257,6 +257,7 @@ impl EdgeReservation {
 struct NodeStats {
     visits: u32,
     wl_sum: f32,
+    wl_sq_sum: f32,
     draw_sum: f32,
     m_sum: f32,
 }
@@ -298,6 +299,22 @@ impl Node {
         self.value_snapshot().0
     }
 
+    /// 在同一把统计锁下读取 Q、WDL/M 与二阶矩，避免 parent 图回算混合 child
+    /// 不同完成时刻的快照。
+    pub(crate) fn value_moments_snapshot(&self) -> (f32, f32, f32, f32) {
+        let stats = self.stats.lock();
+        if stats.visits == 0 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let visits = stats.visits as f32;
+        (
+            stats.wl_sum / visits,
+            stats.draw_sum / visits,
+            stats.m_sum / visits,
+            stats.wl_sq_sum / visits,
+        )
+    }
+
     pub fn draw(&self) -> f32 {
         self.value_snapshot().1
     }
@@ -308,13 +325,8 @@ impl Node {
 
     /// 在同一把统计锁下读取 WDL/M，避免 parent 重算混合 child 的两个不同版本。
     pub(crate) fn value_snapshot(&self) -> (f32, f32, f32) {
-        let stats = self.stats.lock();
-        if stats.visits == 0 {
-            (0.0, 0.0, 0.0)
-        } else {
-            let visits = stats.visits as f32;
-            (stats.wl_sum / visits, stats.draw_sum / visits, stats.m_sum / visits)
-        }
+        let (wl, draw, m, _) = self.value_moments_snapshot();
+        (wl, draw, m)
     }
 
     pub fn expansion_state(&self) -> ExpansionState {
@@ -440,6 +452,7 @@ impl NodeRepository {
             total.visits += visits;
             let local = edge_stats.local_leaf;
             total.wl_sum -= local.wl_sum;
+            total.wl_sq_sum += local.wl_sq_sum;
             total.draw_sum += local.draw_sum;
             total.m_sum += local.m_sum + local.visits as f32;
 
@@ -450,15 +463,17 @@ impl NodeRepository {
             let Some(child) = edge.child_key().and_then(|child| self.get(child)) else {
                 continue;
             };
-            let (child_q, child_draw, child_m) = child.value_snapshot();
+            let (child_q, child_draw, child_m, child_q_sq) = child.value_moments_snapshot();
             let weight = propagated as f32;
             total.wl_sum -= child_q * weight;
+            total.wl_sq_sum += child_q_sq * weight;
             total.draw_sum += child_draw * weight;
             total.m_sum += (child_m + 1.0) * weight;
         }
         let mut stats = node.stats.lock();
         stats.visits = total.visits;
         stats.wl_sum = total.wl_sum;
+        stats.wl_sq_sum = total.wl_sq_sum;
         stats.draw_sum = total.draw_sum;
         stats.m_sum = total.m_sum;
     }

@@ -94,8 +94,10 @@ A → C → D
 parent 暂时落后，但不会永久落后，且避免了向所有 ancestor 广播造成的统计污染。实现上，Gather 每次进入
 已展开 node 后、PUCT 选边前必须先做这次重算；只在 Backprop 时重算不足以满足这个条件。
 
-根选边仍以 root edge 的 `N(root,a)` 排名。node `Q(root)` 是 root posterior policy 的局面估值；两者
-都需要，但不能互相替代。
+根选边默认以 root edge 的 `N(root,a)` 排名。node `Q(root)` 是 root posterior policy 的局面估值；两者
+都需要，但不能互相替代。当前 X7 在最终 Decision 额外允许 root LCB：仅让 completed N 达到 N 第一候选
+`15%` 的非终局 edge 参与，按 `Q - 5·标准误` 选最保守候选。其二阶矩遵循 node 的幂等重算，而样本量始终
+使用该 edge 的 local completed N；这避免转置 child 的总 N 冒充 action 证据。LCB 不进入 PUCT 或回传。
 
 ### 更新方式选择
 

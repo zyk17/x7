@@ -297,6 +297,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 cpuct_base: args.cpuct_base,
                 cpuct_factor: args.cpuct_factor,
                 fpu_reduction: args.fpu_reduction,
+                ..SearchParams::default()
             },
             ..SearchConfig::default()
         },
