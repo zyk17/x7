@@ -321,11 +321,13 @@ impl Engine {
             ));
         }
         if has_clock {
-            let position = self
-                .position
+            let root = self
+                .graph
                 .as_ref()
-                .ok_or(EnginError::Uci("position is not configured".into()))?;
-            let side_time = if position.current_position().is_black_to_move() {
+                .ok_or(EnginError::Uci("position is not configured".into()))?
+                .root_history()
+                .last();
+            let side_time = if root.is_black_to_move() {
                 params.btime
             } else {
                 params.wtime
