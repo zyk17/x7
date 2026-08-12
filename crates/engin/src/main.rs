@@ -6,7 +6,7 @@ use engin::{Engine, UciLoop};
 
 /// 在 UCI 启动前定位随程序发布的正式 ONNX 权重。
 ///
-/// 本实现没有权重自动发现或 backend 注册表；发行布局为 `engin.exe` 与同目录
+/// 本实现没有权重自动发现或 backend 注册表；发行布局为 `x7.exe` 与同目录
 /// `x7.onnx`。当前目录与编译期仓库路径仅用于开发期回退。
 fn default_weights_file() -> PathBuf {
     let mut candidates = Vec::new();
@@ -33,7 +33,15 @@ fn main() {
     let mut uci = UciLoop::new(&mut engine);
 
     eprintln!(
-        "\x1b[31m\n  ██╗  ██╗███████╗\n  ╚██╗██╔╝╚════██║\n   ╚███╔╝     ██╔╝\n   ██╔██╗    ██╔╝\n  ██╔╝ ██╗   ██║\n  ╚═╝  ╚═╝   ╚═╝\x1b[0m\n"
+        "\x1b[31m{}\x1b[0m",
+        r#"
+  ██╗  ██╗███████╗
+  ╚██╗██╔╝╚════██║
+   ╚███╔╝     ██╔╝
+   ██╔██╗    ██╔╝
+  ██╔╝ ██╗   ██║
+  ╚═╝  ╚═╝   ╚═╝
+"#
     );
 
     for line in io::stdin().lock().lines() {

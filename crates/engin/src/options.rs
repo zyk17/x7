@@ -56,16 +56,15 @@ impl Default for Options {
 impl Options {
     pub fn list_options_uci(&self) -> Vec<String> {
         vec![
-            format!("option name UCI_ShowWDL type check default {}", self.show_wdl),
-            format!("option name UCI_ShowEPS type check default {}", self.show_eps),
+            format!("option name Threads type spin default {} min 2 max 128", self.threads),
+            format!(
+                "option name NNCacheSizePowerOfTwo type spin default {} min 0 max {}",
+                self.nn_cache_size_power_of_two, MAX_NN_CACHE_SIZE_POWER_OF_TWO
+            ),
             format!("option name MultiPV type spin default {} min 1 max 500", self.multi_pv),
             format!(
                 "option name MiniBatchSize type spin default {} min 0 max 1024",
                 self.mini_batch_size
-            ),
-            format!(
-                "option name NNCacheSizePowerOfTwo type spin default {} min 0 max {}",
-                self.nn_cache_size_power_of_two, MAX_NN_CACHE_SIZE_POWER_OF_TWO
             ),
             format!("option name CPuct type string default {}", self.cpuct),
             format!("option name CPuctBase type string default {}", self.cpuct_base),
@@ -76,7 +75,8 @@ impl Options {
                 "option name LcbMinVisitFraction type string default {}",
                 self.lcb_min_visit_fraction
             ),
-            format!("option name Threads type spin default {} min 2 max 128", self.threads),
+            format!("option name UCI_ShowWDL type check default {}", self.show_wdl),
+            format!("option name UCI_ShowEPS type check default {}", self.show_eps),
             format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
@@ -171,9 +171,9 @@ fn parse_positive_float(name: &str, value: &str) -> Result<f32, crate::EnginErro
 fn parse_thread_count(value: &str) -> Result<usize, crate::EnginError> {
     let value = value
         .parse::<usize>()
-        .map_err(|_| crate::EnginError::Uci("Threads must be an integer within [2, 128]".into()))?;
-    if !(2..=128).contains(&value) {
-        return Err(crate::EnginError::Uci("Threads must be within [2, 128]".into()));
+        .map_err(|_| crate::EnginError::Uci("Threads must be an integer no greater than 128".into()))?;
+    if value > 128 {
+        return Err(crate::EnginError::Uci("Threads must be no greater than 128".into()));
     }
-    Ok(value)
+    Ok(value.max(2))
 }

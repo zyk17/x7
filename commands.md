@@ -107,7 +107,7 @@ isready
 position startpos
 go nodes 64
 quit
-'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+'@ | C:\projects\77xiangqi_engine\target\release\x7.exe
 ```
 
 验证真实 history：
@@ -120,7 +120,7 @@ isready
 position startpos moves h2e2 h7e7
 go nodes 64
 quit
-'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+'@ | C:\projects\77xiangqi_engine\target\release\x7.exe
 ```
 
 默认不指定 `--bin` 时，`cargo run -p engin` 仍然启动主 UCI 引擎：
@@ -152,7 +152,7 @@ position startpos moves h2e2 h7e7
 go nodes 64
 wait
 quit
-'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+'@ | C:\projects\77xiangqi_engine\target\release\x7.exe
 ```
 
 `setoption` 示例：
@@ -166,7 +166,7 @@ isready
 position startpos
 go nodes 64
 quit
-'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+'@ | C:\projects\77xiangqi_engine\target\release\x7.exe
 ```
 
 ## 10. 搜索与 ONNX 诊断

@@ -575,7 +575,12 @@ mod tests {
         assert!(options.set_uci_option("FpuReduction", "-0.1").is_err());
         assert!(options.set_uci_option("LcbStdevs", "NaN").is_err());
         assert!(options.set_uci_option("LcbMinVisitFraction", "1.1").is_err());
-        assert!(options.set_uci_option("Threads", "1").is_err());
+        options
+            .set_uci_option("Threads", "1")
+            .expect("threads below minimum clamp");
+        assert_eq!(options.threads, 2);
+        options.set_uci_option("Threads", "0").expect("zero threads clamp");
+        assert_eq!(options.threads, 2);
         assert!(options.set_uci_option("Threads", "129").is_err());
         assert!(options.set_uci_option("NNCacheSizePowerOfTwo", "49").is_err());
     }

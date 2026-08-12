@@ -4,7 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 description = "End-user UCI chess engine: search + xiangqi_core + NN backend (ONNX)."
 publish = false
-default-run = "engin"
+autobins = false
+default-run = "x7"
 
 [features]
 # 日常开发默认 DirectML；大节点实验才显式切 TensorRT，二者不混入同一二进制。
@@ -14,6 +15,10 @@ directml = ["ort/directml", "ort/download-binaries", "ort/copy-dylibs", "ort/tls
 tensorrt = ["ort/tensorrt", "ort/load-dynamic", "ort/api-24"]
 # 仅基准诊断：队列等待、collision 深度与 in-flight 分布不进入正式 UCI 热路径。
 benchmark = []
+
+[[bin]]
+name = "x7"
+path = "src/main.rs"
 
 [[bin]]
 name = "benchmark"
