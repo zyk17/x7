@@ -32,17 +32,15 @@ fn main() {
         .expect("default UCI options must be valid");
     let mut uci = UciLoop::new(&mut engine);
 
-    eprintln!(
-        "\x1b[31m{}\x1b[0m",
-        r#"
+    let banner = r#"
   ██╗  ██╗███████╗
   ╚██╗██╔╝╚════██║
    ╚███╔╝     ██╔╝
    ██╔██╗    ██╔╝
   ██╔╝ ██╗   ██║
   ╚═╝  ╚═╝   ╚═╝
-"#
-    );
+"#;
+    eprintln!("\x1b[31m{banner}\x1b[0m");
 
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else {

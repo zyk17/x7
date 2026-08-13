@@ -165,6 +165,24 @@ impl PositionHistory {
         &self.positions
     }
 
+    /// 返回搜索 worker 可复制的最小历史窗口。
+    ///
+    /// 吃子或兵走会将 `rule60_ply` 清零；此前局面不可能再与当前局面构成重复，
+    /// 连将/长捉也不会跨过这次零化着。因此规则只需保留最近一次零化着之后的
+    /// history。另一方面，NN 需要固定数量的最近局面平面，故两者取更早的起点。
+    /// 原完整 history 仍由 UCI/Engine 持有，用于跨回合定位和 root 裁决。
+    pub fn search_window(&self, recent_positions: usize) -> Self {
+        assert!(!self.positions.is_empty(), "PositionHistory is empty");
+        let rule_start = self
+            .positions
+            .iter()
+            .rposition(|position| position.rule60_ply == 0)
+            .unwrap_or(0);
+        let nn_start = self.positions.len().saturating_sub(recent_positions.max(1));
+        let start = rule_start.min(nn_start);
+        Self::from_positions(self.positions[start..].to_vec())
+    }
+
     /// Copies a root history without discarding this instance's reserved DFS
     /// capacity. px0 gives every search workspace a persistent
     /// `PositionHistory` and reuses it through `Trim`/`Append`
@@ -388,5 +406,30 @@ mod tests {
         let right = PositionHistory::from_positions(vec![Position::new(suffix.board.clone(), 23, 8), zero, suffix]);
 
         assert_eq!(left.rule_context_hash(), right.rule_context_hash());
+    }
+
+    #[test]
+    fn search_window_keeps_rule_suffix_and_nn_history() {
+        let (board, _) = ChessBoard::from_fen("4k4/9/9/9/9/9/9/9/9/4K4 w - - 0 1").expect("board");
+        let positions = (0..12)
+            .map(|index| {
+                Position::new(
+                    board.clone(),
+                    if index < 5 { index as u32 + 1 } else { index as u32 - 5 },
+                    index as u32,
+                )
+            })
+            .collect();
+        let history = PositionHistory::from_positions(positions);
+
+        let window = history.search_window(8);
+        assert_eq!(window.len(), 8, "NN keeps the latest eight positions");
+        assert_eq!(window.starting().game_ply(), 4);
+        assert_eq!(window.last().game_ply(), 11);
+        assert_eq!(
+            window.get(1).rule60_ply(),
+            0,
+            "the latest zeroing position stays in the window"
+        );
     }
 }

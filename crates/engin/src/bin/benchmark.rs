@@ -24,6 +24,7 @@ struct Args {
     evals: Vec<usize>,
     backprops: Vec<usize>,
     eval_batch: Option<usize>,
+    max_in_flight: Option<usize>,
     cache: bool,
     warm_cache: bool,
     root_top: usize,
@@ -33,7 +34,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--cache|--warm-cache] [--root-top 8]"
+     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--max-in-flight 128] [--cache|--warm-cache] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -48,6 +49,7 @@ fn parse_args() -> Result<Args, String> {
     let mut evals = vec![4];
     let mut backprops = vec![1];
     let mut eval_batch = None;
+    let mut max_in_flight = None;
     let mut cache = false;
     let mut warm_cache = false;
     let mut root_top = 8;
@@ -101,6 +103,14 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|_| "--eval-batch must be an unsigned integer")?,
                 )
             }
+            "--max-in-flight" => {
+                max_in_flight = Some(
+                    args.next()
+                        .ok_or("--max-in-flight requires an integer")?
+                        .parse()
+                        .map_err(|_| "--max-in-flight must be an unsigned integer")?,
+                )
+            }
             "--cache" => cache = true,
             "--warm-cache" => {
                 cache = true;
@@ -117,8 +127,14 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown argument: {argument}\n{}", usage())),
         }
     }
-    if playouts == Some(0) || movetime == Some(0) || repeat == 0 || eval_batch == Some(0) || root_top == 0 {
-        return Err("playouts, movetime, repeat, eval-batch, and root-top must be positive".into());
+    if playouts == Some(0)
+        || movetime == Some(0)
+        || repeat == 0
+        || eval_batch == Some(0)
+        || max_in_flight == Some(0)
+        || root_top == 0
+    {
+        return Err("playouts, movetime, repeat, eval-batch, max-in-flight, and root-top must be positive".into());
     }
     if positions.is_some() && !moves.is_empty() {
         return Err("--positions cannot be combined with --moves".into());
@@ -144,6 +160,7 @@ fn parse_args() -> Result<Args, String> {
         evals,
         backprops,
         eval_batch,
+        max_in_flight,
         cache,
         warm_cache,
         root_top,
@@ -256,13 +273,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} cache={} warm_cache={} recommended_batch={} target_batch={} budget={} repeat={} worker_matrix={} positions={}",
+        "onnx={} provider={} cache={} warm_cache={} recommended_batch={} target_batch={} max_in_flight={} budget={} repeat={} worker_matrix={} positions={}",
         args.onnx.display(),
         provider,
         args.cache,
         args.warm_cache,
         recommended,
         target_batch,
+        args.max_in_flight.unwrap_or(target_batch.saturating_mul(4)),
         args.playouts
             .map(|n| format!("playouts={n}"))
             .unwrap_or_else(|| format!("movetime={}ms", args.movetime.unwrap_or(0))),
@@ -296,6 +314,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             Arc::clone(&history),
                             SearchConfig {
                                 eval_batch_size: target_batch,
+                                max_in_flight: args.max_in_flight.unwrap_or(0),
                                 gather_workers,
                                 eval_workers,
                                 backprop_workers,

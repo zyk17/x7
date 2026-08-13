@@ -110,6 +110,11 @@ fn edge_lcb(repository: &NodeRepository, edge: &Edge, stdevs: f32) -> Option<f32
     Some(q - stdevs * (variance / effective_samples).sqrt())
 }
 
+/// 根边的 LCB 只有明确优于当前 N-first 候选时才翻盘。网络把多条边同时压到
+/// `Q≈±1` 时，万分位的方差差不是足以改变着法的 Evidence；保留 N-first 能避免
+/// tree reuse 中旧样本的微小差异来回切换 MultiPV。
+const LCB_OVERRIDE_MIN_ADVANTAGE: f32 = 0.01;
+
 fn edge_child(repository: &NodeRepository, edge: &Edge) -> Option<Arc<Node>> {
     edge.child_key().and_then(|key| repository.get(key))
 }
@@ -270,6 +275,7 @@ fn ranked_root_edges(
         };
         if best_key.rank == BestEdgeRank::NonTerminal {
             let min_visits = best_key.visits as f32 * params.lcb_min_visit_fraction;
+            let incumbent_lcb = edge_lcb(repository, &candidates[0].0, params.lcb_stdevs);
             let mut best_lcb: Option<(usize, f32)> = None;
             for (index, (edge, _child, key)) in candidates.iter().enumerate() {
                 if key.rank != BestEdgeRank::NonTerminal
@@ -286,7 +292,10 @@ fn ranked_root_edges(
                     best_lcb = Some((index, lcb));
                 }
             }
-            if let Some((index, _)) = best_lcb {
+            if let (Some((index, lcb)), Some(incumbent_lcb)) = (best_lcb, incumbent_lcb)
+                && index != 0
+                && lcb >= incumbent_lcb + LCB_OVERRIDE_MIN_ADVANTAGE
+            {
                 let selected = candidates.remove(index);
                 candidates.insert(0, selected);
             }
@@ -572,8 +581,9 @@ mod tests {
     use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN, Square};
 
     use super::{
-        best_mate_with_params, best_move, best_move_filtered, best_move_filtered_with_params, edge_value,
-        principal_variation, root_stats, root_variations_with_params,
+        LCB_OVERRIDE_MIN_ADVANTAGE, best_mate_with_params, best_move, best_move_filtered,
+        best_move_filtered_with_params, edge_lcb, edge_value, principal_variation, root_stats,
+        root_variations_with_params,
     };
     use crate::neural::backend::UniformBackend;
     use crate::search::{NodeKey, NodeRepository, Search, SearchConfig, SearchParams, ValueDelta};
@@ -673,6 +683,43 @@ mod tests {
             best_move_filtered_with_params(&repo, root_key, false, &[], &too_few_visits),
             Some(first),
             "a challenger below the minimum visit fraction cannot replace N-first"
+        );
+    }
+
+    #[test]
+    fn root_lcb_keeps_n_first_when_its_advantage_is_too_small() {
+        let repo = NodeRepository::default();
+        let root_key = NodeKey::board(4);
+        let root = repo.get_or_insert(root_key);
+        let first = Move::new(Square::parse("a0").unwrap(), Square::parse("a1").unwrap());
+        let challenger = Move::new(Square::parse("b0").unwrap(), Square::parse("b1").unwrap());
+        assert!(root.try_begin_evaluation());
+        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.publish_edges(vec![(first, 0.8), (challenger, 0.2)]);
+
+        let edges = root.edges();
+        for (index, (key, value, visits)) in [(NodeKey::board(41), 0.998, 100), (NodeKey::board(42), 0.9999, 80)]
+            .into_iter()
+            .enumerate()
+        {
+            let child = repo.get_or_insert(key);
+            child.set_graph_value(ValueDelta::one(value, 0.0));
+            repo.recompute_graph_node(key);
+            edges[index].bind_child_key(key);
+            for _ in 0..visits {
+                root.reserve_edge(index).unwrap().complete();
+            }
+        }
+        repo.recompute_graph_node(root_key);
+
+        let first_lcb = edge_lcb(&repo, &edges[0], 5.0).expect("first LCB");
+        let challenger_lcb = edge_lcb(&repo, &edges[1], 5.0).expect("challenger LCB");
+        assert!(challenger_lcb > first_lcb);
+        assert!(challenger_lcb - first_lcb < LCB_OVERRIDE_MIN_ADVANTAGE);
+        assert_eq!(
+            best_move_filtered_with_params(&repo, root_key, false, &[], &SearchParams::default()),
+            Some(first),
+            "tiny saturated-value LCB differences must not overturn the N-first candidate"
         );
     }
 

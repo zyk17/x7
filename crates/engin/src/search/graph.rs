@@ -23,16 +23,23 @@ use super::ValueDelta;
 ///
 /// `u64` 已由 `hash_cat` 混合。分片 map 使用 `nohash_hasher::NoHashHasher`，直接
 /// 以此值为 bucket index，不再进行第二次 hash。
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
-pub struct NodeKey {
-    hash: u64,
-    board: u64,
-    context: Option<u64>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum NodeKey {
+    /// 普通 MCGS state。相同棋盘（含行棋方）共享 node 与后续统计。
+    GraphNode { board_hash: u64 },
+    /// 首次重复后的规则敏感 state。相同棋盘但不同历史不得共享 N/Q。
+    TreeNode { board_hash: u64, rule_context_hash: u64 },
+}
+
+impl Default for NodeKey {
+    fn default() -> Self {
+        Self::GraphNode { board_hash: 0 }
+    }
 }
 
 impl Hash for NodeKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash);
+        state.write_u64(self.storage_hash());
     }
 }
 
@@ -42,28 +49,22 @@ impl IsEnabled for NodeKey {}
 impl NodeKey {
     /// MCGS 的共享 state identity：只由当前棋盘（含行棋方）决定。
     pub const fn board(board_hash: u64) -> Self {
-        Self {
-            hash: board_hash,
-            board: board_hash,
-            context: None,
-        }
+        Self::GraphNode { board_hash }
     }
 
     /// 图闭环处的纯树形续搜 node。相同棋盘但规则 history 不同，不共享 N/Q。
     pub fn continuation(board_hash: u64, context: u64) -> Self {
-        Self {
-            hash: hash_cat(hash_cat(board_hash, context), 1),
-            board: board_hash,
-            context: Some(context),
+        Self::TreeNode {
+            board_hash,
+            rule_context_hash: context,
         }
     }
 
     /// 当前 history 应使用的 repository identity。
     ///
-    /// 普通 MCGS 只按 board 共享。一次真实重复出现后，到下一次零化着之前的
-    /// variation 都必须留在 ContinuationTree：否则跨回合重新落回 board node，
-    /// 已积累的 edge N/Q 会被无意义地丢弃，且会再次与无历史的 shared-Q 混用。
-    /// 零化着（吃子或兵走）会清空重复规则上下文，随后自然回到普通 board graph。
+    /// 普通 MCGS 只按 board 共享。真实重复进入 TreeNode；零化着清空重复规则
+    /// 上下文，Tree 内该 edge 的 child 随即回到普通 GraphNode。这样本回合已展开的
+    /// 零化后子图可在实际走子后的下一回合直接复用，而 Tree 先前的统计不会迁移。
     pub fn for_history(history: &PositionHistory) -> Self {
         let board_hash = history.last().board().hash();
         if history.did_repeat_since_last_zeroing_move() {
@@ -74,7 +75,17 @@ impl NodeKey {
     }
 
     pub const fn is_continuation(self) -> bool {
-        self.context.is_some()
+        matches!(self, Self::TreeNode { .. })
+    }
+
+    fn storage_hash(self) -> u64 {
+        match self {
+            Self::GraphNode { board_hash } => board_hash,
+            Self::TreeNode {
+                board_hash,
+                rule_context_hash,
+            } => hash_cat(hash_cat(board_hash, rule_context_hash), 1),
+        }
     }
 }
 
@@ -106,8 +117,8 @@ impl ExpansionState {
 #[derive(Debug)]
 pub struct Edge {
     mv: Move,
-    /// MCGS 中 move 指向的共享 board node。首次沿此 edge 下降时绑定；同一 parent
-    /// board 与 move 必然导向同一 child board。KataGo GraphSearch 的 action/state 分离。
+    /// 已绑定的 child state。普通 Graph edge 与 Tree 的零化 edge 都可永久绑定；
+    /// Graph → Tree 入口因 child context 取决于本次 variation，刻意保持未绑定。
     child_key: OnceLock<NodeKey>,
     /// 若接入 child 会闭合 shared-Q 图环，此合法着不参与本 graph 的 PUCT。它不是
     /// 规则裁决；真实 variation 重复由 ContinuationTree 继续搜索。
@@ -595,7 +606,7 @@ impl NodeRepository {
     }
 
     fn shard_index(&self, key: NodeKey) -> usize {
-        key.hash as usize & (self.shards.len() - 1)
+        key.storage_hash() as usize & (self.shards.len() - 1)
     }
 
     /// 检查 `root` 以下的 edge-local reservation 不变量。
@@ -810,6 +821,18 @@ mod graph_tests {
         SearchGraph::new(Arc::new(PositionHistory::from_positions(state.positions())))
     }
 
+    #[test]
+    fn graph_and_tree_keys_keep_their_identity_separate() {
+        let graph = NodeKey::board(42);
+        let first_tree = NodeKey::continuation(42, 1);
+        let second_tree = NodeKey::continuation(42, 2);
+
+        assert!(matches!(graph, NodeKey::GraphNode { .. }));
+        assert!(matches!(first_tree, NodeKey::TreeNode { .. }));
+        assert_ne!(graph, first_tree);
+        assert_ne!(first_tree, second_tree);
+    }
+
     fn repeated_history() -> Arc<PositionHistory> {
         let (board, _) = xiangqi_core::ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
         let mut history = PositionHistory::default();
@@ -884,7 +907,7 @@ mod graph_tests {
 
         let mv = history.last().board().parse_move("d9e9").expect("legal move");
         let mut variation = Variation::root(Arc::clone(&history));
-        let expected_child = variation.continuation_child_key(mv);
+        let expected_child = variation.child_key_for_history(mv);
         let root_node = graph.repository().get_or_insert(root);
         assert!(root_node.try_begin_evaluation());
         root_node.publish_edges(vec![(mv, 1.0)]);

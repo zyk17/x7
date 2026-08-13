@@ -15,8 +15,9 @@ use super::{EdgeReservation, NodeKey, ValueDelta};
 
 /// root history 加上从 root 到 repository node 的走法。
 ///
-/// 中国象棋重复局面和 rule60 依赖历史，因此 event 不能只保存棋盘 hash。root history
-/// 以不可变方式共享；Gather 下行时在本 event 内扩展其 owned 走法路径。
+/// 中国象棋重复局面和 rule60 依赖历史，因此 event 不能只保存棋盘 hash。Search 在
+/// 创建时已将完整 UCI history 裁成规则/NN 所需的最小窗口，并以不可变方式共享；
+/// Gather 下行时在本 event 内扩展其 owned 走法路径。
 #[derive(Clone, Debug)]
 pub struct Variation {
     root_history: Arc<PositionHistory>,
@@ -56,8 +57,8 @@ impl Variation {
         &self.moves
     }
 
-    /// 返回 worker 私有的准确 history。首次读取才从共享 root 重放一次，之后由
-    /// `push` 维护，供重复规则、RuleJudge 与 NN 编码共用。
+    /// 返回 worker 私有的准确规则与 NN history。root window 已由 Search 共享；首次
+    /// 读取只复制这一份窗口，之后由 `push` 增量维护。
     pub(crate) fn history(&mut self) -> &PositionHistory {
         if self.history.is_none() {
             let mut history = self.root_history.as_ref().clone();
@@ -76,11 +77,14 @@ impl Variation {
         NodeKey::board(Position::after(&self.position, mv).board().hash())
     }
 
-    pub(crate) fn continuation_child_key(&mut self, mv: Move) -> NodeKey {
+    /// 走后节点的真实 identity。重复上下文仍有效时返回 TreeNode；零化着清空
+    /// 上下文后返回 GraphNode，使本次搜索已展开的普通子图可跨回合直接复用。
+    pub(crate) fn child_key_for_history(&mut self, mv: Move) -> NodeKey {
         let child = Position::after(&self.position, mv);
         let mut history = self.history().clone();
         history.append(mv);
-        NodeKey::continuation(child.board().hash(), history.rule_context_hash())
+        debug_assert_eq!(child.board().hash(), history.last().board().hash());
+        NodeKey::for_history(&history)
     }
 }
 
@@ -95,8 +99,9 @@ pub struct NodeEvent {
     pub generation: u64,
     pub node_key: NodeKey,
     node_path: Vec<NodeKey>,
-    /// `(入边 reservation 索引, ContinuationTree 根 key)`。正常 path 为 `None`。
-    continuation: Option<(usize, NodeKey)>,
+    /// 每次 Graph → Tree 的 `(入边 reservation 索引, Tree 根 key)`。一条 variation
+    /// 可以在零化后回到 Graph，再进入新的 Tree，因此这里不是单值。
+    tree_entries: Vec<(usize, NodeKey)>,
     pub variation: Variation,
     pub reservations: Vec<EdgeReservation>,
     #[cfg(feature = "benchmark")]
@@ -113,7 +118,7 @@ impl NodeEvent {
             generation,
             node_key: root_key,
             node_path: vec![root_key],
-            continuation: None,
+            tree_entries: Vec::new(),
             variation: Variation::root(root_history),
             reservations: Vec::new(),
             #[cfg(feature = "benchmark")]
@@ -129,20 +134,34 @@ impl NodeEvent {
         self
     }
 
-    pub(crate) fn repeats_in_history(&mut self, mv: Move) -> bool {
+    /// 若走后会形成棋规认可的第一次重复，返回对应 TreeNode key。
+    ///
+    /// 不能只在全部 history 中查相同 board hash：相差奇数 ply 的 canonical board
+    /// 可能相同，却不是同一行棋方的重复。先按 parity 过滤，再由
+    /// `PositionHistory::append` 作为规则真相确认 `repetitions`。
+    pub(crate) fn repeated_child_key(&mut self, mv: Move) -> Option<NodeKey> {
         let board = Position::after(&self.variation.position, mv).board().hash();
-        self.variation
-            .history()
+        let history = self.variation.history();
+        let child_parity = history.len() & 1;
+        if !history
             .positions()
             .iter()
-            .any(|position| position.board().hash() == board)
+            .enumerate()
+            .any(|(index, position)| index & 1 == child_parity && position.board().hash() == board)
+        {
+            return None;
+        }
+
+        let mut child_history = history.clone();
+        child_history.append(mv);
+        (child_history.last().repetitions() > 0).then(|| NodeKey::for_history(&child_history))
     }
 
-    /// 进入 ContinuationTree。`child_key` 必须是本 variation 第一次重复后的局面：
-    /// 这条入边不绑定 shared graph，树根和其后代只按完整规则上下文保存。
+    /// 进入 ContinuationTree。入口 edge 不绑定 child，因为同一个 Graph edge 在不同
+    /// variation 下可通向不同的规则上下文；Tree root 仍按其 key 在 repository 复用。
     pub fn descend_continuation(mut self, child_key: NodeKey, reservation: EdgeReservation) -> Self {
-        assert!(self.continuation.is_none());
-        self.continuation = Some((self.reservations.len(), child_key));
+        assert!(child_key.is_continuation(), "continuation entry must target a TreeNode");
+        self.tree_entries.push((self.reservations.len(), child_key));
         self.variation.push(reservation.mv());
         self.node_key = child_key;
         self.node_path.push(child_key);
@@ -249,11 +268,11 @@ impl BackpropEvent {
                 "shared-leaf path has one more node; local leaf path has no shared leaf"
             );
             let depth = node.reservations.len() as u64 + 1;
-            let continuation = node.continuation;
+            let tree_entries = node.tree_entries;
             let mut reservations: Vec<_> = node.reservations.into_iter().map(Some).collect();
             let mut local_leaf = local_leaf;
             for index in (0..reservations.len()).rev() {
-                if continuation.is_some_and(|(entry, _)| entry == index) {
+                if tree_entries.iter().any(|(entry, _)| *entry == index) {
                     continue;
                 }
                 let reservation = reservations[index].take().expect("one reservation");
@@ -263,7 +282,9 @@ impl BackpropEvent {
                     reservation.complete();
                 }
             }
-            if let Some((index, root)) = continuation {
+            // 从最内层 Tree 开始采样。若零化后又发生第一次重复，内层 Tree 的结果
+            // 先进入其 Graph parent，外层入口随后读到已更新的局部树根。
+            for (index, root) in tree_entries.into_iter().rev() {
                 let entry = reservations[index].take().expect("continuation entry reservation");
                 if let Some(value) = local_leaf.take() {
                     // ContinuationTree 根本身就是 path terminal（例如重复正好触发
@@ -314,10 +335,10 @@ impl BackpropEvent {
 mod tests {
     use std::sync::Arc;
 
-    use xiangqi_core::{GameState, Move, STARTPOS_FEN};
+    use xiangqi_core::{GameState, Move, Position, STARTPOS_FEN};
 
-    use super::{BackpropEvent, NodeEvent};
-    use crate::search::{NodeKey, NodeRepository};
+    use super::{BackpropEvent, NodeEvent, Variation};
+    use crate::search::{NodeKey, NodeRepository, ValueDelta};
 
     #[test]
     fn variation_keeps_root_history_and_owns_its_path() {
@@ -361,12 +382,92 @@ mod tests {
             .board()
             .parse_move("d9e9")
             .expect("repeat move");
-        assert!(event.repeats_in_history(mv));
-        let child = event.variation.continuation_child_key(mv);
+        let child = event.repeated_child_key(mv).expect("first repetition");
 
         let mut event = event.descend_continuation(child, crate::search::EdgeReservation::test_only(mv));
         assert!(event.node_key.is_continuation());
         assert_eq!(event.variation.history().last().repetitions(), 1);
+    }
+
+    #[test]
+    fn opposite_ply_board_match_does_not_enter_the_continuation_tree() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let parent = state.current_position();
+        let mv = parent.board().parse_move("b2b3").expect("legal move");
+        let child = Position::after(&parent, mv);
+        // `PositionHistory` 的奇偶位置代表不同的行棋方。这里故意放入一个只在
+        // 相反 parity 出现的相同 board，模拟旧的全量 hash 扫描误判。
+        let history = xiangqi_core::PositionHistory::from_positions(vec![child, parent.clone(), parent]);
+        let mut event = NodeEvent::root(3, Arc::new(history));
+        let child_hash = Position::after(&event.variation.position, mv).board().hash();
+
+        assert!(
+            event
+                .variation
+                .history()
+                .positions()
+                .iter()
+                .any(|position| position.board().hash() == child_hash)
+        );
+        assert!(event.repeated_child_key(mv).is_none());
+    }
+
+    #[test]
+    fn zeroing_move_leaves_the_continuation_tree() {
+        let (board, _) = xiangqi_core::ChessBoard::from_fen("3k5/9/9/r3R4/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
+        let mut history = xiangqi_core::PositionHistory::default();
+        history.reset(board, 2, 30);
+        for text in ["d9e9", "d2e2", "e9d9", "e2d2"] {
+            let mv = history.last().board().parse_move(text).expect(text);
+            history.append(mv);
+        }
+        let mut variation = Variation::root(Arc::new(history));
+
+        let repeat = variation.position.board().parse_move("d9e9").expect("repeat move");
+        assert!(variation.child_key_for_history(repeat).is_continuation());
+        variation.push(repeat);
+        let reply = variation.position.board().parse_move("d2e2").expect("reply");
+        variation.push(reply);
+        let zeroing = variation
+            .position
+            .board()
+            .generate_legal_moves()
+            .into_iter()
+            .find(|mv| xiangqi_core::Position::after(&variation.position, *mv).rule60_ply() == 0)
+            .expect("legal capture");
+
+        assert!(matches!(
+            variation.child_key_for_history(zeroing),
+            NodeKey::GraphNode { .. }
+        ));
+    }
+
+    #[test]
+    fn real_history_can_enter_tree_then_zero_then_enter_tree_again() {
+        // 黑将、红车的四步往返先形成第一次重复。黑车吃掉 e6 红车后，重复
+        // 上下文清零而回到 Graph；再用同样的四步往返，必须重新进入 Tree。
+        // 这是实战中 Graph → Tree → Graph → Tree 的最小规则形状，不依赖 NN。
+        let (board, _) = xiangqi_core::ChessBoard::from_fen("3k5/9/9/r3R4/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
+        let mut history = xiangqi_core::PositionHistory::default();
+        history.reset(board, 2, 30);
+        for text in ["d9e9", "d2e2", "e9d9", "e2d2"] {
+            let mv = history.last().board().parse_move(text).expect(text);
+            history.append(mv);
+        }
+        assert!(history.did_repeat_since_last_zeroing_move());
+        assert!(NodeKey::for_history(&history).is_continuation());
+
+        let capture = history.last().board().parse_move("a6e6").expect("capture");
+        history.append(capture);
+        assert!(!history.did_repeat_since_last_zeroing_move());
+        assert!(matches!(NodeKey::for_history(&history), NodeKey::GraphNode { .. }));
+
+        for text in ["d2e2", "d9e9", "e2d2", "e9d9"] {
+            let mv = history.last().board().parse_move(text).expect(text);
+            history.append(mv);
+        }
+        assert_eq!(history.last().repetitions(), 1);
+        assert!(NodeKey::for_history(&history).is_continuation());
     }
 
     #[test]
@@ -526,6 +627,56 @@ mod tests {
         assert!((shard.edges()[0].completed_stats().local_leaf.q() + 0.2).abs() < f32::EPSILON);
         assert_eq!(shard.completed_visits(), 2);
         assert!((shard.q() - 0.1).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn backprop_handles_a_second_tree_after_a_zeroing_graph_segment() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let root = NodeEvent::root(
+            13,
+            Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
+        );
+        let repository = NodeRepository::default();
+        let root_node = repository.get_or_insert(root.node_key);
+        let first_tree_key = NodeKey::continuation(42, 1);
+        let graph_key = NodeKey::board(43);
+        let second_tree_key = NodeKey::continuation(44, 2);
+        let first_tree = repository.get_or_insert(first_tree_key);
+        let graph = repository.get_or_insert(graph_key);
+        let second_tree = repository.get_or_insert(second_tree_key);
+        let first = Move::new(
+            xiangqi_core::Square::parse("b2").expect("from"),
+            xiangqi_core::Square::parse("b3").expect("to"),
+        );
+        let second = Move::new(
+            xiangqi_core::Square::parse("b9").expect("from"),
+            xiangqi_core::Square::parse("b8").expect("to"),
+        );
+        let third = Move::new(
+            xiangqi_core::Square::parse("c3").expect("from"),
+            xiangqi_core::Square::parse("c4").expect("to"),
+        );
+        for (node, mv, value) in [
+            (root_node.as_ref(), first, 0.0),
+            (first_tree.as_ref(), second, 0.2),
+            (graph.as_ref(), third, 0.4),
+        ] {
+            assert!(node.try_begin_evaluation());
+            node.publish_edges(vec![(mv, 1.0)]);
+            node.set_graph_value(ValueDelta::one(value, 0.0));
+        }
+        second_tree.set_graph_value(ValueDelta::one(0.6, 0.0));
+        first_tree.edges()[0].bind_child_key(graph_key);
+
+        let event = root
+            .descend_continuation(first_tree_key, root_node.reserve_edge(0).expect("first entry"))
+            .descend(graph_key, first_tree.reserve_edge(0).expect("zeroing edge"))
+            .descend_continuation(second_tree_key, graph.reserve_edge(0).expect("second entry"));
+        BackpropEvent::complete_batch([BackpropEvent::evaluation(event)], &repository);
+
+        assert_eq!(root_node.edges()[0].completed_visits(), 1);
+        assert_eq!(first_tree.edges()[0].completed_visits(), 1);
+        assert_eq!(graph.edges()[0].completed_visits(), 1);
     }
 
     #[test]

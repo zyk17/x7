@@ -19,7 +19,8 @@ use xiangqi_core::{Move, PositionHistory};
 use crate::EnginError;
 use crate::neural::backend::{Backend, EvalCacheKey, EvalResult};
 use crate::neural::{
-    EncodedBatch, FillEmptyHistory, InputPlanes, encode_position_input_planes, eval_result_from_encoded_row,
+    EncodedBatch, FillEmptyHistory, InputPlanes, MOVE_HISTORY, encode_position_input_planes,
+    eval_result_from_encoded_row,
 };
 
 use super::extension::{ExtensionKind, classify_extension, path_terminal_value};
@@ -147,6 +148,9 @@ pub struct SearchConfig {
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`；Eval 不会等待凑满 batch。
     pub eval_batch_size: usize,
+    /// 同一 search job 的在途 owned playout 上限。`0` 表示当前默认的
+    /// `4 * eval_batch_size`；benchmark 可覆写它以量化碰撞与 batch 的关系。
+    pub max_in_flight: usize,
     pub params: SearchParams,
     pub gather_workers: usize,
     /// Eval worker 数。它负责准备、缓存、合法着；NN inference 是独立线程。
@@ -161,6 +165,7 @@ impl Default for SearchConfig {
         Self {
             queue_capacity: 0,
             eval_batch_size: 0,
+            max_in_flight: 0,
             params: SearchParams::default(),
             gather_workers: 4,
             eval_workers: 4,
@@ -201,9 +206,17 @@ impl SearchConfig {
             eval_batch_size <= queue_capacity,
             "stream eval batch size must fit the queue capacity"
         );
+        let max_in_flight = if self.max_in_flight == 0 {
+            eval_batch_size.saturating_mul(4)
+        } else {
+            self.max_in_flight
+        }
+        .min(queue_capacity)
+        .max(1);
         ResolvedSearchConfig {
             queue_capacity,
             eval_batch_size,
+            max_in_flight,
             params: self.params,
             gather_workers: self.gather_workers,
             eval_workers: self.eval_workers,
@@ -216,6 +229,7 @@ impl SearchConfig {
 struct ResolvedSearchConfig {
     queue_capacity: usize,
     eval_batch_size: usize,
+    max_in_flight: usize,
     params: SearchParams,
     gather_workers: usize,
     eval_workers: usize,
@@ -627,7 +641,9 @@ impl Search {
         let (gather_tx, gather_rx) = bounded(resolved.queue_capacity);
         let (eval_tx, eval_rx) = bounded(resolved.queue_capacity);
         let (backprop_tx, backprop_rx) = bounded(resolved.queue_capacity);
-        let root_history = Arc::clone(graph.root_history());
+        // UCI/graph 持有完整 history 用于跨回合定位；每个 event 只需要重复规则自
+        // 最近零化着以来的后缀，以及 NN 的最近 8 层。这里一次裁剪后由整次 job 共享。
+        let root_history = Arc::new(graph.root_history().search_window(MOVE_HISTORY));
         let root_key = graph.root_key();
         let initial_visits = graph
             .repository()
@@ -681,11 +697,7 @@ impl Search {
             root_key,
             initial_visits,
             // 保持数个 Eval batch 的叶子处于 in-flight，而非占满全部队列深度。
-            max_in_flight: resolved
-                .eval_batch_size
-                .saturating_mul(4)
-                .min(resolved.queue_capacity)
-                .max(1),
+            max_in_flight: resolved.max_in_flight,
             worker_pool,
             workers_idle: false,
         }
@@ -1041,14 +1053,16 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                     return;
                 };
                 let reservation = node.reserve_edge(edge_index).expect("selected stream edge");
-                if !event.node_key.is_continuation() && event.repeats_in_history(reservation.mv()) {
-                    let child = event.variation.continuation_child_key(reservation.mv());
+                if !event.node_key.is_continuation()
+                    && let Some(child) = event.repeated_child_key(reservation.mv())
+                {
+                    debug_assert!(child.is_continuation(), "first repetition must enter a TreeNode");
                     shared.repository.get_or_insert(child);
                     event = event.descend_continuation(child, reservation);
                     continue;
                 }
                 let child = if event.node_key.is_continuation() {
-                    event.variation.continuation_child_key(reservation.mv())
+                    event.variation.child_key_for_history(reservation.mv())
                 } else {
                     event.variation.child_board_key(reservation.mv())
                 };
@@ -1913,8 +1927,7 @@ mod tests {
         let root = tree.repository().get_or_insert(tree.root_key());
         let mv = history.last().board().parse_move("e2d2").expect("repeat move");
         let mut event = NodeEvent::root(42, Arc::clone(&history));
-        assert!(event.repeats_in_history(mv));
-        let continuation = event.variation.continuation_child_key(mv);
+        let continuation = event.repeated_child_key(mv).expect("first repetition");
 
         assert!(root.try_begin_evaluation());
         root.set_graph_value(ValueDelta::one(0.0, 0.0));
@@ -1934,6 +1947,52 @@ mod tests {
             ExpansionState::Expanded
         );
         search.stop_and_finish();
+    }
+
+    #[test]
+    fn zeroing_edge_from_a_tree_node_rejoins_the_shared_graph() {
+        let (board, _) = ChessBoard::from_fen("3k5/9/9/r3R4/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
+        let mut history = PositionHistory::default();
+        history.reset(board, 2, 30);
+        for text in ["d9e9", "d2e2", "e9d9", "e2d2", "d9e9", "d2e2"] {
+            let mv = history.last().board().parse_move(text).expect(text);
+            history.append(mv);
+        }
+        assert!(history.did_repeat_since_last_zeroing_move());
+        let history = Arc::new(history);
+        let mut graph = SearchGraph::new(Arc::clone(&history));
+        assert!(graph.root_key().is_continuation());
+        let root = graph.repository().get_or_insert(graph.root_key());
+        let capture = history
+            .last()
+            .board()
+            .generate_legal_moves()
+            .into_iter()
+            .find(|mv| Position::after(history.last(), *mv).rule60_ply() == 0)
+            .expect("legal capture");
+        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        assert!(root.try_begin_evaluation());
+        root.publish_edges(vec![(capture, 1.0)]);
+
+        let mut search =
+            Search::new_with_graph(Arc::new(UniformBackend::default()), 43, &graph, SearchConfig::default());
+        assert_eq!(search.run_playouts(1).expect("one playout").completed_playouts, 1);
+
+        let child = root.edges()[0].child_key().expect("zeroing edge binds graph child");
+        assert!(matches!(child, crate::search::NodeKey::GraphNode { .. }));
+        assert!(graph.repository().get(child).is_some());
+        search.stop_and_finish();
+
+        let mut target = history.as_ref().clone();
+        target.append(capture);
+        assert!(
+            graph
+                .reset_to_history(Arc::new(target))
+                .expect("played zeroing move reuses graph child")
+                .is_none()
+        );
+        assert_eq!(graph.root_key(), child);
+        assert!(graph.repository().get(child).expect("reused root").completed_visits() > 0);
     }
 
     #[test]

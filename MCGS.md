@@ -161,7 +161,9 @@ tree 版可以由 `parent_key.child(move)` 得到 child key。图版必须从 ev
 position，再计算普通 `GraphKey(child_position.board())`。当前 event 保持最小的
 `node_path + reservations`：两者的同一索引顺序表达本次实际走过的 parent edge；正常 path 比
 reservation 多一个 leaf node。首次真实重复则额外记录一个 ContinuationTree entry：该 entry edge
-不绑定 child，回传时把树根当前 value 作为它的 edge-local 样本。无需引入 `PathStep` 结构。
+不绑定 child，回传时把树根当前 value 作为它的 edge-local 样本。Tree 内的零化 edge 则正常绑定
+普通 Graph child；一条 variation 因此可在零化后再次进入新的 Tree，event 记录每个 entry。无需引入
+`PathStep` 结构。
 
 一次回传有两件不同的事，不能混为一谈：
 
@@ -191,15 +193,17 @@ idempotent shared-Q。它必须保留为可复查决策；若实战证明长将�
 候选 child 的 board 已在**当前 variation**出现时，优先于上述拓扑检查按真实 repetition 处理：
 
 1. 走出该边后的节点就是 `ContinuationTree` 根，即此 variation 的第一次重复局面；入边不绑定 shared graph。
-2. ContinuationTree 的每个 key 包含当前 board 与自最近零化着以来的完整规则 history，因此树内不做
-   transposition merge；唯一共享资源是按 board key 的 NN cache。
+2. ContinuationTree 的每个 key 包含当前 board 与自最近零化着以来的完整规则 history，因此重复上下文
+   内不做 transposition merge；唯一共享资源是按 board key 的 NN cache。零化 edge 的 child 立即回到
+   普通 Graph，并可复用已有 Graph node 与其后续子图；Tree 之前的 N/Q 不迁移到该 Graph node。
 3. 第一次重复（`repetitions == 1`）继续正常 PUCT / NN evaluation。树内再次出现相同局面后
    `repetitions >= 2`，才调用 `RuleJudge` 得到 path-local terminal。
 
-这样 shared graph 始终无环，而真实循环仍有足够路径历史交给棋规裁判；ContinuationTree 不反向连接
-shared graph。若当前完整 history 自最近零化着以来已经出现重复，下一回合的 root 仍使用与该历史对应的
-contextual key；因此可达 GC 会保留这棵局部树及其 descendants。零化着清空重复上下文后，root 自然
-回到普通 board graph。普通 graph 与 ContinuationTree 始终只共享 NN cache，不共享 N/Q。
+这样 shared graph 始终无环，而真实循环仍有足够路径历史交给棋规裁判。Graph → Tree entry 不绑定
+contextual child；Tree → Graph 只在零化 edge 发生并正常绑定 board child。若当前完整 history 自最近
+零化着以来已经出现重复，下一回合的 root 仍使用对应 contextual key；零化后则直接成为本回合已创建或
+复用的普通 Graph root。普通 graph 与 Tree 不迁移 N/Q；只有 Tree 的零化后 descendants 使用 Graph
+自己的共享统计。
 
 ## 跨回合复用与 GC
 
