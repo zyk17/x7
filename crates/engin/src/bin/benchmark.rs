@@ -22,9 +22,7 @@ struct Args {
     repeat: usize,
     gathers: Vec<usize>,
     evals: Vec<usize>,
-    backprops: Vec<usize>,
     eval_batch: Option<usize>,
-    max_in_flight: Option<usize>,
     cache: bool,
     warm_cache: bool,
     root_top: usize,
@@ -34,7 +32,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--backprops 1,2] [--eval-batch 64] [--max-in-flight 128] [--cache|--warm-cache] [--root-top 8]"
+     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--eval-batch 64] [--cache|--warm-cache] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -47,9 +45,7 @@ fn parse_args() -> Result<Args, String> {
     let mut repeat = 1;
     let mut gathers = vec![4];
     let mut evals = vec![4];
-    let mut backprops = vec![1];
     let mut eval_batch = None;
-    let mut max_in_flight = None;
     let mut cache = false;
     let mut warm_cache = false;
     let mut root_top = 8;
@@ -94,21 +90,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--gathers" => gathers = parse_list(&args.next().ok_or("--gathers requires list like 4,8")?)?,
             "--evals" => evals = parse_list(&args.next().ok_or("--evals requires list like 1,2")?)?,
-            "--backprops" => backprops = parse_list(&args.next().ok_or("--backprops requires list like 1,2")?)?,
             "--eval-batch" => {
                 eval_batch = Some(
                     args.next()
                         .ok_or("--eval-batch requires an integer")?
                         .parse()
                         .map_err(|_| "--eval-batch must be an unsigned integer")?,
-                )
-            }
-            "--max-in-flight" => {
-                max_in_flight = Some(
-                    args.next()
-                        .ok_or("--max-in-flight requires an integer")?
-                        .parse()
-                        .map_err(|_| "--max-in-flight must be an unsigned integer")?,
                 )
             }
             "--cache" => cache = true,
@@ -127,23 +114,13 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown argument: {argument}\n{}", usage())),
         }
     }
-    if playouts == Some(0)
-        || movetime == Some(0)
-        || repeat == 0
-        || eval_batch == Some(0)
-        || max_in_flight == Some(0)
-        || root_top == 0
-    {
-        return Err("playouts, movetime, repeat, eval-batch, max-in-flight, and root-top must be positive".into());
+    if playouts == Some(0) || movetime == Some(0) || repeat == 0 || eval_batch == Some(0) || root_top == 0 {
+        return Err("playouts, movetime, repeat, eval-batch, and root-top must be positive".into());
     }
     if positions.is_some() && !moves.is_empty() {
         return Err("--positions cannot be combined with --moves".into());
     }
-    for (name, values) in [
-        ("--gathers", &gathers),
-        ("--evals", &evals),
-        ("--backprops", &backprops),
-    ] {
+    for (name, values) in [("--gathers", &gathers), ("--evals", &evals)] {
         if values.contains(&0) {
             return Err(format!("{name} entries must be > 0"));
         }
@@ -158,9 +135,7 @@ fn parse_args() -> Result<Args, String> {
         repeat,
         gathers,
         evals,
-        backprops,
         eval_batch,
-        max_in_flight,
         cache,
         warm_cache,
         root_top,
@@ -247,17 +222,18 @@ fn print_root_candidates(search: &Search, root_is_black: bool, top: usize) {
             .then_with(|| right.prior.total_cmp(&left.prior))
     });
     println!(
-        "    root candidates top {}/{}: move       P    done flight       Q",
+        "    root candidates top {}/{}: move       P    done    obs flight       Q",
         edges.len().min(top),
         edges.len()
     );
     for edge in edges.into_iter().take(top) {
         let mv = if root_is_black { edge.mv.flip() } else { edge.mv };
         println!(
-            "                       {:<6} {:>7.4} {:>7} {:>6} {:>7.4}",
+            "                       {:<6} {:>7.4} {:>7} {:>6} {:>6} {:>7.4}",
             mv.to_uci(),
             edge.prior,
             edge.completed_visits,
+            edge.observations,
             edge.started_visits.saturating_sub(edge.completed_visits),
             edge.q
         );
@@ -273,25 +249,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} cache={} warm_cache={} recommended_batch={} target_batch={} max_in_flight={} budget={} repeat={} worker_matrix={} positions={}",
+        "onnx={} provider={} cache={} warm_cache={} recommended_batch={} target_batch={} budget={} repeat={} worker_matrix={} positions={}",
         args.onnx.display(),
         provider,
         args.cache,
         args.warm_cache,
         recommended,
         target_batch,
-        args.max_in_flight.unwrap_or(target_batch.saturating_mul(4)),
         args.playouts
             .map(|n| format!("playouts={n}"))
             .unwrap_or_else(|| format!("movetime={}ms", args.movetime.unwrap_or(0))),
         args.repeat,
-        args.gathers.len() * args.evals.len() * args.backprops.len(),
+        args.gathers.len() * args.evals.len(),
         positions.len(),
     );
     println!(
-        "note: each run has a fresh graph; --warm-cache alone reuses one NN cache between repeats; hit is normal cache hits; q_* is average queue delay in us"
+        "note: each run has a fresh graph; --warm-cache alone reuses one NN cache between repeats; nps/done are logical visits, eps/leaf_events are physical work; hit is normal cache hits; q_* is average queue delay in us"
     );
-    println!("  G   E   B run       ms      nps      eps    done    hit  coll%    peak  root%    q_g    q_e    q_n");
+    println!("  G   E run       ms      nps      eps    done    hit  coll%    peak  root%    q_g    q_e    q_n");
     let mut generation = 0;
     for (name, fen) in positions {
         let state = GameState::from_fen_moves(&fen, &args.moves)?;
@@ -300,81 +275,76 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("position: {name}");
         for &gather_workers in &args.gathers {
             for &eval_workers in &args.evals {
-                for &backprop_workers in &args.backprops {
-                    let warm_backend = args.warm_cache.then(|| make_backend(&args.onnx, true)).transpose()?;
-                    for run_index in 1..=args.repeat {
-                        generation += 1;
-                        let backend = match &warm_backend {
-                            Some((backend, _, _)) => Arc::clone(backend),
-                            None => make_backend(&args.onnx, args.cache)?.0,
-                        };
-                        let mut search = Search::new(
-                            backend,
-                            generation,
-                            Arc::clone(&history),
-                            SearchConfig {
-                                eval_batch_size: target_batch,
-                                max_in_flight: args.max_in_flight.unwrap_or(0),
-                                gather_workers,
-                                eval_workers,
-                                backprop_workers,
-                                ..SearchConfig::default()
-                            },
-                        );
-                        let started = Instant::now();
-                        let stats = search.run_with_limits(SearchLimits {
-                            max_playouts: args.playouts,
-                            deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
-                        })?;
-                        let seconds = started.elapsed().as_secs_f64();
-                        let total = stats.completed_playouts + stats.collisions;
-                        let collision_rate = if total == 0 {
-                            0.0
-                        } else {
-                            stats.collisions as f64 * 100.0 / total as f64
-                        };
-                        let root_share = root_stats(search.repository(), search.root_key())
-                            .and_then(|root| {
-                                root.edges
-                                    .into_iter()
-                                    .map(|edge| edge.completed_visits)
-                                    .max()
-                                    .map(|best| best as f64 * 100.0 / root.completed_visits.max(1) as f64)
-                            })
-                            .unwrap_or(0.0);
-                        println!(
-                            "{:>3} {:>3} {:>3} {:>3} {:>8.1} {:>8.0} {:>8.0} {:>7} {:>6} {:>6.1} {:>7} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
+                let warm_backend = args.warm_cache.then(|| make_backend(&args.onnx, true)).transpose()?;
+                for run_index in 1..=args.repeat {
+                    generation += 1;
+                    let backend = match &warm_backend {
+                        Some((backend, _, _)) => Arc::clone(backend),
+                        None => make_backend(&args.onnx, args.cache)?.0,
+                    };
+                    let mut search = Search::new(
+                        backend,
+                        generation,
+                        Arc::clone(&history),
+                        SearchConfig {
+                            eval_batch_size: target_batch,
                             gather_workers,
                             eval_workers,
-                            backprop_workers,
-                            run_index,
-                            seconds * 1e3,
-                            stats.completed_playouts as f64 / seconds,
-                            stats.network_evaluations as f64 / seconds,
-                            stats.completed_playouts,
-                            stats.cache_hits,
-                            collision_rate,
-                            stats.peak_in_flight,
-                            root_share,
-                            average_wait_us(stats.gather_queue),
-                            average_wait_us(stats.eval_queue),
-                            average_wait_us(stats.nn_queue)
-                        );
-                        println!(
-                            "    batch avg={:.2} max={} q_backprop={:.1}us submitted={} collision_depths={}",
-                            if stats.network_batches == 0 {
-                                0.0
-                            } else {
-                                stats.network_evaluations as f64 / stats.network_batches as f64
-                            },
-                            stats.network_batch_size_max,
-                            average_wait_us(stats.backprop_queue),
-                            stats.submitted_playouts,
-                            collision_depths(&stats)
-                        );
-                        print_root_candidates(&search, root_is_black, args.root_top);
-                        search.stop_and_finish();
-                    }
+                            ..SearchConfig::default()
+                        },
+                    );
+                    let started = Instant::now();
+                    let stats = search.run_with_limits(SearchLimits {
+                        max_playouts: args.playouts,
+                        deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
+                    })?;
+                    let seconds = started.elapsed().as_secs_f64();
+                    let total = stats.completed_playouts + stats.collisions;
+                    let collision_rate = if total == 0 {
+                        0.0
+                    } else {
+                        stats.collisions as f64 * 100.0 / total as f64
+                    };
+                    let root_share = root_stats(search.repository(), search.root_key())
+                        .and_then(|root| {
+                            root.edges
+                                .into_iter()
+                                .map(|edge| edge.completed_visits)
+                                .max()
+                                .map(|best| best as f64 * 100.0 / root.completed_visits.max(1) as f64)
+                        })
+                        .unwrap_or(0.0);
+                    println!(
+                        "{:>3} {:>3} {:>3} {:>8.1} {:>8.0} {:>8.0} {:>7} {:>6} {:>6.1} {:>7} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
+                        gather_workers,
+                        eval_workers,
+                        run_index,
+                        seconds * 1e3,
+                        stats.completed_playouts as f64 / seconds,
+                        stats.network_evaluations as f64 / seconds,
+                        stats.completed_playouts,
+                        stats.cache_hits,
+                        collision_rate,
+                        stats.peak_in_flight,
+                        root_share,
+                        average_wait_us(stats.gather_queue),
+                        average_wait_us(stats.eval_queue),
+                        average_wait_us(stats.nn_queue)
+                    );
+                    println!(
+                        "    batch avg={:.2} max={} q_backprop={:.1}us leaf_events={} collision_depths={}",
+                        if stats.network_batches == 0 {
+                            0.0
+                        } else {
+                            stats.network_evaluations as f64 / stats.network_batches as f64
+                        },
+                        stats.network_batch_size_max,
+                        average_wait_us(stats.backprop_queue),
+                        stats.submitted_playouts,
+                        collision_depths(&stats)
+                    );
+                    print_root_candidates(&search, root_is_black, args.root_top);
+                    search.stop_and_finish();
                 }
             }
         }

@@ -4,15 +4,17 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use xiangqi_core::Move;
+use xiangqi_core::{Move, PositionHistory};
 
 use super::{Edge, ExpansionState, Node, NodeKey, NodeRepository, SearchParams};
 
-/// 一个 root edge 快照。`started_visits` 包含 in-flight；Q 只使用 completed 值。
+/// 一个 root edge 快照。`started_visits` 包含 in-flight；Q 只使用 completed 值；
+/// `observations` 是完成的物理 leaf event 数。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RootEdgeStats {
     pub mv: Move,
     pub completed_visits: u32,
+    pub observations: u32,
     pub started_visits: u32,
     pub q: f32,
     pub prior: f32,
@@ -50,6 +52,7 @@ pub fn root_stats(repository: &NodeRepository, root_key: NodeKey) -> Option<Root
             .map(|edge| RootEdgeStats {
                 mv: edge.mv(),
                 completed_visits: edge.completed_visits(),
+                observations: edge.completed_stats().observations,
                 started_visits: edge.visits(),
                 q: edge_value(repository, edge),
                 prior: edge.prior(),
@@ -74,8 +77,8 @@ fn edge_value(repository: &NodeRepository, edge: &Edge) -> f32 {
 }
 
 /// root edge 当前 action value 的一、二阶矩。shared child 的二阶矩遵循与 Q 相同的
-/// MCGS 幂等重算；edge N 仍严格只算实际从该 root action 走入的次数。
-fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32, u32)> {
+/// MCGS 幂等重算；第三、四个返回值分别是 logical N 与物理 leaf 权重平方和。
+fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32, u32, u64)> {
     let stats = edge.completed_stats();
     if stats.visits == 0 {
         return None;
@@ -93,6 +96,7 @@ fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32,
         (stats.local_leaf.wl_sum + child_q * propagated as f32) / visits,
         (stats.local_leaf.wl_sq_sum + child_q_sq * propagated as f32) / visits,
         stats.visits,
+        stats.observation_weight_sq_sum,
     ))
 }
 
@@ -101,8 +105,11 @@ fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32,
 /// `cpp/search/searchhelpers.cpp::getSelfUtilityLCBAndRadius`，但不复制其围棋 utility、
 /// 权重或 play-selection 机制。
 fn edge_lcb(repository: &NodeRepository, edge: &Edge, stdevs: f32) -> Option<f32> {
-    let (q, q_sq, visits) = edge_q_moments(repository, edge)?;
-    let weight = visits as f32;
+    let (q, q_sq, visits, observation_weight_sq_sum) = edge_q_moments(repository, edge)?;
+    // Q 的权重仍是 logical N；LCB 的样本量改用加权 observation 的有效样本数。
+    // 单个 K-visit leaf 的有效样本量仍为 1；普通逐 leaf 回传时恰好退化为 N。
+    let weight = (visits as f64).powi(2) / observation_weight_sq_sum.max(1) as f64;
+    let weight = weight.max(1.0) as f32;
     let prior_weight = 1.0 / (weight * weight);
     let adjusted_sq = (q_sq * weight + (q_sq.max(q * q) + 1.0) * prior_weight) / (weight + prior_weight);
     let effective_samples = (weight + prior_weight).powi(2) / (weight + prior_weight * prior_weight);
@@ -313,11 +320,25 @@ fn mate_from_terminal(child: &Node) -> Option<i32> {
     })
 }
 
+#[cfg(test)]
 fn principal_variation_from_root_edge(
     repository: &NodeRepository,
     root_key: NodeKey,
     root_is_black: bool,
     first_move: Move,
+) -> Vec<Move> {
+    principal_variation_from_root_edge_with_history(repository, root_key, root_is_black, first_move, None)
+}
+
+/// 与普通 PV 相同，但可在 Graph → ContinuationTree 的未绑定入口处按本条 PV 的
+/// history 推导临时 TreeNode key。入口不能永久写入 edge，因为它的规则上下文依赖
+/// variation；PV 读取却恰好拥有这条 variation，因此不应在第一次重复处截断。
+fn principal_variation_from_root_edge_with_history(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_is_black: bool,
+    first_move: Move,
+    root_history: Option<&PositionHistory>,
 ) -> Vec<Move> {
     // px0 `SendUciInfo` 的 PV 遍历（`search.cc:343-350`）。
     let mut pv = vec![orient_move(first_move, root_is_black)];
@@ -327,7 +348,8 @@ fn principal_variation_from_root_edge(
     else {
         return pv;
     };
-    let Some(mut key) = first_edge.child_key() else {
+    let mut history = root_history.cloned();
+    let Some(mut key) = next_pv_key(repository, &first_edge, &mut history) else {
         return pv;
     };
     let mut seen = HashSet::from([root_key]);
@@ -346,12 +368,11 @@ fn principal_variation_from_root_edge(
             break;
         }
         pv.push(orient_move(abs_mv, flip));
-        let Some(next) = node
-            .edges()
-            .iter()
-            .find(|edge| edge.mv() == abs_mv)
-            .and_then(|edge| edge.child_key())
-        else {
+        let edges = node.edges();
+        let Some(edge) = edges.iter().find(|edge| edge.mv() == abs_mv) else {
+            break;
+        };
+        let Some(next) = next_pv_key(repository, edge, &mut history) else {
             break;
         };
         key = next;
@@ -360,6 +381,21 @@ fn principal_variation_from_root_edge(
     pv
 }
 
+fn next_pv_key(repository: &NodeRepository, edge: &Edge, history: &mut Option<PositionHistory>) -> Option<NodeKey> {
+    if let Some(history) = history {
+        history.append(edge.mv());
+        let key = NodeKey::for_history(history);
+        // 普通 Graph/零化 edge 已绑定；首次重复入口则按本 PV 的完整 history 临时
+        // 推导 TreeNode。二者应指向同一个 child，若不一致宁可停止显示，不猜测图路径。
+        if let Some(bound) = edge.child_key() {
+            return (bound == key).then_some(bound);
+        }
+        return repository.get(key).map(|_| key);
+    }
+    edge.child_key()
+}
+
+#[cfg(test)]
 pub(crate) fn root_variations_with_params(
     repository: &NodeRepository,
     root_key: NodeKey,
@@ -394,6 +430,51 @@ pub(crate) fn root_variations_with_params(
                 draw,
                 mate,
                 pv: principal_variation_from_root_edge(repository, root_key, root_is_black, edge.mv()),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn root_variations_with_history_and_params(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_history: &PositionHistory,
+    root_is_black: bool,
+    root_move_filter: &[Move],
+    max_pv: usize,
+    params: &SearchParams,
+) -> Vec<RootVariation> {
+    let Some(root) = repository.get(root_key) else {
+        return Vec::new();
+    };
+    let default_wl = (-root.q()).clamp(-1.0, 1.0);
+    let default_draw = root.draw().clamp(0.0, 1.0);
+    ranked_root_edges(repository, root_key, root_move_filter, params)
+        .into_iter()
+        .take(max_pv)
+        .map(|(edge, child)| {
+            let visited = edge.completed_visits() > 0;
+            let wl = if visited {
+                edge_value(repository, &edge)
+            } else {
+                default_wl
+            };
+            let draw = child
+                .as_ref()
+                .filter(|_| visited)
+                .map_or(default_draw, |node| node.draw());
+            let mate = child.as_deref().filter(|_| visited).and_then(mate_from_terminal);
+            RootVariation {
+                wl,
+                draw,
+                mate,
+                pv: principal_variation_from_root_edge_with_history(
+                    repository,
+                    root_key,
+                    root_is_black,
+                    edge.mv(),
+                    Some(root_history),
+                ),
             }
         })
         .collect()
@@ -574,6 +655,20 @@ pub(crate) fn principal_variation_filtered_with_params(
     pv
 }
 
+pub(crate) fn principal_variation_with_history_and_params(
+    repository: &NodeRepository,
+    root_key: NodeKey,
+    root_history: &PositionHistory,
+    root_is_black: bool,
+    root_move_filter: &[Move],
+    params: &SearchParams,
+) -> Vec<Move> {
+    let Some(first_move) = best_root_edge_absolute(repository, root_key, root_move_filter, params) else {
+        return Vec::new();
+    };
+    principal_variation_from_root_edge_with_history(repository, root_key, root_is_black, first_move, Some(root_history))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -582,11 +677,15 @@ mod tests {
 
     use super::{
         LCB_OVERRIDE_MIN_ADVANTAGE, best_mate_with_params, best_move, best_move_filtered,
-        best_move_filtered_with_params, edge_lcb, edge_value, principal_variation, root_stats,
-        root_variations_with_params,
+        best_move_filtered_with_params, edge_lcb, edge_value, principal_variation,
+        principal_variation_with_history_and_params, root_stats, root_variations_with_params,
     };
     use crate::neural::backend::UniformBackend;
     use crate::search::{NodeKey, NodeRepository, Search, SearchConfig, SearchParams, ValueDelta};
+
+    fn mv(from: &str, to: &str) -> Move {
+        Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
+    }
 
     #[test]
     fn root_snapshot_reports_completed_and_in_flight_visits_separately() {
@@ -753,6 +852,31 @@ mod tests {
             best_move_filtered_with_params(&repo, root_key, false, &[], &SearchParams::default()),
             Some(stable),
             "LCB uses wl_sq_sum to prefer the lower-variance action"
+        );
+    }
+
+    #[test]
+    fn root_lcb_does_not_count_one_batched_leaf_as_many_observations() {
+        let repo = NodeRepository::default();
+        let root_key = NodeKey::board(125);
+        let root = repo.get_or_insert(root_key);
+        assert!(root.try_begin_evaluation());
+        root.publish_edges(vec![(mv("a0", "a1"), 0.5), (mv("b0", "b1"), 0.5)]);
+        let edges = root.edges();
+
+        root.reserve_edge_visits(0, 10)
+            .expect("batched reservation")
+            .complete_local_leaf(ValueDelta::one(0.2, 0.0).repeated(10));
+        for _ in 0..10 {
+            root.reserve_edge(1)
+                .expect("independent reservation")
+                .complete_local_leaf(ValueDelta::one(0.2, 0.0));
+        }
+
+        assert_eq!(edges[0].completed_visits(), edges[1].completed_visits());
+        assert!(
+            edge_lcb(&repo, &edges[0], 5.0) < edge_lcb(&repo, &edges[1], 5.0),
+            "one repeated NN result must retain a wider confidence radius than ten leaf events"
         );
     }
 
@@ -1005,5 +1129,60 @@ mod tests {
         repository.recompute_graph_node(root_key);
 
         assert_eq!(principal_variation(&repository, root_key, false), vec![mv]);
+    }
+
+    #[test]
+    fn history_aware_pv_crosses_an_unbound_continuation_entry() {
+        use xiangqi_core::{ChessBoard, PositionHistory};
+
+        let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
+        let mut history = PositionHistory::default();
+        history.reset(board, 2, 30);
+        for text in ["d9e9", "d2e2", "e9d9"] {
+            let mv = history.last().board().parse_move(text).expect(text);
+            history.append(mv);
+        }
+        let root_key = NodeKey::for_history(&history);
+        assert!(!root_key.is_continuation());
+
+        let entry_move = history.last().board().parse_move("e2d2").expect("repeat");
+        let mut continuation_history = history.clone();
+        continuation_history.append(entry_move);
+        let continuation_key = NodeKey::for_history(&continuation_history);
+        assert!(continuation_key.is_continuation());
+
+        let reply = continuation_history.last().board().parse_move("d9e9").expect("reply");
+        let mut after_reply = continuation_history.clone();
+        after_reply.append(reply);
+        let after_reply_key = NodeKey::for_history(&after_reply);
+
+        let repository = NodeRepository::default();
+        let root = repository.get_or_insert(root_key);
+        assert!(root.try_begin_evaluation());
+        root.publish_edges(vec![(entry_move, 1.0)]);
+        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        root.reserve_edge(0).expect("root visit").complete();
+
+        let continuation = repository.get_or_insert(continuation_key);
+        assert!(continuation.try_begin_evaluation());
+        continuation.publish_edges(vec![(reply, 1.0)]);
+        continuation.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        continuation.reserve_edge(0).expect("tree visit").complete();
+        repository.get_or_insert(after_reply_key);
+        repository.recompute_graph_node(continuation_key);
+
+        // Graph → Tree 的 entry edge 没有永久 child；PV 必须由这条 PV 的 history
+        // 推导 continuation key，而不是在 `entry_move` 处截断。
+        assert!(root.edges()[0].child_key().is_none());
+        let pv = principal_variation_with_history_and_params(
+            &repository,
+            root_key,
+            &history,
+            false,
+            &[],
+            &SearchParams::default(),
+        );
+        assert_eq!(pv.len(), 2);
+        assert_eq!(pv[0], entry_move);
     }
 }

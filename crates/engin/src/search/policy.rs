@@ -91,7 +91,7 @@ use std::sync::Arc;
 
 use xiangqi_core::Move;
 
-use super::{Edge, Node, NodeRepository};
+use super::{Edge, NodeRepository};
 
 /// stream backpropagation 使用的紧凑 WDL 更新。
 ///
@@ -155,6 +155,18 @@ impl ValueDelta {
         }
     }
 
+    /// 同一个 NN / terminal 结果代表多个 logical visit 时的等权展开。
+    pub fn repeated(self, visits: u32) -> Self {
+        assert_eq!(self.visits, 1, "only a single sample can be repeated");
+        Self {
+            visits,
+            wl_sum: self.wl_sum * visits as f32,
+            wl_sq_sum: self.wl_sq_sum * visits as f32,
+            draw_sum: self.draw_sum * visits as f32,
+            m_sum: self.m_sum * visits as f32,
+        }
+    }
+
     pub fn q(self) -> f32 {
         if self.visits == 0 {
             0.0
@@ -204,10 +216,11 @@ pub(crate) fn edge_utility(repository: &NodeRepository, edge: &Edge, fpu: f32) -
     (stats.local_leaf.wl_sum + child_value) / stats.visits as f32
 }
 
-/// 选择 px0 风格 PUCT 最高的 edge。
+/// 选择 PUCT 最高的 edge。
 ///
-/// `root_move_filter` 对应 px0 `Search::root_move_filter_` 与 UCI `go searchmoves`
-/// （`search.cc:53-58,721-724,1668-1739`）；空数组表示不过滤。
+/// completed N 决定 cPUCT 曲线；U 的根号项则使用所有 child 的 started N。这样
+/// pending reservation 同时计入父节点已分配预算与该 edge 的分母，等价于 batch 内
+/// 临时树继续执行串行 PUCT，而不是只把 virtual visit 压低某一条边的 U。
 pub fn select_edge(
     repository: &NodeRepository,
     edges: &[Arc<Edge>],
@@ -221,7 +234,9 @@ pub fn select_edge(
         return None;
     }
     let is_root = depth == 0;
-    let children_visits = parent_completed_visits.saturating_sub(1);
+    let children_visits = edges
+        .iter()
+        .fold(0_u32, |total, edge| total.saturating_add(edge.visits()));
     let cpuct = compute_cpuct(*params, parent_completed_visits);
     let u_coeff = cpuct * (children_visits.max(1) as f32).sqrt();
     let fpu = get_fpu(repository, params, parent_q, edges);
@@ -243,25 +258,6 @@ pub fn select_edge(
         }
     }
     best.map(|(index, _)| index)
-}
-
-/// 供已持有 parent node 的 Gather 调用点使用的便利函数。
-pub fn select_edge_from_node(
-    repository: &NodeRepository,
-    node: &Node,
-    depth: usize,
-    params: &SearchParams,
-    root_move_filter: &[Move],
-) -> Option<usize> {
-    select_edge(
-        repository,
-        &node.edges(),
-        node.completed_visits(),
-        node.q(),
-        depth,
-        params,
-        root_move_filter,
-    )
 }
 
 #[cfg(test)]
@@ -319,6 +315,38 @@ mod tests {
         assert_eq!(select_edge(&repo, &edges, 0, 0.0, 0, &params, &[]), Some(1));
         reservation.cancel();
         assert_eq!(edges[0].completed_visits(), 0);
+    }
+
+    #[test]
+    fn virtual_visits_also_raise_the_parent_puct_numerator() {
+        let repo = NodeRepository::default();
+        let parent_key = NodeKey::board(51);
+        let parent = repo.get_or_insert(parent_key);
+        assert!(parent.try_begin_evaluation());
+        parent.publish_edges(vec![(mv("b2", "b3"), 0.9), (mv("c3", "c4"), 0.1)]);
+        let edges = parent.edges();
+
+        for (edge, key, q) in [
+            (&edges[0], NodeKey::board(52), 0.0),
+            (&edges[1], NodeKey::board(53), 0.15),
+        ] {
+            edge.bind_child_key(key);
+            repo.get_or_insert(key).set_graph_value(ValueDelta::one(q, 0.0));
+            repo.recompute_graph_node(key);
+        }
+        let reservations: Vec<_> = (0..4).map(|_| parent.reserve_edge(0).expect("virtual visit")).collect();
+        let params = SearchParams {
+            cpuct: 1.0,
+            cpuct_factor: 0.0,
+            ..SearchParams::default()
+        };
+
+        // sqrt(started children N)=2 makes the high-prior edge win; with the
+        // old completed-only numerator (=1), the 0.15-Q edge incorrectly won.
+        assert_eq!(select_edge(&repo, &edges, 1, 0.0, 0, &params, &[]), Some(0));
+        for reservation in reservations {
+            reservation.cancel();
+        }
     }
 
     #[test]

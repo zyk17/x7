@@ -11,7 +11,7 @@
 - 规则与训练数据格式的历史工程参考：`C:\Users\Administrator\projects\px0`、`C:\Users\Administrator\projects\pxzero-training`。
 - stream / MCGS 可参考 [LC3 公开文档](https://lczero.org/dev/lc0/search/lc3/overview/)；本地没有 LC3 源码，不得宣称 1:1 翻译或行为等价。
 - KataGo 按需参考：本地源码 `C:\Users\Administrator\projects\KataGo`（如 GraphSearch、NN cache、部分搜索细节）；不是默认必读，也不承诺行为等价。
-- 已明确偏离 px0/Lc0 stream 基线：无 multivisit、无 prefetch、无 tree-batch gather。PUCT 使用 edge in-flight reservation 作为 virtual visit（计入 started N，偏转选择）；碰撞取消未完成路径的 reservation。
+- 已明确偏离 px0/Lc0 stream 基线：无 prefetch、无 tree-batch gather。PUCT 使用 edge in-flight reservation 作为 virtual visit；每个 Search batch 内按 PUCT 重新分配 logical visit，未展开叶子才合并。碰撞取消未完成路径的 reservation。
 - 正式模型契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。
 - 搜索只有 stream；不维护 classic 对照实现或 `TaskWorkers`。
 

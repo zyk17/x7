@@ -6,14 +6,14 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use xiangqi_core::{GameState, Move, STARTPOS_FEN};
+use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
 use crate::neural::backend::{Backend, CachingBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::{
     Search, SearchConfig, SearchControl, SearchGraph, SearchLimits, SearchParams, Stats, TimeBudget, TimeManager,
-    WorkerPool, best_mate_with_params, best_move_filtered_with_params, principal_variation_filtered_with_params,
-    root_stats, root_variations_with_params,
+    WorkerPool, best_mate_with_params, best_move_filtered_with_params, principal_variation_with_history_and_params,
+    root_stats, root_variations_with_history_and_params,
 };
 use crate::uci_loop::{
     BestMoveInfo, GoParams, ThinkingInfo, Wdl, write_stdout, write_stdout_best_move, write_stdout_thinking,
@@ -125,6 +125,7 @@ const OWNER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 struct RootSnapshot {
     repository: Arc<crate::search::NodeRepository>,
     root_key: crate::search::NodeKey,
+    root_history: Arc<PositionHistory>,
     initial_visits: u64,
     root_is_black: bool,
     root_move_filter: Vec<Move>,
@@ -381,7 +382,6 @@ impl Engine {
             },
             gather_workers: self.options.threads.div_ceil(2),
             eval_workers: self.options.threads / 2,
-            backprop_workers: 1,
             ..SearchConfig::default()
         };
         let decision_params = config.params;
@@ -399,6 +399,7 @@ impl Engine {
         let snapshot = RootSnapshot {
             repository: Arc::clone(search.repository()),
             root_key: search.root_key(),
+            root_history: Arc::clone(graph.root_history()),
             initial_visits: search.initial_visits(),
             root_is_black,
             root_move_filter: root_move_filter.clone(),
@@ -543,9 +544,10 @@ fn run_search(
                     &snapshot.root_move_filter,
                     &snapshot.params,
                 ),
-                principal_variation_filtered_with_params(
+                principal_variation_with_history_and_params(
                     search.repository(),
                     search.root_key(),
+                    snapshot.root_history.as_ref(),
                     snapshot.root_is_black,
                     &snapshot.root_move_filter,
                     &snapshot.params,
@@ -619,9 +621,10 @@ impl RootSnapshot {
         };
         let wl = (-root.q).clamp(-1.0, 1.0);
         let draw = root.draw.clamp(0.0, 1.0);
-        let variations = root_variations_with_params(
+        let variations = root_variations_with_history_and_params(
             &self.repository,
             self.root_key,
+            self.root_history.as_ref(),
             self.root_is_black,
             &self.root_move_filter,
             self.multi_pv,
@@ -639,9 +642,10 @@ impl RootSnapshot {
                     d: (draw * 1000.0).round() as i32,
                     l: (loss * 1000.0).round() as i32,
                 }),
-                pv: principal_variation_filtered_with_params(
+                pv: principal_variation_with_history_and_params(
                     &self.repository,
                     self.root_key,
+                    self.root_history.as_ref(),
                     self.root_is_black,
                     &self.root_move_filter,
                     &self.params,

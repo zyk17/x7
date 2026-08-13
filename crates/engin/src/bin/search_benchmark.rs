@@ -299,7 +299,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.lcb_stdevs,
         args.lcb_min_visit_fraction,
     );
-    println!("note: fresh graph; worker=4/4/1; batch uses backend default; trace drains at each milestone");
+    println!(
+        "note: fresh graph; workers=4 Search / 4 Eval; batch uses backend default; trace drains at each milestone"
+    );
     let mut generation = 0;
     for &cpuct in &args.cpucts {
         for &cpuct_base in &args.cpuct_bases {

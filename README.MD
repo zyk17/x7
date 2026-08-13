@@ -4,7 +4,7 @@
 
 这是一个独立的中国象棋研究引擎（X7）。项目目标是在有限计算资源、固定思考时间下研究上述协同，并只以固定时间 Elo 评估成果；网络架构、搜索算法和硬件分工都是实现选择，不是项目目标。
 
-第一版规则、网络外围、UCI 与训练格式参考过 px0 / Lc0 / LC3 公开文档；**当前正式搜索是本仓的 stream MCGS，不再是 px0 重写，也不承诺与 px0/LC3 行为等价**。相对早期 stream 基线，本实现没有 multivisit、prefetch 或 tree-batch gather。`mcts` 分支可保留树 MCTS；本分支研究 stream MCGS。两者共用规则、网络与 UCI 外围，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+第一版规则、网络外围、UCI 与训练格式参考过 px0 / Lc0 / LC3 公开文档；**当前正式搜索是本仓的 stream MCGS，不再是 px0 重写，也不承诺与 px0/LC3 行为等价**。搜索以一个固定的两 batch gather 窗口运行：纯 virtual visit 的 multivisit 在每个已展开节点重新按 PUCT 分配 pending N，不注入虚拟 Q；当前 batch 进入 NN 时只允许准备一个后继 batch，同轮 collision 在该轮结束时归还。没有无界 prefetch 或多轮提前 gather。`mcts` 分支可保留树 MCTS；本分支研究 stream MCGS。两者共用规则、网络与 UCI 外围，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 快速运行
 
@@ -36,8 +36,9 @@ CUDA 13 / cuDNN 9。TensorRT 包会复制配置 `tensorrt_libs` 目录中的全�
 - `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`LcbStdevs`、`LcbMinVisitFraction`、`Threads`
 
 `MiniBatchSize` 沿用常见 UCI 同名 option（历史上与 px0/Lc0 同名），范围 `0..=1024`，默认 `0`
-（由 backend 建议）。它限制一次 NN 调用最多合并的局面数；较大值通常提高吞吐，却可能因增加在途局面和
-collision 降低固定时间棋力。它是引擎生命周期配置：一次 `setoption` 会影响之后启动的每次
+（由 backend 建议）。它限制一轮 gather 的 logical-visit 预算与其中一次 NN 调用最多合并的局面数；实际
+NN batch 可能因合并同一未展开叶子、终局、缓存或 collision 更小。较大值通常提高吞吐，却也会增大 batch
+近似对固定时间棋力的影响。它是引擎生命周期配置：一次 `setoption` 会影响之后启动的每次
 `go`；正在运行的搜索保持其 worker。
 
 `NNCacheSizePowerOfTwo` 对应 KataGo 的同名配置，范围 `0..=48`，默认 `20`，即
@@ -52,7 +53,7 @@ bestmove 的既有根边排序与各自的 WDL、分数、将杀距离和 PV，�
 共用同一条 cPUCT 曲线，`C(0)=1.75`，不再维护根专用参数；`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度。
 三者仍可作为一个整体实验，但默认不再扩散扫描。`FpuReduction`（默认 `0.200`）控制未访问边相对 parent Q
 的降幅；小网络可能有系统性偏差，故降低未知候选的首次入场门槛。LC0 对照值 `0.330` 与原 X7
-基线 `CPuct=1.0`、`FpuReduction=0.220` 保留为实验参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`Threads` 默认 `8`，只在 Gather 和 Eval 间近似平分（默认 `4/4`）；NN 与 Backprop 固定各一条线程，不计入该值。范围为 `2..=128`。它与 `MiniBatchSize` 一样是引擎生命周期配置：`setoption` 影响之后的每次 `go`，当前 job 始终使用启动时的参数与 worker pool。
+基线 `CPuct=1.0`、`FpuReduction=0.220` 保留为实验参数而非默认值。`setoption` 的 option 名称与布尔值大小写不敏感。`Threads` 默认 `8`，只在 Search 和 Eval 间近似平分（默认 `4/4`）；NN 固定一条线程，不计入该值。Search worker 优先回传、空闲时 gather，因此没有独立 Backprop worker。范围为 `2..=128`。它与 `MiniBatchSize` 一样是引擎生命周期配置：`setoption` 影响之后的每次 `go`，当前 job 始终使用启动时的参数与 worker pool。
 
 `LcbStdevs=5.0`、`LcbMinVisitFraction=0.15` 只影响根的最终 Decision，不参与 PUCT 或 visit 分配。
 根候选先按既有终局/N/Q/P 排名确定访问门槛；达到 N 第一候选 15% 的非终局候选再按 `Q - k·标准误`
@@ -69,7 +70,7 @@ KataGo LCB 思路的简化借鉴，不是其围棋 utility/weight 公式的移�
 `data/benchmark_positions.txt`；每行是“名称 | FEN”，使用时只复制 `|` 后的完整 FEN：
 
 ```powershell
-cargo run -p engin --release --features benchmark --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4 --backprops 1
+cargo run -p engin --release --features benchmark --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4
 ```
 
 `benchmark` 默认每轮都使用 fresh graph 与 fresh backend/cache，适合比较流水线本身。仅诊断 NN
@@ -77,7 +78,7 @@ cache 跨图复用时加入 `--warm-cache`：每个 worker 配置的首轮填表
 graph、但共享同一 NN cache；输出的 `hit` 是实际跳过 NN 的次数，不能与 graph reuse 混淆。
 
 要诊断实战中的评分突变，优先保留完整历史而不是只复制最终 FEN；分流参数使用独立的
-`search_benchmark`，固定 `4/4/1` worker、backend 默认 batch 与 fresh graph：
+`search_benchmark`，固定 `4/4` Search/Eval worker、backend 默认 batch 与 fresh graph：
 
 ```powershell
 cargo run -p engin --release --bin search_benchmark -- --moves "c3c4 g6g5 ..." --playouts 2000 --root-top 12

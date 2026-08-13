@@ -141,7 +141,14 @@ pub struct Edge {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EdgeStats {
+    /// 已完成的 logical visit。它决定 PUCT 的 N 与 action Q 的权重。
     pub visits: u32,
+    /// 实际完成的 leaf event 数。一个 batch leaf 可代表多个 logical visit；因此它
+    /// 不能由 `visits` 推导。根 LCB 用它避免把同一次 NN 结果当成独立证据。
+    pub observations: u32,
+    /// 每个物理 leaf 的 logical 权重平方和。LCB 用它计算加权 observation 的有效
+    /// 样本量：`visits² / Σ(weight²)`。
+    pub observation_weight_sq_sum: u64,
     pub local_leaf: ValueDelta,
 }
 
@@ -190,18 +197,25 @@ impl Edge {
         self.started.load(Ordering::Acquire).saturating_sub(completed)
     }
 
-    fn reserve(self: &Arc<Self>) -> EdgeReservation {
-        self.started.fetch_add(1, Ordering::AcqRel);
-        EdgeReservation { edge: Arc::clone(self) }
+    pub(crate) fn reserve(self: &Arc<Self>, visits: u32) -> EdgeReservation {
+        assert!(visits > 0, "edge reservation must have positive weight");
+        self.started.fetch_add(visits, Ordering::AcqRel);
+        EdgeReservation {
+            edge: Arc::clone(self),
+            visits,
+        }
     }
 
-    fn cancel(&self) {
+    fn cancel(&self, visits: u32) {
         // `complete` 也持有此锁。必须在同一临界区内检查并减少 `started`，否则
         // complete 可在检查与 CAS 之间增加 completed，破坏 started >= completed。
         let completed = self.completed.lock();
         let started = self.started.load(Ordering::Acquire);
-        assert!(started > completed.visits, "stream edge reservation underflow");
-        self.started.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            started.saturating_sub(completed.visits) >= visits,
+            "stream edge reservation underflow"
+        );
+        self.started.fetch_sub(visits, Ordering::AcqRel);
     }
 
     pub fn child_key(&self) -> Option<NodeKey> {
@@ -219,15 +233,22 @@ impl Edge {
         }
     }
 
-    fn complete(&self, local_leaf: Option<ValueDelta>) {
+    fn complete(&self, visits: u32, local_leaf: Option<ValueDelta>) {
         let mut completed = self.completed.lock();
         assert!(
-            self.started.load(Ordering::Acquire) > completed.visits,
+            self.started.load(Ordering::Acquire).saturating_sub(completed.visits) >= visits,
             "stream edge completion without reservation"
         );
-        completed.visits += 1;
+        completed.visits += visits;
+        // 一个 BackpropEvent 对应一个真正到达的 leaf；即使它把一个未展开叶子的
+        // NN 结果展开为 K 个 logical visit，也仍只有一份独立 Evidence。
+        completed.observations += 1;
+        let weight = u64::from(visits);
+        completed.observation_weight_sq_sum = completed
+            .observation_weight_sq_sum
+            .saturating_add(weight.saturating_mul(weight));
         if let Some(value) = local_leaf {
-            assert_eq!(value.visits, 1, "one local leaf completes one edge visit");
+            assert_eq!(value.visits, visits, "local leaf must match reservation weight");
             completed.local_leaf = completed.local_leaf.merge(value);
         }
     }
@@ -238,6 +259,7 @@ impl Edge {
 #[derive(Debug)]
 pub struct EdgeReservation {
     edge: Arc<Edge>,
+    visits: u32,
 }
 
 impl EdgeReservation {
@@ -246,20 +268,54 @@ impl EdgeReservation {
     }
 
     pub fn complete(self) {
-        self.edge.complete(None);
+        self.edge.complete(self.visits, None);
+    }
+
+    /// 将已保留的 visit 预算交给多个后继 event。它不改动 edge 的 started N；各份
+    /// reservation 之后各自 complete/cancel，合计恰好消费原来的 reservation。
+    pub(crate) fn split(self, weights: &[u32]) -> Vec<Self> {
+        assert_eq!(
+            weights.iter().sum::<u32>(),
+            self.visits,
+            "reservation split must preserve visits"
+        );
+        weights
+            .iter()
+            .map(|&visits| Self {
+                edge: Arc::clone(&self.edge),
+                visits,
+            })
+            .collect()
+    }
+
+    pub(crate) fn merge(parts: Vec<Self>) -> Self {
+        assert!(!parts.is_empty(), "reservation merge requires a part");
+        let edge = Arc::clone(&parts[0].edge);
+        let visits = parts
+            .iter()
+            .map(|part| {
+                assert!(Arc::ptr_eq(&edge, &part.edge), "only one edge can be merged");
+                part.visits
+            })
+            .sum();
+        Self { edge, visits }
+    }
+
+    pub(crate) fn visits(&self) -> u32 {
+        self.visits
     }
 
     pub(crate) fn complete_local_leaf(self, value: ValueDelta) {
-        self.edge.complete(Some(value));
+        self.edge.complete(self.visits, Some(value));
     }
 
     pub fn cancel(self) {
-        self.edge.cancel();
+        self.edge.cancel(self.visits);
     }
 
     #[cfg(test)]
     pub(crate) fn test_only(mv: Move) -> Self {
-        Arc::new(Edge::new(mv, 1.0)).reserve()
+        Arc::new(Edge::new(mv, 1.0)).reserve(1)
     }
 }
 
@@ -292,8 +348,10 @@ pub struct Node {
 }
 
 impl Node {
+    /// 节点首次 Prediction 也要带 multivisit 权重，保证后续 shared-Q 重算的 base N
+    /// 与入边 completed N 一致。
     pub(crate) fn set_graph_value(&self, value: ValueDelta) {
-        assert_eq!(value.visits, 1, "graph node base value has weight one");
+        assert!(value.visits > 0, "graph node base value must have positive weight");
         let mut graph_value = self.graph_value.lock();
         if let Some(existing) = *graph_value {
             assert_eq!(existing, value, "shared node keeps its first evaluation");
@@ -398,6 +456,17 @@ impl Node {
         self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
     }
 
+    pub(crate) fn set_terminal_value_weighted(&self, wl: f32, draw: f32, plies_left: f32, visits: u32) {
+        assert_eq!(
+            self.expansion_state(),
+            ExpansionState::Evaluating,
+            "node must be evaluating"
+        );
+        *self.terminal.lock() = Some((wl, draw, plies_left));
+        self.set_graph_value(ValueDelta::with_plies_left(wl, draw, plies_left).repeated(visits));
+        self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
+    }
+
     pub fn terminal_wl(&self) -> Option<(f32, f32)> {
         (*self.terminal.lock()).map(|(wl, draw, _)| (wl, draw))
     }
@@ -415,7 +484,12 @@ impl Node {
     }
 
     pub fn reserve_edge(&self, edge_index: usize) -> Option<EdgeReservation> {
-        self.edges().get(edge_index).map(Edge::reserve)
+        self.reserve_edge_visits(edge_index, 1)
+    }
+
+    /// Gather 的一组 logical visit 已在此 edge 上预占；只在分裂/终局合并时使用。
+    pub(crate) fn reserve_edge_visits(&self, edge_index: usize, visits: u32) -> Option<EdgeReservation> {
+        self.edges().get(edge_index).map(|edge| edge.reserve(visits))
     }
 }
 
@@ -609,24 +683,17 @@ impl NodeRepository {
         key.storage_hash() as usize & (self.shards.len() - 1)
     }
 
-    /// 检查 `root` 以下的 edge-local reservation 不变量。
-    pub(crate) fn graph_is_settled(&self, root: NodeKey) -> bool {
-        let mut pending = vec![root];
-        let mut seen: HashSet<NodeKey, BuildHasherDefault<NoHashHasher<u64>>> = HashSet::default();
-        while let Some(key) = pending.pop() {
-            if !seen.insert(key) {
-                continue;
-            }
-            let Some(node) = self.get(key) else {
-                continue;
-            };
-            let edges = node.edges();
-            if edges.iter().any(|edge| edge.visits() != edge.completed_visits()) {
-                return false;
-            }
-            pending.extend(edges.iter().filter_map(|edge| edge.child_key()));
-        }
-        true
+    /// 检查整个 repository 是否没有 edge-local reservation。
+    ///
+    /// Graph → ContinuationTree 的入口不能绑定 contextual child；只从 graph root
+    /// 遍历会漏掉这类 Tree node。因此 reset / advance 的安全边界必须检查全部 node。
+    pub(crate) fn is_settled(&self) -> bool {
+        self.shards.iter().all(|shard| {
+            shard
+                .read()
+                .values()
+                .all(|node| node.edges().iter().all(|edge| edge.visits() == edge.completed_visits()))
+        })
     }
 
     #[cfg(test)]
@@ -693,8 +760,7 @@ impl SearchGraph {
     /// 旧 root 留作悔棋；它仍可到达原图的所有已绑定分支，所以同步 DFS 回收不会删掉
     /// 正常对局中的 node，只会阻塞下一回合。这条路径只更新 root/history。
     pub fn advance(&mut self, mv: Move) -> Result<(), EnginError> {
-        let old_root = self.root_key();
-        if !self.repository.graph_is_settled(old_root) {
+        if !self.repository.is_settled() {
             return Err(EnginError::PortIncomplete(
                 "search graph advance requires settled reservations",
             ));
@@ -738,7 +804,7 @@ impl SearchGraph {
         &mut self,
         target: Arc<PositionHistory>,
     ) -> Result<Option<Arc<NodeRepository>>, EnginError> {
-        if !self.repository.graph_is_settled(self.root_key()) {
+        if !self.repository.is_settled() {
             return Err(EnginError::PortIncomplete(
                 "search graph reset requires settled reservations",
             ));
@@ -977,7 +1043,7 @@ mod repository_tests {
 
     use xiangqi_core::{Move, Square};
 
-    use super::{ChildLink, ExpansionState, NodeKey, NodeRepository};
+    use super::{ChildLink, ExpansionState, Node, NodeKey, NodeRepository};
     use crate::search::ValueDelta;
 
     fn b2_b3() -> Move {
@@ -1148,6 +1214,23 @@ mod repository_tests {
             assert_eq!(root.edges()[0].visits(), 1);
             assert_eq!(root.edges()[0].completed_visits(), 1);
         }
+    }
+
+    #[test]
+    fn split_reservation_preserves_the_parent_visit_budget() {
+        let node = Arc::new(Node::default());
+        assert!(node.try_begin_evaluation());
+        node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        node.publish_edges(vec![(b2_b3(), 1.0)]);
+
+        let parts = node
+            .reserve_edge_visits(0, 4)
+            .expect("weighted reservation")
+            .split(&[1, 3]);
+        assert_eq!(node.edges()[0].visits(), 4);
+        parts.into_iter().for_each(|part| part.complete());
+        assert_eq!(node.edges()[0].completed_visits(), 4);
+        assert_eq!(node.edges()[0].in_flight_visits(), 0);
     }
 
     #[test]
