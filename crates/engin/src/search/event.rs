@@ -696,7 +696,7 @@ mod tests {
         assert!((continuation.q() + 0.2).abs() < f32::EPSILON);
         assert_eq!(shard.edges()[0].completed_visits(), 1);
         assert!(shard.edges()[0].child_key().is_none());
-        assert!((shard.edges()[0].completed_stats().local_leaf.q() + 0.2).abs() < f32::EPSILON);
+        assert!((shard.edges()[0].stats().local_leaf.q() + 0.2).abs() < f32::EPSILON);
         assert_eq!(shard.completed_visits(), 2);
         assert!((shard.q() - 0.1).abs() < f32::EPSILON);
     }
@@ -782,7 +782,7 @@ mod tests {
         );
 
         assert_eq!(node.edges()[0].completed_visits(), 1);
-        assert!((node.edges()[0].completed_stats().local_leaf.q() - 0.8).abs() < f32::EPSILON);
+        assert!((node.edges()[0].stats().local_leaf.q() - 0.8).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -814,7 +814,7 @@ mod tests {
             );
         }
 
-        let stats = root.edges()[0].completed_stats();
+        let stats = root.edges()[0].stats();
         assert_eq!(stats.local_leaf.visits, 2);
         assert!((stats.local_leaf.q() - 0.2).abs() < f32::EPSILON);
     }

@@ -377,6 +377,8 @@ impl Engine {
                 cpuct_base: self.options.cpuct_base,
                 cpuct_factor: self.options.cpuct_factor,
                 fpu_reduction: self.options.fpu_reduction,
+                // 当前实战 A/B；`None` 可直接回退为纯 virtual visit。
+                virtual_mean_fpu_scale: Some(1.0),
                 lcb_stdevs: self.options.lcb_stdevs,
                 lcb_min_visit_fraction: self.options.lcb_min_visit_fraction,
             },

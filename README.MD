@@ -4,7 +4,7 @@
 
 这是一个独立的中国象棋研究引擎（X7）。项目目标是在有限计算资源、固定思考时间下研究上述协同，并只以固定时间 Elo 评估成果；网络架构、搜索算法和硬件分工都是实现选择，不是项目目标。
 
-第一版规则、网络外围、UCI 与训练格式参考过 px0 / Lc0 / LC3 公开文档；**当前正式搜索是本仓的 stream MCGS，不再是 px0 重写，也不承诺与 px0/LC3 行为等价**。搜索以一个固定的两 batch gather 窗口运行：纯 virtual visit 的 multivisit 在每个已展开节点重新按 PUCT 分配 pending N，不注入虚拟 Q；当前 batch 进入 NN 时只允许准备一个后继 batch，同轮 collision 在该轮结束时归还。没有无界 prefetch 或多轮提前 gather。`mcts` 分支可保留树 MCTS；本分支研究 stream MCGS。两者共用规则、网络与 UCI 外围，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+第一版规则、网络外围、UCI 与训练格式参考过 px0 / Lc0 / LC3 公开文档；**当前正式搜索是本仓的 stream MCGS，不再是 px0 重写，也不承诺与 px0/LC3 行为等价**。搜索以固定两 batch gather 窗口运行：multivisit 在每个已展开节点重新按 PUCT 分配 pending N；当前实战使用 `μ=FPU` 的临时 virtual mean 增强 batch 内分流，完成或取消时精确归还，不写入 completed Evidence。当前 batch 进入 NN 时只允许准备一个后继 batch，同轮 collision 在该轮结束时归还。没有无界 prefetch 或多轮提前 gather。`mcts` 分支可保留树 MCTS；本分支研究 stream MCGS。两者共用规则、网络与 UCI 外围，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 快速运行
 
@@ -76,6 +76,9 @@ cargo run -p engin --release --features benchmark --bin benchmark -- --fen "<FEN
 `benchmark` 默认每轮都使用 fresh graph 与 fresh backend/cache，适合比较流水线本身。仅诊断 NN
 cache 跨图复用时加入 `--warm-cache`：每个 worker 配置的首轮填表，后续 `--repeat` 轮仍使用 fresh
 graph、但共享同一 NN cache；输出的 `hit` 是实际跳过 NN 的次数，不能与 graph reuse 混淆。
+
+需要对照 pure virtual visit 与 virtual mean 时，传入 `--virtual-mean-fpu-scale <x>`；不传就是
+pure virtual visit。正式引擎当前固定 `x=1.0`，不暴露 UCI option。
 
 要诊断实战中的评分突变，优先保留完整历史而不是只复制最终 FEN；分流参数使用独立的
 `search_benchmark`，固定 `4/4` Search/Eval worker、backend 默认 batch 与 fresh graph：

@@ -16,6 +16,9 @@ pub struct SearchParams {
     pub cpuct_base: f32,   // 增长何时开始。更小 → 更早、更快变宽；更大 → 更久保持利用 Q。
     pub cpuct_factor: f32, // 增长幅度。更大 → 后期更强地向 PUCT/P 分流；更小 → 后期更容易让已验证的高 Q 分支继续积累 N。
     pub fpu_reduction: f32,
+    /// `Some(scale)` 时 reservation 暂时以 `scale * FPU` 进入 action Q；`None` 是纯
+    /// virtual visit。当前实战基线为 `Some(1.0)`。
+    pub virtual_mean_fpu_scale: Option<f32>,
     /// 根最终选边的 LCB 半径倍数；0 表示退回既有 N→Q→P 排名。
     pub lcb_stdevs: f32,
     /// LCB 候选至少须达到 N 第一候选的这一 completed-N 比例。
@@ -31,6 +34,7 @@ impl Default for SearchParams {
             cpuct_factor: 4.0,
             // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
             fpu_reduction: 0.200,
+            virtual_mean_fpu_scale: None,
             // KataGo 搜索参数的经验起点；只用于根最终 Decision，不参与 PUCT。
             lcb_stdevs: 5.0,
             lcb_min_visit_fraction: 0.15,
@@ -56,6 +60,12 @@ impl SearchParams {
             self.fpu_reduction.is_finite() && self.fpu_reduction >= 0.0,
             "stream FPU reduction must be finite and non-negative"
         );
+        if let Some(scale) = self.virtual_mean_fpu_scale {
+            assert!(
+                scale.is_finite() && scale >= 0.0,
+                "stream virtual mean FPU scale must be finite and non-negative"
+            );
+        }
         assert!(
             self.lcb_stdevs.is_finite() && self.lcb_stdevs >= 0.0,
             "stream LCB stdevs must be finite and non-negative"
@@ -82,7 +92,7 @@ pub(crate) fn get_fpu(repository: &NodeRepository, params: &SearchParams, parent
     -parent_q - params.fpu_reduction * visited_policy(repository, edges).sqrt()
 }
 
-// 未定义并验证的能力不预留字段：OOO evaluation、multi-visit、prefetch、tree-batch gather 等。
+// 未定义并验证的能力不预留字段：OOO evaluation、prefetch、tree-batch gather 等。
 
 // PUCT / FPU / edge scoring 形状历史上参考过常见 MCTS 实现；默认参数与
 // `draw_score=0`、in-flight 计入 edge visit 等约定以本仓 stream 为准。
@@ -195,25 +205,29 @@ pub(crate) fn visited_policy(repository: &NodeRepository, edges: &[Arc<Edge>]) -
 /// 已完成过，也已有可复用的 state evidence。FPU 只用于尚无 child Q 的真正未知边。
 /// 重复、连将/追击和 rule60 的路径终局则只保留为这一次 edge visit 的本地样本。访问数仍
 /// 严格属于 edge，不能读取 child N。
-pub(crate) fn edge_utility(repository: &NodeRepository, edge: &Edge, fpu: f32) -> f32 {
-    let stats = edge.completed_stats();
-    if stats.visits == 0 {
-        return edge
-            .child_key()
+pub(crate) fn edge_utility(repository: &NodeRepository, edge: &Edge, fpu: f32, use_virtual_mean: bool) -> f32 {
+    let (stats, started_visits) = edge.selection_snapshot();
+    let completed_q = if stats.visits == 0 {
+        edge.child_key()
             .and_then(|key| repository.get(key))
             .filter(|child| child.completed_visits() > 0)
-            .map_or(fpu, |child| child.q());
-    }
-    let propagated = stats.visits.saturating_sub(stats.local_leaf.visits);
-    let child_value = if propagated == 0 {
-        0.0
+            .map_or(fpu, |child| child.q())
     } else {
-        let Some(child) = edge.child_key().and_then(|key| repository.get(key)) else {
-            return fpu;
-        };
-        child.q() * propagated as f32
+        let propagated = stats.visits.saturating_sub(stats.local_leaf.visits);
+        if propagated == 0 {
+            stats.local_leaf.wl_sum / stats.visits as f32
+        } else if let Some(child) = edge.child_key().and_then(|key| repository.get(key)) {
+            (stats.local_leaf.wl_sum + child.q() * propagated as f32) / stats.visits as f32
+        } else {
+            fpu
+        }
     };
-    (stats.local_leaf.wl_sum + child_value) / stats.visits as f32
+    let in_flight = started_visits.saturating_sub(stats.visits);
+    if !use_virtual_mean || in_flight == 0 {
+        completed_q
+    } else {
+        (completed_q * stats.visits as f32 + stats.virtual_wl_sum) / (stats.visits + in_flight) as f32
+    }
 }
 
 /// 选择 PUCT 最高的 edge。
@@ -221,7 +235,7 @@ pub(crate) fn edge_utility(repository: &NodeRepository, edge: &Edge, fpu: f32) -
 /// completed N 决定 cPUCT 曲线；U 的根号项则使用所有 child 的 started N。这样
 /// pending reservation 同时计入父节点已分配预算与该 edge 的分母，等价于 batch 内
 /// 临时树继续执行串行 PUCT，而不是只把 virtual visit 压低某一条边的 U。
-pub fn select_edge(
+pub(crate) fn select_edge(
     repository: &NodeRepository,
     edges: &[Arc<Edge>],
     parent_completed_visits: u32,
@@ -229,7 +243,7 @@ pub fn select_edge(
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
-) -> Option<usize> {
+) -> Option<(usize, f32)> {
     if edges.is_empty() {
         return None;
     }
@@ -251,13 +265,13 @@ pub fn select_edge(
         if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
             continue;
         }
-        let q = edge_utility(repository, edge, fpu);
+        let q = edge_utility(repository, edge, fpu, params.virtual_mean_fpu_scale.is_some());
         let score = q + u_coeff * edge.prior() / (1 + edge.visits()) as f32;
         if best.is_none_or(|(_, best_score)| score > best_score) {
             best = Some((index, score));
         }
     }
-    best.map(|(index, _)| index)
+    best.map(|(index, _)| (index, fpu))
 }
 
 #[cfg(test)]
@@ -309,10 +323,16 @@ mod tests {
         node.publish_edges(vec![(mv("b2", "b3"), 0.6), (mv("c3", "c4"), 0.4)]);
         let edges = node.edges();
         let params = SearchParams::default();
-        assert_eq!(select_edge(&repo, &edges, 0, 0.0, 0, &params, &[]), Some(0));
+        assert_eq!(
+            select_edge(&repo, &edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index),
+            Some(0)
+        );
 
         let reservation = node.reserve_edge(0).expect("first edge");
-        assert_eq!(select_edge(&repo, &edges, 0, 0.0, 0, &params, &[]), Some(1));
+        assert_eq!(
+            select_edge(&repo, &edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index),
+            Some(1)
+        );
         reservation.cancel();
         assert_eq!(edges[0].completed_visits(), 0);
     }
@@ -343,7 +363,10 @@ mod tests {
 
         // sqrt(started children N)=2 makes the high-prior edge win; with the
         // old completed-only numerator (=1), the 0.15-Q edge incorrectly won.
-        assert_eq!(select_edge(&repo, &edges, 1, 0.0, 0, &params, &[]), Some(0));
+        assert_eq!(
+            select_edge(&repo, &edges, 1, 0.0, 0, &params, &[]).map(|(index, _)| index),
+            Some(0)
+        );
         for reservation in reservations {
             reservation.cancel();
         }
@@ -359,7 +382,10 @@ mod tests {
         let edges = node.edges();
         let params = SearchParams::default();
         let filter = [mv("c3", "c4")];
-        assert_eq!(select_edge(&repo, &edges, 0, 0.0, 0, &params, &filter), Some(1));
+        assert_eq!(
+            select_edge(&repo, &edges, 0, 0.0, 0, &params, &filter).map(|(index, _)| index),
+            Some(1)
+        );
     }
 
     #[test]
@@ -375,7 +401,7 @@ mod tests {
         repo.get_or_insert(child_key).set_graph_value(ValueDelta::one(0.5, 0.0));
         repo.recompute_graph_node(child_key);
         node.reserve_edge(0).expect("res").complete();
-        assert!((edge_utility(&repo, &edge, 0.0) - 0.5).abs() < 1e-6);
+        assert!((edge_utility(&repo, &edge, 0.0, false) - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -392,8 +418,35 @@ mod tests {
         repo.recompute_graph_node(child_key);
 
         assert_eq!(edge.completed_visits(), 0);
-        assert!((edge_utility(&repo, &edge, -0.4) - 0.5).abs() < 1e-6);
+        assert!((edge_utility(&repo, &edge, -0.4, false) - 0.5).abs() < 1e-6);
         assert!((visited_policy(&repo, &[edge]) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn virtual_fpu_mean_is_temporary_action_q_only() {
+        let repo = NodeRepository::default();
+        let key = NodeKey::board(50);
+        let node = repo.get_or_insert(key);
+        assert!(node.try_begin_evaluation());
+        node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
+        let edge = node.edges()[0].clone();
+        let child_key = NodeKey::board(51);
+        edge.bind_child_key(child_key);
+        repo.get_or_insert(child_key).set_graph_value(ValueDelta::one(0.8, 0.0));
+        repo.recompute_graph_node(child_key);
+        node.reserve_edge(0).expect("completed evidence").complete();
+        assert!((edge_utility(&repo, &edge, -0.3, true) - 0.8).abs() < 1e-6);
+
+        let reservation = node
+            .reserve_edge_visits(0, 1, Some(-0.3))
+            .expect("virtual mean reservation");
+        assert!((edge_utility(&repo, &edge, -0.3, true) - 0.25).abs() < 1e-6);
+        reservation.cancel();
+
+        assert!((edge_utility(&repo, &edge, -0.3, true) - 0.8).abs() < 1e-6);
+        let stats = edge.stats();
+        assert_eq!(stats.visits, 1);
+        assert_eq!(stats.virtual_wl_sum, 0.0);
     }
 
     #[test]
@@ -415,6 +468,6 @@ mod tests {
             .complete_local_leaf(ValueDelta::one(0.6, 0.0));
         node.reserve_edge(0).expect("child reservation").complete();
 
-        assert!((edge_utility(&repo, &edge, 0.0) - 0.2).abs() < 1e-6);
+        assert!((edge_utility(&repo, &edge, 0.0, false) - 0.2).abs() < 1e-6);
     }
 }

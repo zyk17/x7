@@ -6,8 +6,9 @@
 //! - <https://lczero.org/dev/lc0/search/lc3/glossary/>
 //!
 //! 本模块拥有 MCGS 图与 worker 生命周期。相对早期 px0/Lc0 stream 基线，这里已有
-//! pure virtual visit multivisit + 单轮 gather batch，但没有 prefetch。选择公式历史上参考过 px0 PUCT /
-//! N-Q-P，默认参数与图统计语义以本仓为准，不是 px0/LC3 等价实现。
+//! multivisit + 单轮 gather batch；当前实战还使用只在 pending reservation 期间生效的 FPU
+//! virtual mean，但没有 prefetch。选择公式历史上参考过 px0 PUCT / N-Q-P，默认参数与图统计
+//! 语义以本仓为准，不是 px0/LC3 等价实现。
 
 use xiangqi_core::GameResult;
 
@@ -25,7 +26,8 @@ pub use graph::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeReposi
 pub use pipeline::QueueStats;
 pub(crate) use pipeline::WorkerPool;
 pub use pipeline::{Search, SearchConfig, SearchControl, SearchLimits, Stats};
-pub use policy::{SearchParams, ValueDelta, select_edge};
+pub(crate) use policy::select_edge;
+pub use policy::{SearchParams, ValueDelta};
 pub use stats::{
     RootEdgeStats, RootStats, best_move, best_move_filtered, principal_variation, principal_variation_filtered,
     root_stats,

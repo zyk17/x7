@@ -1,7 +1,7 @@
 //! 只测 stream worker、NN batch、缓存与流水线吞吐。
 //!
-//! 搜索参数和根边分流诊断见 `search_benchmark`；这里刻意固定
-//! `SearchParams::default()`，避免把两类实验混在一个命令中。
+//! 搜索参数和根边分流诊断见 `search_benchmark`；这里固定默认 PUCT，只允许切换
+//! pending-work 实验，观察它对 batch/collision 的影响。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use engin::neural::backend::{Backend, CachingBackend};
 use engin::neural::onnx::OnnxBackend;
-use engin::search::{QueueStats, Search, SearchConfig, SearchLimits, Stats, root_stats};
+use engin::search::{QueueStats, Search, SearchConfig, SearchLimits, SearchParams, Stats, root_stats};
 use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
 struct Args {
@@ -25,6 +25,7 @@ struct Args {
     eval_batch: Option<usize>,
     cache: bool,
     warm_cache: bool,
+    virtual_mean_fpu_scale: Option<f32>,
     root_top: usize,
 }
 
@@ -32,7 +33,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--eval-batch 64] [--cache|--warm-cache] [--root-top 8]"
+     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--eval-batch 64] [--cache|--warm-cache] [--virtual-mean-fpu-scale 1.0] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -48,6 +49,7 @@ fn parse_args() -> Result<Args, String> {
     let mut eval_batch = None;
     let mut cache = false;
     let mut warm_cache = false;
+    let mut virtual_mean_fpu_scale = None;
     let mut root_top = 8;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -103,6 +105,17 @@ fn parse_args() -> Result<Args, String> {
                 cache = true;
                 warm_cache = true;
             }
+            "--virtual-mean-fpu-scale" => {
+                let scale = args
+                    .next()
+                    .ok_or("--virtual-mean-fpu-scale needs a value")?
+                    .parse::<f32>()
+                    .map_err(|_| "--virtual-mean-fpu-scale must be a number")?;
+                if !scale.is_finite() || scale < 0.0 {
+                    return Err("--virtual-mean-fpu-scale must be finite and non-negative".into());
+                }
+                virtual_mean_fpu_scale = Some(scale);
+            }
             "--root-top" => {
                 root_top = args
                     .next()
@@ -138,6 +151,7 @@ fn parse_args() -> Result<Args, String> {
         eval_batch,
         cache,
         warm_cache,
+        virtual_mean_fpu_scale,
         root_top,
     })
 }
@@ -249,11 +263,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} cache={} warm_cache={} recommended_batch={} target_batch={} budget={} repeat={} worker_matrix={} positions={}",
+        "onnx={} provider={} cache={} warm_cache={} virtual_mean_fpu_scale={:?} recommended_batch={} target_batch={} budget={} repeat={} worker_matrix={} positions={}",
         args.onnx.display(),
         provider,
         args.cache,
         args.warm_cache,
+        args.virtual_mean_fpu_scale,
         recommended,
         target_batch,
         args.playouts
@@ -290,6 +305,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             eval_batch_size: target_batch,
                             gather_workers,
                             eval_workers,
+                            params: SearchParams {
+                                virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
+                                ..SearchParams::default()
+                            },
                             ..SearchConfig::default()
                         },
                     );

@@ -52,7 +52,7 @@ pub fn root_stats(repository: &NodeRepository, root_key: NodeKey) -> Option<Root
             .map(|edge| RootEdgeStats {
                 mv: edge.mv(),
                 completed_visits: edge.completed_visits(),
-                observations: edge.completed_stats().observations,
+                observations: edge.stats().observations,
                 started_visits: edge.visits(),
                 q: edge_value(repository, edge),
                 prior: edge.prior(),
@@ -64,7 +64,7 @@ pub fn root_stats(repository: &NodeRepository, root_key: NodeKey) -> Option<Root
 /// MCGS 的 action Q 混合 shared child 的当前值与该 edge 实际遇到的路径终局样本。
 /// 未完成 edge 的 Q 不参与最终统计。
 fn edge_value(repository: &NodeRepository, edge: &Edge) -> f32 {
-    let stats = edge.completed_stats();
+    let stats = edge.stats();
     if stats.visits == 0 {
         return 0.0;
     }
@@ -79,7 +79,7 @@ fn edge_value(repository: &NodeRepository, edge: &Edge) -> f32 {
 /// root edge 当前 action value 的一、二阶矩。shared child 的二阶矩遵循与 Q 相同的
 /// MCGS 幂等重算；第三、四个返回值分别是 logical N 与物理 leaf 权重平方和。
 fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32, u32, u64)> {
-    let stats = edge.completed_stats();
+    let stats = edge.stats();
     if stats.visits == 0 {
         return None;
     }
@@ -104,17 +104,23 @@ fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32,
 /// utility 方差先验。形状参考 KataGo
 /// `cpp/search/searchhelpers.cpp::getSelfUtilityLCBAndRadius`，但不复制其围棋 utility、
 /// 权重或 play-selection 机制。
-fn edge_lcb(repository: &NodeRepository, edge: &Edge, stdevs: f32) -> Option<f32> {
+fn edge_standard_error(repository: &NodeRepository, edge: &Edge) -> Option<f32> {
     let (q, q_sq, visits, observation_weight_sq_sum) = edge_q_moments(repository, edge)?;
     // Q 的权重仍是 logical N；LCB 的样本量改用加权 observation 的有效样本数。
     // 单个 K-visit leaf 的有效样本量仍为 1；普通逐 leaf 回传时恰好退化为 N。
-    let weight = (visits as f64).powi(2) / observation_weight_sq_sum.max(1) as f64;
-    let weight = weight.max(1.0) as f32;
-    let prior_weight = 1.0 / (weight * weight);
-    let adjusted_sq = (q_sq * weight + (q_sq.max(q * q) + 1.0) * prior_weight) / (weight + prior_weight);
-    let effective_samples = (weight + prior_weight).powi(2) / (weight + prior_weight * prior_weight);
+    let effective_samples = ((visits as f64).powi(2) / observation_weight_sq_sum.max(1) as f64).max(1.0) as f32;
+    let prior_weight = 1.0 / (effective_samples * effective_samples);
+    let adjusted_sq =
+        (q_sq * effective_samples + (q_sq.max(q * q) + 1.0) * prior_weight) / (effective_samples + prior_weight);
+    let lcb_samples = (effective_samples + prior_weight).powi(2) / (effective_samples + prior_weight * prior_weight);
     let variance = (adjusted_sq - q * q).max(0.0);
-    Some(q - stdevs * (variance / effective_samples).sqrt())
+    Some((variance / lcb_samples).sqrt())
+}
+
+fn edge_lcb(repository: &NodeRepository, edge: &Edge, stdevs: f32) -> Option<f32> {
+    let (q, _, _, _) = edge_q_moments(repository, edge)?;
+    let standard_error = edge_standard_error(repository, edge)?;
+    Some(q - stdevs * standard_error)
 }
 
 /// 根边的 LCB 只有明确优于当前 N-first 候选时才翻盘。网络把多条边同时压到
@@ -864,7 +870,7 @@ mod tests {
         root.publish_edges(vec![(mv("a0", "a1"), 0.5), (mv("b0", "b1"), 0.5)]);
         let edges = root.edges();
 
-        root.reserve_edge_visits(0, 10)
+        root.reserve_edge_visits(0, 10, None)
             .expect("batched reservation")
             .complete_local_leaf(ValueDelta::one(0.2, 0.0).repeated(10));
         for _ in 0..10 {

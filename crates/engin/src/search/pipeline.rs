@@ -1131,7 +1131,7 @@ fn branch_at_expanded_node(
     let mut groups: Vec<(usize, ChildTarget, Vec<super::EdgeReservation>)> = Vec::new();
     let mut assigned = 0;
     while assigned < event.logical_visits {
-        let Some(edge_index) = select_edge(
+        let Some((edge_index, fpu)) = select_edge(
             &shared.repository,
             &node.edges(),
             node.completed_visits(),
@@ -1155,10 +1155,16 @@ fn branch_at_expanded_node(
             }
             break;
         };
+        // 复用本次 PUCT selection 的 FPU。`selected_child` 可能绑定一个已有 graph
+        // child；那会改变下一次 selection 的 FPU 参与集合，但不能倒写本次 pending
+        // sample 的均值。
+        let virtual_mean = shared.params.virtual_mean_fpu_scale.map(|scale| scale * fpu);
         let Some(target) = selected_child(shared, &mut event, node, edge_index) else {
             continue;
         };
-        let reservation = node.reserve_edge(edge_index).expect("selected stream edge");
+        let reservation = node
+            .reserve_edge_visits(edge_index, 1, virtual_mean)
+            .expect("selected stream edge");
         assigned += 1;
         if let Some((_, _, reservations)) = groups.iter_mut().find(|(candidate_edge, candidate, _)| {
             *candidate_edge == edge_index

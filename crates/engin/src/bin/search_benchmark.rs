@@ -24,6 +24,7 @@ struct Args {
     cpuct_bases: Vec<f32>,
     cpuct_factors: Vec<f32>,
     fpu_reduction: f32,
+    virtual_mean_fpu_scale: Option<f32>,
     lcb_stdevs: f32,
     lcb_min_visit_fraction: f32,
     root_top: usize,
@@ -32,7 +33,7 @@ struct Args {
 fn usage() -> &'static str {
     "usage: search_benchmark [--onnx data/x7.onnx] [--fen \"...\"] [--moves \"c3c4 h7h3 ...\"] [--playouts 2048] \\
      [--trace 128,256,512] [--track g6g9,i0g0] [--searchmoves \"g6g9 i0g0\"] [--cpuct 1.0,1.745] \\
-     [--cpuct-base 20000,38739] [--cpuct-factor 2.5,3.894] [--fpu-reduction 0.330] \\
+     [--cpuct-base 20000,38739] [--cpuct-factor 2.5,3.894] [--fpu-reduction 0.330] [--virtual-mean-fpu-scale 1.0] \\
      [--lcb-stdevs 5] [--lcb-min-visit-fraction 0.15] [--root-top 8]"
 }
 
@@ -49,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
     let mut cpuct_bases = vec![defaults.cpuct_base];
     let mut cpuct_factors = vec![defaults.cpuct_factor];
     let mut fpu_reduction = defaults.fpu_reduction;
+    let mut virtual_mean_fpu_scale = defaults.virtual_mean_fpu_scale;
     let mut lcb_stdevs = defaults.lcb_stdevs;
     let mut lcb_min_visit_fraction = defaults.lcb_min_visit_fraction;
     let mut root_top = 8;
@@ -104,6 +106,13 @@ fn parse_args() -> Result<Args, String> {
                     false,
                 )?
             }
+            "--virtual-mean-fpu-scale" => {
+                virtual_mean_fpu_scale = Some(parse_float(
+                    "--virtual-mean-fpu-scale",
+                    &args.next().ok_or("--virtual-mean-fpu-scale needs a value")?,
+                    false,
+                )?)
+            }
             "--lcb-stdevs" => {
                 lcb_stdevs = parse_float(
                     "--lcb-stdevs",
@@ -150,6 +159,7 @@ fn parse_args() -> Result<Args, String> {
         cpuct_bases,
         cpuct_factors,
         fpu_reduction,
+        virtual_mean_fpu_scale,
         lcb_stdevs,
         lcb_min_visit_fraction,
         root_top,
@@ -238,25 +248,26 @@ fn print_roots(search: &Search, root_is_black: bool, top: usize, tracked: &[Stri
         return;
     };
     println!(
-        "    root candidates top {}/{}: move       P    done flight       Q",
+        "    root candidates top {}/{}: move       P    done  obs flight       Q",
         edges.len().min(top),
         edges.len()
     );
     for edge in edges.iter().take(top) {
         let mv = if root_is_black { edge.mv.flip() } else { edge.mv };
         println!(
-            "                       {:<6} {:>7.4} {:>7} {:>6} {:>7.4}",
+            "                       {:<6} {:>7.4} {:>7} {:>4} {:>6} {:>7.4}",
             mv.to_uci(),
             edge.prior,
             edge.completed_visits,
+            edge.observations,
             edge.started_visits.saturating_sub(edge.completed_visits),
-            edge.q
+            edge.q,
         );
     }
     if tracked.is_empty() {
         return;
     }
-    println!("    tracked root moves: move  rank       P    done flight       Q");
+    println!("    tracked root moves: move  rank       P    done  obs flight       Q");
     for move_text in tracked {
         let found = edges.iter().enumerate().find(|(_, edge)| {
             let mv = if root_is_black { edge.mv.flip() } else { edge.mv };
@@ -264,13 +275,14 @@ fn print_roots(search: &Search, root_is_black: bool, top: usize, tracked: &[Stri
         });
         match found {
             Some((rank, edge)) => println!(
-                "                       {:<6} {:>5} {:>7.4} {:>7} {:>6} {:>7.4}",
+                "                       {:<6} {:>5} {:>7.4} {:>7} {:>4} {:>6} {:>7.4}",
                 move_text,
                 rank + 1,
                 edge.prior,
                 edge.completed_visits,
+                edge.observations,
                 edge.started_visits.saturating_sub(edge.completed_visits),
-                edge.q
+                edge.q,
             ),
             None => println!("                       {:<6}  --  not legal at root", move_text),
         }
@@ -288,7 +300,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let filter = root_filter(&history, &args.searchmoves)?;
     let backend = OnnxBackend::from_file(&args.onnx)?;
     println!(
-        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3} lcb_stdevs={:.3} lcb_min_visit_fraction={:.3}",
+        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3} virtual_mean_fpu_scale={:?} lcb_stdevs={:.3} lcb_min_visit_fraction={:.3}",
         args.onnx.display(),
         backend.provider().name(),
         args.playouts,
@@ -296,6 +308,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.cpuct_bases,
         args.cpuct_factors,
         args.fpu_reduction,
+        args.virtual_mean_fpu_scale,
         args.lcb_stdevs,
         args.lcb_min_visit_fraction,
     );
@@ -312,12 +325,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cpuct_base,
                     cpuct_factor,
                     fpu_reduction: args.fpu_reduction,
+                    virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
                     lcb_stdevs: args.lcb_stdevs,
                     lcb_min_visit_fraction: args.lcb_min_visit_fraction,
                 };
                 println!(
-                    "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3} lcb={:.3}/{:.3}",
-                    args.fpu_reduction, args.lcb_stdevs, args.lcb_min_visit_fraction
+                    "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3} virtual_mean_fpu_scale={:?} lcb={:.3}/{:.3}",
+                    args.fpu_reduction, args.virtual_mean_fpu_scale, args.lcb_stdevs, args.lcb_min_visit_fraction
                 );
                 let mut search = Search::new(
                     Arc::new(OnnxBackend::from_file(&args.onnx)?) as Arc<dyn Backend>,
