@@ -363,6 +363,7 @@ impl BackpropEvent {
                 } else {
                     for node_key in node.node_path[index + 1..].iter().rev() {
                         repository.recompute_graph_node(*node_key);
+                        repository.prove_terminal(*node_key);
                     }
                     let child = repository.get(root).expect("continuation root");
                     let (wl, draw, plies_left) = child.value_snapshot();
@@ -373,8 +374,13 @@ impl BackpropEvent {
             }
             // KataGo GraphSearch 的 idempotent 回传：只重算本 variation 上已实际经过的
             // node。共享 child 不向所有 parent 广播，未走到的 parent 以后被访问时再重算。
-            for node_key in node.node_path.into_iter().rev() {
+            for (index, node_key) in node.node_path.into_iter().enumerate().rev() {
                 repository.recompute_graph_node(node_key);
+                // 根保留为普通 node；UCI 通过其已证明 terminal child 输出正确的 mate
+                // 距离。其余节点可把已绑定 terminal 沿当前 backprop path 继续证明上去。
+                if index != 0 {
+                    repository.prove_terminal(node_key);
+                }
             }
             result.completed_playouts += logical_visits;
             result.completed_events += 1;
@@ -410,7 +416,7 @@ mod tests {
     use xiangqi_core::{GameState, Move, Position, STARTPOS_FEN};
 
     use super::{BackpropEvent, NodeEvent, Variation};
-    use crate::search::{NodeKey, NodeRepository, ValueDelta};
+    use crate::search::{ExpansionState, NodeKey, NodeRepository, ValueDelta};
 
     #[test]
     fn variation_keeps_root_history_and_owns_its_path() {
@@ -577,6 +583,90 @@ mod tests {
         assert_eq!(child_node.completed_visits(), 1);
         assert!((child_node.q() - 0.4).abs() < f32::EPSILON);
         assert!((child_node.m() - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn backprop_proves_a_terminal_grandchild_immediately() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
+        let repository = NodeRepository::default();
+        let root = NodeEvent::root(18, history);
+        let root_node = repository.get_or_insert(root.node_key);
+        let first = Move::new(
+            xiangqi_core::Square::parse("b2").expect("b2"),
+            xiangqi_core::Square::parse("b3").expect("b3"),
+        );
+        let reply = Move::new(
+            xiangqi_core::Square::parse("b7").expect("b7"),
+            xiangqi_core::Square::parse("b6").expect("b6"),
+        );
+        let parent_key = NodeKey::board(18_001);
+        let terminal_key = NodeKey::board(18_002);
+        assert!(root_node.try_begin_evaluation());
+        root_node.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root_node.publish_edges(vec![(first, 1.0)]);
+        root_node.edges()[0].bind_child_key(parent_key);
+
+        let parent = repository.get_or_insert(parent_key);
+        assert!(parent.try_begin_evaluation());
+        parent.set_graph_value(ValueDelta::one(0.0, 0.0));
+        parent.publish_edges(vec![(reply, 1.0)]);
+        parent.edges()[0].bind_child_key(terminal_key);
+
+        let terminal = repository.get_or_insert(terminal_key);
+        assert!(terminal.try_begin_evaluation());
+        terminal.mark_terminal(1.0, 0.0, 0.0);
+
+        let event = root
+            .descend(parent_key, root_node.reserve_edge(0).expect("root edge"))
+            .descend(terminal_key, parent.reserve_edge(0).expect("parent edge"));
+        BackpropEvent::complete_batch([BackpropEvent::evaluation(event)], &repository);
+
+        assert_eq!(parent.expansion_state(), ExpansionState::Terminal);
+        assert_eq!(parent.terminal_value(), Some((-1.0, 0.0, 1.0)));
+        assert_eq!(root_node.edges()[0].completed_visits(), 1);
+    }
+
+    #[test]
+    fn continuation_entry_samples_the_terminal_proof_from_this_event() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
+        let repository = NodeRepository::default();
+        let root = NodeEvent::root(19, history);
+        let root_node = repository.get_or_insert(root.node_key);
+        let first = Move::new(
+            xiangqi_core::Square::parse("b2").expect("b2"),
+            xiangqi_core::Square::parse("b3").expect("b3"),
+        );
+        let reply = Move::new(
+            xiangqi_core::Square::parse("b7").expect("b7"),
+            xiangqi_core::Square::parse("b6").expect("b6"),
+        );
+        let continuation_key = NodeKey::continuation(19_001, 19_002);
+        let terminal_key = NodeKey::continuation(19_003, 19_004);
+        assert!(root_node.try_begin_evaluation());
+        root_node.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root_node.publish_edges(vec![(first, 1.0)]);
+
+        let continuation = repository.get_or_insert(continuation_key);
+        assert!(continuation.try_begin_evaluation());
+        continuation.set_graph_value(ValueDelta::one(0.0, 0.0));
+        continuation.publish_edges(vec![(reply, 1.0)]);
+        continuation.edges()[0].bind_child_key(terminal_key);
+
+        let terminal = repository.get_or_insert(terminal_key);
+        assert!(terminal.try_begin_evaluation());
+        terminal.mark_terminal(1.0, 0.0, 0.0);
+
+        let event = root
+            .descend_continuation(continuation_key, root_node.reserve_edge(0).expect("entry edge"))
+            .descend(terminal_key, continuation.reserve_edge(0).expect("tree edge"));
+        BackpropEvent::complete_batch([BackpropEvent::evaluation(event)], &repository);
+
+        assert_eq!(continuation.terminal_value(), Some((-1.0, 0.0, 1.0)));
+        let entry = root_node.edges()[0].stats();
+        assert_eq!(entry.local_leaf.visits, 1);
+        assert!((entry.local_leaf.wl_sum + 1.0).abs() < f32::EPSILON);
     }
 
     #[test]

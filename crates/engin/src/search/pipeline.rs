@@ -1445,6 +1445,19 @@ fn handle_eval_event(
         }
         ExtensionKind::PathTerminal { wl, draw, plies_left } => {
             let value = ValueDelta::with_plies_left(wl, draw, plies_left);
+            // TreeNode 的 key 包含最近零化着以来完整规则 history；第三次重复等
+            // 路径裁决对这个局部 state 是确定的，可以作为 terminal 固定并继续在
+            // continuation tree 内传播。普通 GraphNode 仍可能从另一条 history 到达，
+            // 只能保留为本次 edge 的 local leaf。
+            if event.node_key.is_continuation() {
+                node.set_terminal_value_weighted(wl, draw, plies_left, event.logical_visits);
+                batch.finish_eval(false);
+                shared.send_backprop(BackpropTask {
+                    event: BackpropEvent::evaluation(event),
+                    batch,
+                });
+                return Ok(());
+            }
             node.abort_evaluation();
             if event.reservations.is_empty() {
                 shared.root_path_terminal.store(true, Ordering::Release);

@@ -14,8 +14,8 @@ pub(crate) enum ExtensionKind {
     Evaluate,
     /// 只由棋盘决定的终局，可安全发布到共享 node。
     SharedTerminal { wl: f32, draw: f32, plies_left: f32 },
-    /// 依赖当前 Variation 的终局。不得改变 board-key shared node；由实际入边保存这次
-    /// 路径的裁决。参见 `MCGS.md` “环与重复”。
+    /// 依赖当前 Variation 的终局。普通 board-key GraphNode 不得改变；带完整规则
+    /// history 的 TreeNode 则可安全固定为 terminal。参见 `MCGS.md` “环与重复”。
     PathTerminal { wl: f32, draw: f32, plies_left: f32 },
 }
 

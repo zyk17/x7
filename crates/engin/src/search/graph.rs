@@ -481,6 +481,7 @@ impl Node {
         );
         *self.terminal.lock() = Some((wl, draw, plies_left));
         self.set_graph_value(ValueDelta::with_plies_left(wl, draw, plies_left));
+        self.set_terminal_stats(wl, draw, plies_left, 1);
         self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
     }
 
@@ -492,7 +493,40 @@ impl Node {
         );
         *self.terminal.lock() = Some((wl, draw, plies_left));
         self.set_graph_value(ValueDelta::with_plies_left(wl, draw, plies_left).repeated(visits));
+        self.set_terminal_stats(wl, draw, plies_left, visits);
         self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
+    }
+
+    fn set_terminal_stats(&self, wl: f32, draw: f32, plies_left: f32, visits: u32) {
+        let mut stats = self.stats.lock();
+        stats.visits = visits;
+        stats.wl_sum = wl * visits as f32;
+        stats.wl_sq_sum = wl * wl * visits as f32;
+        stats.draw_sum = draw * visits as f32;
+        stats.m_sum = plies_left * visits as f32;
+    }
+
+    /// 已展开 node 的已绑定 terminal 子边已经构成完整 minimax 证明时，将它固定为
+    /// terminal。Graph → Tree 入口没有绑定 child，故 tree 的路径裁决只会回传到
+    /// 那条 entry edge；Tree 内带完整 history 的已绑定 child 则可正常继续传播。
+    fn mark_proven_terminal(&self, wl: f32, draw: f32, plies_left: f32) -> bool {
+        if self.expansion_state() != ExpansionState::Expanded {
+            return false;
+        }
+        {
+            let mut terminal = self.terminal.lock();
+            if terminal.is_some() {
+                return false;
+            }
+            *terminal = Some((wl, draw, plies_left));
+        }
+        // 先写 terminal 标记，再单独取得统计锁，避免同时持有两把 node 锁。
+        // 已展开 node 至少带有首次 NN 预测；`max(1)` 也保证手工构造的已证明
+        // 节点向父边传播的是精确终局值而非零 Q。
+        let visits = self.stats.lock().visits.max(1);
+        self.set_terminal_stats(wl, draw, plies_left, visits);
+        self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
+        true
     }
 
     pub fn terminal_wl(&self) -> Option<(f32, f32)> {
@@ -559,6 +593,9 @@ impl NodeRepository {
     /// shared Q，从本 node 的首次预测 U 重算统计；不向其他 parent 广播。
     pub(crate) fn recompute_graph_node(&self, key: NodeKey) {
         let Some(node) = self.get(key) else { return };
+        if node.expansion_state() == ExpansionState::Terminal {
+            return;
+        }
         let base = *node.graph_value.lock();
         let Some(base) = base else { return };
         let edges = node.edges();
@@ -596,6 +633,60 @@ impl NodeRepository {
         stats.wl_sq_sum = total.wl_sq_sum;
         stats.draw_sum = total.draw_sum;
         stats.m_sum = total.m_sum;
+    }
+
+    /// 对一个已展开的非 root node 做最小终局证明传播。
+    ///
+    /// child 的 terminal value 从当前 node 行棋方视角保存：任一 `wl=1` child 即证明
+    /// 当前方有必胜着；若所有合法 child 都 terminal，则选择其中最好结果。node 自己的
+    /// value 则翻转一次，仍保持“对 incoming edge 的价值”契约。
+    pub(crate) fn prove_terminal(&self, key: NodeKey) -> bool {
+        let Some(node) = self.get(key) else { return false };
+        if node.expansion_state() != ExpansionState::Expanded {
+            return false;
+        }
+        let edges = node.edges();
+        if edges.is_empty() {
+            return false;
+        }
+
+        let mut all_terminal = true;
+        let mut winning_plies: Option<f32> = None;
+        let mut best: Option<(f32, f32, f32)> = None;
+        for edge in edges.iter() {
+            let Some(child) = edge.child_key().and_then(|child| self.get(child)) else {
+                all_terminal = false;
+                continue;
+            };
+            let Some((wl, draw, plies_left)) = child.terminal_value() else {
+                all_terminal = false;
+                continue;
+            };
+            if wl > 0.0 {
+                winning_plies = Some(winning_plies.map_or(plies_left, |best| best.min(plies_left)));
+                continue;
+            }
+            let replace = match best {
+                None => true,
+                Some((best_wl, _, _)) if wl > best_wl => true,
+                Some((best_wl, _, best_plies)) if wl == best_wl && wl < 0.0 => plies_left > best_plies,
+                Some((best_wl, _, best_plies)) if wl == best_wl => plies_left < best_plies,
+                _ => false,
+            };
+            if replace {
+                best = Some((wl, draw, plies_left));
+            }
+        }
+        if let Some(plies_left) = winning_plies {
+            return node.mark_proven_terminal(-1.0, 0.0, plies_left + 1.0);
+        }
+        if !all_terminal {
+            return false;
+        }
+        let Some((wl, draw, plies_left)) = best else {
+            return false;
+        };
+        node.mark_proven_terminal(-wl, draw, plies_left + 1.0)
     }
     pub fn new(shard_count: usize) -> Self {
         assert!(
@@ -1286,6 +1377,54 @@ mod repository_tests {
         parts.into_iter().for_each(|part| part.complete());
         assert_eq!(node.edges()[0].completed_visits(), 4);
         assert_eq!(node.edges()[0].in_flight_visits(), 0);
+    }
+
+    #[test]
+    fn proven_terminal_propagates_one_level_without_path_rules() {
+        let repo = NodeRepository::default();
+        let parent_key = NodeKey::board(701);
+        let child_key = NodeKey::board(702);
+        let parent = repo.get_or_insert(parent_key);
+        assert!(parent.try_begin_evaluation());
+        parent.set_graph_value(ValueDelta::one(0.0, 0.0));
+        parent.publish_edges(vec![(b2_b3(), 1.0)]);
+
+        let child = repo.get_or_insert(child_key);
+        assert!(child.try_begin_evaluation());
+        child.mark_terminal(1.0, 0.0, 0.0);
+        parent.edges()[0].bind_child_key(child_key);
+        parent.reserve_edge(0).expect("terminal edge visit").complete();
+        repo.recompute_graph_node(parent_key);
+
+        assert!(repo.prove_terminal(parent_key));
+        assert_eq!(parent.expansion_state(), ExpansionState::Terminal);
+        assert_eq!(parent.terminal_value(), Some((-1.0, 0.0, 1.0)));
+        assert!((parent.q() + 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn terminal_loss_needs_every_legal_child_proven() {
+        let repo = NodeRepository::default();
+        let parent_key = NodeKey::board(703);
+        let child_key = NodeKey::board(704);
+        let parent = repo.get_or_insert(parent_key);
+        assert!(parent.try_begin_evaluation());
+        parent.set_graph_value(ValueDelta::one(0.0, 0.0));
+        parent.publish_edges(vec![
+            (b2_b3(), 0.5),
+            (
+                Move::new(Square::parse("c2").unwrap(), Square::parse("c3").unwrap()),
+                0.5,
+            ),
+        ]);
+
+        let child = repo.get_or_insert(child_key);
+        assert!(child.try_begin_evaluation());
+        child.mark_terminal(-1.0, 0.0, 0.0);
+        parent.edges()[0].bind_child_key(child_key);
+
+        assert!(!repo.prove_terminal(parent_key));
+        assert_eq!(parent.expansion_state(), ExpansionState::Expanded);
     }
 
     #[test]
