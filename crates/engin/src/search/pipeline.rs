@@ -1,13 +1,12 @@
-//! Stream 搜索主线：Search / Eval / NN worker。
+//! Stream 搜索主线：Gather / Eval / NN / Backprop worker。
 //!
 //! worker 角色划分可参考 LC3 Overview 的 "Workers"：
 //! <https://lczero.org/dev/lc0/search/lc3/overview/>
 //!
 //! Eval 负责终局、缓存、合法着和编码；NN 线程只做「取批 → 推理 → 交回」，
-//! 不处理象棋/搜索逻辑。Search worker 优先处理回传，再 gather 下一个 NN batch。
-//! 每个 batch 的 logical visit 在每层重新按 PUCT 分配；碰撞只取消 reservation。
+//! 不处理象棋/搜索逻辑。每个 owned event 独立流过队列；NN 只消费已经编码的 tensor，
+//! 因而当前推理期间 Eval 可以持续准备下一批。
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -216,127 +215,13 @@ struct ResolvedSearchConfig {
     eval_workers: usize,
 }
 
-/// 一个逻辑 NN batch 的生命周期。
-///
-/// Search owner 最多同时保留两个：一个由 NN/Eval/回传完成，另一个可并行 gather。
-/// 它不是一轮全局屏障；batch 收集完叶子即可关闭，回传仍由 Search worker 优先执行。
-struct SearchBatch {
-    state: Mutex<SearchBatchState>,
-    ready: Condvar,
-}
-
-struct SearchBatchState {
-    gather_left: usize,
-    eval_left: usize,
-    nn_requests: usize,
-    playouts_left: usize,
-}
-
-impl SearchBatch {
-    fn new(gather_tasks: usize) -> Self {
-        Self {
-            state: Mutex::new(SearchBatchState {
-                gather_left: gather_tasks,
-                eval_left: 0,
-                nn_requests: 0,
-                playouts_left: 0,
-            }),
-            ready: Condvar::new(),
-        }
-    }
-
-    fn begin_eval(&self) {
-        self.state.lock().eval_left += 1;
-    }
-
-    fn begin_playout(&self) {
-        self.state.lock().playouts_left += 1;
-    }
-
-    fn finish_playout(&self) {
-        let mut state = self.state.lock();
-        assert!(state.playouts_left > 0, "search batch playout underflow");
-        state.playouts_left -= 1;
-        if state.gather_left == 0 && state.eval_left == 0 && state.playouts_left == 0 {
-            self.ready.notify_all();
-        }
-    }
-
-    fn finish_eval(&self, needs_nn: bool) {
-        let mut state = self.state.lock();
-        assert!(state.eval_left > 0, "search batch eval underflow");
-        state.eval_left -= 1;
-        state.nn_requests += usize::from(needs_nn);
-        if state.gather_left == 0 && state.eval_left == 0 {
-            self.ready.notify_all();
-        }
-    }
-
-    fn finish_gather(&self) {
-        let mut state = self.state.lock();
-        assert!(state.gather_left > 0, "search batch worker underflow");
-        state.gather_left -= 1;
-        if state.gather_left == 0 && state.eval_left == 0 {
-            self.ready.notify_all();
-        }
-    }
-
-    fn wait_for_nn_requests(&self, stopping: &AtomicBool) -> usize {
-        let mut state = self.state.lock();
-        while (state.gather_left != 0 || state.eval_left != 0) && !stopping.load(Ordering::Acquire) {
-            self.ready.wait_for(&mut state, RECEIVE_POLL);
-        }
-        state.nn_requests
-    }
-
-    fn wait_until_closed(&self, stopping: &AtomicBool) {
-        let mut state = self.state.lock();
-        while (state.gather_left != 0 || state.eval_left != 0) && !stopping.load(Ordering::Acquire) {
-            self.ready.wait_for(&mut state, RECEIVE_POLL);
-        }
-    }
-
-    fn wait_until_finished(&self, stopping: &AtomicBool) {
-        let mut state = self.state.lock();
-        while (state.gather_left != 0 || state.eval_left != 0 || state.playouts_left != 0)
-            && !stopping.load(Ordering::Acquire)
-        {
-            self.ready.wait_for(&mut state, RECEIVE_POLL);
-        }
-    }
-}
-
-/// 一个 Search worker 在 batch 内分配的逻辑 visit 预算。展开节点会按临时 PUCT
-/// 把它递归拆分为多个叶子；collision 不进入 completed N。
-struct SearchTask {
-    batch: Arc<SearchBatch>,
-    root_key: NodeKey,
-    root_history: Arc<PositionHistory>,
-    visits: u32,
-    /// 该串行 gather 允许累计的 collision logical visit；恰好等于它的 logical
-    /// visit 配额。碰撞只消耗本批已分配的预算，不会因跨回合 root N 增长而扩张。
-    collision_budget: u32,
-}
-
-/// Eval 的输入与其所属 batch 一起移动；同一 batch 的 Eval 都完成编码/缓存判断后，
-/// NN 才执行该 batch 的真实推理。
-struct EvalTask {
-    event: NodeEvent,
-    batch: Arc<SearchBatch>,
-}
-
-struct BackpropTask {
-    event: BackpropEvent,
-    batch: Arc<SearchBatch>,
-}
-
-enum SearchCommand {
-    Run(Arc<Shared>, Receiver<SearchTask>, Receiver<BackpropTask>),
+enum GatherCommand {
+    Run(Arc<Shared>, Receiver<NodeEvent>),
     Shutdown,
 }
 
 enum EvalCommand {
-    Run(Arc<Shared>, Receiver<EvalTask>, Sender<NnRequest>),
+    Run(Arc<Shared>, Receiver<NodeEvent>, Sender<NnRequest>),
     Shutdown,
 }
 
@@ -345,14 +230,20 @@ enum NnCommand {
     Shutdown,
 }
 
+enum BackpropCommand {
+    Run(Arc<Shared>, Receiver<BackpropEvent>),
+    Shutdown,
+}
+
 /// Engine 持有的固定 worker 拓扑。
 ///
 /// 每个 job 独占树视图、队列与 generation；线程池只跨 job 保留线程。
 /// 参考：LC3 Overview 的 "Workers" / "Search"。
 pub(crate) struct WorkerPool {
-    search_commands: Vec<Sender<SearchCommand>>,
+    gather_commands: Vec<Sender<GatherCommand>>,
     eval_commands: Vec<Sender<EvalCommand>>,
     nn_commands: Sender<NnCommand>,
+    backprop_commands: Vec<Sender<BackpropCommand>>,
     job_done: Receiver<()>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     eval_batch_size: usize,
@@ -369,21 +260,22 @@ impl WorkerPool {
     pub(crate) fn matches_config(&self, backend: &dyn Backend, config: &SearchConfig) -> bool {
         let config = config.resolve(backend);
         self.eval_batch_size == config.eval_batch_size
-            && self.search_commands.len() == config.gather_workers
+            && self.gather_commands.len() == config.gather_workers
             && self.eval_commands.len() == config.eval_workers
     }
 
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
         let (job_done_tx, job_done) = crossbeam_channel::unbounded();
         let eval_batch_size = config.eval_batch_size;
-        let mut search_commands = Vec::with_capacity(config.gather_workers);
+        let mut gather_commands = Vec::with_capacity(config.gather_workers);
         let mut eval_commands = Vec::with_capacity(config.eval_workers);
-        let mut threads = Vec::with_capacity(config.gather_workers + config.eval_workers + 1);
+        let (backprop_commands, backprop_rx) = crossbeam_channel::unbounded();
+        let mut threads = Vec::with_capacity(config.gather_workers + config.eval_workers + 2);
         for _ in 0..config.gather_workers {
             let (tx, rx) = crossbeam_channel::unbounded();
             let job_done = job_done_tx.clone();
-            threads.push(thread::spawn(move || persistent_search_worker(rx, job_done)));
-            search_commands.push(tx);
+            threads.push(thread::spawn(move || persistent_gather_worker(rx, job_done)));
+            gather_commands.push(tx);
         }
         let (nn_commands, nn_rx) = crossbeam_channel::unbounded();
         threads.push(thread::spawn({
@@ -396,10 +288,15 @@ impl WorkerPool {
             threads.push(thread::spawn(move || persistent_eval_worker(rx, job_done)));
             eval_commands.push(tx);
         }
+        threads.push(thread::spawn({
+            let job_done = job_done_tx.clone();
+            move || persistent_backprop_worker(backprop_rx, job_done)
+        }));
         Self {
-            search_commands,
+            gather_commands,
             eval_commands,
             nn_commands,
+            backprop_commands: vec![backprop_commands],
             job_done,
             threads: Mutex::new(threads),
             eval_batch_size: config.eval_batch_size,
@@ -409,19 +306,15 @@ impl WorkerPool {
     fn start_job(
         &self,
         shared: &Arc<Shared>,
-        search_rx: &Receiver<SearchTask>,
-        eval_rx: &Receiver<EvalTask>,
+        gather_rx: &Receiver<NodeEvent>,
+        eval_rx: &Receiver<NodeEvent>,
         nn_tx: &Sender<NnRequest>,
         nn_rx: &Receiver<NnRequest>,
-        backprop_rx: &Receiver<BackpropTask>,
+        backprop_rx: &Receiver<BackpropEvent>,
     ) {
-        for sender in &self.search_commands {
+        for sender in &self.gather_commands {
             sender
-                .send(SearchCommand::Run(
-                    Arc::clone(shared),
-                    search_rx.clone(),
-                    backprop_rx.clone(),
-                ))
+                .send(GatherCommand::Run(Arc::clone(shared), gather_rx.clone()))
                 .expect("persistent search worker is alive");
         }
         self.nn_commands
@@ -432,17 +325,20 @@ impl WorkerPool {
                 .send(EvalCommand::Run(Arc::clone(shared), eval_rx.clone(), nn_tx.clone()))
                 .expect("persistent eval worker is alive");
         }
+        self.backprop_commands[0]
+            .send(BackpropCommand::Run(Arc::clone(shared), backprop_rx.clone()))
+            .expect("persistent backprop worker is alive");
     }
 
     fn finish_job(&self) {
-        for _ in 0..self.search_commands.len() + self.eval_commands.len() + 1 {
+        for _ in 0..self.gather_commands.len() + self.eval_commands.len() + 2 {
             self.job_done.recv().expect("persistent worker completion");
         }
     }
 
     fn assert_compatible(&self, config: &ResolvedSearchConfig) {
         assert_eq!(
-            self.search_commands.len(),
+            self.gather_commands.len(),
             config.gather_workers,
             "worker pool gather topology changed"
         );
@@ -460,12 +356,15 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        for sender in &self.search_commands {
-            let _ = sender.send(SearchCommand::Shutdown);
+        for sender in &self.gather_commands {
+            let _ = sender.send(GatherCommand::Shutdown);
         }
         let _ = self.nn_commands.send(NnCommand::Shutdown);
         for sender in &self.eval_commands {
             let _ = sender.send(EvalCommand::Shutdown);
+        }
+        for sender in &self.backprop_commands {
+            let _ = sender.send(BackpropCommand::Shutdown);
         }
         for worker in self.threads.get_mut().drain(..) {
             let _ = worker.join();
@@ -509,16 +408,13 @@ struct Shared {
     error: Mutex<Option<EnginError>>,
     idle_lock: Mutex<()>,
     idle: Condvar,
-    search_tx: Sender<SearchTask>,
-    eval_tx: Sender<EvalTask>,
-    backprop_tx: Sender<BackpropTask>,
+    gather_tx: Sender<NodeEvent>,
+    eval_tx: Sender<NodeEvent>,
+    backprop_tx: Sender<BackpropEvent>,
 }
 
 impl Shared {
-    /// 一条真实 leaf 开始进入 Eval/Backprop。collision 只保留临时 reservation，
-    /// 不计为 playout。
-    fn start_playout(&self, batch: &SearchBatch) {
-        batch.begin_playout();
+    fn start_playout(&self) {
         let outstanding = self.outstanding.fetch_add(1, Ordering::AcqRel) + 1;
         #[cfg(feature = "benchmark")]
         {
@@ -533,7 +429,10 @@ impl Shared {
         self.completed.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn finish(&self) {
+    fn finish(&self, completed: bool) {
+        if completed {
+            self.completed.fetch_add(1, Ordering::AcqRel);
+        }
         let previous = self.outstanding.fetch_sub(1, Ordering::AcqRel);
         assert!(previous > 0, "stream outstanding task underflow");
         // 唤醒等待本轮真实 leaf 完成的 owner。
@@ -542,24 +441,15 @@ impl Shared {
         let _ = previous;
     }
 
-    fn add_completed_visits(&self, visits: u32) {
-        self.completed.fetch_add(visits as u64, Ordering::AcqRel);
-    }
-
-    /// 一个 batch gather 结束后归还 collision 的 virtual visit；它从未进入 Eval/NN/Backprop。
+    /// 正在评估的叶子不重复计算；直接归还这条未完成路径的 reservation。
     fn finish_collision(&self, event: NodeEvent) {
         #[cfg(feature = "benchmark")]
         {
-            let visits = event
-                .reservations
-                .iter()
-                .map(|reservation| reservation.visits())
-                .max()
-                .unwrap_or(1);
-            self.collisions.fetch_add(visits as u64, Ordering::AcqRel);
+            self.collisions.fetch_add(1, Ordering::AcqRel);
             self.record_collision_depths(&[event.variation.moves().len()]);
         }
         event.cancel();
+        self.finish(false);
     }
 
     /// Cancels an event after Gather has claimed its leaf for Eval.
@@ -567,12 +457,12 @@ impl Shared {
     /// Reference: LC3 overview's EvalWorker ownership model. Releasing only
     /// the edge reservations would leave the claimed node permanently
     /// `Evaluating`, so this also restores it to `Unexpanded`.
-    fn cancel_claimed_evaluation(&self, event: NodeEvent, batch: Arc<SearchBatch>) {
+    fn cancel_claimed_evaluation(&self, event: NodeEvent) {
         let node = self
             .repository
             .get(event.node_key)
             .expect("claimed stream node remains in the repository");
-        cancel_evaluation(self, event, node, batch);
+        cancel_evaluation(self, event, node);
     }
 
     fn fail(&self, error: EnginError) {
@@ -586,50 +476,46 @@ impl Shared {
 
     /// Non-blocking enqueue: `try_send` + yield instead of parking on a full
     /// queue so Gather can keep polling `stopping` and stay schedulable.
-    fn send_eval(&self, mut task: EvalTask) {
+    fn send_eval(&self, mut event: NodeEvent) {
         #[cfg(feature = "benchmark")]
-        task.event.mark_queued();
+        event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
-                task.batch.finish_eval(false);
-                self.cancel_claimed_evaluation(task.event, task.batch);
+                self.cancel_claimed_evaluation(event);
                 return;
             }
-            match self.eval_tx.try_send(task) {
+            match self.eval_tx.try_send(event) {
                 Ok(()) => return,
                 Err(TrySendError::Full(returned)) => {
-                    task = returned;
+                    event = returned;
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    returned.batch.finish_eval(false);
-                    self.cancel_claimed_evaluation(returned.event, returned.batch);
+                    self.cancel_claimed_evaluation(returned);
                     return;
                 }
             }
         }
     }
 
-    fn send_backprop(&self, mut task: BackpropTask) {
+    fn send_backprop(&self, mut event: BackpropEvent) {
         #[cfg(feature = "benchmark")]
-        task.event.mark_queued();
+        event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
-                task.event.cancel();
-                task.batch.finish_playout();
-                self.finish();
+                event.cancel();
+                self.finish(false);
                 return;
             }
-            match self.backprop_tx.try_send(task) {
+            match self.backprop_tx.try_send(event) {
                 Ok(()) => return,
                 Err(TrySendError::Full(returned)) => {
-                    task = returned;
+                    event = returned;
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    returned.event.cancel();
-                    returned.batch.finish_playout();
-                    self.finish();
+                    returned.cancel();
+                    self.finish(false);
                     return;
                 }
             }
@@ -680,7 +566,7 @@ impl Shared {
     }
 }
 
-/// LC3 风格流式搜索：Search / Eval / NN；Backprop 由 Search worker 优先处理。
+/// 连续流式搜索：Gather / Eval / NN / Backprop。
 /// Eval：terminal | cache → Backprop；否则稀疏编码 → NN queue；NN expand + 合批推理后
 /// 整批交回 → Eval 切行/softmax/edges → Backprop。
 pub struct Search {
@@ -725,7 +611,7 @@ impl Search {
         config.validate();
         let resolved = config.resolve(backend.as_ref());
         worker_pool.assert_compatible(&resolved);
-        let (search_tx, search_rx) = bounded(resolved.queue_capacity);
+        let (gather_tx, gather_rx) = bounded(resolved.queue_capacity);
         let (eval_tx, eval_rx) = bounded(resolved.queue_capacity);
         let (backprop_tx, backprop_rx) = bounded(resolved.queue_capacity);
         // UCI/graph 持有完整 history 用于跨回合定位；每个 event 只需要重复规则自
@@ -771,12 +657,12 @@ impl Search {
             error: Mutex::new(None),
             idle_lock: Mutex::new(()),
             idle: Condvar::new(),
-            search_tx,
+            gather_tx,
             eval_tx,
             backprop_tx,
         });
         let (nn_tx, nn_rx) = bounded::<NnRequest>(resolved.queue_capacity);
-        worker_pool.start_job(&shared, &search_rx, &eval_rx, &nn_tx, &nn_rx, &backprop_rx);
+        worker_pool.start_job(&shared, &gather_rx, &eval_rx, &nn_tx, &nn_rx, &backprop_rx);
         drop(nn_tx);
         Self {
             shared,
@@ -831,44 +717,30 @@ impl Search {
         self.shared.stopping.load(Ordering::Acquire)
     }
 
-    /// 提交一个逻辑 NN batch。真实 leaf 总数最多为一个 NN batch，并按 Search worker 均分；
-    /// 同轮 collision 仅作为 temporary virtual visit，绝不进入 completed N。
-    fn submit_batch(&self, visits: usize) -> Result<Arc<SearchBatch>, EnginError> {
+    fn submit_playout(&self) -> Result<(), EnginError> {
         if self.shared.stopping.load(Ordering::Acquire) {
             return Err(EnginError::PortIncomplete("stream worker pipeline is stopped"));
         }
-        let workers = self.worker_pool.search_commands.len().min(visits).max(1);
-        let batch = Arc::new(SearchBatch::new(workers));
-        for worker in 0..workers {
-            let visit_quota = visits / workers + usize::from(worker < visits % workers);
-            let mut task = SearchTask {
-                batch: Arc::clone(&batch),
-                root_key: self.root_key,
-                root_history: Arc::clone(&self.root_history),
-                visits: visit_quota as u32,
-                collision_budget: visit_quota as u32,
-            };
-            loop {
-                if self.shared.stopping.load(Ordering::Acquire) {
-                    task.batch.finish_gather();
-                    return Err(EnginError::PortIncomplete("stream worker pipeline is stopped"));
-                }
-                match self.shared.search_tx.send_timeout(task, RECEIVE_POLL) {
-                    Ok(()) => break,
-                    Err(SendTimeoutError::Timeout(returned)) => task = returned,
-                    Err(SendTimeoutError::Disconnected(_)) => {
-                        return Err(EnginError::PortIncomplete("stream search queue disconnected"));
-                    }
+        self.shared.start_playout();
+        let mut event = NodeEvent::at_root(self.shared.generation, self.root_key, Arc::clone(&self.root_history));
+        #[cfg(feature = "benchmark")]
+        event.mark_queued();
+        loop {
+            if self.shared.stopping.load(Ordering::Acquire) {
+                event.cancel();
+                self.shared.finish(false);
+                return Err(EnginError::PortIncomplete("stream worker pipeline is stopped"));
+            }
+            match self.shared.gather_tx.send_timeout(event, RECEIVE_POLL) {
+                Ok(()) => return Ok(()),
+                Err(SendTimeoutError::Timeout(returned)) => event = returned,
+                Err(SendTimeoutError::Disconnected(returned)) => {
+                    returned.cancel();
+                    self.shared.finish(false);
+                    return Err(EnginError::PortIncomplete("stream gather queue disconnected"));
                 }
             }
         }
-        Ok(batch)
-    }
-
-    /// 仅供队列/drain 回归逐轮提交；正式 owner 一律按 backend batch 提交整轮。
-    #[cfg(test)]
-    fn submit_playout(&self) -> Result<(), EnginError> {
-        self.submit_batch(1).map(|_| ())
     }
 
     pub fn run_playouts(&self, count: u64) -> Result<Stats, EnginError> {
@@ -893,8 +765,7 @@ impl Search {
     ) -> Result<Stats, EnginError> {
         let target = limits.max_playouts.unwrap_or(u64::MAX);
         let mut next_report = report_interval.and_then(|interval| Instant::now().checked_add(interval));
-        let mut window: VecDeque<(Arc<SearchBatch>, u64)> = VecDeque::new();
-        let mut reserved_visits = 0_u64;
+        let in_flight_limit = self.worker_pool.eval_batch_size.saturating_mul(2).max(1);
         while !self.is_stopping()
             && !limits.is_exhausted(
                 self.initial_visits.saturating_add(self.stats().completed_playouts),
@@ -919,43 +790,38 @@ impl Search {
             }
             if root_state != Some(ExpansionState::Expanded) {
                 // root 展开前只需要一个真实 leaf。
-                let batch = match self.submit_batch(1) {
-                    Ok(batch) => batch,
-                    Err(_error) if self.is_stopping() => break,
-                    Err(error) => return Err(error),
-                };
-                batch.wait_until_finished(&self.shared.stopping);
+                if let Err(error) = self.submit_playout() {
+                    if self.is_stopping() {
+                        break;
+                    }
+                    return Err(error);
+                }
+                self.wait_until_outstanding_below(1)?;
                 continue;
             }
-            while window.len() < 2 {
-                let completed = self.stats().completed_playouts;
-                let remaining = target.saturating_sub(
-                    self.initial_visits
-                        .saturating_add(completed)
-                        .saturating_add(reserved_visits),
-                );
-                if remaining == 0 {
+            let outstanding = self.shared.outstanding.load(Ordering::Acquire);
+            let completed = self.stats().completed_playouts;
+            if self
+                .initial_visits
+                .saturating_add(completed)
+                .saturating_add(outstanding as u64)
+                >= target
+            {
+                if outstanding == 0 {
                     break;
                 }
-                let visits = self.worker_pool.eval_batch_size.min(remaining as usize).max(1);
-                let batch = match self.submit_batch(visits) {
-                    Ok(batch) => batch,
-                    Err(_error) if self.is_stopping() => break,
-                    Err(error) => return Err(error),
-                };
-                // 先让这一 batch 的 Eval 完成缓存/编码判断，保证 NN 队列按 batch 顺序
-                // 接收；随后可并行准备唯一的后继 batch。
-                batch.wait_until_closed(&self.shared.stopping);
-                reserved_visits += visits as u64;
-                window.push_back((batch, visits as u64));
+                self.wait_until_outstanding_below(outstanding)?;
+                continue;
             }
-            let Some((batch, visits)) = window.pop_front() else {
-                break;
-            };
-            batch.wait_until_finished(&self.shared.stopping);
-            reserved_visits = reserved_visits.saturating_sub(visits);
-            if self.is_stopping() {
-                break;
+            if outstanding >= in_flight_limit {
+                self.wait_until_outstanding_below(in_flight_limit)?;
+                continue;
+            }
+            if let Err(error) = self.submit_playout() {
+                if self.is_stopping() {
+                    break;
+                }
+                return Err(error);
             }
         }
         // 请求停止是正常搜索结果。`wait_for_idle()` 已保证每个入队 event 都已完成或取消
@@ -998,102 +864,45 @@ impl Drop for Search {
     }
 }
 
-fn search_worker(shared: Arc<Shared>, gather: Receiver<SearchTask>, backprop: Receiver<BackpropTask>) {
+fn gather_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>) {
     loop {
-        crossbeam_channel::select_biased! {
-            recv(backprop) -> task => match task {
-                Ok(first) => complete_backprop(&shared, std::iter::once(first).chain(backprop.try_iter())),
-                Err(_) => break,
-            },
-            recv(gather) -> task => match task {
-                Ok(task) if shared.stopping.load(Ordering::Acquire) => task.batch.finish_gather(),
-                Ok(task) => process_search_task(&shared, task),
-                Err(_) => break,
-            },
-            default(RECEIVE_POLL) => {
-                if !shared.stopping.load(Ordering::Acquire) {
-                    continue;
+        match receiver.recv_timeout(RECEIVE_POLL) {
+            #[cfg(feature = "benchmark")]
+            Ok(mut event) => {
+                if let Some(wait) = event.take_queue_wait() {
+                    shared.gather_queue.record(wait);
                 }
-                while let Ok(task) = backprop.try_recv() {
-                    complete_backprop(&shared, std::iter::once(task));
+                if shared.stopping.load(Ordering::Acquire) {
+                    event.cancel();
+                    shared.finish(false);
+                } else {
+                    process_gather_event(&shared, event);
                 }
-                while let Ok(task) = gather.try_recv() {
-                    task.batch.finish_gather();
-                }
-                break;
             }
+            #[cfg(not(feature = "benchmark"))]
+            Ok(event) if shared.stopping.load(Ordering::Acquire) => {
+                event.cancel();
+                shared.finish(false);
+            }
+            #[cfg(not(feature = "benchmark"))]
+            Ok(event) => process_gather_event(&shared, event),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
 
-fn persistent_search_worker(commands: Receiver<SearchCommand>, job_done: Sender<()>) {
+fn persistent_gather_worker(commands: Receiver<GatherCommand>, job_done: Sender<()>) {
     while let Ok(command) = commands.recv() {
         match command {
-            SearchCommand::Run(shared, gather, backprop) => {
-                search_worker(shared, gather, backprop);
+            GatherCommand::Run(shared, receiver) => {
+                gather_worker(shared, receiver);
                 let _ = job_done.send(());
             }
-            SearchCommand::Shutdown => break,
+            GatherCommand::Shutdown => break,
         }
     }
-}
-
-fn process_search_task(shared: &Shared, task: SearchTask) {
-    let mut collisions = Vec::new();
-    let mut collision_visits = 0_u32;
-    let mut pending = VecDeque::from([NodeEvent::at_root_with_visits(
-        shared.generation,
-        task.root_key,
-        Arc::clone(&task.root_history),
-        task.visits,
-    )]);
-    while let Some(event) = pending.pop_front() {
-        if shared.stopping.load(Ordering::Acquire) {
-            event.cancel();
-            break;
-        }
-        match process_gather_event(shared, &task.batch, event) {
-            GatherResult::Eval(event) => {
-                task.batch.begin_eval();
-                shared.start_playout(&task.batch);
-                shared.send_eval(EvalTask {
-                    event,
-                    batch: Arc::clone(&task.batch),
-                });
-            }
-            GatherResult::Completed => {}
-            GatherResult::Collision(event) => {
-                if collision_visits.saturating_add(event.logical_visits) <= task.collision_budget {
-                    collision_visits += event.logical_visits;
-                    collisions.push(event);
-                } else {
-                    // 预算耗尽不改变“已经撞到 Evaluating node”这一事实；统计仍应
-                    // 反映真实 collision，只是立即归还 reservation。
-                    shared.finish_collision(event);
-                    break;
-                }
-            }
-            GatherResult::Branch(events) => pending.extend(events),
-            GatherResult::Stopped => break,
-        }
-    }
-    // collision 预算用尽或 stop 后，尚未取出的分支没有真实 leaf；必须归还它们
-    // 已在每层占用的 virtual visit，不能把它们留到下一 batch。
-    for event in pending {
-        event.cancel();
-    }
-    for event in collisions {
-        shared.finish_collision(event);
-    }
-    task.batch.finish_gather();
-}
-
-enum GatherResult {
-    Eval(NodeEvent),
-    Completed,
-    Collision(NodeEvent),
-    Branch(Vec<NodeEvent>),
-    Stopped,
 }
 
 #[derive(Clone, Copy)]
@@ -1123,15 +932,12 @@ fn selected_child(shared: &Shared, event: &mut NodeEvent, node: &Node, edge_inde
 
 fn branch_at_expanded_node(
     shared: &Shared,
-    batch: &Arc<SearchBatch>,
-    mut event: NodeEvent,
+    event: &mut NodeEvent,
     node: &Node,
     depth: usize,
-) -> GatherResult {
-    let mut groups: Vec<(usize, ChildTarget, Vec<super::EdgeReservation>)> = Vec::new();
-    let mut assigned = 0;
-    while assigned < event.logical_visits {
-        let Some((edge_index, fpu)) = select_edge(
+) -> Option<(ChildTarget, super::EdgeReservation)> {
+    loop {
+        let (edge_index, fpu) = select_edge(
             &shared.repository,
             &node.edges(),
             node.completed_visits(),
@@ -1139,92 +945,43 @@ fn branch_at_expanded_node(
             depth,
             &shared.params,
             &shared.root_move_filter,
-        ) else {
-            if groups.is_empty() {
-                if event.reservations.is_empty() {
-                    shared.root_path_terminal.store(true, Ordering::Release);
-                    shared.complete_root_terminal();
-                    return GatherResult::Stopped;
-                }
-                shared.start_playout(batch);
-                shared.send_backprop(BackpropTask {
-                    event: BackpropEvent::evaluation(event),
-                    batch: Arc::clone(batch),
-                });
-                return GatherResult::Completed;
-            }
-            break;
-        };
+        )?;
         // 复用本次 PUCT selection 的 FPU。`selected_child` 可能绑定一个已有 graph
         // child；那会改变下一次 selection 的 FPU 参与集合，但不能倒写本次 pending
         // sample 的均值。
         let virtual_mean = shared.params.virtual_mean_fpu_scale.map(|scale| scale * fpu);
-        let Some(target) = selected_child(shared, &mut event, node, edge_index) else {
+        let Some(target) = selected_child(shared, event, node, edge_index) else {
             continue;
         };
         let reservation = node
-            .reserve_edge_visits(edge_index, 1, virtual_mean)
+            .reserve_edge_with_virtual_mean(edge_index, virtual_mean)
             .expect("selected stream edge");
-        assigned += 1;
-        if let Some((_, _, reservations)) = groups.iter_mut().find(|(candidate_edge, candidate, _)| {
-            *candidate_edge == edge_index
-                && match (*candidate, target) {
-                    (ChildTarget::Graph(left), ChildTarget::Graph(right))
-                    | (ChildTarget::Continuation(left), ChildTarget::Continuation(right)) => left == right,
-                    _ => false,
-                }
-        }) {
-            reservations.push(reservation);
-        } else {
-            groups.push((edge_index, target, vec![reservation]));
-        }
+        return Some((target, reservation));
     }
-    if groups.is_empty() {
-        event.cancel();
-        return GatherResult::Stopped;
-    }
-    let weights: Vec<_> = groups
-        .iter()
-        .map(|(_, _, reservations)| reservations.len() as u32)
-        .collect();
-    let mut children = event.split(&weights).into_iter();
-    let branches = groups
-        .into_iter()
-        .map(|(_, target, reservations)| {
-            let event = children.next().expect("one event per PUCT branch");
-            let reservation = super::EdgeReservation::merge(reservations);
-            match target {
-                ChildTarget::Graph(child) => event.descend(child, reservation),
-                ChildTarget::Continuation(child) => event.descend_continuation(child, reservation),
-            }
-        })
-        .collect();
-    GatherResult::Branch(branches)
 }
 
-fn process_gather_event(shared: &Shared, batch: &Arc<SearchBatch>, mut event: NodeEvent) -> GatherResult {
+fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             event.cancel();
-            return GatherResult::Stopped;
+            shared.finish(false);
+            return;
         }
         let node = shared.repository.get_or_insert(event.node_key);
         match node.expansion_state() {
             ExpansionState::Unexpanded => {
                 if node.try_begin_evaluation() {
-                    return GatherResult::Eval(event);
+                    shared.send_eval(event);
+                    return;
                 }
             }
             ExpansionState::Evaluating => {
-                return GatherResult::Collision(event);
+                shared.finish_collision(event);
+                return;
             }
             ExpansionState::Terminal => {
-                shared.start_playout(batch);
-                shared.send_backprop(BackpropTask {
-                    event: BackpropEvent::evaluation(event),
-                    batch: Arc::clone(batch),
-                });
-                return GatherResult::Completed;
+                shared.send_backprop(BackpropEvent::evaluation(event));
+                return;
             }
             ExpansionState::Expanded => {
                 // board-key node 可由历史中已展开的局面复用；重复、长将/长捉和 rule60
@@ -1243,21 +1000,32 @@ fn process_gather_event(shared: &Shared, batch: &Arc<SearchBatch>, mut event: No
                     if event.reservations.is_empty() {
                         shared.root_path_terminal.store(true, Ordering::Release);
                         shared.complete_root_terminal();
-                        return GatherResult::Stopped;
+                        shared.finish(false);
+                        return;
                     } else {
-                        shared.start_playout(batch);
-                        shared.send_backprop(BackpropTask {
-                            event: BackpropEvent::local_leaf(event.discard_leaf_node(), value),
-                            batch: Arc::clone(batch),
-                        });
+                        shared.send_backprop(BackpropEvent::local_leaf(event.discard_leaf_node(), value));
                     }
-                    return GatherResult::Completed;
+                    return;
                 }
                 // MCGS 的共享 child 可能刚刚由另一条 variation 更新。回传只重算实际
                 // 路径上的 node；因此每次再次访问本 node 前都要按最新 child Q 重算。
                 // 参考 KataGo `docs/GraphSearch.md` “Stale Q Values”。
                 shared.repository.recompute_graph_node(event.node_key);
-                return branch_at_expanded_node(shared, batch, event, node.as_ref(), depth);
+                let Some((target, reservation)) = branch_at_expanded_node(shared, &mut event, node.as_ref(), depth)
+                else {
+                    if event.reservations.is_empty() {
+                        shared.root_path_terminal.store(true, Ordering::Release);
+                        shared.complete_root_terminal();
+                        shared.finish(false);
+                    } else {
+                        shared.send_backprop(BackpropEvent::evaluation(event));
+                    }
+                    return;
+                };
+                event = match target {
+                    ChildTarget::Graph(child) => event.descend(child, reservation),
+                    ChildTarget::Continuation(child) => event.descend_continuation(child, reservation),
+                };
             }
         }
     }
@@ -1270,7 +1038,6 @@ type NnReply = Result<(Arc<EncodedBatch>, usize), EnginError>;
 struct NnRequest {
     planes: InputPlanes,
     reply: Sender<NnReply>,
-    batch: Arc<SearchBatch>,
     #[cfg(feature = "benchmark")]
     queued_at: Option<Instant>,
 }
@@ -1294,22 +1061,20 @@ struct WaitingNn {
     legal_moves: Vec<xiangqi_core::Move>,
     cache_key: EvalCacheKey,
     reply: Receiver<NnReply>,
-    batch: Arc<SearchBatch>,
 }
 
 /// LC3 EvalWorker：terminal | cache → Backprop；否则合法着 + 编码 → NN queue；
 /// NN 回复后 → softmax/edges → Backprop。它不会因一次 GPU 调用阻塞整个 worker，
 /// 而是在新 NodeEvent 之间轮询已完成结果。
-fn eval_worker(shared: Arc<Shared>, receiver: Receiver<EvalTask>, nn_tx: Sender<NnRequest>) {
+fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender<NnRequest>) {
     let mut waiting: Vec<WaitingNn> = Vec::new();
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             for item in waiting.drain(..) {
                 cancel_waiting_item(&shared, item);
             }
-            while let Ok(task) = receiver.try_recv() {
-                task.batch.finish_eval(false);
-                shared.cancel_claimed_evaluation(task.event, task.batch);
+            while let Ok(event) = receiver.try_recv() {
+                shared.cancel_claimed_evaluation(event);
             }
             break;
         }
@@ -1318,18 +1083,18 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<EvalTask>, nn_tx: Sender<
 
         match receiver.recv_timeout(RECEIVE_POLL) {
             #[cfg(feature = "benchmark")]
-            Ok(mut task) => {
+            Ok(mut event) => {
                 #[cfg(feature = "benchmark")]
-                if let Some(wait) = task.event.take_queue_wait() {
+                if let Some(wait) = event.take_queue_wait() {
                     shared.eval_queue.record(wait);
                 }
-                if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, task) {
+                if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
                     shared.fail(error);
                 }
             }
             #[cfg(not(feature = "benchmark"))]
-            Ok(task) => {
-                if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, task) {
+            Ok(event) => {
+                if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
                     shared.fail(error);
                 }
             }
@@ -1422,12 +1187,10 @@ fn handle_eval_event(
     shared: &Shared,
     nn_tx: &Sender<NnRequest>,
     waiting: &mut Vec<WaitingNn>,
-    task: EvalTask,
+    mut event: NodeEvent,
 ) -> Result<(), EnginError> {
-    let EvalTask { mut event, batch } = task;
     if shared.stopping.load(Ordering::Acquire) {
-        batch.finish_eval(false);
-        shared.cancel_claimed_evaluation(event, batch);
+        shared.cancel_claimed_evaluation(event);
         return Ok(());
     }
     let node = shared.repository.get_or_insert(event.node_key);
@@ -1435,12 +1198,8 @@ fn handle_eval_event(
     let history = event.variation.history();
     match classify_extension(history, depth) {
         ExtensionKind::SharedTerminal { wl, draw, plies_left } => {
-            node.set_terminal_value_weighted(wl, draw, plies_left, event.logical_visits);
-            batch.finish_eval(false);
-            shared.send_backprop(BackpropTask {
-                event: BackpropEvent::evaluation(event),
-                batch,
-            });
+            node.mark_terminal(wl, draw, plies_left);
+            shared.send_backprop(BackpropEvent::evaluation(event));
             Ok(())
         }
         ExtensionKind::PathTerminal { wl, draw, plies_left } => {
@@ -1450,27 +1209,16 @@ fn handle_eval_event(
             // continuation tree 内传播。普通 GraphNode 仍可能从另一条 history 到达，
             // 只能保留为本次 edge 的 local leaf。
             if event.node_key.is_continuation() {
-                node.set_terminal_value_weighted(wl, draw, plies_left, event.logical_visits);
-                batch.finish_eval(false);
-                shared.send_backprop(BackpropTask {
-                    event: BackpropEvent::evaluation(event),
-                    batch,
-                });
+                node.mark_terminal(wl, draw, plies_left);
+                shared.send_backprop(BackpropEvent::evaluation(event));
                 return Ok(());
             }
             node.abort_evaluation();
             if event.reservations.is_empty() {
                 shared.root_path_terminal.store(true, Ordering::Release);
-                batch.finish_eval(false);
-                batch.finish_playout();
-                shared.add_completed_visits(1);
-                shared.finish();
+                shared.finish(true);
             } else {
-                batch.finish_eval(false);
-                shared.send_backprop(BackpropTask {
-                    event: BackpropEvent::local_leaf(event.discard_leaf_node(), value),
-                    batch,
-                });
+                shared.send_backprop(BackpropEvent::local_leaf(event.discard_leaf_node(), value));
             }
             Ok(())
         }
@@ -1479,8 +1227,7 @@ fn handle_eval_event(
             let cache_key = EvalCacheKey::new(history.last(), legal_moves.len());
             if let Some(eval) = shared.backend.cached_evaluation(cache_key) {
                 shared.cache_hits.fetch_add(1, Ordering::AcqRel);
-                batch.finish_eval(false);
-                return publish_eval(shared, event, node, legal_moves, eval, batch);
+                return publish_eval(shared, event, node, legal_moves, eval);
             }
             let planes = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
             let (reply_tx, reply_rx) = bounded(1);
@@ -1490,13 +1237,11 @@ fn handle_eval_event(
                 NnRequest {
                     planes,
                     reply: reply_tx,
-                    batch: Arc::clone(&batch),
                     #[cfg(feature = "benchmark")]
                     queued_at: None,
                 },
             ) {
-                batch.finish_eval(false);
-                cancel_evaluation(shared, event, node, batch);
+                cancel_evaluation(shared, event, node);
                 return if shared.stopping.load(Ordering::Acquire) {
                     Ok(())
                 } else {
@@ -1509,9 +1254,7 @@ fn handle_eval_event(
                 legal_moves,
                 cache_key,
                 reply: reply_rx,
-                batch: Arc::clone(&batch),
             });
-            batch.finish_eval(true);
             Ok(())
         }
     }
@@ -1546,7 +1289,7 @@ fn complete_nn_item(shared: &Shared, item: WaitingNn, batch: Arc<EncodedBatch>, 
         }
     };
     shared.backend.store_evaluation(item.cache_key, Arc::clone(&eval));
-    publish_eval(shared, item.event, item.node, item.legal_moves, eval, item.batch)
+    publish_eval(shared, item.event, item.node, item.legal_moves, eval)
 }
 
 /// 在 backend 完成结果写入 graph 前校验它。
@@ -1559,7 +1302,6 @@ fn publish_eval(
     node: Arc<Node>,
     legal_moves: Vec<xiangqi_core::Move>,
     eval: Arc<EvalResult>,
-    batch: Arc<SearchBatch>,
 ) -> Result<(), EnginError> {
     let value_is_valid = eval.wl.is_finite()
         && eval.d.is_finite()
@@ -1573,36 +1315,33 @@ fn publish_eval(
         && policy_sum.is_finite()
         && (policy_sum - 1.0).abs() <= 1e-3;
     if !value_is_valid || !policy_is_valid {
-        cancel_evaluation(shared, event, node, batch);
+        cancel_evaluation(shared, event, node);
         return Err(EnginError::Onnx("stream backend evaluation is invalid".into()));
     }
-    node.set_graph_value(
-        ValueDelta::with_plies_left(network_wl_to_node(eval.wl), eval.d, eval.plies_left)
-            .repeated(event.logical_visits),
-    );
+    node.set_graph_value(ValueDelta::with_plies_left(
+        network_wl_to_node(eval.wl),
+        eval.d,
+        eval.plies_left,
+    ));
     // 先发布共享基值，再把 node 变为 Expanded；否则并发 Gather 可能在两者之间
     // 完成一次回传，而那次幂等重算会看不到基值。
     node.publish_edges(legal_moves.iter().copied().zip(eval.policies.iter().copied()).collect());
-    shared.send_backprop(BackpropTask {
-        event: BackpropEvent::evaluation(event),
-        batch,
-    });
+    shared.send_backprop(BackpropEvent::evaluation(event));
     Ok(())
 }
 
 fn cancel_waiting_item(shared: &Shared, item: WaitingNn) {
-    cancel_evaluation(shared, item.event, item.node, item.batch);
+    cancel_evaluation(shared, item.event, item.node);
 }
 
 /// 释放已 claim 但不会发布结果的 evaluation event。
 ///
 /// 参考：LC3 Overview 的 EvalWorker 所有权模型：每个 owned event 必须经 backpropagation
 /// 完成，或显式取消。
-fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>, batch: Arc<SearchBatch>) {
+fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>) {
     event.cancel();
     node.abort_evaluation();
-    batch.finish_playout();
-    shared.finish();
+    shared.finish(false);
 }
 
 /// NN：取队列 → 稀疏合批推理 → 整批交回 → 继续取。
@@ -1629,11 +1368,9 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
         };
         #[cfg(feature = "benchmark")]
         record_nn_queue_wait(&shared, &mut first);
-        let search_batch = Arc::clone(&first.batch);
-        let expected = search_batch.wait_for_nn_requests(&shared.stopping);
         let mut requests = vec![first];
-        while requests.len() < expected {
-            match receiver.recv_timeout(RECEIVE_POLL) {
+        while requests.len() < batch_size {
+            match receiver.try_recv() {
                 #[cfg(feature = "benchmark")]
                 Ok(mut request) => {
                     #[cfg(feature = "benchmark")]
@@ -1642,15 +1379,9 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
                 }
                 #[cfg(not(feature = "benchmark"))]
                 Ok(request) => requests.push(request),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
-        debug_assert!(
-            requests.len() <= batch_size,
-            "one search batch must not exceed one NN batch"
-        );
         if shared.stopping.load(Ordering::Acquire) {
             reject_nn_requests(requests, EnginError::PortIncomplete("stream nn stopping"));
             continue;
@@ -1712,40 +1443,53 @@ fn persistent_nn_worker(commands: Receiver<NnCommand>, job_done: Sender<()>, bat
     }
 }
 
-fn complete_backprop(shared: &Shared, tasks: impl IntoIterator<Item = BackpropTask>) {
-    let tasks: Vec<_> = tasks.into_iter().collect();
-    if tasks.is_empty() {
-        return;
-    }
-    if shared.stopping.load(Ordering::Acquire) {
-        for task in tasks {
-            task.event.cancel();
-            task.batch.finish_playout();
-            shared.finish();
+fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
+    loop {
+        let first = match receiver.recv_timeout(RECEIVE_POLL) {
+            Ok(event) => event,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        let mut events = Vec::with_capacity(1 + receiver.len());
+        events.push(first);
+        events.extend(receiver.try_iter());
+        if events.is_empty() {
+            continue;
         }
-        return;
-    }
-    let mut events = Vec::with_capacity(tasks.len());
-    let mut batches = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        #[cfg(feature = "benchmark")]
-        let mut task = task;
-        #[cfg(feature = "benchmark")]
-        if let Some(wait) = task.event.take_queue_wait() {
-            shared.backprop_queue.record(wait);
+        if shared.stopping.load(Ordering::Acquire) {
+            for event in events {
+                event.cancel();
+                shared.finish(false);
+            }
+            continue;
         }
-        batches.push(task.batch);
-        events.push(task.event);
+        #[cfg(feature = "benchmark")]
+        for event in &mut events {
+            if let Some(wait) = event.take_queue_wait() {
+                shared.backprop_queue.record(wait);
+            }
+        }
+        let result = BackpropEvent::complete_batch(events, &shared.repository);
+        shared
+            .completed_depth
+            .fetch_add(result.completed_depth, Ordering::AcqRel);
+        shared.max_depth.fetch_max(result.max_depth, Ordering::AcqRel);
+        for _ in 0..result.completed_playouts {
+            shared.finish(true);
+        }
     }
-    let result = BackpropEvent::complete_batch(events, &shared.repository);
-    shared
-        .completed_depth
-        .fetch_add(result.completed_depth, Ordering::AcqRel);
-    shared.max_depth.fetch_max(result.max_depth, Ordering::AcqRel);
-    shared.add_completed_visits(result.completed_playouts);
-    for batch in batches {
-        batch.finish_playout();
-        shared.finish();
+}
+
+fn persistent_backprop_worker(commands: Receiver<BackpropCommand>, job_done: Sender<()>) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            BackpropCommand::Run(shared, receiver) => {
+                backprop_worker(shared, receiver);
+                let _ = job_done.send(());
+            }
+            BackpropCommand::Shutdown => break,
+        }
     }
 }
 
@@ -1760,7 +1504,7 @@ mod tests {
     use parking_lot::{Condvar, Mutex};
     use xiangqi_core::{ChessBoard, GameState, Move, Position, PositionHistory, STARTPOS_FEN, Square};
 
-    use super::{EvalTask, NodeEvent, Search, SearchBatch, SearchConfig, SearchLimits, Shared};
+    use super::{NodeEvent, Search, SearchConfig, SearchLimits, Shared};
     use crate::EnginError;
     use crate::neural::backend::{Backend, BackendAttributes, UniformBackend};
     use crate::search::{ExpansionState, NodeRepository, SearchGraph, SearchParams, ValueDelta, best_move, root_stats};
@@ -2288,7 +2032,7 @@ mod tests {
         let repository = Arc::new(NodeRepository::default());
         let root = repository.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
-        let (search_tx, _search_rx) = bounded(1);
+        let (gather_tx, _gather_rx) = bounded(1);
         let (eval_tx, eval_rx) = bounded(1);
         let (backprop_tx, _backprop_rx) = bounded(1);
         drop(eval_rx);
@@ -2327,18 +2071,12 @@ mod tests {
             error: Mutex::new(None),
             idle_lock: Mutex::new(()),
             idle: Condvar::new(),
-            search_tx,
+            gather_tx,
             eval_tx,
             backprop_tx,
         };
 
-        let batch = Arc::new(SearchBatch::new(0));
-        batch.begin_eval();
-        batch.begin_playout();
-        shared.send_eval(EvalTask {
-            event: NodeEvent::root(30, history),
-            batch,
-        });
+        shared.send_eval(NodeEvent::root(30, history));
 
         assert_eq!(root.expansion_state(), ExpansionState::Unexpanded);
         assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);

@@ -26,7 +26,7 @@
 - 规则、classical 编码、UCI 外围与训练 record 的历史工程参考：`C:\Users\Administrator\projects\px0`、`C:\Users\Administrator\projects\pxzero-training`。
 - stream / MCGS 可参考 [LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/)；本地没有 LC3 源码，不得标称为源码翻译或行为等价。
 - KataGo 按需参考：本地源码 `C:\Users\Administrator\projects\KataGo`（如 `docs/GraphSearch.md`、NN cache、部分搜索细节）；不是每次改搜索都必读，也不承诺行为等价。
-- 相对早期 px0/Lc0 风格 stream 基线，本实现有 multivisit 与固定两 batch gather 窗口：PUCT 使用 edge in-flight reservation 作为 pending visit（计入 started N）；当前实战还以 `μ=FPU` 暂入 action Q，完成或取消时精确归还。它不进入 completed Evidence 或 shared node Q。每个已展开节点重新分配进入它的 pending visit，未展开叶子才合并同一路径的份额。当前 batch 进入 NN 后最多准备一个后继 batch；同轮 collision 在该轮结束时取消 reservation。没有无界 prefetch 或多轮提前 gather。
+- 本实现使用连续 `Gather → Eval → NN → Eval → Backprop`：每个 Gather event 是一份 visit，PUCT 的 edge reservation 作为 pending visit（计入 started N）；当前实战还以 `μ=FPU` 暂入 action Q，完成或取消时精确归还。它不进入 completed Evidence 或 shared node Q。Eval 处理终局、cache、编码和输出解码；NN 只合并 tensor 并推理，空闲时立即执行当前队列可得请求。owner 将 in-flight owned event 限为两个 `MiniBatchSize`，而不是暴露独立 `MaxInFlight`。collision 直接取消 reservation。没有 multivisit、prefetch 或 tree-batch gather。
 
 ## 当前认识
 
@@ -70,7 +70,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 - repository 是一个 64 分片的 key-value map。普通 MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。真实 variation 第一次重复时，以该重复局面为根进入 `ContinuationTree`：其 key 纳入自最近零化着以来的规则 history，重复上下文内不换位合并，只复用按棋盘索引的 NN cache；Graph → Tree 的入口 edge 不绑定 contextual child。Tree 内吃子等零化 edge 的 child 立即回到普通 Graph，因此本回合已经展开的零化后子图可跨回合复用，但 Tree 先前的 N/Q 不迁移。第三次出现同一局面才由 `RuleJudge` 终局。首次绑定普通 shared edge 若 DFS 发现会形成 shared-Q 图环，则永久标为 topology-pruned 并从 PUCT 排除，不写 N/Q，也不伪装成棋规和棋。这是为保持 shared-Q 无环的 X7 结构近似，须由残局回归与 Elo 验证。
 - NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
-- Engine 直接常驻 Search×4、Eval×4、NN×1；UCI `Threads` 只在 Search/Eval 间近似平分，下一次 `go` 必要时重建 pool。Search worker 优先处理回传，空闲时才 gather；没有独立 Backprop worker。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、稀疏合批推理，并以整批 `EncodedBatch` 交回。
+- Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；UCI `Threads` 只在 Gather/Eval 间近似平分，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、稀疏合批推理，并以整批 `EncodedBatch` 交回；Backprop 回收 reservation 并更新图。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
   Engine 启动 job 时按固定中性的时间预算（历史上参考 px0 legacy stopper）转换为不可变 deadline，job drain 后才归还剩余时间。
 - graph reuse 只保留当前 root 可达图：确认走子后，旧 root 的 sibling 图由后台 mark/sweep 回收，UCI 可立即启动新
@@ -78,11 +78,11 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
   旧 sibling 子树。后台 GC 以 topology 写锁与 node 创建/edge 绑定同步，避免删掉刚由 transposition 接回的 node。
   当前不做 edge 入度引用计数：多父图下仍须维护解绑，且“从当前 root 可达”才是保留语义。无关 `position` 换图时，
   整个旧 repository 同样在后台逐 shard 释放。search owner 已输出最小 info 与一次 bestmove。
-- `MultiPV` 只在 search owner 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。每个 Search batch 分配至多 `MiniBatchSize` 份 logical visit；在每个已展开 node 连续执行 PUCT，并把该 node 收到的预算分给多个子边，未展开叶子才合并同一路径份额。batch-local PUCT 的 U 根号项使用 child 的 started N，故 pending reservation 同时表示父节点已分配预算；当前实战的 virtual mean 仅在 reservation 未完成时进入 action Q，完成后 Q 仍只来自 completed Evidence。同 batch collision 会在该 batch 结束时取消 reservation，不额外改变 completed `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCGS 的既定策略。一个物理 leaf 可以展开为多个 logical visit：它们共同决定 action N/Q，但根 LCB 单独记录物理 leaf observation，不能把同一次 NN 结果误当成多份独立证据。`MiniBatchSize` 限制一个 batch 的逻辑预算上限，`0` 使用 backend 建议值；实际 NN batch 可能因合并叶子、终局、缓存或 collision 小于该值。它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
+- `MultiPV` 只在 search owner 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。每个 Gather event 是一份 visit；pending reservation 同时表示 PUCT 已分配的预算，当前实战的 virtual mean 仅在 reservation 未完成时进入 action Q，完成后 Q 仍只来自 completed Evidence。collision 直接取消该 event，不额外改变 completed `N/Q`。`MiniBatchSize` 只限制 NN 一次合并的 tensor 数量，`0` 使用 backend 建议值；实际 NN batch 可能因终局、缓存、collision 或队列暂时不足更小。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
 stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 公式，不是 LC3 Policy 的正式公式，也不是 px0 搜索等价实现）。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.75 / 40000 / 4.0`。所有 node 共用一条对数 cPUCT 曲线，`C(0)=1.75`、`C(50k)≈5`，不维护根专用初值或参数。`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。
 
-根最终 Decision 额外使用最小 LCB：仅在非终局根候选的 completed N 达到 N 第一候选的 `15%` 后，按其 shared-Q 一、二阶矩计算 `LCB = Q - 5·标准误`；`LcbStdevs=0` 退回 N→Q→P。它不改变 PUCT、FPU、edge N、MCGS 回传或 worker。二阶矩按 shared child 的当前 Q² 与 path-local leaf 的 WDL² 递归重算；LCB 的样本量用 root edge 物理 leaf 的加权有效样本数 `N² / Σ(weight²)`，而不是 logical N，因此转置 evidence 或同一次 NN evaluation 展开的 K 个 logical visit 都不会伪装成独立 action evidence。该形状借鉴 KataGo `cpp/search/searchhelpers.cpp` 的 LCB 保守半径和最小访问筛选，但未移植其围棋 utility、weight 或 play-selection 机制。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
+根最终 Decision 额外使用最小 LCB：仅在非终局根候选的 completed N 达到 N 第一候选的 `15%` 后，按其 shared-Q 一、二阶矩计算 `LCB = Q - 5·标准误`；`LcbStdevs=0` 退回 N→Q→P。它不改变 PUCT、FPU、edge N、MCGS 回传或 worker。二阶矩按 shared child 的当前 Q² 与 path-local leaf 的 WDL² 递归重算；当前每次 NN leaf 恰好是一份 visit，故 LCB 的样本量直接使用 completed N。该形状借鉴 KataGo `cpp/search/searchhelpers.cpp` 的 LCB 保守半径和最小访问筛选，但未移植其围棋 utility、weight 或 play-selection 机制。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
 
 ## 模型
 

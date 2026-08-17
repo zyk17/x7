@@ -165,18 +165,6 @@ impl ValueDelta {
         }
     }
 
-    /// 同一个 NN / terminal 结果代表多个 logical visit 时的等权展开。
-    pub fn repeated(self, visits: u32) -> Self {
-        assert_eq!(self.visits, 1, "only a single sample can be repeated");
-        Self {
-            visits,
-            wl_sum: self.wl_sum * visits as f32,
-            wl_sq_sum: self.wl_sq_sum * visits as f32,
-            draw_sum: self.draw_sum * visits as f32,
-            m_sum: self.m_sum * visits as f32,
-        }
-    }
-
     pub fn q(self) -> f32 {
         if self.visits == 0 {
             0.0
@@ -207,11 +195,18 @@ pub(crate) fn visited_policy(repository: &NodeRepository, edges: &[Arc<Edge>]) -
 /// 严格属于 edge，不能读取 child N。
 pub(crate) fn edge_utility(repository: &NodeRepository, edge: &Edge, fpu: f32, use_virtual_mean: bool) -> f32 {
     let (stats, started_visits) = edge.selection_snapshot();
-    let completed_q = if stats.visits == 0 {
+    let shared_child_q = if stats.visits == 0 {
         edge.child_key()
             .and_then(|key| repository.get(key))
             .filter(|child| child.completed_visits() > 0)
-            .map_or(fpu, |child| child.q())
+            .map(|child| child.q())
+    } else {
+        None
+    };
+    let completed_q = if let Some(q) = shared_child_q {
+        q
+    } else if stats.visits == 0 {
+        fpu
     } else {
         let propagated = stats.visits.saturating_sub(stats.local_leaf.visits);
         if propagated == 0 {
@@ -223,7 +218,7 @@ pub(crate) fn edge_utility(repository: &NodeRepository, edge: &Edge, fpu: f32, u
         }
     };
     let in_flight = started_visits.saturating_sub(stats.visits);
-    if !use_virtual_mean || in_flight == 0 {
+    if !use_virtual_mean || in_flight == 0 || shared_child_q.is_some() {
         completed_q
     } else {
         (completed_q * stats.visits as f32 + stats.virtual_wl_sum) / (stats.visits + in_flight) as f32
@@ -438,7 +433,7 @@ mod tests {
         assert!((edge_utility(&repo, &edge, -0.3, true) - 0.8).abs() < 1e-6);
 
         let reservation = node
-            .reserve_edge_visits(0, 1, Some(-0.3))
+            .reserve_edge_with_virtual_mean(0, Some(-0.3))
             .expect("virtual mean reservation");
         assert!((edge_utility(&repo, &edge, -0.3, true) - 0.25).abs() < 1e-6);
         reservation.cancel();
@@ -447,6 +442,26 @@ mod tests {
         let stats = edge.stats();
         assert_eq!(stats.visits, 1);
         assert_eq!(stats.virtual_wl_sum, 0.0);
+    }
+
+    #[test]
+    fn virtual_mean_keeps_a_shared_child_value_when_the_edge_has_no_local_visit() {
+        let repo = NodeRepository::default();
+        let key = NodeKey::board(60);
+        let node = repo.get_or_insert(key);
+        assert!(node.try_begin_evaluation());
+        node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
+        let edge = node.edges()[0].clone();
+        let child_key = NodeKey::board(61);
+        edge.bind_child_key(child_key);
+        repo.get_or_insert(child_key).set_graph_value(ValueDelta::one(0.8, 0.0));
+        repo.recompute_graph_node(child_key);
+
+        let reservation = node
+            .reserve_edge_with_virtual_mean(0, Some(-0.3))
+            .expect("virtual mean reservation");
+        assert!((edge_utility(&repo, &edge, -0.3, true) - 0.8).abs() < 1e-6);
+        reservation.cancel();
     }
 
     #[test]

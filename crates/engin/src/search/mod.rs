@@ -5,10 +5,10 @@
 //! - <https://lczero.org/dev/lc0/search/lc3/policy/>
 //! - <https://lczero.org/dev/lc0/search/lc3/glossary/>
 //!
-//! 本模块拥有 MCGS 图与 worker 生命周期。相对早期 px0/Lc0 stream 基线，这里已有
-//! multivisit + 单轮 gather batch；当前实战还使用只在 pending reservation 期间生效的 FPU
-//! virtual mean，但没有 prefetch。选择公式历史上参考过 px0 PUCT / N-Q-P，默认参数与图统计
-//! 语义以本仓为准，不是 px0/LC3 等价实现。
+//! 本模块拥有 MCGS 图与连续的 Gather / Eval / NN / Backprop 生命周期。每个 Gather event
+//! 是一份 visit；当前实战使用只在 pending reservation 期间生效的 FPU virtual mean，
+//! 但没有 multivisit、prefetch 或 tree-batch gather。选择公式历史上参考过 px0 PUCT / N-Q-P，
+//! 默认参数与图统计语义以本仓为准，不是 px0/LC3 等价实现。
 
 use xiangqi_core::GameResult;
 

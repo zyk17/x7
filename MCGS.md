@@ -3,11 +3,11 @@
 本文件属于 `feat/mcgs` 分支，记录当前正式搜索 **stream Monte Carlo Graph Search（MCGS）**
 的设计边界。它不是 px0/LC3 的等价移植：worker 生命周期、统计回传与 visit 分配以本仓实现为准。
 
-相对早期 px0/Lc0 风格 stream 基线，本实现已有纯 virtual visit 的 multivisit 与固定两 batch
-gather 窗口：PUCT 使用 edge in-flight reservation 作为 virtual visit（计入 started N，偏转
-选择）；每个已展开 node 都重新按 PUCT 分配进入它的 pending visit，未展开叶子才合并同一路径
-份额。当前 batch 进入 NN 后最多准备一个后继 batch，同轮 collision 在该轮结束时取消 reservation；
-没有无界 prefetch 或多轮提前 gather。
+本实现使用连续 `Gather → Eval → NN → Eval → Backprop`：PUCT 使用 edge in-flight
+reservation 作为 virtual visit（计入 started N，偏转选择）；每个 Gather event 是一份
+visit，collision 直接取消 reservation。Eval 持续向 NN 提交已编码 tensor；NN 空闲时立即处理当前
+队列可得请求，不等待逻辑搜索轮次。owner 将 in-flight owned event 限为两个 `MiniBatchSize`，防止
+无界使用过时统计。没有 multivisit、prefetch 或 tree-batch gather。
 
 ## 目标
 
@@ -32,9 +32,8 @@ table：repository 就是唯一的 node store。完整历史不属于 GraphKey�
   <https://lczero.org/dev/lc0/search/lc3/overview/>。
 - LC3 Search Policy, `MakeNodeKey`、`DistributeVisits`、`MakeEdgeDelta` 与
   `UpdateNodeAggregate`
-  <https://lczero.org/dev/lc0/search/lc3/policy/>。本仓未移植其 policy 公式；multivisit
-  在每个 node 直接逐份执行 batch-local PUCT，再按相同 child 合并叶子预算，不采用
-  best/second-best 的跳跃近似。
+  <https://lczero.org/dev/lc0/search/lc3/policy/>。本仓未移植其 policy 公式或
+  `DistributeVisits`；每个 event 只做一次 PUCT selection。
 - 本地 Lc0 `src/search/dag_classic/node.h:614,957-959`：共享 low node 与弱引用表仅作
   DAG 语义参考；不移植 classic worker/GC 结构。
 - 本地 px0 `src/search/dag_classic/{node.h,search.cc}`：理解数据布局与回传的历史参考，
@@ -99,9 +98,9 @@ parent 暂时落后，但不会永久落后，且避免了向所有 ancestor 广
 
 根选边默认以 root edge 的 `N(root,a)` 排名。node `Q(root)` 是 root posterior policy 的局面估值；两者
 都需要，但不能互相替代。当前 X7 在最终 Decision 额外允许 root LCB：仅让 completed N 达到 N 第一候选
-`15%` 的非终局 edge 参与，按 `Q - 5·标准误` 选最保守候选。其二阶矩遵循 node 的幂等重算；样本量只来自该
-edge 的物理 leaf，并以 `N² / Σ(weight²)` 计算 batch 权重下的有效样本数。这样转置 child 的总 N、或同一次
-NN evaluation 展开的 K 个 logical visit，都不会伪装成 K 份独立 action Evidence。LCB 不进入 PUCT 或回传。
+`15%` 的非终局 edge 参与，按 `Q - 5·标准误` 选最保守候选。其二阶矩遵循 node 的幂等重算；当前每次
+NN evaluation 恰好完成一份 edge visit，样本量直接使用 completed N。转置 child 的总 N 不会伪装成该 action
+的 Evidence。LCB 不进入 PUCT 或回传。
 
 ### 更新方式选择
 

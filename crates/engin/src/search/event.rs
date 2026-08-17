@@ -104,9 +104,6 @@ pub struct NodeEvent {
     tree_entries: Vec<(usize, NodeKey)>,
     pub variation: Variation,
     pub reservations: Vec<EdgeReservation>,
-    /// 这条叶子代表的已分配 visit 数。Gather 只在一个未展开叶子前合并同一路径；
-    /// 每个已展开节点都会重新按 PUCT 把预算分给它的子边。
-    pub logical_visits: u32,
     #[cfg(feature = "benchmark")]
     queued_at: Option<Instant>,
 }
@@ -124,75 +121,17 @@ impl NodeEvent {
             tree_entries: Vec::new(),
             variation: Variation::root(root_history),
             reservations: Vec::new(),
-            logical_visits: 1,
             #[cfg(feature = "benchmark")]
             queued_at: None,
         }
     }
 
-    pub(crate) fn at_root_with_visits(
-        generation: u64,
-        root_key: NodeKey,
-        root_history: Arc<PositionHistory>,
-        logical_visits: u32,
-    ) -> Self {
-        Self {
-            logical_visits,
-            ..Self::at_root(generation, root_key, root_history)
-        }
-    }
-
     pub fn descend(mut self, child_key: NodeKey, reservation: EdgeReservation) -> Self {
-        assert_eq!(
-            reservation.visits(),
-            self.logical_visits,
-            "reservation weight must match child budget"
-        );
         self.variation.push(reservation.mv());
         self.node_key = child_key;
         self.node_path.push(child_key);
         self.reservations.push(reservation);
         self
-    }
-
-    /// 已展开节点把本 event 的预算分给多个 child 前，先同步切分整条已有路径的
-    /// reservation。这样每一条 edge 最终完成的 N 等于其所有后继叶子的份额之和。
-    pub(crate) fn split(self, weights: &[u32]) -> Vec<Self> {
-        assert!(!weights.is_empty());
-        assert_eq!(
-            weights.iter().sum::<u32>(),
-            self.logical_visits,
-            "event split must preserve visits"
-        );
-        let Self {
-            generation,
-            node_key,
-            node_path,
-            tree_entries,
-            variation,
-            reservations,
-            ..
-        } = self;
-        let mut children: Vec<_> = weights
-            .iter()
-            .map(|&logical_visits| Self {
-                generation,
-                node_key,
-                node_path: node_path.clone(),
-                tree_entries: tree_entries.clone(),
-                variation: variation.clone(),
-                reservations: Vec::new(),
-                logical_visits,
-                #[cfg(feature = "benchmark")]
-                queued_at: None,
-            })
-            .collect();
-        for reservation in reservations {
-            for (child, part) in children.iter_mut().zip(reservation.split(weights)) {
-                child.reservations.push(part);
-            }
-        }
-        children
     }
 
     /// 若走后会形成棋规认可的第一次重复，返回对应 TreeNode key。
@@ -222,11 +161,6 @@ impl NodeEvent {
     /// variation 下可通向不同的规则上下文；Tree root 仍按其 key 在 repository 复用。
     pub fn descend_continuation(mut self, child_key: NodeKey, reservation: EdgeReservation) -> Self {
         assert!(child_key.is_continuation(), "continuation entry must target a TreeNode");
-        assert_eq!(
-            reservation.visits(),
-            self.logical_visits,
-            "reservation weight must match child budget"
-        );
         self.tree_entries.push((self.reservations.len(), child_key));
         self.variation.push(reservation.mv());
         self.node_key = child_key;
@@ -289,8 +223,6 @@ pub struct BackpropEvent {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackpropResult {
     pub completed_playouts: u32,
-    /// 真实 event 数；in-flight 生命周期必须按它回收，不能按 multivisit 后的 N 回收。
-    pub completed_events: u32,
     /// 已完成叶子深度之和，root 记为深度一。语义参考自 `cum_depth_` 的计数方式
     /// （`search.cc:2157-2167`）。
     pub completed_depth: u64,
@@ -316,8 +248,7 @@ impl BackpropEvent {
         }
     }
 
-    /// 经 Backprop worker 使用的聚合路径完成 event。一个未展开叶子可代表多个
-    /// 已分配 visit；它之前的每个已展开节点都已独立完成过 PUCT 分配。
+    /// 经 Backprop worker 完成一批独立 event。
     ///
     /// LC3 Overview, "BackpropWorker":
     /// <https://lczero.org/dev/lc0/search/lc3/overview/>.
@@ -329,7 +260,6 @@ impl BackpropEvent {
 
         for event in events {
             let Self { node, local_leaf, .. } = event;
-            let logical_visits = node.logical_visits;
             let expected_nodes = node.reservations.len() + usize::from(local_leaf.is_none());
             debug_assert_eq!(
                 node.node_path.len(),
@@ -346,7 +276,7 @@ impl BackpropEvent {
                 }
                 let reservation = reservations[index].take().expect("one reservation");
                 if let Some(value) = local_leaf.take() {
-                    reservation.complete_local_leaf(value.repeated(logical_visits));
+                    reservation.complete_local_leaf(value);
                 } else {
                     reservation.complete();
                 }
@@ -359,7 +289,7 @@ impl BackpropEvent {
                     // ContinuationTree 根本身就是 path terminal（例如重复正好触发
                     // rule60）时，它已被 `discard_leaf_node` 移出 node_path，不能读
                     // 未展开 node 的默认值；直接把本次规则裁决写入 entry edge。
-                    entry.complete_local_leaf(value.repeated(logical_visits));
+                    entry.complete_local_leaf(value);
                 } else {
                     for node_key in node.node_path[index + 1..].iter().rev() {
                         repository.recompute_graph_node(*node_key);
@@ -367,9 +297,7 @@ impl BackpropEvent {
                     }
                     let child = repository.get(root).expect("continuation root");
                     let (wl, draw, plies_left) = child.value_snapshot();
-                    entry.complete_local_leaf(
-                        ValueDelta::with_plies_left(wl, draw, plies_left).repeated(logical_visits),
-                    );
+                    entry.complete_local_leaf(ValueDelta::with_plies_left(wl, draw, plies_left));
                 }
             }
             // KataGo GraphSearch 的 idempotent 回传：只重算本 variation 上已实际经过的
@@ -382,9 +310,8 @@ impl BackpropEvent {
                     repository.prove_terminal(node_key);
                 }
             }
-            result.completed_playouts += logical_visits;
-            result.completed_events += 1;
-            result.completed_depth += depth * logical_visits as u64;
+            result.completed_playouts += 1;
+            result.completed_depth += depth;
             result.max_depth = result.max_depth.max(depth);
         }
 

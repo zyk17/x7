@@ -141,14 +141,8 @@ pub struct Edge {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EdgeStats {
-    /// 已完成的 logical visit。它决定 PUCT 的 N 与 action Q 的权重。
+    /// 已完成 visit。它决定 PUCT 的 N 与 action Q 的权重。
     pub visits: u32,
-    /// 实际完成的 leaf event 数。一个 batch leaf 可代表多个 logical visit；因此它
-    /// 不能由 `visits` 推导。根 LCB 用它避免把同一次 NN 结果当成独立证据。
-    pub observations: u32,
-    /// 每个物理 leaf 的 logical 权重平方和。LCB 用它计算加权 observation 的有效
-    /// 样本量：`visits² / Σ(weight²)`。
-    pub observation_weight_sq_sum: u64,
     pub local_leaf: ValueDelta,
     /// 尚未完成的 virtual mean 之和；in-flight 数直接由 `started - visits` 推导。
     pub virtual_wl_sum: f32,
@@ -206,30 +200,25 @@ impl Edge {
         self.started.load(Ordering::Acquire).saturating_sub(completed)
     }
 
-    pub(crate) fn reserve(self: &Arc<Self>, visits: u32, virtual_mean: Option<f32>) -> EdgeReservation {
-        assert!(visits > 0, "edge reservation must have positive weight");
-        let virtual_wl_sum = virtual_mean.unwrap_or(0.0) * visits as f32;
+    pub(crate) fn reserve(self: &Arc<Self>, virtual_mean: Option<f32>) -> EdgeReservation {
+        let virtual_wl_sum = virtual_mean.unwrap_or(0.0);
         let mut completed = self.completed.lock();
-        self.started.fetch_add(visits, Ordering::AcqRel);
+        self.started.fetch_add(1, Ordering::AcqRel);
         completed.virtual_wl_sum += virtual_wl_sum;
         EdgeReservation {
             edge: Arc::clone(self),
-            visits,
             virtual_wl_sum,
         }
     }
 
-    fn cancel(&self, visits: u32, virtual_wl_sum: f32) {
+    fn cancel(&self, virtual_wl_sum: f32) {
         // `complete` 也持有此锁。必须在同一临界区内检查并减少 `started`，否则
         // complete 可在检查与 CAS 之间增加 completed，破坏 started >= completed。
         let mut completed = self.completed.lock();
         let started = self.started.load(Ordering::Acquire);
-        assert!(
-            started.saturating_sub(completed.visits) >= visits,
-            "stream edge reservation underflow"
-        );
+        assert!(started > completed.visits, "stream edge reservation underflow");
         completed.virtual_wl_sum -= virtual_wl_sum;
-        let started = self.started.fetch_sub(visits, Ordering::AcqRel) - visits;
+        let started = self.started.fetch_sub(1, Ordering::AcqRel) - 1;
         if started == completed.visits {
             completed.virtual_wl_sum = 0.0;
         }
@@ -250,26 +239,19 @@ impl Edge {
         }
     }
 
-    fn complete(&self, visits: u32, virtual_wl_sum: f32, local_leaf: Option<ValueDelta>) {
+    fn complete(&self, virtual_wl_sum: f32, local_leaf: Option<ValueDelta>) {
         let mut completed = self.completed.lock();
         assert!(
-            self.started.load(Ordering::Acquire).saturating_sub(completed.visits) >= visits,
+            self.started.load(Ordering::Acquire) > completed.visits,
             "stream edge completion without reservation"
         );
         completed.virtual_wl_sum -= virtual_wl_sum;
-        completed.visits += visits;
+        completed.visits += 1;
         if self.started.load(Ordering::Acquire) == completed.visits {
             completed.virtual_wl_sum = 0.0;
         }
-        // 一个 BackpropEvent 对应一个真正到达的 leaf；即使它把一个未展开叶子的
-        // NN 结果展开为 K 个 logical visit，也仍只有一份独立 Evidence。
-        completed.observations += 1;
-        let weight = u64::from(visits);
-        completed.observation_weight_sq_sum = completed
-            .observation_weight_sq_sum
-            .saturating_add(weight.saturating_mul(weight));
         if let Some(value) = local_leaf {
-            assert_eq!(value.visits, visits, "local leaf must match reservation weight");
+            assert_eq!(value.visits, 1, "one reservation completes one leaf");
             completed.local_leaf = completed.local_leaf.merge(value);
         }
     }
@@ -280,7 +262,6 @@ impl Edge {
 #[derive(Debug)]
 pub struct EdgeReservation {
     edge: Arc<Edge>,
-    visits: u32,
     virtual_wl_sum: f32,
 }
 
@@ -290,60 +271,20 @@ impl EdgeReservation {
     }
 
     pub fn complete(self) {
-        self.edge.complete(self.visits, self.virtual_wl_sum, None);
-    }
-
-    /// 将已保留的 visit 预算交给多个后继 event。它不改动 edge 的 started N；各份
-    /// reservation 之后各自 complete/cancel，合计恰好消费原来的 reservation。
-    pub(crate) fn split(self, weights: &[u32]) -> Vec<Self> {
-        assert_eq!(
-            weights.iter().sum::<u32>(),
-            self.visits,
-            "reservation split must preserve visits"
-        );
-        weights
-            .iter()
-            .map(|&visits| Self {
-                edge: Arc::clone(&self.edge),
-                visits,
-                virtual_wl_sum: self.virtual_wl_sum * visits as f32 / self.visits as f32,
-            })
-            .collect()
-    }
-
-    pub(crate) fn merge(parts: Vec<Self>) -> Self {
-        assert!(!parts.is_empty(), "reservation merge requires a part");
-        let edge = Arc::clone(&parts[0].edge);
-        let visits = parts
-            .iter()
-            .map(|part| {
-                assert!(Arc::ptr_eq(&edge, &part.edge), "only one edge can be merged");
-                part.visits
-            })
-            .sum();
-        let virtual_wl_sum = parts.iter().map(|part| part.virtual_wl_sum).sum();
-        Self {
-            edge,
-            visits,
-            virtual_wl_sum,
-        }
-    }
-
-    pub(crate) fn visits(&self) -> u32 {
-        self.visits
+        self.edge.complete(self.virtual_wl_sum, None);
     }
 
     pub(crate) fn complete_local_leaf(self, value: ValueDelta) {
-        self.edge.complete(self.visits, self.virtual_wl_sum, Some(value));
+        self.edge.complete(self.virtual_wl_sum, Some(value));
     }
 
     pub fn cancel(self) {
-        self.edge.cancel(self.visits, self.virtual_wl_sum);
+        self.edge.cancel(self.virtual_wl_sum);
     }
 
     #[cfg(test)]
     pub(crate) fn test_only(mv: Move) -> Self {
-        Arc::new(Edge::new(mv, 1.0)).reserve(1, None)
+        Arc::new(Edge::new(mv, 1.0)).reserve(None)
     }
 }
 
@@ -376,7 +317,7 @@ pub struct Node {
 }
 
 impl Node {
-    /// 节点首次 Prediction 也要带 multivisit 权重，保证后续 shared-Q 重算的 base N
+    /// 节点首次 Prediction 以一份 visit 保存，保证后续 shared-Q 重算的 base N
     /// 与入边 completed N 一致。
     pub(crate) fn set_graph_value(&self, value: ValueDelta) {
         assert!(value.visits > 0, "graph node base value must have positive weight");
@@ -485,18 +426,6 @@ impl Node {
         self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
     }
 
-    pub(crate) fn set_terminal_value_weighted(&self, wl: f32, draw: f32, plies_left: f32, visits: u32) {
-        assert_eq!(
-            self.expansion_state(),
-            ExpansionState::Evaluating,
-            "node must be evaluating"
-        );
-        *self.terminal.lock() = Some((wl, draw, plies_left));
-        self.set_graph_value(ValueDelta::with_plies_left(wl, draw, plies_left).repeated(visits));
-        self.set_terminal_stats(wl, draw, plies_left, visits);
-        self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
-    }
-
     fn set_terminal_stats(&self, wl: f32, draw: f32, plies_left: f32, visits: u32) {
         let mut stats = self.stats.lock();
         stats.visits = visits;
@@ -546,19 +475,15 @@ impl Node {
     }
 
     pub fn reserve_edge(&self, edge_index: usize) -> Option<EdgeReservation> {
-        self.reserve_edge_visits(edge_index, 1, None)
+        self.reserve_edge_with_virtual_mean(edge_index, None)
     }
 
-    /// Gather 的一组 logical visit 已在此 edge 上预占；只在分裂/终局合并时使用。
-    pub(crate) fn reserve_edge_visits(
+    pub(crate) fn reserve_edge_with_virtual_mean(
         &self,
         edge_index: usize,
-        visits: u32,
         virtual_mean: Option<f32>,
     ) -> Option<EdgeReservation> {
-        self.edges()
-            .get(edge_index)
-            .map(|edge| edge.reserve(visits, virtual_mean))
+        self.edges().get(edge_index).map(|edge| edge.reserve(virtual_mean))
     }
 }
 
@@ -1169,7 +1094,7 @@ mod repository_tests {
 
     use xiangqi_core::{Move, Square};
 
-    use super::{ChildLink, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository};
+    use super::{ChildLink, ExpansionState, NodeKey, NodeRepository};
     use crate::search::ValueDelta;
 
     fn b2_b3() -> Move {
@@ -1313,26 +1238,6 @@ mod repository_tests {
     }
 
     #[test]
-    fn split_virtual_mean_is_fully_removed_on_completion() {
-        let root = NodeRepository::default().get_or_insert(NodeKey::board(322));
-        assert!(root.try_begin_evaluation());
-        root.publish_edges(vec![(b2_b3(), 1.0)]);
-        let parts = root
-            .reserve_edge_visits(0, 4, Some(-0.25))
-            .expect("virtual mean reservation")
-            .split(&[1, 3]);
-        let reservation = EdgeReservation::merge(parts);
-        let edge = &root.edges()[0];
-        assert!((edge.stats().virtual_wl_sum + 1.0).abs() < f32::EPSILON);
-
-        reservation.complete();
-
-        let stats = edge.stats();
-        assert_eq!(stats.visits, 4);
-        assert_eq!(stats.virtual_wl_sum, 0.0);
-    }
-
-    #[test]
     // LC3 Overview 的 owned event 约束：每个 reservation 只能完成或取消一次。
     fn concurrent_complete_and_cancel_keep_reservation_balanced() {
         for _ in 0..128 {
@@ -1360,23 +1265,6 @@ mod repository_tests {
             assert_eq!(root.edges()[0].visits(), 1);
             assert_eq!(root.edges()[0].completed_visits(), 1);
         }
-    }
-
-    #[test]
-    fn split_reservation_preserves_the_parent_visit_budget() {
-        let node = Arc::new(Node::default());
-        assert!(node.try_begin_evaluation());
-        node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
-        node.publish_edges(vec![(b2_b3(), 1.0)]);
-
-        let parts = node
-            .reserve_edge_visits(0, 4, None)
-            .expect("weighted reservation")
-            .split(&[1, 3]);
-        assert_eq!(node.edges()[0].visits(), 4);
-        parts.into_iter().for_each(|part| part.complete());
-        assert_eq!(node.edges()[0].completed_visits(), 4);
-        assert_eq!(node.edges()[0].in_flight_visits(), 0);
     }
 
     #[test]

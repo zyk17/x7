@@ -236,18 +236,17 @@ fn print_root_candidates(search: &Search, root_is_black: bool, top: usize) {
             .then_with(|| right.prior.total_cmp(&left.prior))
     });
     println!(
-        "    root candidates top {}/{}: move       P    done    obs flight       Q",
+        "    root candidates top {}/{}: move       P    done flight       Q",
         edges.len().min(top),
         edges.len()
     );
     for edge in edges.into_iter().take(top) {
         let mv = if root_is_black { edge.mv.flip() } else { edge.mv };
         println!(
-            "                       {:<6} {:>7.4} {:>7} {:>6} {:>6} {:>7.4}",
+            "                       {:<6} {:>7.4} {:>7} {:>6} {:>7.4}",
             mv.to_uci(),
             edge.prior,
             edge.completed_visits,
-            edge.observations,
             edge.started_visits.saturating_sub(edge.completed_visits),
             edge.q
         );
@@ -279,7 +278,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         positions.len(),
     );
     println!(
-        "note: each run has a fresh graph; --warm-cache alone reuses one NN cache between repeats; nps/done are logical visits, eps/leaf_events are physical work; hit is normal cache hits; q_* is average queue delay in us"
+        "note: each run has a fresh graph; --warm-cache alone reuses one NN cache between repeats; nps/done are completed visits, eps/leaf_events are NN work; hit is normal cache hits; q_* is average queue delay in us"
     );
     println!("  G   E run       ms      nps      eps    done    hit  coll%    peak  root%    q_g    q_e    q_n");
     let mut generation = 0;

@@ -248,18 +248,17 @@ fn print_roots(search: &Search, root_is_black: bool, top: usize, tracked: &[Stri
         return;
     };
     println!(
-        "    root candidates top {}/{}: move       P    done  obs flight       Q",
+        "    root candidates top {}/{}: move       P    done flight       Q",
         edges.len().min(top),
         edges.len()
     );
     for edge in edges.iter().take(top) {
         let mv = if root_is_black { edge.mv.flip() } else { edge.mv };
         println!(
-            "                       {:<6} {:>7.4} {:>7} {:>4} {:>6} {:>7.4}",
+            "                       {:<6} {:>7.4} {:>7} {:>6} {:>7.4}",
             mv.to_uci(),
             edge.prior,
             edge.completed_visits,
-            edge.observations,
             edge.started_visits.saturating_sub(edge.completed_visits),
             edge.q,
         );
@@ -267,7 +266,7 @@ fn print_roots(search: &Search, root_is_black: bool, top: usize, tracked: &[Stri
     if tracked.is_empty() {
         return;
     }
-    println!("    tracked root moves: move  rank       P    done  obs flight       Q");
+    println!("    tracked root moves: move  rank       P    done flight       Q");
     for move_text in tracked {
         let found = edges.iter().enumerate().find(|(_, edge)| {
             let mv = if root_is_black { edge.mv.flip() } else { edge.mv };
@@ -275,12 +274,11 @@ fn print_roots(search: &Search, root_is_black: bool, top: usize, tracked: &[Stri
         });
         match found {
             Some((rank, edge)) => println!(
-                "                       {:<6} {:>5} {:>7.4} {:>7} {:>4} {:>6} {:>7.4}",
+                "                       {:<6} {:>5} {:>7.4} {:>7} {:>6} {:>7.4}",
                 move_text,
                 rank + 1,
                 edge.prior,
                 edge.completed_visits,
-                edge.observations,
                 edge.started_visits.saturating_sub(edge.completed_visits),
                 edge.q,
             ),

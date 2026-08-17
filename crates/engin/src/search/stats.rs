@@ -8,13 +8,11 @@ use xiangqi_core::{Move, PositionHistory};
 
 use super::{Edge, ExpansionState, Node, NodeKey, NodeRepository, SearchParams};
 
-/// 一个 root edge 快照。`started_visits` 包含 in-flight；Q 只使用 completed 值；
-/// `observations` 是完成的物理 leaf event 数。
+/// 一个 root edge 快照。`started_visits` 包含 in-flight；Q 只使用 completed 值。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RootEdgeStats {
     pub mv: Move,
     pub completed_visits: u32,
-    pub observations: u32,
     pub started_visits: u32,
     pub q: f32,
     pub prior: f32,
@@ -52,7 +50,6 @@ pub fn root_stats(repository: &NodeRepository, root_key: NodeKey) -> Option<Root
             .map(|edge| RootEdgeStats {
                 mv: edge.mv(),
                 completed_visits: edge.completed_visits(),
-                observations: edge.stats().observations,
                 started_visits: edge.visits(),
                 q: edge_value(repository, edge),
                 prior: edge.prior(),
@@ -77,8 +74,8 @@ fn edge_value(repository: &NodeRepository, edge: &Edge) -> f32 {
 }
 
 /// root edge 当前 action value 的一、二阶矩。shared child 的二阶矩遵循与 Q 相同的
-/// MCGS 幂等重算；第三、四个返回值分别是 logical N 与物理 leaf 权重平方和。
-fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32, u32, u64)> {
+/// MCGS 幂等重算；第三个返回值是 completed N。
+fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32, u32)> {
     let stats = edge.stats();
     if stats.visits == 0 {
         return None;
@@ -96,19 +93,16 @@ fn edge_q_moments(repository: &NodeRepository, edge: &Edge) -> Option<(f32, f32,
         (stats.local_leaf.wl_sum + child_q * propagated as f32) / visits,
         (stats.local_leaf.wl_sq_sum + child_q_sq * propagated as f32) / visits,
         stats.visits,
-        stats.observation_weight_sq_sum,
     ))
 }
 
-/// X7 的最小 root LCB：以 edge 的实际完成次数为样本量，并对极小样本加入有界
+/// X7 的最小 root LCB：以 edge 的 completed N 为样本量，并对极小样本加入有界
 /// utility 方差先验。形状参考 KataGo
 /// `cpp/search/searchhelpers.cpp::getSelfUtilityLCBAndRadius`，但不复制其围棋 utility、
 /// 权重或 play-selection 机制。
 fn edge_standard_error(repository: &NodeRepository, edge: &Edge) -> Option<f32> {
-    let (q, q_sq, visits, observation_weight_sq_sum) = edge_q_moments(repository, edge)?;
-    // Q 的权重仍是 logical N；LCB 的样本量改用加权 observation 的有效样本数。
-    // 单个 K-visit leaf 的有效样本量仍为 1；普通逐 leaf 回传时恰好退化为 N。
-    let effective_samples = ((visits as f64).powi(2) / observation_weight_sq_sum.max(1) as f64).max(1.0) as f32;
+    let (q, q_sq, visits) = edge_q_moments(repository, edge)?;
+    let effective_samples = visits.max(1) as f32;
     let prior_weight = 1.0 / (effective_samples * effective_samples);
     let adjusted_sq =
         (q_sq * effective_samples + (q_sq.max(q * q) + 1.0) * prior_weight) / (effective_samples + prior_weight);
@@ -118,7 +112,7 @@ fn edge_standard_error(repository: &NodeRepository, edge: &Edge) -> Option<f32> 
 }
 
 fn edge_lcb(repository: &NodeRepository, edge: &Edge, stdevs: f32) -> Option<f32> {
-    let (q, _, _, _) = edge_q_moments(repository, edge)?;
+    let (q, _, _) = edge_q_moments(repository, edge)?;
     let standard_error = edge_standard_error(repository, edge)?;
     Some(q - stdevs * standard_error)
 }
@@ -689,10 +683,6 @@ mod tests {
     use crate::neural::backend::UniformBackend;
     use crate::search::{NodeKey, NodeRepository, Search, SearchConfig, SearchParams, ValueDelta};
 
-    fn mv(from: &str, to: &str) -> Move {
-        Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
-    }
-
     #[test]
     fn root_snapshot_reports_completed_and_in_flight_visits_separately() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
@@ -858,31 +848,6 @@ mod tests {
             best_move_filtered_with_params(&repo, root_key, false, &[], &SearchParams::default()),
             Some(stable),
             "LCB uses wl_sq_sum to prefer the lower-variance action"
-        );
-    }
-
-    #[test]
-    fn root_lcb_does_not_count_one_batched_leaf_as_many_observations() {
-        let repo = NodeRepository::default();
-        let root_key = NodeKey::board(125);
-        let root = repo.get_or_insert(root_key);
-        assert!(root.try_begin_evaluation());
-        root.publish_edges(vec![(mv("a0", "a1"), 0.5), (mv("b0", "b1"), 0.5)]);
-        let edges = root.edges();
-
-        root.reserve_edge_visits(0, 10, None)
-            .expect("batched reservation")
-            .complete_local_leaf(ValueDelta::one(0.2, 0.0).repeated(10));
-        for _ in 0..10 {
-            root.reserve_edge(1)
-                .expect("independent reservation")
-                .complete_local_leaf(ValueDelta::one(0.2, 0.0));
-        }
-
-        assert_eq!(edges[0].completed_visits(), edges[1].completed_visits());
-        assert!(
-            edge_lcb(&repo, &edges[0], 5.0) < edge_lcb(&repo, &edges[1], 5.0),
-            "one repeated NN result must retain a wider confidence radius than ten leaf events"
         );
     }
 
