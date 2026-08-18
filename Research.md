@@ -6,6 +6,7 @@
 当前正式搜索是独立的 X7 stream MCGS，不是 px0 等价实现。下列实验说明：cache-only
 prefetch，以及“碰撞时额外保留 reservation”的最小 virtual visit 变体未被保留；正式搜索仍保留
 真实异步 playout 的 in-flight reservation 作为 virtual visit（计入 edge started N）。
+batch-budget multivisit 已决定不采用，见 2026-08-17。
 
 ## 2026-08-03：cache-only prefetch 与最小 virtual visit
 
@@ -67,6 +68,15 @@ reservation：它计入 edge started N（PUCT virtual visit），并保证每条
 
 - 这不是“深窄局面不需要更大 batch”的结论；它只说明当前两种补 batch 方法没有证明价值。
 - 单次 1 秒 fresh-tree 对比不能代替固定时间 Elo、自对弈或带外部锚点的候选质量测试。
-- 如果以后有明确的 batch-local multivisit 语义、wave gather，或 collision 时可执行的 CPU Proof
-  工作，应作为新假设重新设计和独立验证，而不是恢复本次实现。
+- 如果以后有 wave gather，或 collision 时可执行的 CPU Proof 工作，应作为新假设重新设计和独立
+  验证，而不是恢复本次 prefetch 实现。batch-budget multivisit 已否决，见下节。
+
+## 2026-08-17：不采用 batch-budget multivisit
+
+classic lc0 的 collision/terminal multivisit 是一次评估按 K 次 visit 加权回传，用来填 batch、
+补偿纯 virtual visit 分流弱。X7 不采用：
+
+1. Gather 每次采集一个叶子，不是一批；GPU 合批在 NN 队列完成。
+2. 实战 `μ=FPU` virtual mean 已比纯 virtual visit 更明显且更温和。一次打入 K 份 FPU 会破坏
+   这份分流，让 select 更不可靠。后续若研究分流，改 virtual mean / virtual visit，不加 K。
 

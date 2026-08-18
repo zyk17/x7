@@ -31,12 +31,6 @@ pub enum NodeKey {
     TreeNode { board_hash: u64, rule_context_hash: u64 },
 }
 
-impl Default for NodeKey {
-    fn default() -> Self {
-        Self::GraphNode { board_hash: 0 }
-    }
-}
-
 impl Hash for NodeKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.storage_hash());
@@ -48,12 +42,12 @@ impl IsEnabled for NodeKey {}
 
 impl NodeKey {
     /// MCGS 的共享 state identity：只由当前棋盘（含行棋方）决定。
-    pub const fn board(board_hash: u64) -> Self {
+    pub const fn graph_node(board_hash: u64) -> Self {
         Self::GraphNode { board_hash }
     }
 
     /// 图闭环处的纯树形续搜 node。相同棋盘但规则 history 不同，不共享 N/Q。
-    pub fn continuation(board_hash: u64, context: u64) -> Self {
+    pub fn tree_node(board_hash: u64, context: u64) -> Self {
         Self::TreeNode {
             board_hash,
             rule_context_hash: context,
@@ -68,9 +62,9 @@ impl NodeKey {
     pub fn for_history(history: &PositionHistory) -> Self {
         let board_hash = history.last().board().hash();
         if history.did_repeat_since_last_zeroing_move() {
-            Self::continuation(board_hash, history.rule_context_hash())
+            Self::tree_node(board_hash, history.rule_context_hash())
         } else {
-            Self::board(board_hash)
+            Self::graph_node(board_hash)
         }
     }
 
@@ -112,31 +106,25 @@ impl ExpansionState {
     }
 }
 
-/// child edge。in-flight visit 保存在入边，绝不计入 child node 的 completed visit，
-/// 对齐 LC3 的 node 不变量。
+/// child edge。in-flight visit 保存在入边，不计入 child node 的 completed visit，
 #[derive(Debug)]
 pub struct Edge {
     mv: Move,
-    /// 已绑定的 child state。普通 Graph edge 与 Tree 的零化 edge 都可永久绑定；
-    /// Graph → Tree 入口因 child context 取决于本次 variation，刻意保持未绑定。
+    /// 图与树的根, 由于 variation 可能不同, 所以逻辑连接, 不绑定该值.
+    /// 其他的图节点与图节点, 树节点与树节点, 树节点连接图节点(零化后) 正常绑定
     child_key: OnceLock<NodeKey>,
-    /// 若接入 child 会闭合 shared-Q 图环，此合法着不参与本 graph 的 PUCT。它不是
-    /// 规则裁决；真实 variation 重复由 ContinuationTree 继续搜索。
+    /// A -> B -> ... -> D
+    /// A -> C -> ... -> D 在这条路径D遇到B不连接回去; 不参与本 graph 的 PUCT
+    /// 拓扑剪枝, 可能会导致搜索对 move_left 不稳定;
+    /// 通常不会造成棋力影响, 需要更多测试 (目前可显著减少复杂度)
     topology_pruned: OnceLock<()>,
-    /// policy prior 在 node 发布后不再变化；普通不可变 `f32` 即可安全地被所有
-    /// Gather worker 读取，不需要为 PUCT 热路径使用原子加载。
+    /// policy prior 在 node 创建后后不再变化；
     prior: f32,
     started: AtomicU32,
-    /// 已完成访问和其中 variation-local 终局的实际样本。
-    ///
-    /// 同一 board edge 可由不同 history 到达。重复、连将/追击与 rule60 的裁决不能
-    /// first-writer-wins；每次命中的路径终局只计入自己的这一次 edge visit。
-    /// 参考 KataGo `docs/GraphSearch.md` 的 edge-local action statistic。
-    ///
-    /// 受保护的聚合值：必须同时读取 completed N 与 local leaf 样本。
-    /// 与 `started` 协同维护 `started >= completed`。`complete` 与 `cancel` 必须在
-    /// 同一把锁下先检查、再修改，不能拆成独立原子计数。
-    completed: Mutex<EdgeStats>,
+    /// 这条边自己的 N/Q：已完成次数、这条路径上遇到的终局，以及还在飞的 virtual mean。
+    /// 同一棋盘边可能从不同历史走到；重复/长将/rule60 只记在这次 visit 上，不覆盖别人。
+    /// 选边要一起读这些量，所以放同一把锁。`started` 至少不小于已完成 N。
+    stats: Mutex<EdgeStats>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -157,7 +145,7 @@ impl Edge {
             topology_pruned: OnceLock::new(),
             prior,
             started: AtomicU32::new(0),
-            completed: Mutex::new(EdgeStats::default()),
+            stats: Mutex::new(EdgeStats::default()),
         }
     }
 
@@ -169,59 +157,31 @@ impl Edge {
         self.prior
     }
 
-    /// LC3 edge N 包含 in-flight visit。GPU 评估未返回时，另存 completed N 才能形成
-    /// 稳定的 Q。
+    /// edge N 包含 in-flight visit。
     pub fn visits(&self) -> u32 {
         self.started.load(Ordering::Acquire)
     }
 
     pub fn completed_visits(&self) -> u32 {
-        self.completed.lock().visits
-    }
-
-    pub(crate) fn stats(&self) -> EdgeStats {
-        *self.completed.lock()
-    }
-
-    /// 供 selection 同时读取已完成统计与 started N。所有更新二者的路径都先持有
-    /// `completed`，因此这个快照不会把另一份 reservation 的 virtual mean 与旧 N 混用。
-    pub(crate) fn selection_snapshot(&self) -> (EdgeStats, u32) {
-        let stats = *self.completed.lock();
-        (stats, self.started.load(Ordering::Acquire))
+        self.stats.lock().visits
     }
 
     /// 此 edge 上待完成的 reservation。
-    ///
-    /// 由 `started - completed` 推导而非单独存储，所以 `complete` / `cancel`
-    /// 会自动释放它。参考：LC3 Overview 的 "Node structure"。KataGo 将类似临时
-    /// 计数放在 child node；x7 将它放在入边，owner 更明确也更简单。
+    /// `complete` / `cancel` 会自动释放它。
     pub fn in_flight_visits(&self) -> u32 {
-        let completed = self.completed.lock().visits;
+        let completed = self.stats.lock().visits;
         self.started.load(Ordering::Acquire).saturating_sub(completed)
     }
 
-    pub(crate) fn reserve(self: &Arc<Self>, virtual_mean: Option<f32>) -> EdgeReservation {
-        let virtual_wl_sum = virtual_mean.unwrap_or(0.0);
-        let mut completed = self.completed.lock();
-        self.started.fetch_add(1, Ordering::AcqRel);
-        completed.virtual_wl_sum += virtual_wl_sum;
-        EdgeReservation {
-            edge: Arc::clone(self),
-            virtual_wl_sum,
-        }
+    pub(crate) fn stats(&self) -> EdgeStats {
+        *self.stats.lock()
     }
 
-    fn cancel(&self, virtual_wl_sum: f32) {
-        // `complete` 也持有此锁。必须在同一临界区内检查并减少 `started`，否则
-        // complete 可在检查与 CAS 之间增加 completed，破坏 started >= completed。
-        let mut completed = self.completed.lock();
-        let started = self.started.load(Ordering::Acquire);
-        assert!(started > completed.visits, "stream edge reservation underflow");
-        completed.virtual_wl_sum -= virtual_wl_sum;
-        let started = self.started.fetch_sub(1, Ordering::AcqRel) - 1;
-        if started == completed.visits {
-            completed.virtual_wl_sum = 0.0;
-        }
+    /// 供 selection 同时读取已完成统计与 started N。所有更新二者的路径都先持有
+    /// `stats`，因此这个快照不会把另一份 reservation 的 virtual mean 与旧 N 混用。
+    pub(crate) fn selection_snapshot(&self) -> (EdgeStats, u32) {
+        let stats = *self.stats.lock();
+        (stats, self.started.load(Ordering::Acquire))
     }
 
     pub fn child_key(&self) -> Option<NodeKey> {
@@ -239,19 +199,39 @@ impl Edge {
         }
     }
 
+    pub(crate) fn reserve(self: &Arc<Self>, virtual_mean: Option<f32>) -> EdgeReservation {
+        let virtual_wl_sum = virtual_mean.unwrap_or(0.0);
+        let mut completed = self.stats.lock();
+        self.started.fetch_add(1, Ordering::AcqRel);
+        completed.virtual_wl_sum += virtual_wl_sum;
+        EdgeReservation {
+            edge: Arc::clone(self),
+            virtual_wl_sum,
+        }
+    }
+
+    fn cancel(&self, virtual_wl_sum: f32) {
+        // `complete` 也持有此锁。必须在同一临界区内检查并减少 `started`，否则
+        // complete 可在检查与 CAS 之间增加 completed，破坏 started >= completed。
+        let mut completed = self.stats.lock();
+        let started = self.started.fetch_sub(1, Ordering::AcqRel);
+        assert!(started > completed.visits, "stream edge reservation underflow");
+        completed.virtual_wl_sum -= virtual_wl_sum;
+        if started - 1 == completed.visits {
+            completed.virtual_wl_sum = 0.0;
+        }
+    }
+
     fn complete(&self, virtual_wl_sum: f32, local_leaf: Option<ValueDelta>) {
-        let mut completed = self.completed.lock();
-        assert!(
-            self.started.load(Ordering::Acquire) > completed.visits,
-            "stream edge completion without reservation"
-        );
+        let mut completed = self.stats.lock();
+        let started = self.started.load(Ordering::Acquire);
+        assert!(started > completed.visits, "stream edge completion without reservation");
         completed.virtual_wl_sum -= virtual_wl_sum;
         completed.visits += 1;
-        if self.started.load(Ordering::Acquire) == completed.visits {
+        if started == completed.visits {
             completed.virtual_wl_sum = 0.0;
         }
         if let Some(value) = local_leaf {
-            assert_eq!(value.visits, 1, "one reservation completes one leaf");
             completed.local_leaf = completed.local_leaf.merge(value);
         }
     }
@@ -302,39 +282,33 @@ struct NodeStats {
 /// 不需要整张图锁。
 #[derive(Debug, Default)]
 pub struct Node {
-    /// 生命周期：Unexpanded → Evaluating → Expanded|Terminal（`ExpansionState` 以 u8
-    /// 供 CAS 使用）。
+    /// 生命周期：Unexpanded → Evaluating → Expanded|Terminal
     expansion: AtomicU8,
     edges: RwLock<Arc<[Arc<Edge>]>>,
-    /// LC3 node 保留其 completed 聚合值。in-flight visit 保持在 edge-local，刻意不计入
-    /// 此值。
+    /// 当前 completed N/Q。in-flight 留在 edge，不计入这里。
     stats: Mutex<NodeStats>,
-    /// 首次 NN / 非共享终局的原始预测 U。图回传从它和 edge action N 幂等重算。
-    graph_value: Mutex<Option<ValueDelta>>,
+    /// 首次 NN / 非共享终局的原始预测 U(n)，冻住后不再随边累加；当前 N/Q 在 `stats`。
+    /// 用 `ValueDelta` 只因为它是 Eval 写入的那份 1-visit 样本，不是路径增量，也不是聚合。
+    base_value: Mutex<Option<ValueDelta>>,
     /// 终局 WDL 与 plies：`(wl, draw≡d, plies_left≡m)`。`m` 以 ply（半回合）保存，
     /// UCI “moves left” 另行换算为完整回合。
     terminal: Mutex<Option<(f32, f32, f32)>>,
 }
 
 impl Node {
-    /// 节点首次 Prediction 以一份 visit 保存，保证后续 shared-Q 重算的 base N
-    /// 与入边 completed N 一致。
-    pub(crate) fn set_graph_value(&self, value: ValueDelta) {
-        assert!(value.visits > 0, "graph node base value must have positive weight");
-        let mut graph_value = self.graph_value.lock();
-        if let Some(existing) = *graph_value {
+    /// 写入冻住的 U(n)。`value.visits` 是这份样本的权重（通常为 1），与 `stats.visits` 无关。
+    pub(crate) fn set_base_value(&self, value: ValueDelta) {
+        assert!(value.visits > 0, "node base value must have positive weight");
+        let mut base_value = self.base_value.lock();
+        if let Some(existing) = *base_value {
             assert_eq!(existing, value, "shared node keeps its first evaluation");
         } else {
-            *graph_value = Some(value);
+            *base_value = Some(value);
         }
     }
 
     pub fn completed_visits(&self) -> u32 {
         self.stats.lock().visits
-    }
-
-    pub fn q(&self) -> f32 {
-        self.value_snapshot().0
     }
 
     /// 在同一把统计锁下读取 Q、WDL/M 与二阶矩，避免 parent 图回算混合 child
@@ -353,6 +327,16 @@ impl Node {
         )
     }
 
+    /// 在同一把统计锁下读取 WDL/M，避免 parent 重算混合 child 的两个不同版本。
+    pub(crate) fn value_snapshot(&self) -> (f32, f32, f32) {
+        let (wl, draw, m, _) = self.value_moments_snapshot();
+        (wl, draw, m)
+    }
+
+    pub fn q(&self) -> f32 {
+        self.value_snapshot().0
+    }
+
     pub fn draw(&self) -> f32 {
         self.value_snapshot().1
     }
@@ -361,18 +345,12 @@ impl Node {
         self.value_snapshot().2
     }
 
-    /// 在同一把统计锁下读取 WDL/M，避免 parent 重算混合 child 的两个不同版本。
-    pub(crate) fn value_snapshot(&self) -> (f32, f32, f32) {
-        let (wl, draw, m, _) = self.value_moments_snapshot();
-        (wl, draw, m)
-    }
-
     pub fn expansion_state(&self) -> ExpansionState {
         ExpansionState::from_raw(self.expansion.load(Ordering::Acquire))
     }
 
-    /// 恰好一个 Eval worker 取得未展开 node。其他 worker 报告 collision 并直接
-    /// cancel 自己的 reservation，不重复评估同一局面。
+    /// Gather 声称评估未展开 node：恰好一个 caller 将 `Unexpanded → Evaluating` 并把
+    /// event 交给 Eval。其他 Gather 再走到已 `Evaluating` 的同一叶子则记 collision。
     pub fn try_begin_evaluation(&self) -> bool {
         self.expansion
             .compare_exchange(
@@ -390,7 +368,6 @@ impl Node {
             ExpansionState::Evaluating,
             "node must be evaluating"
         );
-        // px0 在 policy 初始化后调用 `Node::SortEdges`（`node.cc:291-297`）。
         let mut edges = edges;
         edges.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
         let edges: Arc<[Arc<Edge>]> = edges
@@ -414,18 +391,6 @@ impl Node {
             .expect("only evaluating stream nodes can abort evaluation");
     }
 
-    pub fn mark_terminal(&self, wl: f32, draw: f32, plies_left: f32) {
-        assert_eq!(
-            self.expansion_state(),
-            ExpansionState::Evaluating,
-            "node must be evaluating"
-        );
-        *self.terminal.lock() = Some((wl, draw, plies_left));
-        self.set_graph_value(ValueDelta::with_plies_left(wl, draw, plies_left));
-        self.set_terminal_stats(wl, draw, plies_left, 1);
-        self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
-    }
-
     fn set_terminal_stats(&self, wl: f32, draw: f32, plies_left: f32, visits: u32) {
         let mut stats = self.stats.lock();
         stats.visits = visits;
@@ -433,6 +398,18 @@ impl Node {
         stats.wl_sq_sum = wl * wl * visits as f32;
         stats.draw_sum = draw * visits as f32;
         stats.m_sum = plies_left * visits as f32;
+    }
+
+    pub fn mark_terminal(&self, wl: f32, draw: f32, plies_left: f32) {
+        assert_eq!(
+            self.expansion_state(),
+            ExpansionState::Evaluating,
+            "node must be evaluating"
+        );
+        *self.terminal.lock() = Some((wl, draw, plies_left));
+        self.set_base_value(ValueDelta::with_plies_left(wl, draw, plies_left));
+        self.set_terminal_stats(wl, draw, plies_left, 1);
+        self.expansion.store(ExpansionState::Terminal as u8, Ordering::Release);
     }
 
     /// 已展开 node 的已绑定 terminal 子边已经构成完整 minimax 证明时，将它固定为
@@ -495,14 +472,12 @@ type ShardNodes = RwLock<HashMap<NodeKey, Arc<Node>, BuildHasherDefault<NoHashHa
 pub struct NodeRepository {
     /// `NoHashHasher`：`NodeKey` 已经 `hash_cat`，不得再次 hash。
     shards: Box<[ShardNodes]>,
-    /// 只保护 node 创建、edge 绑定和后台 mark/sweep 的拓扑一致性；N/Q 不经过它。
+    /// GC ↔ 建/查 node 的成员关系：读锁下可创建与查找，写锁下做 mark/sweep。
+    /// N/Q、PUCT、reservation 不经过它。shared-Q 无环靠 edge 的 topology prune，不靠这把锁。
     topology_lock: RwLock<()>,
-    /// 仅序列化“检查新边是否会闭环 + 绑定新边”这一极少发生的操作。正常 PUCT、
-    /// reservation 与统计更新均不经过此锁。
-    ///
-    /// KataGo `cpp/search/search.cpp:1426-1445` 在单条 playout 的 graph path 上截断
-    /// cycle；这里的 shared-Q 重算要求更强：不允许 repository 的已绑定边形成 Q
-    /// 依赖环，故在第一次连接 edge 时做一次 DFS。
+    /// 仅串行「首次绑定前的拓扑过滤检查 + prune/bind」。无环策略是永久过滤会成环的
+    /// edge（`topology_pruned`），此锁只防并发两次检查各自通过后合起来成环。
+    /// 正常 PUCT、reservation 与统计更新不经过它。
     link_lock: Mutex<()>,
 }
 
@@ -521,7 +496,7 @@ impl NodeRepository {
         if node.expansion_state() == ExpansionState::Terminal {
             return;
         }
-        let base = *node.graph_value.lock();
+        let base = *node.base_value.lock();
         let Some(base) = base else { return };
         let edges = node.edges();
         let mut total = base;
@@ -613,6 +588,7 @@ impl NodeRepository {
         };
         node.mark_proven_terminal(-wl, draw, plies_left + 1.0)
     }
+
     pub fn new(shard_count: usize) -> Self {
         assert!(
             shard_count.is_power_of_two(),
@@ -650,11 +626,11 @@ impl NodeRepository {
         shard.read().get(&key).cloned()
     }
 
-    /// 原子地检查并绑定一条此前未绑定的 graph edge。
+    /// 首次绑定 graph edge：会成环则永久 topology prune，否则绑定。
     ///
-    /// 若 `child` 已能沿已绑定 edge 到达 `parent`，再连接 `parent -> child` 会让
-    /// `recompute_graph_node` 的 shared Q 产生循环依赖。此时永久过滤这条 edge；它
-    /// 不是棋规终局，调用方取消本次 reservation 后继续选择其他 edge。
+    /// 无环靠过滤这条 edge，不是靠锁。`topology_lock` 读锁只保证检查期间 node 仍在
+    /// repository；`link_lock` 只串行本次检查，避免并发漏网。被 prune 的边不是棋规
+    /// 终局，调用方取消本次 reservation 后继续选其他 edge。
     pub(crate) fn bind_child_or_cut_cycle(&self, parent: NodeKey, edge: &Edge, child: NodeKey) -> ChildLink {
         let _topology = self.topology_lock.read();
         let _link = self.link_lock.lock();
@@ -703,9 +679,8 @@ impl NodeRepository {
 
     /// 以当前 root 为唯一保留根回收不可达图。
     ///
-    /// GC 持有 topology 写锁，node 创建与 edge 绑定会短暂等待，因而不会删掉刚被
-    /// transposition 接回的 node；统计更新不受此锁影响。参考 LC3 Overview 的
-    /// "Node repository"；LC3 未公开 GC 细节，mark/sweep 是当前单图语义的直接实现。
+    /// GC 持有 topology 写锁（挡建/查）与 link_lock（挡并发 bind），因而不会删掉刚被
+    /// transposition 接回的 node，也不会在半截新边写入时扫可达集。统计更新不受影响。
     pub(crate) fn retain_from_root(&self, root: NodeKey) -> usize {
         let _topology = self.topology_lock.write();
         let _link = self.link_lock.lock();
@@ -770,7 +745,7 @@ impl Default for NodeRepository {
     }
 }
 
-// 跨回合复用保留已走根，并回收不再从任一 retained root 可达的 node。
+// 跨回合复用：只保留当前搜索 root；后台从该根 mark/sweep，删除不可达 node。
 
 /// 两次已完成 stream 搜索之间保留的 graph 状态。
 #[derive(Debug)]
@@ -778,7 +753,7 @@ pub struct SearchGraph {
     repository: Arc<NodeRepository>,
     root_key: NodeKey,
     /// 当前 root 的完整历史。悔棋由下一条 UCI `position ... moves` 重建，不保留旧
-    /// root 的所有 sibling 图，否则 GC 永远无法回收它们。
+    /// root 的 sibling 图，否则从当前根做 GC 永远清不掉它们。
     root_history: Arc<PositionHistory>,
     gc_pending: bool,
 }
@@ -808,8 +783,8 @@ impl SearchGraph {
 
     /// 在当前 root 以下的 event 都完成或取消后，推进到一个合法 child。
     ///
-    /// 旧 root 留作悔棋；它仍可到达原图的所有已绑定分支，所以同步 DFS 回收不会删掉
-    /// 正常对局中的 node，只会阻塞下一回合。这条路径只更新 root/history。
+    /// 此处只改 `root_key` / history 并标记 `gc_pending`。不同步 DFS：旧根若仍从新根
+    /// 可达（换位）会留下，否则由后台 `retain_from_root(新根)` 删掉。悔棋不靠保留旧根。
     pub fn advance(&mut self, mv: Move) -> Result<(), EnginError> {
         if !self.repository.is_settled() {
             return Err(EnginError::PortIncomplete(
@@ -940,9 +915,9 @@ mod graph_tests {
 
     #[test]
     fn graph_and_tree_keys_keep_their_identity_separate() {
-        let graph = NodeKey::board(42);
-        let first_tree = NodeKey::continuation(42, 1);
-        let second_tree = NodeKey::continuation(42, 2);
+        let graph = NodeKey::graph_node(42);
+        let first_tree = NodeKey::tree_node(42, 1);
+        let second_tree = NodeKey::tree_node(42, 2);
 
         assert!(matches!(graph, NodeKey::GraphNode { .. }));
         assert!(matches!(first_tree, NodeKey::TreeNode { .. }));
@@ -973,11 +948,11 @@ mod graph_tests {
         root.publish_edges(vec![(keep, 0.5), (drop, 0.5)]);
         let mut kept_history = tree.root_history().as_ref().clone();
         kept_history.append(keep);
-        let kept_child = NodeKey::board(kept_history.last().board().hash());
+        let kept_child = NodeKey::graph_node(kept_history.last().board().hash());
         let mut dropped_history = tree.root_history().as_ref().clone();
         dropped_history.append(drop);
-        let dropped_child = NodeKey::board(dropped_history.last().board().hash());
-        let dropped_grandchild = NodeKey::board(0xdead_beef);
+        let dropped_child = NodeKey::graph_node(dropped_history.last().board().hash());
+        let dropped_grandchild = NodeKey::graph_node(0xdead_beef);
         root.edges()[0].bind_child_key(kept_child);
         root.edges()[1].bind_child_key(dropped_child);
         tree.repository().get_or_insert(kept_child);
@@ -1030,7 +1005,7 @@ mod graph_tests {
         root_node.publish_edges(vec![(mv, 1.0)]);
         root_node.edges()[0].bind_child_key(expected_child);
         let child_node = graph.repository().get_or_insert(expected_child);
-        child_node.set_graph_value(crate::search::ValueDelta::one(0.6, 0.0));
+        child_node.set_base_value(crate::search::ValueDelta::one(0.6, 0.0));
         graph.repository().recompute_graph_node(expected_child);
 
         graph.advance(mv).expect("advance contextual root");
@@ -1083,7 +1058,7 @@ mod graph_tests {
         assert_eq!(retired.len(), 1);
         assert_eq!(tree.root_history(), &target);
         assert_eq!(tree.repository().len(), 0);
-        assert_eq!(tree.root_key(), NodeKey::board(target.last().board().hash()));
+        assert_eq!(tree.root_key(), NodeKey::graph_node(target.last().board().hash()));
     }
 }
 
@@ -1104,10 +1079,10 @@ mod repository_tests {
     #[test]
     fn graph_recompute_keeps_action_visits_local_to_its_parent() {
         let repo = NodeRepository::default();
-        let a = NodeKey::board(1);
-        let b = NodeKey::board(2);
-        let c = NodeKey::board(3);
-        let d = NodeKey::board(4);
+        let a = NodeKey::graph_node(1);
+        let b = NodeKey::graph_node(2);
+        let c = NodeKey::graph_node(3);
+        let d = NodeKey::graph_node(4);
         let ab = b2_b3();
         let ac = Move::new(Square::parse("c2").unwrap(), Square::parse("c3").unwrap());
         let bd = Move::new(Square::parse("d2").unwrap(), Square::parse("d3").unwrap());
@@ -1121,7 +1096,7 @@ mod repository_tests {
             let node = repo.get_or_insert(key);
             assert!(node.try_begin_evaluation());
             node.publish_edges(edges);
-            node.set_graph_value(ValueDelta::one(value, 0.0));
+            node.set_base_value(ValueDelta::one(value, 0.0));
         }
         repo.get(a).unwrap().edges()[0].bind_child_key(b);
         repo.get(a).unwrap().edges()[1].bind_child_key(c);
@@ -1145,10 +1120,10 @@ mod repository_tests {
         // A -> B -> D 与 A -> C -> D 合并后，D -> B 会让 B/D 的 Q 互相依赖。
         // 这不是棋规重复；X7 直接将该 edge 排除在 shared 图之外。
         let repo = NodeRepository::default();
-        let a = NodeKey::board(10);
-        let b = NodeKey::board(11);
-        let c = NodeKey::board(12);
-        let d = NodeKey::board(13);
+        let a = NodeKey::graph_node(10);
+        let b = NodeKey::graph_node(11);
+        let c = NodeKey::graph_node(12);
+        let d = NodeKey::graph_node(13);
         let moves = [
             b2_b3(),
             Move::new(Square::parse("c2").unwrap(), Square::parse("c3").unwrap()),
@@ -1164,7 +1139,7 @@ mod repository_tests {
         ] {
             let node = repo.get_or_insert(key);
             assert!(node.try_begin_evaluation());
-            node.set_graph_value(ValueDelta::one(value, 0.0));
+            node.set_base_value(ValueDelta::one(value, 0.0));
             node.publish_edges(edges);
         }
         assert!(matches!(
@@ -1201,7 +1176,7 @@ mod repository_tests {
     #[test]
     fn one_worker_claims_evaluation_and_edge_reservation_balances() {
         let repository = Arc::new(NodeRepository::default());
-        let key = NodeKey::board(123);
+        let key = NodeKey::graph_node(123);
         let mut workers = Vec::new();
         for _ in 0..8 {
             let repository = Arc::clone(&repository);
@@ -1229,7 +1204,7 @@ mod repository_tests {
 
     #[test]
     fn cancelled_reservation_restores_started_visit_count() {
-        let root = NodeRepository::default().get_or_insert(NodeKey::board(321));
+        let root = NodeRepository::default().get_or_insert(NodeKey::graph_node(321));
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(b2_b3(), 1.0)]);
         root.reserve_edge(0).expect("edge").cancel();
@@ -1241,7 +1216,7 @@ mod repository_tests {
     // LC3 Overview 的 owned event 约束：每个 reservation 只能完成或取消一次。
     fn concurrent_complete_and_cancel_keep_reservation_balanced() {
         for _ in 0..128 {
-            let root = NodeRepository::default().get_or_insert(NodeKey::board(654));
+            let root = NodeRepository::default().get_or_insert(NodeKey::graph_node(654));
             assert!(root.try_begin_evaluation());
             root.publish_edges(vec![(b2_b3(), 1.0)]);
             let completed = root.reserve_edge(0).expect("completed reservation");
@@ -1270,11 +1245,11 @@ mod repository_tests {
     #[test]
     fn proven_terminal_propagates_one_level_without_path_rules() {
         let repo = NodeRepository::default();
-        let parent_key = NodeKey::board(701);
-        let child_key = NodeKey::board(702);
+        let parent_key = NodeKey::graph_node(701);
+        let child_key = NodeKey::graph_node(702);
         let parent = repo.get_or_insert(parent_key);
         assert!(parent.try_begin_evaluation());
-        parent.set_graph_value(ValueDelta::one(0.0, 0.0));
+        parent.set_base_value(ValueDelta::one(0.0, 0.0));
         parent.publish_edges(vec![(b2_b3(), 1.0)]);
 
         let child = repo.get_or_insert(child_key);
@@ -1293,11 +1268,11 @@ mod repository_tests {
     #[test]
     fn terminal_loss_needs_every_legal_child_proven() {
         let repo = NodeRepository::default();
-        let parent_key = NodeKey::board(703);
-        let child_key = NodeKey::board(704);
+        let parent_key = NodeKey::graph_node(703);
+        let child_key = NodeKey::graph_node(704);
         let parent = repo.get_or_insert(parent_key);
         assert!(parent.try_begin_evaluation());
-        parent.set_graph_value(ValueDelta::one(0.0, 0.0));
+        parent.set_base_value(ValueDelta::one(0.0, 0.0));
         parent.publish_edges(vec![
             (b2_b3(), 0.5),
             (
@@ -1317,7 +1292,7 @@ mod repository_tests {
 
     #[test]
     fn failed_evaluation_returns_node_to_claimable_state() {
-        let root = NodeRepository::default().get_or_insert(NodeKey::board(456));
+        let root = NodeRepository::default().get_or_insert(NodeKey::graph_node(456));
         assert!(root.try_begin_evaluation());
         root.abort_evaluation();
         assert_eq!(root.expansion_state(), ExpansionState::Unexpanded);

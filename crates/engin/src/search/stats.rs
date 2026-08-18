@@ -731,21 +731,21 @@ mod tests {
     #[test]
     fn root_lcb_can_choose_a_well_visited_higher_q_challenger() {
         let repo = NodeRepository::default();
-        let root_key = NodeKey::board(1);
+        let root_key = NodeKey::graph_node(1);
         let root = repo.get_or_insert(root_key);
         let first = Move::new(Square::parse("a0").unwrap(), Square::parse("a1").unwrap());
         let challenger = Move::new(Square::parse("b0").unwrap(), Square::parse("b1").unwrap());
         assert!(root.try_begin_evaluation());
-        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
         root.publish_edges(vec![(first, 0.8), (challenger, 0.2)]);
 
         let edges = root.edges();
-        for (index, (key, value, visits)) in [(NodeKey::board(2), 0.20, 100), (NodeKey::board(3), 0.25, 20)]
+        for (index, (key, value, visits)) in [(NodeKey::graph_node(2), 0.20, 100), (NodeKey::graph_node(3), 0.25, 20)]
             .into_iter()
             .enumerate()
         {
             let child = repo.get_or_insert(key);
-            child.set_graph_value(ValueDelta::one(value, 0.0));
+            child.set_base_value(ValueDelta::one(value, 0.0));
             repo.recompute_graph_node(key);
             edges[index].bind_child_key(key);
             for _ in 0..visits {
@@ -784,21 +784,21 @@ mod tests {
     #[test]
     fn root_lcb_keeps_n_first_when_its_advantage_is_too_small() {
         let repo = NodeRepository::default();
-        let root_key = NodeKey::board(4);
+        let root_key = NodeKey::graph_node(4);
         let root = repo.get_or_insert(root_key);
         let first = Move::new(Square::parse("a0").unwrap(), Square::parse("a1").unwrap());
         let challenger = Move::new(Square::parse("b0").unwrap(), Square::parse("b1").unwrap());
         assert!(root.try_begin_evaluation());
-        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
         root.publish_edges(vec![(first, 0.8), (challenger, 0.2)]);
 
         let edges = root.edges();
-        for (index, (key, value, visits)) in [(NodeKey::board(41), 0.998, 100), (NodeKey::board(42), 0.9999, 80)]
+        for (index, (key, value, visits)) in [(NodeKey::graph_node(41), 0.998, 100), (NodeKey::graph_node(42), 0.9999, 80)]
             .into_iter()
             .enumerate()
         {
             let child = repo.get_or_insert(key);
-            child.set_graph_value(ValueDelta::one(value, 0.0));
+            child.set_base_value(ValueDelta::one(value, 0.0));
             repo.recompute_graph_node(key);
             edges[index].bind_child_key(key);
             for _ in 0..visits {
@@ -821,12 +821,12 @@ mod tests {
     #[test]
     fn root_lcb_penalizes_an_unstable_action_value() {
         let repo = NodeRepository::default();
-        let root_key = NodeKey::board(10);
+        let root_key = NodeKey::graph_node(10);
         let root = repo.get_or_insert(root_key);
         let noisy = Move::new(Square::parse("a0").unwrap(), Square::parse("a1").unwrap());
         let stable = Move::new(Square::parse("b0").unwrap(), Square::parse("b1").unwrap());
         assert!(root.try_begin_evaluation());
-        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
         root.publish_edges(vec![(noisy, 0.8), (stable, 0.2)]);
 
         let edges = root.edges();
@@ -860,7 +860,7 @@ mod tests {
         }
 
         let repo = NodeRepository::default();
-        let root_key = NodeKey::board(7);
+        let root_key = NodeKey::graph_node(7);
         let root = repo.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![
@@ -868,7 +868,7 @@ mod tests {
             (mv("b0", "b1"), 0.20),
             (mv("c0", "c1"), 0.70),
         ]);
-        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        root.set_base_value(crate::search::ValueDelta::one(0.0, 0.0));
         let edges = root.edges();
         let idx = |target: Move| edges.iter().position(|edge| edge.mv() == target).expect("edge");
         let loss_idx = idx(mv("a0", "a1"));
@@ -876,7 +876,7 @@ mod tests {
         let other_idx = idx(mv("c0", "c1"));
 
         {
-            let child_key = NodeKey::board(71);
+            let child_key = NodeKey::graph_node(71);
             edges[loss_idx].bind_child_key(child_key);
             let child = repo.get_or_insert(child_key);
             assert!(child.try_begin_evaluation());
@@ -887,7 +887,7 @@ mod tests {
             }
         }
         {
-            let child_key = NodeKey::board(72);
+            let child_key = NodeKey::graph_node(72);
             edges[win_idx].bind_child_key(child_key);
             let child = repo.get_or_insert(child_key);
             assert!(child.try_begin_evaluation());
@@ -896,10 +896,10 @@ mod tests {
                 root.reserve_edge(win_idx).expect("res").complete();
             }
         }
-        let other_key = NodeKey::board(73);
+        let other_key = NodeKey::graph_node(73);
         edges[other_idx].bind_child_key(other_key);
         let other = repo.get_or_insert(other_key);
-        other.set_graph_value(crate::search::ValueDelta::one(0.1, 0.0));
+        other.set_base_value(crate::search::ValueDelta::one(0.1, 0.0));
         repo.recompute_graph_node(other_key);
         for _ in 0..20 {
             root.reserve_edge(other_idx).expect("res").complete();
@@ -918,12 +918,12 @@ mod tests {
         use crate::search::{NodeKey, NodeRepository};
 
         let repository = NodeRepository::default();
-        let root_key = NodeKey::board(99);
+        let root_key = NodeKey::graph_node(99);
         let root = repository.get_or_insert(root_key);
         let mv = Move::new(Square::parse("b2").expect("from"), Square::parse("b3").expect("to"));
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(mv, 1.0)]);
-        let child_key = NodeKey::board(1000);
+        let child_key = NodeKey::graph_node(1000);
         root.edges()[0].bind_child_key(child_key);
         let child = repository.get_or_insert(child_key);
         assert!(child.try_begin_evaluation());
@@ -940,12 +940,12 @@ mod tests {
         use crate::search::{NodeKey, NodeRepository};
 
         let repository = NodeRepository::default();
-        let root = repository.get_or_insert(NodeKey::board(100));
+        let root = repository.get_or_insert(NodeKey::graph_node(100));
         assert!(root.try_begin_evaluation());
         root.mark_terminal(1.0, 0.0, 0.0);
 
         assert_eq!(
-            best_mate_with_params(&repository, NodeKey::board(100), &[], &SearchParams::default()),
+            best_mate_with_params(&repository, NodeKey::graph_node(100), &[], &SearchParams::default()),
             Some(-1)
         );
     }
@@ -959,7 +959,7 @@ mod tests {
         }
 
         let repo = NodeRepository::default();
-        let root_key = NodeKey::board(5);
+        let root_key = NodeKey::graph_node(5);
         let root = repo.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(mv("a0", "a1"), 0.9), (mv("b0", "b1"), 0.1)]);
@@ -979,8 +979,8 @@ mod tests {
         }
 
         let repo = NodeRepository::default();
-        let root_key = NodeKey::board(5);
-        let child_key = NodeKey::board(6);
+        let root_key = NodeKey::graph_node(5);
+        let child_key = NodeKey::graph_node(6);
         let root = repo.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         let pruned = mv("a0", "a1");
@@ -1014,17 +1014,17 @@ mod tests {
         }
 
         let repository = NodeRepository::default();
-        let root_key = NodeKey::board(19);
+        let root_key = NodeKey::graph_node(19);
         let root = repository.get_or_insert(root_key);
         let first = mv("a0", "a1");
         let second = mv("b0", "b1");
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(first, 0.9), (second, 0.1)]);
-        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
-        for (index, (key, value)) in [(0, (NodeKey::board(191), 0.1)), (1, (NodeKey::board(192), 0.2))] {
+        root.set_base_value(crate::search::ValueDelta::one(0.0, 0.0));
+        for (index, (key, value)) in [(0, (NodeKey::graph_node(191), 0.1)), (1, (NodeKey::graph_node(192), 0.2))] {
             root.edges()[index].bind_child_key(key);
             let child = repository.get_or_insert(key);
-            child.set_graph_value(crate::search::ValueDelta::one(value, 0.0));
+            child.set_base_value(crate::search::ValueDelta::one(value, 0.0));
             repository.recompute_graph_node(key);
         }
         for _ in 0..3 {
@@ -1052,7 +1052,7 @@ mod tests {
         }
 
         let repo = NodeRepository::default();
-        let root_key = NodeKey::board(11);
+        let root_key = NodeKey::graph_node(11);
         let root = repo.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(mv("a0", "a1"), 0.5), (mv("b0", "b1"), 0.5)]);
@@ -1061,7 +1061,7 @@ mod tests {
         let long_idx = edges.iter().position(|e| e.mv() == mv("b0", "b1")).unwrap();
 
         {
-            let child_key = NodeKey::board(111);
+            let child_key = NodeKey::graph_node(111);
             edges[short_idx].bind_child_key(child_key);
             let child = repo.get_or_insert(child_key);
             assert!(child.try_begin_evaluation());
@@ -1069,7 +1069,7 @@ mod tests {
             root.reserve_edge(short_idx).unwrap().complete();
         }
         {
-            let child_key = NodeKey::board(112);
+            let child_key = NodeKey::graph_node(112);
             edges[long_idx].bind_child_key(child_key);
             let child = repo.get_or_insert(child_key);
             assert!(child.try_begin_evaluation());
@@ -1089,12 +1089,12 @@ mod tests {
         use crate::search::{NodeKey, NodeRepository};
 
         let repository = NodeRepository::default();
-        let root_key = NodeKey::board(400);
+        let root_key = NodeKey::graph_node(400);
         let root = repository.get_or_insert(root_key);
         let mv = Move::new(Square::parse("a0").unwrap(), Square::parse("a1").unwrap());
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(mv, 1.0)]);
-        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        root.set_base_value(crate::search::ValueDelta::one(0.0, 0.0));
         root.edges()[0].bind_child_key(root_key);
         root.reserve_edge(0).unwrap().complete();
         repository.recompute_graph_node(root_key);
@@ -1131,13 +1131,13 @@ mod tests {
         let root = repository.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(entry_move, 1.0)]);
-        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        root.set_base_value(crate::search::ValueDelta::one(0.0, 0.0));
         root.reserve_edge(0).expect("root visit").complete();
 
         let continuation = repository.get_or_insert(continuation_key);
         assert!(continuation.try_begin_evaluation());
         continuation.publish_edges(vec![(reply, 1.0)]);
-        continuation.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        continuation.set_base_value(crate::search::ValueDelta::one(0.0, 0.0));
         continuation.reserve_edge(0).expect("tree visit").complete();
         repository.get_or_insert(after_reply_key);
         repository.recompute_graph_node(continuation_key);

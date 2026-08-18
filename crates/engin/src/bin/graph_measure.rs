@@ -234,10 +234,10 @@ mod tests {
         let second = history.last().board().parse_move("a3a4").expect("legal move");
 
         let repository = NodeRepository::default();
-        let root_key = NodeKey::board(history.last().board().hash());
-        let left_key = NodeKey::board(1);
-        let right_key = NodeKey::board(2);
-        let shared_key = NodeKey::board(3);
+        let root_key = NodeKey::graph_node(history.last().board().hash());
+        let left_key = NodeKey::graph_node(1);
+        let right_key = NodeKey::graph_node(2);
+        let shared_key = NodeKey::graph_node(3);
         let root = repository.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(first, 0.5), (second, 0.5)]);

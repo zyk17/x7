@@ -4,10 +4,14 @@
 的设计边界。它不是 px0/LC3 的等价移植：worker 生命周期、统计回传与 visit 分配以本仓实现为准。
 
 本实现使用连续 `Gather → Eval → NN → Eval → Backprop`：PUCT 使用 edge in-flight
-reservation 作为 virtual visit（计入 started N，偏转选择）；每个 Gather event 是一份
-visit，collision 直接取消 reservation。Eval 持续向 NN 提交已编码 tensor；NN 空闲时立即处理当前
+reservation 作为 virtual visit（计入 started N，偏转选择）；Gather 每次采集一个叶子，
+collision 直接取消 reservation。Eval 持续向 NN 提交已编码 tensor；NN 空闲时立即处理当前
 队列可得请求，不等待逻辑搜索轮次。owner 将 in-flight owned event 限为两个 `MiniBatchSize`，防止
-无界使用过时统计。没有 multivisit、prefetch 或 tree-batch gather。
+无界使用过时统计。没有 prefetch 或 tree-batch gather。
+
+不用 classic 那种一次评估记 K 次 visit 的 **multivisit**。GPU 合批在 NN 队列，不靠 Gather
+一次收一批。实战以 `μ=FPU` virtual mean 做比纯 virtual visit 更明显、但仍温和的分流；K 份
+假样本会一次打偏 in-flight Q/N。后续若研究分流强度，改 virtual mean / virtual visit，不加 K。
 
 ## 目标
 
@@ -214,14 +218,15 @@ contextual child；Tree → Graph 只在零化 edge 发生并正常绑定 board 
 
 第一版不维护 parent refcount，也不复刻 Lc0 classic 的复杂释放器。每次 `position` 已 drain 后：
 
-1. 从全部 retained roots 做一次 visited-set traversal；
-2. repository 删除未标记 node；
+1. 只从**当前**搜索 root 做一次 visited-set traversal；
+2. repository 删除未标记（从当前根不可达）的 node；
 3. 不可达 node 的 `Arc` 自然释放。
 
 这是 `O(V + E)`，但只发生在跨回合 GC 边界，且 repository 本来就是 map。若测量证明成为瓶颈，再
 讨论 refcount 或分代；当前不提前引入。
 
-unrelated `position` 仍直接换新 repository。悔棋保留的历史 root 仍是 reachability 的起点。
+unrelated `position` 仍直接换新 repository。悔棋由完整 UCI `position ... moves` 重建 root，
+不保留旧 root / sibling 作为额外 GC 起点。
 
 ## 必须同时改掉的 tree 假设
 
@@ -313,7 +318,7 @@ cargo run -p engin --release --bin graph_measure -- --fen "<FEN>" --moves "..." 
 
 ### Phase 3：图 GC、PV 与 terminal（已完成）
 
-改为 retained-root reachability GC；PV/graph-shape 防环；明确 history-dependent terminal 的局部语义。
+改为当前-root 可达 mark/sweep GC；PV/graph-shape 防环；明确 history-dependent terminal 的局部语义。
 流式路径与 UCI 生命周期回归已通过；在此基础上才能开始固定时间 Elo 比较。
 
 ### Phase 4：评估

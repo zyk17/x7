@@ -4,7 +4,7 @@
 
 这是一个独立的中国象棋研究引擎（X7）。项目目标是在有限计算资源、固定思考时间下研究上述协同，并只以固定时间 Elo 评估成果；网络架构、搜索算法和硬件分工都是实现选择，不是项目目标。
 
-第一版规则、网络外围、UCI 与训练格式参考过 px0 / Lc0 / LC3 公开文档；**当前正式搜索是本仓的 stream MCGS，不再是 px0 重写，也不承诺与 px0/LC3 行为等价**。搜索采用连续的 `Gather → Eval → NN → Eval → Backprop` 流水线：Gather 直接提交一个 owned leaf；Eval 处理终局、缓存、编码和 NN 输出解码；NN 只做 tensor 合批与推理。NN 空闲时立即执行队列中当前可得的 tensor，不等待逻辑搜索轮次。owner 最多保留两个 `MiniBatchSize` 的 in-flight owned event 窗口，避免无界过时统计。当前实战使用 `μ=FPU` 的临时 virtual mean，完成或取消时精确归还，不写入 completed Evidence；collision 直接取消 reservation。没有 multivisit、prefetch 或 tree-batch gather。`mcts` 分支可保留树 MCTS；本分支研究 stream MCGS。两者共用规则、网络与 UCI 外围，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+第一版规则、网络外围、UCI 与训练格式参考过 px0 / Lc0 / LC3 公开文档；**当前正式搜索是本仓的 stream MCGS，不再是 px0 重写，也不承诺与 px0/LC3 行为等价**。搜索采用连续的 `Gather → Eval → NN → Eval → Backprop` 流水线：Gather 每次提交一个 owned leaf；Eval 处理终局、缓存、编码和 NN 输出解码；NN 只做 tensor 合批与推理。NN 空闲时立即执行队列中当前可得的 tensor，不等待逻辑搜索轮次。owner 最多保留两个 `MiniBatchSize` 的 in-flight owned event 窗口，避免无界过时统计。当前实战使用 `μ=FPU` 的临时 virtual mean，完成或取消时精确归还，不写入 completed Evidence；collision 直接取消 reservation。没有 prefetch 或 tree-batch gather。不用一次评估记 K 次 visit 的 multivisit：Gather 本来就是一个一个采，K 还会破坏 virtual FPU 分流；后续若调分流，改 virtual mean / virtual visit。`mcts` 分支可保留树 MCTS；本分支研究 stream MCGS。两者共用规则、网络与 UCI 外围，模型契约固定为 `124 × 10 × 9 → 2062 policy + WDL + moves-left`，搜索值使用 `win - loss`。训练期辅助头不进入 ONNX 正式契约。研究原则、参考边界与架构约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 快速运行
 

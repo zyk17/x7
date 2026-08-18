@@ -1,14 +1,14 @@
 //! X7 stream MCGS。
 //!
-//! 架构形状可参考 LC3 公开文档（本地没有 LC3 源码）：
+//! 架构形状可参考 LC3 公开文档
 //! - <https://lczero.org/dev/lc0/search/lc3/overview/>
 //! - <https://lczero.org/dev/lc0/search/lc3/policy/>
 //! - <https://lczero.org/dev/lc0/search/lc3/glossary/>
 //!
-//! 本模块拥有 MCGS 图与连续的 Gather / Eval / NN / Backprop 生命周期。每个 Gather event
-//! 是一份 visit；当前实战使用只在 pending reservation 期间生效的 FPU virtual mean，
-//! 但没有 multivisit、prefetch 或 tree-batch gather。选择公式历史上参考过 px0 PUCT / N-Q-P，
-//! 默认参数与图统计语义以本仓为准，不是 px0/LC3 等价实现。
+//! 本模块拥有 MCGS 图与连续的 Gather / Eval / NN / Backprop 生命周期。Gather 每次采集
+//! 一个叶子；实战用 pending reservation 上的 FPU virtual mean 分流。不把一次评估记成
+//! 多次 visit：那会一次打入 K 份 FPU，破坏这份温和分流；后续若调分流，改 virtual mean /
+//! virtual visit。没有 prefetch 或 tree-batch gather。
 
 use xiangqi_core::GameResult;
 
@@ -39,9 +39,6 @@ pub(crate) use stats::{
 pub(crate) use time::{TimeBudget, TimeManager};
 
 /// 将 NN 的 side-to-move WDL 转为 node / incoming-edge 视角：取反。
-///
-/// 历史语义参考：px0 `FetchSingleNodeResult` 的 `eval->q = -eval->q`，以及
-/// `Node::wl_` 的走子方视角约定。
 pub(crate) fn network_wl_to_node(stm_wl: f32) -> f32 {
     -stm_wl
 }
@@ -49,7 +46,6 @@ pub(crate) fn network_wl_to_node(stm_wl: f32) -> f32 {
 /// 将**绝对** game result（`compute_game_result`）转为终局叶子 incoming-edge `(wl, d)`。
 ///
 /// 先换成 STM 视角，再取反，对齐 NN fetch 与将死快径 `WHITE_WON`→`+1`
-///（`search.cc:1913-1919`、`node.cc:300-317`）。
 ///
 /// 注意：`rule_judge()` 的返回值**不是**绝对胜负，不能走这里；应使用
 /// [`rule_judge_wl_for_node`]。
@@ -68,7 +64,7 @@ pub(crate) fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (
 ///
 /// `rule_judge` 的胜负枚举已是 node / incoming-edge 视角（与 `checkThem`/`checkUs`
 /// 绑定），**不要**再按 `is_black_to_move` 当绝对颜色转换，否则白方行棋时的长将/长捉
-/// 符号会反转。历史语义参考：px0 `Node::MakeTerminal(RuleJudge())`。
+/// 符号会反转。
 pub(crate) fn rule_judge_wl_for_node(result: GameResult) -> (f32, f32) {
     match result {
         GameResult::WhiteWon => (1.0, 0.0),

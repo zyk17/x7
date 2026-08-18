@@ -25,7 +25,7 @@ pub struct FenState {
 }
 
 /// 棋盘始终以当前行棋方为 `ours` 视角保存。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ChessBoard {
     ours: BitBoard,
     theirs: BitBoard,
@@ -40,6 +40,24 @@ pub struct ChessBoard {
     flipped: bool,
     rule_id: [u8; 90],
 }
+
+impl PartialEq for ChessBoard {
+    fn eq(&self, other: &Self) -> bool {
+        self.flipped == other.flipped &&
+        self.our_king == other.our_king &&
+        self.their_king == other.their_king &&
+        self.ours == other.ours &&
+        self.theirs == other.theirs &&
+        self.rooks == other.rooks &&
+        self.advisors == other.advisors &&
+        self.cannons == other.cannons &&
+        self.pawns == other.pawns &&
+        self.knights == other.knights &&
+        self.bishops == other.bishops
+    }
+}
+
+impl Eq for ChessBoard {}
 
 impl Default for ChessBoard {
     fn default() -> Self {

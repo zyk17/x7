@@ -441,7 +441,8 @@ impl Shared {
         let _ = previous;
     }
 
-    /// 正在评估的叶子不重复计算；直接归还这条未完成路径的 reservation。
+    /// 当前碰撞路径：cancel 整条未完成 reservation。Gather 撞到 `Evaluating` 时
+    /// 不应依赖这一步，见该处注释。
     fn finish_collision(&self, event: NodeEvent) {
         #[cfg(feature = "benchmark")]
         {
@@ -922,7 +923,7 @@ fn selected_child(shared: &Shared, event: &mut NodeEvent, node: &Node, edge_inde
     let child = if event.node_key.is_continuation() {
         event.variation.child_key_for_history(edge.mv())
     } else {
-        event.variation.child_board_key(edge.mv())
+        event.variation.child_key(edge.mv())
     };
     match shared.repository.bind_child_or_cut_cycle(event.node_key, edge, child) {
         ChildLink::Bound => Some(ChildTarget::Graph(child)),
@@ -976,6 +977,8 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                 }
             }
             ExpansionState::Evaluating => {
+                // 不应直接 cancel：路径上已攒的 in-flight / virtual mean 会被拆掉，
+                // 分流几乎作废。当前仍走 finish_collision。
                 shared.finish_collision(event);
                 return;
             }
@@ -1204,10 +1207,9 @@ fn handle_eval_event(
         }
         ExtensionKind::PathTerminal { wl, draw, plies_left } => {
             let value = ValueDelta::with_plies_left(wl, draw, plies_left);
-            // TreeNode 的 key 包含最近零化着以来完整规则 history；第三次重复等
-            // 路径裁决对这个局部 state 是确定的，可以作为 terminal 固定并继续在
-            // continuation tree 内传播。普通 GraphNode 仍可能从另一条 history 到达，
-            // 只能保留为本次 edge 的 local leaf。
+            // TreeNode 的 key 含完整规则 history，第三次重复等对这个局部 state
+            // 是确定的，可 `mark_terminal`。GraphNode 落到这里只可能是 rule60：
+            // 同一棋盘从另一条 history 进来可以不到 120，只能写本次 edge 的 local leaf。
             if event.node_key.is_continuation() {
                 node.mark_terminal(wl, draw, plies_left);
                 shared.send_backprop(BackpropEvent::evaluation(event));
@@ -1318,7 +1320,7 @@ fn publish_eval(
         cancel_evaluation(shared, event, node);
         return Err(EnginError::Onnx("stream backend evaluation is invalid".into()));
     }
-    node.set_graph_value(ValueDelta::with_plies_left(
+    node.set_base_value(ValueDelta::with_plies_left(
         network_wl_to_node(eval.wl),
         eval.d,
         eval.plies_left,
@@ -1749,7 +1751,7 @@ mod tests {
         assert!(root.try_begin_evaluation());
         let legal = history.last().board().generate_legal_moves();
         root.publish_edges(legal.iter().map(|&mv| (mv, 1.0 / legal.len() as f32)).collect());
-        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        root.set_base_value(crate::search::ValueDelta::one(0.0, 0.0));
 
         let mut search =
             Search::new_with_graph(Arc::new(UniformBackend::default()), 27, &tree, SearchConfig::default());
@@ -1771,16 +1773,16 @@ mod tests {
         let root_key = tree.root_key();
         let mv = history.last().board().parse_move("b2b3").expect("legal root move");
         let fallback = history.last().board().parse_move("g3g4").expect("legal fallback move");
-        let child_key = NodeEvent::root(41, Arc::clone(&history)).variation.child_board_key(mv);
+        let child_key = NodeEvent::root(41, Arc::clone(&history)).variation.child_key(mv);
 
         let root = tree.repository().get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
-        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
         root.publish_edges(vec![(mv, 0.9), (fallback, 0.1)]);
 
         let child = tree.repository().get_or_insert(child_key);
         assert!(child.try_begin_evaluation());
-        child.set_graph_value(ValueDelta::one(0.4, 0.0));
+        child.set_base_value(ValueDelta::one(0.4, 0.0));
         child.publish_edges(vec![(
             Move::new(Square::parse("b9").unwrap(), Square::parse("b8").unwrap()),
             1.0,
@@ -1808,26 +1810,26 @@ mod tests {
         let first = history.last().board().parse_move("b2b3").expect("legal first move");
         let child_key = NodeEvent::root(43, Arc::clone(&history))
             .variation
-            .child_board_key(first);
+            .child_key(first);
         let child_position = Position::after(history.last(), first);
         let reply = child_position.board().parse_move("b9b8").expect("legal reply");
         let grandchild = Position::after(&child_position, reply);
-        let grandchild_key = crate::search::NodeKey::board(grandchild.board().hash());
+        let grandchild_key = crate::search::NodeKey::graph_node(grandchild.board().hash());
 
         let root = tree.repository().get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
-        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
         root.publish_edges(vec![(first, 1.0)]);
         root.edges()[0].bind_child_key(child_key);
 
         let child = tree.repository().get_or_insert(child_key);
         assert!(child.try_begin_evaluation());
-        child.set_graph_value(ValueDelta::one(0.4, 0.0));
+        child.set_base_value(ValueDelta::one(0.4, 0.0));
         child.publish_edges(vec![(reply, 1.0)]);
 
         let grandchild_node = tree.repository().get_or_insert(grandchild_key);
         assert!(grandchild_node.try_begin_evaluation());
-        grandchild_node.set_graph_value(ValueDelta::one(0.2, 0.0));
+        grandchild_node.set_base_value(ValueDelta::one(0.2, 0.0));
         grandchild_node.publish_edges(vec![(
             Move::new(Square::parse("c0").unwrap(), Square::parse("c1").unwrap()),
             1.0,
@@ -1865,7 +1867,7 @@ mod tests {
         let continuation = event.repeated_child_key(mv).expect("first repetition");
 
         assert!(root.try_begin_evaluation());
-        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
         root.publish_edges(vec![(mv, 1.0)]);
         let mut search =
             Search::new_with_graph(Arc::new(UniformBackend::default()), 42, &tree, SearchConfig::default());
@@ -1905,7 +1907,7 @@ mod tests {
             .into_iter()
             .find(|mv| Position::after(history.last(), *mv).rule60_ply() == 0)
             .expect("legal capture");
-        root.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
         assert!(root.try_begin_evaluation());
         root.publish_edges(vec![(capture, 1.0)]);
 
@@ -2028,7 +2030,7 @@ mod tests {
     #[test]
     fn failed_eval_enqueue_releases_the_claimed_node() {
         let history = startpos_history();
-        let root_key = crate::search::NodeKey::board(history.last().board().hash());
+        let root_key = crate::search::NodeKey::graph_node(history.last().board().hash());
         let repository = Arc::new(NodeRepository::default());
         let root = repository.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());

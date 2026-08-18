@@ -41,14 +41,6 @@ impl Variation {
         }
     }
 
-    pub fn push(&mut self, mv: Move) {
-        self.position = Position::after(&self.position, mv);
-        self.moves.push(mv);
-        if let Some(history) = self.history.as_mut() {
-            history.append(mv);
-        }
-    }
-
     pub fn root_history(&self) -> &Arc<PositionHistory> {
         &self.root_history
     }
@@ -70,11 +62,18 @@ impl Variation {
         self.history.as_ref().expect("variation history is initialized")
     }
 
+    pub fn push(&mut self, mv: Move) {
+        self.position = Position::after(&self.position, mv);
+        self.moves.push(mv);
+        if let Some(history) = self.history.as_mut() {
+            history.append(mv);
+        }
+    }
+
     /// MCGS child identity 只使用走子后的棋盘，不混入 repetition/rule60/history。
-    /// `Position::after`（px0 `position.cc:31-60`）只复制当前 position，不重放整个
-    /// variation。
-    pub fn child_board_key(&self, mv: Move) -> NodeKey {
-        NodeKey::board(Position::after(&self.position, mv).board().hash())
+    /// 只复制当前 position，不重放整个 variation。
+    pub fn child_key(&self, mv: Move) -> NodeKey {
+        NodeKey::graph_node(Position::after(&self.position, mv).board().hash())
     }
 
     /// 走后节点的真实 identity。重复上下文仍有效时返回 TreeNode；零化着清空
@@ -88,7 +87,7 @@ impl Variation {
     }
 }
 
-/// Gather、Eval 与 Backprop worker 间传递的工作项。
+/// Gather、Eval 与 Backprop worker 间传递的事件。
 ///
 /// event 拥有全部搜索专用数据，不持有 graph/backend 的 `&mut` 引用，因此可安全地通过
 /// 有界 worker 队列发送。
@@ -101,7 +100,7 @@ pub struct NodeEvent {
     node_path: Vec<NodeKey>,
     /// 每次 Graph → Tree 的 `(入边 reservation 索引, Tree 根 key)`。一条 variation
     /// 可以在零化后回到 Graph，再进入新的 Tree，因此这里不是单值。
-    tree_entries: Vec<(usize, NodeKey)>,
+    continuation_entries: Vec<(usize, NodeKey)>,
     pub variation: Variation,
     pub reservations: Vec<EdgeReservation>,
     #[cfg(feature = "benchmark")]
@@ -118,7 +117,7 @@ impl NodeEvent {
             generation,
             node_key: root_key,
             node_path: vec![root_key],
-            tree_entries: Vec::new(),
+            continuation_entries: Vec::new(),
             variation: Variation::root(root_history),
             reservations: Vec::new(),
             #[cfg(feature = "benchmark")]
@@ -134,20 +133,32 @@ impl NodeEvent {
         self
     }
 
+    /// 进入 ContinuationTree。入口 edge 不绑定 child，因为同一个 Graph edge 在不同
+    /// variation 下可通向不同的规则上下文；Tree root 仍按其 key 在 repository 复用。
+    pub fn descend_continuation(mut self, child_key: NodeKey, reservation: EdgeReservation) -> Self {
+        assert!(child_key.is_continuation(), "continuation entry must target a TreeNode");
+        self.continuation_entries.push((self.reservations.len(), child_key));
+        self.variation.push(reservation.mv());
+        self.node_key = child_key;
+        self.node_path.push(child_key);
+        self.reservations.push(reservation);
+        self
+    }
+
     /// 若走后会形成棋规认可的第一次重复，返回对应 TreeNode key。
     ///
-    /// 不能只在全部 history 中查相同 board hash：相差奇数 ply 的 canonical board
-    /// 可能相同，却不是同一行棋方的重复。先按 parity 过滤，再由
+    /// board 已经判断了行棋方是否相同，只需检查是否重复。
     /// `PositionHistory::append` 作为规则真相确认 `repetitions`。
     pub(crate) fn repeated_child_key(&mut self, mv: Move) -> Option<NodeKey> {
-        let board = Position::after(&self.variation.position, mv).board().hash();
+        let child = Position::after(&self.variation.position, mv);
         let history = self.variation.history();
-        let child_parity = history.len() & 1;
         if !history
             .positions()
             .iter()
-            .enumerate()
-            .any(|(index, position)| index & 1 == child_parity && position.board().hash() == board)
+            .rev()
+            .skip(1)
+            .step_by(2)
+            .any(|position| position.board() == child.board())
         {
             return None;
         }
@@ -157,20 +168,11 @@ impl NodeEvent {
         (child_history.last().repetitions() > 0).then(|| NodeKey::for_history(&child_history))
     }
 
-    /// 进入 ContinuationTree。入口 edge 不绑定 child，因为同一个 Graph edge 在不同
-    /// variation 下可通向不同的规则上下文；Tree root 仍按其 key 在 repository 复用。
-    pub fn descend_continuation(mut self, child_key: NodeKey, reservation: EdgeReservation) -> Self {
-        assert!(child_key.is_continuation(), "continuation entry must target a TreeNode");
-        self.tree_entries.push((self.reservations.len(), child_key));
-        self.variation.push(reservation.mv());
-        self.node_key = child_key;
-        self.node_path.push(child_key);
-        self.reservations.push(reservation);
-        self
-    }
-
-    /// 当前 leaf 是路径终局但不是共享 node 时，在回传前丢弃它；实际入边仍保留在
-    /// `reservations` 中。这样与环边一样，只重算真正可共享的 parent node。
+    /// GraphNode 路径终局目前只可能是 `rule60_ply >= 120`：重复 / 长将长捉在第一次
+    /// 出现时已转入 ContinuationTree，不会落到 GraphNode（其 `repetitions` 恒为 0）。
+    /// rule60 跟 history 走，同一棋盘从另一条路径进来可以不到 120，因此不能
+    /// `mark_terminal`，值写到入边 `local_leaf`。叶子移出 `node_path`，backprop 只重算
+    /// 剩余的共享 parent。ContinuationTree 的规则终局走 `mark_terminal`，不经过这里。
     pub(crate) fn discard_leaf_node(mut self) -> Self {
         assert_eq!(
             self.node_path.len(),
@@ -181,7 +183,8 @@ impl NodeEvent {
         self
     }
 
-    /// collision、停止或评估失败后释放全部 edge-local in-flight visit。消费 `self`
+    /// 搜索停止或评估失败后释放全部 edge-local in-flight visit。collision 不应走
+    /// 这条路径——cancel 会拆掉已攒的 virtual mean，使分流几乎作废。消费 `self`
     /// 让调用方遗漏 reservation 成为显式错误。
     pub fn cancel(self) {
         for reservation in self.reservations.into_iter().rev() {
@@ -267,7 +270,7 @@ impl BackpropEvent {
                 "shared-leaf path has one more node; local leaf path has no shared leaf"
             );
             let depth = node.reservations.len() as u64 + 1;
-            let tree_entries = node.tree_entries;
+            let tree_entries = node.continuation_entries;
             let mut reservations: Vec<_> = node.reservations.into_iter().map(Some).collect();
             let mut local_leaf = local_leaf;
             for index in (0..reservations.len()).rev() {
@@ -286,9 +289,9 @@ impl BackpropEvent {
             for (index, root) in tree_entries.into_iter().rev() {
                 let entry = reservations[index].take().expect("continuation entry reservation");
                 if let Some(value) = local_leaf.take() {
-                    // ContinuationTree 根本身就是 path terminal（例如重复正好触发
-                    // rule60）时，它已被 `discard_leaf_node` 移出 node_path，不能读
-                    // 未展开 node 的默认值；直接把本次规则裁决写入 entry edge。
+                    // GraphNode 的 rule60 终局叶子已被 `discard_leaf_node` 移出
+                    // `node_path`；不能读未展开 node 的默认值，直接把这次裁决写入
+                    // entry edge。ContinuationTree 终局走 `mark_terminal`，不走这条。
                     entry.complete_local_leaf(value);
                 } else {
                     for node_key in node.node_path[index + 1..].iter().rev() {
@@ -358,7 +361,7 @@ mod tests {
             xiangqi_core::Square::parse("b2").expect("b2"),
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
-        let child_key = root.variation.child_board_key(mv);
+        let child_key = root.variation.child_key(mv);
         let root_history_len = root.variation.root_history().len();
         let mut next = root.descend(child_key, crate::search::EdgeReservation::test_only(mv));
 
@@ -490,11 +493,11 @@ mod tests {
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         root_node.publish_edges(vec![(mv, 1.0)]);
-        root_node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
-        let child_key = NodeKey::board(42);
+        root_node.set_base_value(ValueDelta::one(0.0, 0.0));
+        let child_key = NodeKey::graph_node(42);
         root_node.edges()[0].bind_child_key(child_key);
         let child_node = repository.get_or_insert(child_key);
-        child_node.set_graph_value(crate::search::ValueDelta::with_plies_left(0.4, 0.2, 2.0));
+        child_node.set_base_value(ValueDelta::with_plies_left(0.4, 0.2, 2.0));
         let child = root.descend(child_key, root_node.reserve_edge(0).expect("edge"));
 
         BackpropEvent::complete_batch([BackpropEvent::evaluation(child)], &repository);
@@ -527,16 +530,16 @@ mod tests {
             xiangqi_core::Square::parse("b7").expect("b7"),
             xiangqi_core::Square::parse("b6").expect("b6"),
         );
-        let parent_key = NodeKey::board(18_001);
-        let terminal_key = NodeKey::board(18_002);
+        let parent_key = NodeKey::graph_node(18_001);
+        let terminal_key = NodeKey::graph_node(18_002);
         assert!(root_node.try_begin_evaluation());
-        root_node.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root_node.set_base_value(ValueDelta::one(0.0, 0.0));
         root_node.publish_edges(vec![(first, 1.0)]);
         root_node.edges()[0].bind_child_key(parent_key);
 
         let parent = repository.get_or_insert(parent_key);
         assert!(parent.try_begin_evaluation());
-        parent.set_graph_value(ValueDelta::one(0.0, 0.0));
+        parent.set_base_value(ValueDelta::one(0.0, 0.0));
         parent.publish_edges(vec![(reply, 1.0)]);
         parent.edges()[0].bind_child_key(terminal_key);
 
@@ -569,15 +572,15 @@ mod tests {
             xiangqi_core::Square::parse("b7").expect("b7"),
             xiangqi_core::Square::parse("b6").expect("b6"),
         );
-        let continuation_key = NodeKey::continuation(19_001, 19_002);
-        let terminal_key = NodeKey::continuation(19_003, 19_004);
+        let continuation_key = NodeKey::tree_node(19_001, 19_002);
+        let terminal_key = NodeKey::tree_node(19_003, 19_004);
         assert!(root_node.try_begin_evaluation());
-        root_node.set_graph_value(ValueDelta::one(0.0, 0.0));
+        root_node.set_base_value(ValueDelta::one(0.0, 0.0));
         root_node.publish_edges(vec![(first, 1.0)]);
 
         let continuation = repository.get_or_insert(continuation_key);
         assert!(continuation.try_begin_evaluation());
-        continuation.set_graph_value(ValueDelta::one(0.0, 0.0));
+        continuation.set_base_value(ValueDelta::one(0.0, 0.0));
         continuation.publish_edges(vec![(reply, 1.0)]);
         continuation.edges()[0].bind_child_key(terminal_key);
 
@@ -609,12 +612,12 @@ mod tests {
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         root_node.publish_edges(vec![(mv, 1.0)]);
-        root_node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
-        let child_key = NodeKey::board(42);
+        root_node.set_base_value(ValueDelta::one(0.0, 0.0));
+        let child_key = NodeKey::graph_node(42);
         root_node.edges()[0].bind_child_key(child_key);
         repository
             .get_or_insert(child_key)
-            .set_graph_value(crate::search::ValueDelta::one(0.3, 0.3));
+            .set_base_value(ValueDelta::one(0.3, 0.3));
         let first = first.descend(child_key, root_node.reserve_edge(0).expect("first edge"));
         let second =
             NodeEvent::root(1, root_history).descend(child_key, root_node.reserve_edge(0).expect("second edge"));
@@ -652,10 +655,10 @@ mod tests {
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         node.publish_edges(vec![(mv, 1.0)]);
-        node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
-        let continuation_key = NodeKey::continuation(42, 99);
+        node.set_base_value(ValueDelta::one(0.0, 0.0));
+        let continuation_key = NodeKey::tree_node(42, 99);
         let continuation = repository.get_or_insert(continuation_key);
-        continuation.set_graph_value(crate::search::ValueDelta::one(0.6, 0.0));
+        continuation.set_base_value(ValueDelta::one(0.6, 0.0));
         let event = root.descend_continuation(continuation_key, node.reserve_edge(0).expect("entry edge"));
         BackpropEvent::complete_batch([BackpropEvent::evaluation(event)], &repository);
 
@@ -681,9 +684,9 @@ mod tests {
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         shard.publish_edges(vec![(entry_move, 1.0)]);
-        shard.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
+        shard.set_base_value(ValueDelta::one(0.0, 0.0));
 
-        let continuation_key = NodeKey::continuation(42, 99);
+        let continuation_key = NodeKey::tree_node(42, 99);
         let continuation = repository.get_or_insert(continuation_key);
         assert!(continuation.try_begin_evaluation());
         let inside_move = Move::new(
@@ -691,11 +694,11 @@ mod tests {
             xiangqi_core::Square::parse("c3").expect("c3"),
         );
         continuation.publish_edges(vec![(inside_move, 1.0)]);
-        continuation.set_graph_value(crate::search::ValueDelta::with_plies_left(0.4, 0.0, 2.0));
+        continuation.set_base_value(ValueDelta::with_plies_left(0.4, 0.0, 2.0));
 
-        let leaf_key = NodeKey::continuation(43, 100);
+        let leaf_key = NodeKey::tree_node(43, 100);
         let leaf = repository.get_or_insert(leaf_key);
-        leaf.set_graph_value(crate::search::ValueDelta::with_plies_left(0.8, 0.0, 3.0));
+        leaf.set_base_value(ValueDelta::with_plies_left(0.8, 0.0, 3.0));
         continuation.edges()[0].bind_child_key(leaf_key);
 
         let event = root
@@ -727,9 +730,9 @@ mod tests {
         );
         let repository = NodeRepository::default();
         let root_node = repository.get_or_insert(root.node_key);
-        let first_tree_key = NodeKey::continuation(42, 1);
-        let graph_key = NodeKey::board(43);
-        let second_tree_key = NodeKey::continuation(44, 2);
+        let first_tree_key = NodeKey::tree_node(42, 1);
+        let graph_key = NodeKey::graph_node(43);
+        let second_tree_key = NodeKey::tree_node(44, 2);
         let first_tree = repository.get_or_insert(first_tree_key);
         let graph = repository.get_or_insert(graph_key);
         let second_tree = repository.get_or_insert(second_tree_key);
@@ -752,9 +755,9 @@ mod tests {
         ] {
             assert!(node.try_begin_evaluation());
             node.publish_edges(vec![(mv, 1.0)]);
-            node.set_graph_value(ValueDelta::one(value, 0.0));
+            node.set_base_value(ValueDelta::one(value, 0.0));
         }
-        second_tree.set_graph_value(ValueDelta::one(0.6, 0.0));
+        second_tree.set_base_value(ValueDelta::one(0.6, 0.0));
         first_tree.edges()[0].bind_child_key(graph_key);
 
         let event = root
@@ -783,8 +786,8 @@ mod tests {
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         node.publish_edges(vec![(mv, 1.0)]);
-        node.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
-        let continuation = NodeKey::continuation(42, 100);
+        node.set_base_value(ValueDelta::one(0.0, 0.0));
+        let continuation = NodeKey::tree_node(42, 100);
         repository.get_or_insert(continuation);
         let event = root
             .descend_continuation(continuation, node.reserve_edge(0).expect("entry edge"))
@@ -793,7 +796,7 @@ mod tests {
         BackpropEvent::complete_batch(
             [BackpropEvent::local_leaf(
                 event,
-                crate::search::ValueDelta::one(0.8, 0.0),
+                ValueDelta::one(0.8, 0.0),
             )],
             &repository,
         );
@@ -815,8 +818,8 @@ mod tests {
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         root.publish_edges(vec![(mv, 1.0)]);
-        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
-        let child_key = NodeKey::board(42);
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
+        let child_key = NodeKey::graph_node(42);
         root.edges()[0].bind_child_key(child_key);
 
         for value in [0.6, -0.2] {
@@ -825,7 +828,7 @@ mod tests {
             BackpropEvent::complete_batch(
                 [BackpropEvent::local_leaf(
                     event.discard_leaf_node(),
-                    crate::search::ValueDelta::one(value, 0.0),
+                    ValueDelta::one(value, 0.0),
                 )],
                 &repository,
             );
@@ -849,8 +852,8 @@ mod tests {
             xiangqi_core::Square::parse("b3").expect("b3"),
         );
         root.publish_edges(vec![(mv, 1.0)]);
-        root.set_graph_value(crate::search::ValueDelta::one(0.0, 0.0));
-        let child_key = root_event.variation.child_board_key(mv);
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
+        let child_key = root_event.variation.child_key(mv);
         root.edges()[0].bind_child_key(child_key);
         let child = repository.get_or_insert(child_key);
         assert!(child.try_begin_evaluation());
@@ -860,12 +863,12 @@ mod tests {
         BackpropEvent::complete_batch(
             [BackpropEvent::local_leaf(
                 event.discard_leaf_node(),
-                crate::search::ValueDelta::one(0.0, 1.0),
+                ValueDelta::one(0.0, 1.0),
             )],
             &repository,
         );
 
-        assert_eq!(child.expansion_state(), crate::search::ExpansionState::Unexpanded);
+        assert_eq!(child.expansion_state(), ExpansionState::Unexpanded);
         assert_eq!(root.edges()[0].completed_visits(), 1);
         assert_eq!(root.completed_visits(), 2);
     }

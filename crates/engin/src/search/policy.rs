@@ -92,7 +92,7 @@ pub(crate) fn get_fpu(repository: &NodeRepository, params: &SearchParams, parent
     -parent_q - params.fpu_reduction * visited_policy(repository, edges).sqrt()
 }
 
-// 未定义并验证的能力不预留字段：OOO evaluation、prefetch、tree-batch gather 等。
+// 未定义并验证的能力不预留字段：multivisit、OOO evaluation、prefetch、tree-batch gather 等。
 
 // PUCT / FPU / edge scoring 形状历史上参考过常见 MCTS 实现；默认参数与
 // `draw_score=0`、in-flight 计入 edge visit 等约定以本仓 stream 为准。
@@ -105,6 +105,7 @@ use super::{Edge, NodeRepository};
 
 /// stream backpropagation 使用的紧凑 WDL 更新。
 ///
+/// - `visits`：多份 `one()` 样本的合计，不是一次 reservation 携带的 K
 /// - `wl_sum`：走子方 / incoming-edge 视角（非 NN 原始 STM）
 /// - `draw_sum`：和棋分量
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -312,7 +313,7 @@ mod tests {
     #[test]
     fn in_flight_visit_deflects_selection_without_changing_completed_q() {
         let repo = NodeRepository::default();
-        let key = NodeKey::board(9);
+        let key = NodeKey::graph_node(9);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("b2", "b3"), 0.6), (mv("c3", "c4"), 0.4)]);
@@ -335,18 +336,18 @@ mod tests {
     #[test]
     fn virtual_visits_also_raise_the_parent_puct_numerator() {
         let repo = NodeRepository::default();
-        let parent_key = NodeKey::board(51);
+        let parent_key = NodeKey::graph_node(51);
         let parent = repo.get_or_insert(parent_key);
         assert!(parent.try_begin_evaluation());
         parent.publish_edges(vec![(mv("b2", "b3"), 0.9), (mv("c3", "c4"), 0.1)]);
         let edges = parent.edges();
 
         for (edge, key, q) in [
-            (&edges[0], NodeKey::board(52), 0.0),
-            (&edges[1], NodeKey::board(53), 0.15),
+            (&edges[0], NodeKey::graph_node(52), 0.0),
+            (&edges[1], NodeKey::graph_node(53), 0.15),
         ] {
             edge.bind_child_key(key);
-            repo.get_or_insert(key).set_graph_value(ValueDelta::one(q, 0.0));
+            repo.get_or_insert(key).set_base_value(ValueDelta::one(q, 0.0));
             repo.recompute_graph_node(key);
         }
         let reservations: Vec<_> = (0..4).map(|_| parent.reserve_edge(0).expect("virtual visit")).collect();
@@ -370,7 +371,7 @@ mod tests {
     #[test]
     fn root_move_filter_restricts_selection() {
         let repo = NodeRepository::default();
-        let key = NodeKey::board(9);
+        let key = NodeKey::graph_node(9);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("b2", "b3"), 0.9), (mv("c3", "c4"), 0.1)]);
@@ -386,14 +387,14 @@ mod tests {
     #[test]
     fn visited_edge_utility_reads_shared_child_q() {
         let repo = NodeRepository::default();
-        let key = NodeKey::board(3);
+        let key = NodeKey::graph_node(3);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();
-        let child_key = NodeKey::board(4);
+        let child_key = NodeKey::graph_node(4);
         edge.bind_child_key(child_key);
-        repo.get_or_insert(child_key).set_graph_value(ValueDelta::one(0.5, 0.0));
+        repo.get_or_insert(child_key).set_base_value(ValueDelta::one(0.5, 0.0));
         repo.recompute_graph_node(child_key);
         node.reserve_edge(0).expect("res").complete();
         assert!((edge_utility(&repo, &edge, 0.0, false) - 0.5).abs() < 1e-6);
@@ -402,14 +403,14 @@ mod tests {
     #[test]
     fn unvisited_transposition_uses_shared_child_q_not_fpu() {
         let repo = NodeRepository::default();
-        let key = NodeKey::board(40);
+        let key = NodeKey::graph_node(40);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();
-        let child_key = NodeKey::board(41);
+        let child_key = NodeKey::graph_node(41);
         edge.bind_child_key(child_key);
-        repo.get_or_insert(child_key).set_graph_value(ValueDelta::one(0.5, 0.0));
+        repo.get_or_insert(child_key).set_base_value(ValueDelta::one(0.5, 0.0));
         repo.recompute_graph_node(child_key);
 
         assert_eq!(edge.completed_visits(), 0);
@@ -420,14 +421,14 @@ mod tests {
     #[test]
     fn virtual_fpu_mean_is_temporary_action_q_only() {
         let repo = NodeRepository::default();
-        let key = NodeKey::board(50);
+        let key = NodeKey::graph_node(50);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();
-        let child_key = NodeKey::board(51);
+        let child_key = NodeKey::graph_node(51);
         edge.bind_child_key(child_key);
-        repo.get_or_insert(child_key).set_graph_value(ValueDelta::one(0.8, 0.0));
+        repo.get_or_insert(child_key).set_base_value(ValueDelta::one(0.8, 0.0));
         repo.recompute_graph_node(child_key);
         node.reserve_edge(0).expect("completed evidence").complete();
         assert!((edge_utility(&repo, &edge, -0.3, true) - 0.8).abs() < 1e-6);
@@ -447,14 +448,14 @@ mod tests {
     #[test]
     fn virtual_mean_keeps_a_shared_child_value_when_the_edge_has_no_local_visit() {
         let repo = NodeRepository::default();
-        let key = NodeKey::board(60);
+        let key = NodeKey::graph_node(60);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();
-        let child_key = NodeKey::board(61);
+        let child_key = NodeKey::graph_node(61);
         edge.bind_child_key(child_key);
-        repo.get_or_insert(child_key).set_graph_value(ValueDelta::one(0.8, 0.0));
+        repo.get_or_insert(child_key).set_base_value(ValueDelta::one(0.8, 0.0));
         repo.recompute_graph_node(child_key);
 
         let reservation = node
@@ -467,15 +468,15 @@ mod tests {
     #[test]
     fn path_terminal_is_one_edge_sample_not_a_permanent_child_override() {
         let repo = NodeRepository::default();
-        let key = NodeKey::board(30);
+        let key = NodeKey::graph_node(30);
         let node = repo.get_or_insert(key);
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();
-        let child_key = NodeKey::board(31);
+        let child_key = NodeKey::graph_node(31);
         edge.bind_child_key(child_key);
         let child = repo.get_or_insert(child_key);
-        child.set_graph_value(ValueDelta::one(-0.2, 0.0));
+        child.set_base_value(ValueDelta::one(-0.2, 0.0));
         repo.recompute_graph_node(child_key);
 
         node.reserve_edge(0)

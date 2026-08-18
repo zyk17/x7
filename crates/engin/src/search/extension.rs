@@ -14,8 +14,8 @@ pub(crate) enum ExtensionKind {
     Evaluate,
     /// 只由棋盘决定的终局，可安全发布到共享 node。
     SharedTerminal { wl: f32, draw: f32, plies_left: f32 },
-    /// 依赖当前 Variation 的终局。普通 board-key GraphNode 不得改变；带完整规则
-    /// history 的 TreeNode 则可安全固定为 terminal。参见 `MCGS.md` “环与重复”。
+    /// 依赖当前 Variation 的终局。GraphNode 落到这里只可能是 rule60；带完整规则
+    /// history 的 TreeNode 则可把第三次重复等固定为 terminal。参见 `MCGS.md` “环与重复”。
     PathTerminal { wl: f32, draw: f32, plies_left: f32 },
 }
 
@@ -48,8 +48,9 @@ pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> Ext
     ExtensionKind::Evaluate
 }
 
-/// 只检查依赖 variation history 的终局。共享 node 已展开后再次被另一条 variation
-/// 命中时，Gather 必须仍调用它；不能因 board node 已存在而跳过重复、长将/长捉或 rule60。
+/// 只检查依赖 variation history 的终局。已展开的共享 GraphNode 再次被命中时，
+/// 仍可能因本条路径 `rule60_ply >= 120` 而终局；重复 / 长将长捉只出现在
+/// ContinuationTree（`repetitions >= 2`）。不能因 board node 已存在而跳过。
 pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Option<(f32, f32, f32)> {
     let is_root = depth == 0;
     if !is_root {
