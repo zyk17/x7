@@ -58,7 +58,7 @@ fn deadline_in_flight_limit(deadline: Option<Instant>, window: usize, batch: usi
     if deadline.saturating_duration_since(now) >= SHORT_CLOCK {
         return window;
     }
-    batch.min(SHORT_CLOCK_IN_FLIGHT_CAP).max(1).min(window)
+    batch.clamp(1, SHORT_CLOCK_IN_FLIGHT_CAP).min(window)
 }
 
 /// 一条队列的 benchmark 等待时间快照。
@@ -494,9 +494,7 @@ impl Shared {
 
     fn wait_while(&self, deadline: Option<Instant>, stop_on_stopping: bool, mut busy: impl FnMut(&Self) -> bool) {
         let mut guard = self.idle_lock.lock();
-        while busy(self)
-            && !(stop_on_stopping && self.stopping.load(Ordering::Acquire))
-            && self.error.lock().is_none()
+        while busy(self) && !(stop_on_stopping && self.stopping.load(Ordering::Acquire)) && self.error.lock().is_none()
         {
             let Some(deadline) = deadline else {
                 self.idle.wait(&mut guard);
@@ -2408,12 +2406,7 @@ mod tests {
     fn reused_graph_survives_incremental_uci_chase() {
         // GUI 跨回合 `position fen … moves …` 复用图；一次性直接设到终局 fen+moves 不复现。
         let fen = "2bakc3/4a3n/4b4/2C1p4/P8/4P2cN/P8/4B1C2/4A4/4KAB2 b - - 0 1";
-        let steps: [&[&str]; 4] = [
-            &[],
-            &["f9f4"],
-            &["f9f4", "g2g4"],
-            &["f9f4", "g2g4", "f4f3"],
-        ];
+        let steps: [&[&str]; 4] = [&[], &["f9f4"], &["f9f4", "g2g4"], &["f9f4", "g2g4", "f4f3"]];
         let backend = Arc::new(UniformBackend::default()) as Arc<dyn Backend>;
         let start = GameState::from_fen_moves(fen, &[] as &[&str]).expect("fen");
         let mut graph = super::SearchGraph::new(Arc::new(PositionHistory::from_positions(start.positions())));
@@ -2443,8 +2436,7 @@ mod tests {
             let root_is_black = history.last().is_black_to_move();
             let mv = best_move(search.repository(), search.root_key(), root_is_black);
             assert!(
-                mv.is_some_and(|mv| !mv.is_null())
-                    || !history.last().board().generate_legal_moves().is_empty(),
+                mv.is_some_and(|mv| !mv.is_null()) || !history.last().board().generate_legal_moves().is_empty(),
                 "reused root at ply {generation} produced no playable move"
             );
             search.stop_and_finish();

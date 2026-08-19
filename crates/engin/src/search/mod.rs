@@ -31,7 +31,6 @@ pub use stats::{
     root_stats,
 };
 pub(crate) use stats::{
-    best_mate_with_params, best_move_filtered_with_params, principal_variation_with_history_and_params,
-    root_variations,
+    best_mate_with_params, best_move_filtered_with_params, principal_variation_with_history_and_params, root_variations,
 };
 pub(crate) use time::{TimeBudget, TimeManager};

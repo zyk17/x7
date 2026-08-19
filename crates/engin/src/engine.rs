@@ -550,11 +550,7 @@ fn run_search(
         if let Some(info) = infos.first_mut() {
             info.pv = principal_variation;
         }
-        let best_move = reported_uci_move(
-            best_move,
-            snapshot.root_history.as_ref(),
-            &snapshot.root_move_filter,
-        );
+        let best_move = reported_uci_move(best_move, snapshot.root_history.as_ref(), &snapshot.root_move_filter);
         let _output = output_gate.lock();
         if publish_output.load(Ordering::Acquire) {
             write_stdout_thinking(&infos, &output_options);

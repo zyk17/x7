@@ -412,9 +412,7 @@ pub(crate) fn root_variations(
                 wl,
                 draw,
                 mate,
-                pv: principal_variation_from_root_edge(
-                    repository, root_key, root_is_black, edge.mv(), root_history,
-                ),
+                pv: principal_variation_from_root_edge(repository, root_key, root_is_black, edge.mv(), root_history),
             }
         })
         .collect()
