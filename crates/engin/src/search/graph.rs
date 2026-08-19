@@ -193,11 +193,17 @@ impl Edge {
         self.topology_pruned.load(Ordering::Acquire)
     }
 
-    pub fn bind_child_key(&self, key: NodeKey) {
+    fn write_child_key(&self, key: NodeKey) {
         assert!(!self.topology_pruned(), "topology-pruned edge cannot bind a child");
         if let Err(existing) = self.child_key.set(key) {
             assert_eq!(existing, key, "one edge must keep one child board");
         }
+    }
+
+    /// 测试夹具：只写 child，不做拓扑剪枝。生产路径走 `NodeRepository::bind_child_or_cut_cycle`。
+    #[cfg(test)]
+    pub(crate) fn bind_child_key(&self, key: NodeKey) {
+        self.write_child_key(key);
     }
 
     pub(crate) fn reserve(self: &Arc<Self>, virtual_mean: Option<f32>) -> EdgeReservation {
@@ -294,9 +300,22 @@ pub struct Node {
     /// 终局 WDL 与 plies：`(wl, draw≡d, plies_left≡m)`。`m` 以 ply（半回合）保存，
     /// UCI “moves left” 另行换算为完整回合。
     terminal: Mutex<Option<(f32, f32, f32)>>,
+    /// 首次到达深度。0 表示还没有从某条入边赋值。只在 `link_lock` 下改写。
+    depth: AtomicU32,
 }
 
 impl Node {
+    fn depth(&self) -> Option<u32> {
+        match self.depth.load(Ordering::Relaxed) {
+            0 => None,
+            encoded => Some(encoded - 1),
+        }
+    }
+
+    fn set_depth(&self, depth: u32) {
+        self.depth.store(depth + 1, Ordering::Relaxed);
+    }
+
     /// 写入冻住的 U(n)。`value.visits` 是这份样本的权重（通常为 1），与 `stats.visits` 无关。
     pub(crate) fn set_base_value(&self, value: ValueDelta) {
         assert!(value.visits > 0, "node base value must have positive weight");
@@ -383,14 +402,12 @@ impl Node {
     /// Eval 在发布终局数据或 policy 前失败后恢复 node，避免后续 PlayoutEvent 将失败的
     /// NN 请求当作永久 collision。
     pub fn abort_evaluation(&self) {
-        self.expansion
-            .compare_exchange(
-                ExpansionState::Evaluating as u8,
-                ExpansionState::Unexpanded as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .expect("only evaluating stream nodes can abort evaluation");
+        let _ = self.expansion.compare_exchange(
+            ExpansionState::Evaluating as u8,
+            ExpansionState::Unexpanded as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn set_terminal_stats(&self, wl: f32, draw: f32, plies_left: f32, visits: u32) {
@@ -477,9 +494,7 @@ pub struct NodeRepository {
     /// GC ↔ 建/查 node 的成员关系：读锁下可创建与查找，写锁下做 mark/sweep。
     /// N/Q、PUCT、reservation 不经过它。shared-Q 无环靠 edge 的 topology prune，不靠这把锁。
     topology_lock: RwLock<()>,
-    /// 仅串行「首次绑定前的拓扑过滤检查 + prune/bind」。无环策略是永久过滤会成环的
-    /// edge（`topology_pruned`），此锁只防并发两次检查各自通过后合起来成环。
-    /// 正常 PUCT、reservation 与统计更新不经过它。
+    /// 仅串行「首次深度赋值 + prune/bind」。只剪回边（parent 比 child 首次到达更深）。
     link_lock: Mutex<()>,
 }
 
@@ -628,12 +643,9 @@ impl NodeRepository {
         shard.read().get(&key).cloned()
     }
 
-    /// 首次绑定 graph edge：会成环则永久 topology prune，否则绑定。
-    ///
-    /// 无环靠过滤这条 edge，不是靠锁。`topology_lock` 读锁只保证检查期间 node 仍在
-    /// repository；`link_lock` 只串行本次检查，避免并发漏网。被 prune 的边不是棋规
-    /// 终局，调用方取消本次 reservation 后继续选其他 edge。
-    pub(crate) fn bind_child_or_cut_cycle(&self, parent: NodeKey, edge: &Edge, child: NodeKey) -> ChildLink {
+    /// 首次绑定：浅层父节点可接到已被更深路径先展开的 child。
+    /// 只剪回边（`depth(parent) > depth(child)`）。`parent` 由调用方持有。
+    pub(crate) fn bind_child_or_cut_cycle(&self, parent: &Node, edge: &Edge, child: NodeKey) -> ChildLink {
         let _topology = self.topology_lock.read();
         let _link = self.link_lock.lock();
         if let Some(existing) = edge.child_key() {
@@ -643,38 +655,25 @@ impl NodeRepository {
         if edge.topology_pruned() {
             return ChildLink::TopologyPruned;
         }
-        // 新 child 尚未进入 repository 时不可能沿既有图边回到 parent，直接绑定。
-        // 这避免绝大多数首次 expansion 的无意义 DFS。
-        if self.get_unlocked(child).is_none() {
-            self.get_or_insert_unlocked(child);
-            edge.bind_child_key(child);
+        let parent_depth = parent.depth().unwrap_or_else(|| {
+            parent.set_depth(0);
+            0
+        });
+        if let Some(child_node) = self.get_unlocked(child) {
+            if let Some(child_depth) = child_node.depth() {
+                if parent_depth > child_depth {
+                    edge.topology_pruned.store(true, Ordering::Release);
+                    return ChildLink::TopologyPruned;
+                }
+            } else {
+                child_node.set_depth(parent_depth + 1);
+            }
+            edge.write_child_key(child);
             return ChildLink::Bound;
         }
-        if self.reaches_unlocked(child, parent) {
-            edge.topology_pruned.store(true, Ordering::Release);
-            return ChildLink::TopologyPruned;
-        }
-        edge.bind_child_key(child);
+        self.get_or_insert_unlocked(child).set_depth(parent_depth + 1);
+        edge.write_child_key(child);
         ChildLink::Bound
-    }
-
-    /// 新边检查专用 DFS。它只读取已绑定 edge，且只在首次连接 edge 时调用。
-    fn reaches_unlocked(&self, from: NodeKey, target: NodeKey) -> bool {
-        let mut pending = vec![from];
-        let mut seen: HashSet<NodeKey, BuildHasherDefault<NoHashHasher<u64>>> = HashSet::default();
-        while let Some(key) = pending.pop() {
-            if !seen.insert(key) {
-                continue;
-            }
-            if key == target {
-                return true;
-            }
-            let Some(node) = self.get_unlocked(key) else {
-                continue;
-            };
-            pending.extend(node.edges().iter().filter_map(|edge| edge.child_key()));
-        }
-        false
     }
 
     /// 以当前 root 为唯一保留根回收不可达图。
@@ -1117,8 +1116,8 @@ mod repository_tests {
 
     #[test]
     fn new_edge_that_would_close_a_graph_cycle_is_permanently_pruned() {
-        // A -> B -> D 与 A -> C -> D 合并后，D -> B 会让 B/D 的 Q 互相依赖。
-        // 这不是棋规重复；X7 直接将该 edge 排除在 shared 图之外。
+        // A -> B -> D 与 A -> C -> D 合并后，D -> B 是回边，剪掉。
+        // 这不是棋规重复；X7 用首次到达深度做拓扑剪枝。
         let repo = NodeRepository::default();
         let a = NodeKey::graph_node(10);
         let b = NodeKey::graph_node(11);
@@ -1142,33 +1141,36 @@ mod repository_tests {
             node.set_base_value(ValueDelta::one(value, 0.0));
             node.publish_edges(edges);
         }
+        let a_node = repo.get(a).unwrap();
+        let b_node = repo.get(b).unwrap();
+        let c_node = repo.get(c).unwrap();
         assert!(matches!(
-            repo.bind_child_or_cut_cycle(a, &repo.get(a).unwrap().edges()[0], b),
+            repo.bind_child_or_cut_cycle(&a_node, &a_node.edges()[0], b),
             ChildLink::Bound
         ));
         assert!(matches!(
-            repo.bind_child_or_cut_cycle(a, &repo.get(a).unwrap().edges()[1], c),
+            repo.bind_child_or_cut_cycle(&a_node, &a_node.edges()[1], c),
             ChildLink::Bound
         ));
         assert!(matches!(
-            repo.bind_child_or_cut_cycle(b, &repo.get(b).unwrap().edges()[0], d),
+            repo.bind_child_or_cut_cycle(&b_node, &b_node.edges()[0], d),
             ChildLink::Bound
         ));
         assert!(matches!(
-            repo.bind_child_or_cut_cycle(c, &repo.get(c).unwrap().edges()[0], d),
+            repo.bind_child_or_cut_cycle(&c_node, &c_node.edges()[0], d),
             ChildLink::Bound
         ));
 
         let d_node = repo.get(d).expect("D node");
         let d_edges = d_node.edges();
         let d_edge = &d_edges[0];
-        let ChildLink::TopologyPruned = repo.bind_child_or_cut_cycle(d, d_edge, b) else {
+        let ChildLink::TopologyPruned = repo.bind_child_or_cut_cycle(&d_node, d_edge, b) else {
             panic!("D -> B must be cut")
         };
         assert!(d_edge.child_key().is_none());
         assert!(d_edge.topology_pruned());
         assert!(matches!(
-            repo.bind_child_or_cut_cycle(d, d_edge, b),
+            repo.bind_child_or_cut_cycle(&d_node, d_edge, b),
             ChildLink::TopologyPruned
         ));
     }

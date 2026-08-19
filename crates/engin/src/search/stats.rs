@@ -361,12 +361,12 @@ fn principal_variation_from_root_edge(
 fn next_pv_key(repository: &NodeRepository, edge: &Edge, history: &mut Option<PositionHistory>) -> Option<NodeKey> {
     if let Some(history) = history {
         history.append(edge.mv());
-        let key = NodeKey::for_history(history);
-        // 普通 Graph/零化 edge 已绑定；首次重复入口则按本 PV 的完整 history 临时
-        // 推导 TreeNode。二者应指向同一个 child，若不一致宁可停止显示，不猜测图路径。
+        // 普通 Graph 边已绑定 child_key，直接使用；Graph→Tree 入口边未绑定，
+        // 按本条 PV 的完整 history 推导临时 continuation key。
         if let Some(bound) = edge.child_key() {
-            return (bound == key).then_some(bound);
+            return Some(bound);
         }
+        let key = NodeKey::for_history(history);
         return repository.get(key).map(|_| key);
     }
     edge.child_key()
@@ -926,12 +926,15 @@ mod tests {
         let child = repo.get_or_insert(child_key);
         assert!(child.try_begin_evaluation());
         child.publish_edges(vec![(mv("c0", "c1"), 1.0)]);
-        child.edges()[0].bind_child_key(root_key);
+        assert!(matches!(
+            repo.bind_child_or_cut_cycle(&child, &child.edges()[0], root_key),
+            crate::search::graph::ChildLink::Bound
+        ));
 
         let root_edges = root.edges();
         let pruned_edge = root_edges.iter().find(|edge| edge.mv() == pruned).expect("pruned edge");
         assert!(matches!(
-            repo.bind_child_or_cut_cycle(root_key, pruned_edge, child_key),
+            repo.bind_child_or_cut_cycle(&root, pruned_edge, child_key),
             crate::search::graph::ChildLink::TopologyPruned
         ));
 

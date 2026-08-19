@@ -31,6 +31,8 @@ use super::{
 };
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
+const SHORT_CLOCK: Duration = Duration::from_millis(500);
+const SHORT_CLOCK_IN_FLIGHT_CAP: usize = 8;
 
 /// 当前 root 的累计 visit 搜索预算。
 ///
@@ -42,9 +44,21 @@ pub struct SearchLimits {
 }
 
 impl SearchLimits {
-    fn is_exhausted(self, completed: u64, target: u64) -> bool {
-        completed >= target || self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    fn is_exhausted(self, completed: u64, target: u64, now: Instant) -> bool {
+        completed >= target || self.deadline.is_some_and(|deadline| now >= deadline)
     }
+}
+
+/// 剩余思考时间不足 `SHORT_CLOCK` 时，不要按推荐 MiniBatch 填满窗口。
+/// 否则第一刀 GPU 推理就会单独超过 `go movetime`。
+fn deadline_in_flight_limit(deadline: Option<Instant>, window: usize, batch: usize, now: Instant) -> usize {
+    let Some(deadline) = deadline else {
+        return window;
+    };
+    if deadline.saturating_duration_since(now) >= SHORT_CLOCK {
+        return window;
+    }
+    batch.min(SHORT_CLOCK_IN_FLIGHT_CAP).max(1).min(window)
 }
 
 /// 一条队列的 benchmark 等待时间快照。
@@ -149,7 +163,7 @@ pub struct SearchConfig {
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
-    /// claim 窗口倍率：`slots = ceil(MiniBatchSize × nn_window)`，启动时算一次。
+    /// 已交给 Eval 的叶子上限倍率：`limit = ceil(MiniBatchSize × nn_window)`，启动时算一次。
     pub nn_window: f32,
     pub params: SearchParams,
     pub gather_workers: usize,
@@ -204,11 +218,11 @@ impl SearchConfig {
             eval_batch_size <= queue_capacity,
             "stream eval batch size must fit the queue capacity"
         );
-        let nn_window_slots = ((eval_batch_size as f32) * self.nn_window).ceil().max(1.0) as usize;
+        let eval_claim_limit = ((eval_batch_size as f32) * self.nn_window).ceil().max(1.0) as usize;
         ResolvedSearchConfig {
             queue_capacity,
             eval_batch_size,
-            nn_window_slots,
+            eval_claim_limit,
             params: self.params,
             gather_workers: self.gather_workers,
             eval_workers: self.eval_workers,
@@ -220,7 +234,7 @@ impl SearchConfig {
 struct ResolvedSearchConfig {
     queue_capacity: usize,
     eval_batch_size: usize,
-    nn_window_slots: usize,
+    eval_claim_limit: usize,
     params: SearchParams,
     gather_workers: usize,
     eval_workers: usize,
@@ -258,7 +272,7 @@ pub(crate) struct WorkerPool {
     job_done: Receiver<()>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     eval_batch_size: usize,
-    nn_window_slots: usize,
+    eval_claim_limit: usize,
 }
 
 impl WorkerPool {
@@ -272,7 +286,7 @@ impl WorkerPool {
     pub(crate) fn matches_config(&self, backend: &dyn Backend, config: &SearchConfig) -> bool {
         let config = config.resolve(backend);
         self.eval_batch_size == config.eval_batch_size
-            && self.nn_window_slots == config.nn_window_slots
+            && self.eval_claim_limit == config.eval_claim_limit
             && self.gather_commands.len() == config.gather_workers
             && self.eval_commands.len() == config.eval_workers
     }
@@ -280,7 +294,7 @@ impl WorkerPool {
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
         let (job_done_tx, job_done) = crossbeam_channel::unbounded();
         let eval_batch_size = config.eval_batch_size;
-        let nn_window_slots = config.nn_window_slots;
+        let eval_claim_limit = config.eval_claim_limit;
         let mut gather_commands = Vec::with_capacity(config.gather_workers);
         let mut eval_commands = Vec::with_capacity(config.eval_workers);
         let (backprop_commands, backprop_rx) = crossbeam_channel::unbounded();
@@ -289,7 +303,7 @@ impl WorkerPool {
             let (tx, rx) = crossbeam_channel::unbounded();
             let job_done = job_done_tx.clone();
             threads.push(thread::spawn(move || {
-                persistent_gather_worker(rx, job_done, nn_window_slots)
+                persistent_gather_worker(rx, job_done, eval_claim_limit)
             }));
             gather_commands.push(tx);
         }
@@ -316,7 +330,7 @@ impl WorkerPool {
             job_done,
             threads: Mutex::new(threads),
             eval_batch_size: config.eval_batch_size,
-            nn_window_slots: config.nn_window_slots,
+            eval_claim_limit: config.eval_claim_limit,
         }
     }
 
@@ -369,7 +383,7 @@ impl WorkerPool {
             "worker pool batch size changed"
         );
         assert_eq!(
-            self.nn_window_slots, config.nn_window_slots,
+            self.eval_claim_limit, config.eval_claim_limit,
             "worker pool nn window changed"
         );
     }
@@ -463,11 +477,33 @@ impl Shared {
         let _ = previous;
     }
 
-    fn nn_slot_down(&self) {
+    fn release_eval_claim(&self) {
         let previous = self.nn_inflight.fetch_sub(1, Ordering::AcqRel);
-        assert!(previous > 0, "stream nn slot underflow");
+        assert!(previous > 0, "stream eval claim underflow");
         let _guard = self.idle_lock.lock();
         self.idle.notify_all();
+    }
+
+    fn wait_while(&self, deadline: Option<Instant>, stop_on_stopping: bool, mut busy: impl FnMut(&Self) -> bool) {
+        let mut guard = self.idle_lock.lock();
+        while busy(self)
+            && !(stop_on_stopping && self.stopping.load(Ordering::Acquire))
+            && self.error.lock().is_none()
+        {
+            let Some(deadline) = deadline else {
+                self.idle.wait(&mut guard);
+                continue;
+            };
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = deadline.saturating_duration_since(now).min(RECEIVE_POLL);
+            if wait.is_zero() {
+                break;
+            }
+            self.idle.wait_for(&mut guard, wait);
+        }
     }
 
     /// 撞上正在评估的叶子：挂起整条 reservation，让 μ 继续分流。
@@ -525,10 +561,11 @@ impl Shared {
     /// the edge reservations would leave the claimed node permanently
     /// `Evaluating`, so this also restores it to `Unexpanded`.
     fn cancel_claimed_evaluation(&self, event: PlayoutEvent) {
-        let node = self
-            .repository
-            .get(event.node_key)
-            .expect("claimed stream node remains in the repository");
+        let Some(node) = self.repository.get(event.node_key) else {
+            event.cancel();
+            self.finish(false);
+            return;
+        };
         cancel_evaluation(self, event, node);
     }
 
@@ -541,29 +578,29 @@ impl Shared {
         self.idle.notify_all();
     }
 
-    /// Non-blocking enqueue: `try_send` + yield instead of parking on a full
-    /// queue so Gather can keep polling `stopping` and stay schedulable.
+    /// 先增加 `nn_inflight` 再入队：图复用后 cache hit 极快，若 `try_send` 成功后才 +1，
+    /// Eval 可能已经 `release_eval_claim`，第二手 `go` 就会 underflow 闪退。
     fn send_eval(&self, mut event: PlayoutEvent) {
         #[cfg(feature = "benchmark")]
         event.mark_queued();
+        self.nn_inflight.fetch_add(1, Ordering::AcqRel);
+        #[cfg(feature = "benchmark")]
+        self.peak_in_flight
+            .fetch_max(self.nn_inflight.load(Ordering::Relaxed) as u64, Ordering::Relaxed);
         loop {
             if self.stopping.load(Ordering::Acquire) {
+                self.release_eval_claim();
                 self.cancel_claimed_evaluation(event);
                 return;
             }
             match self.eval_tx.try_send(event) {
-                Ok(()) => {
-                    self.nn_inflight.fetch_add(1, Ordering::AcqRel);
-                    #[cfg(feature = "benchmark")]
-                    self.peak_in_flight
-                        .fetch_max(self.nn_inflight.load(Ordering::Relaxed) as u64, Ordering::Relaxed);
-                    return;
-                }
+                Ok(()) => return,
                 Err(TrySendError::Full(returned)) => {
                     event = returned;
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
+                    self.release_eval_claim();
                     self.cancel_claimed_evaluation(returned);
                     return;
                 }
@@ -848,15 +885,20 @@ impl Search {
     ) -> Result<Stats, EnginError> {
         let target = limits.max_playouts.unwrap_or(u64::MAX);
         let mut next_report = report_interval.and_then(|interval| Instant::now().checked_add(interval));
-        while !self.is_stopping()
-            && !limits.is_exhausted(
-                self.initial_visits.saturating_add(self.stats().completed_playouts),
-                target,
-            )
-        {
-            if next_report.is_some_and(|deadline| Instant::now() >= deadline) {
+        loop {
+            let now = Instant::now();
+            if self.is_stopping()
+                || limits.is_exhausted(
+                    self.initial_visits.saturating_add(self.stats().completed_playouts),
+                    target,
+                    now,
+                )
+            {
+                break;
+            }
+            if next_report.is_some_and(|deadline| now >= deadline) {
                 report(self.stats());
-                next_report = report_interval.and_then(|interval| Instant::now().checked_add(interval));
+                next_report = report_interval.and_then(|interval| now.checked_add(interval));
             }
             let root_state = self
                 .shared
@@ -867,7 +909,7 @@ impl Search {
                 break;
             }
             if root_state == Some(ExpansionState::Evaluating) {
-                self.wait_for_idle()?;
+                self.wait_until_outstanding_below(1, limits.deadline)?;
                 continue;
             }
             if root_state != Some(ExpansionState::Expanded) {
@@ -878,7 +920,7 @@ impl Search {
                     }
                     return Err(error);
                 }
-                self.wait_until_outstanding_below(1)?;
+                self.wait_until_outstanding_below(1, limits.deadline)?;
                 continue;
             }
             let outstanding = self.shared.outstanding.load(Ordering::Acquire);
@@ -892,17 +934,19 @@ impl Search {
                 if outstanding == 0 {
                     break;
                 }
-                self.wait_until_outstanding_below(outstanding)?;
+                self.wait_until_outstanding_below(outstanding, limits.deadline)?;
                 continue;
             }
-            if self.shared.nn_inflight.load(Ordering::Acquire) >= self.worker_pool.nn_window_slots {
-                let mut guard = self.shared.idle_lock.lock();
-                while self.shared.nn_inflight.load(Ordering::Acquire) >= self.worker_pool.nn_window_slots
-                    && !self.shared.stopping.load(Ordering::Acquire)
-                    && self.shared.error.lock().is_none()
-                {
-                    self.shared.idle.wait(&mut guard);
-                }
+            let in_flight_limit = deadline_in_flight_limit(
+                limits.deadline,
+                self.worker_pool.eval_claim_limit,
+                self.worker_pool.eval_batch_size,
+                now,
+            );
+            if self.shared.nn_inflight.load(Ordering::Acquire) >= in_flight_limit {
+                self.shared.wait_while(limits.deadline, true, |shared| {
+                    shared.nn_inflight.load(Ordering::Acquire) >= in_flight_limit
+                });
                 if let Some(error) = self.shared.error.lock().clone() {
                     return Err(error);
                 }
@@ -915,6 +959,11 @@ impl Search {
                 return Err(error);
             }
         }
+        // 时钟到期后必须 request_stop：否则 Eval 会等当前 GPU 整批跑完，200ms
+        // 的 go 就会变成一次推荐 batch 的推理时间。节点预算仍等在途完成。
+        if limits.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.request_stop();
+        }
         // 请求停止是正常搜索结果。`wait_for_idle()` 已保证每个入队 event 都已完成或取消
         // reservation，因此调用方可安全快照部分 graph。
         self.wait_for_idle()?;
@@ -922,14 +971,13 @@ impl Search {
     }
 
     pub fn wait_for_idle(&self) -> Result<(), EnginError> {
-        self.wait_until_outstanding_below(1)
+        self.wait_until_outstanding_below(1, None)
     }
 
-    fn wait_until_outstanding_below(&self, limit: usize) -> Result<(), EnginError> {
-        let mut guard = self.shared.idle_lock.lock();
-        while self.shared.outstanding.load(Ordering::Acquire) >= limit && self.shared.error.lock().is_none() {
-            self.shared.idle.wait(&mut guard);
-        }
+    fn wait_until_outstanding_below(&self, limit: usize, deadline: Option<Instant>) -> Result<(), EnginError> {
+        self.shared.wait_while(deadline, false, |shared| {
+            shared.outstanding.load(Ordering::Acquire) >= limit
+        });
         if let Some(error) = self.shared.error.lock().clone() {
             return Err(error);
         }
@@ -954,7 +1002,7 @@ impl Drop for Search {
     }
 }
 
-fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_window_slots: usize) {
+fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, eval_claim_limit: usize) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
             #[cfg(feature = "benchmark")]
@@ -966,7 +1014,7 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_windo
                     event.cancel();
                     shared.finish(false);
                 } else {
-                    process_gather_event(&shared, event, nn_window_slots);
+                    process_gather_event(&shared, event, eval_claim_limit);
                 }
             }
             #[cfg(not(feature = "benchmark"))]
@@ -975,7 +1023,7 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_windo
                 shared.finish(false);
             }
             #[cfg(not(feature = "benchmark"))]
-            Ok(event) => process_gather_event(&shared, event, nn_window_slots),
+            Ok(event) => process_gather_event(&shared, event, eval_claim_limit),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -983,11 +1031,11 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_windo
     }
 }
 
-fn persistent_gather_worker(commands: Receiver<GatherCommand>, job_done: Sender<()>, nn_window_slots: usize) {
+fn persistent_gather_worker(commands: Receiver<GatherCommand>, job_done: Sender<()>, eval_claim_limit: usize) {
     while let Ok(command) = commands.recv() {
         match command {
             GatherCommand::Run(shared, receiver) => {
-                gather_worker(shared, receiver, nn_window_slots);
+                gather_worker(shared, receiver, eval_claim_limit);
                 let _ = job_done.send(());
             }
             GatherCommand::Shutdown => break,
@@ -1014,7 +1062,7 @@ fn selected_child(shared: &Shared, event: &mut PlayoutEvent, node: &Node, edge_i
     } else {
         event.variation.child_key(edge.mv())
     };
-    match shared.repository.bind_child_or_cut_cycle(event.node_key, edge, child) {
+    match shared.repository.bind_child_or_cut_cycle(node, edge, child) {
         ChildLink::Bound => Some(ChildTarget::Graph(child)),
         ChildLink::TopologyPruned => None,
     }
@@ -1054,7 +1102,7 @@ fn branch_at_expanded_node(
     }
 }
 
-fn process_gather_event(shared: &Shared, mut event: PlayoutEvent, nn_window_slots: usize) {
+fn process_gather_event(shared: &Shared, mut event: PlayoutEvent, eval_claim_limit: usize) {
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             event.cancel();
@@ -1064,14 +1112,10 @@ fn process_gather_event(shared: &Shared, mut event: PlayoutEvent, nn_window_slot
         let node = shared.repository.get_or_insert(event.node_key);
         match node.expansion_state() {
             ExpansionState::Unexpanded => {
-                if shared.nn_inflight.load(Ordering::Acquire) >= nn_window_slots {
-                    let mut guard = shared.idle_lock.lock();
-                    while shared.nn_inflight.load(Ordering::Acquire) >= nn_window_slots
-                        && !shared.stopping.load(Ordering::Acquire)
-                        && shared.error.lock().is_none()
-                    {
-                        shared.idle.wait(&mut guard);
-                    }
+                if shared.nn_inflight.load(Ordering::Acquire) >= eval_claim_limit {
+                    shared.wait_while(None, true, |shared| {
+                        shared.nn_inflight.load(Ordering::Acquire) >= eval_claim_limit
+                    });
                     continue;
                 }
                 if node.try_begin_evaluation() {
@@ -1178,7 +1222,7 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_tx: Sen
                 cancel_waiting_item(&shared, item);
             }
             while let Ok(event) = receiver.try_recv() {
-                shared.nn_slot_down();
+                shared.release_eval_claim();
                 shared.cancel_claimed_evaluation(event);
             }
             shared.cancel_all_collisions();
@@ -1205,7 +1249,7 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_tx: Sen
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if waiting.is_empty() {
+                if waiting.is_empty() || shared.stopping.load(Ordering::Acquire) {
                     continue;
                 }
                 // 没有新叶子：短暂等待至少一个 NN 回复。
@@ -1216,7 +1260,7 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_tx: Sen
                     cancel_waiting_item(&shared, item);
                 }
                 while let Ok(event) = receiver.try_recv() {
-                    shared.nn_slot_down();
+                    shared.release_eval_claim();
                     shared.cancel_claimed_evaluation(event);
                 }
                 shared.cancel_all_collisions();
@@ -1271,7 +1315,7 @@ fn poll_nn_completions(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
 }
 
 fn wait_one_nn_completion(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
-    if waiting.is_empty() {
+    if waiting.is_empty() || shared.stopping.load(Ordering::Acquire) {
         return;
     }
     match waiting[0].reply.recv_timeout(RECEIVE_POLL) {
@@ -1306,7 +1350,7 @@ fn handle_eval_event(
     mut event: PlayoutEvent,
 ) -> Result<(), EnginError> {
     if shared.stopping.load(Ordering::Acquire) {
-        shared.nn_slot_down();
+        shared.release_eval_claim();
         shared.cancel_claimed_evaluation(event);
         return Ok(());
     }
@@ -1316,7 +1360,7 @@ fn handle_eval_event(
     match classify_extension(history, depth) {
         ExtensionKind::SharedTerminal { wl, draw, plies_left } => {
             node.mark_terminal(wl, draw, plies_left);
-            shared.nn_slot_down();
+            shared.release_eval_claim();
             shared.send_backprop(BackpropEvent::evaluation(event));
             Ok(())
         }
@@ -1327,11 +1371,11 @@ fn handle_eval_event(
             // 同一棋盘从另一条 history 进来可以不到 120，只能写本次 edge 的 local leaf。
             if event.node_key.is_continuation() {
                 node.mark_terminal(wl, draw, plies_left);
-                shared.nn_slot_down();
+                shared.release_eval_claim();
                 shared.send_backprop(BackpropEvent::evaluation(event));
                 return Ok(());
             }
-            shared.nn_slot_down();
+            shared.release_eval_claim();
             node.abort_evaluation();
             shared.cancel_collisions(event.node_key);
             if event.reservations.is_empty() {
@@ -1347,7 +1391,7 @@ fn handle_eval_event(
             let cache_key = EvalCacheKey::new(history.last(), legal_moves.len());
             if let Some(eval) = shared.backend.cached_evaluation(cache_key) {
                 shared.cache_hits.fetch_add(1, Ordering::AcqRel);
-                shared.nn_slot_down();
+                shared.release_eval_claim();
                 return publish_eval(shared, event, node, legal_moves, eval);
             }
             let planes = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
@@ -1363,7 +1407,7 @@ fn handle_eval_event(
                 },
             ) {
                 cancel_evaluation(shared, event, node);
-                shared.nn_slot_down();
+                shared.release_eval_claim();
                 return if shared.stopping.load(Ordering::Acquire) {
                     Ok(())
                 } else {
@@ -1403,7 +1447,7 @@ fn send_nn_request(shared: &Shared, nn_tx: &Sender<NnRequest>, mut request: NnRe
 }
 
 fn complete_nn_item(shared: &Shared, item: WaitingNn, batch: Arc<EncodedBatch>, row: usize) -> Result<(), EnginError> {
-    shared.nn_slot_down();
+    shared.release_eval_claim();
     let eval = match eval_result_from_encoded_row(&batch, row, &item.legal_moves) {
         Ok(eval) => eval,
         Err(error) => {
@@ -1454,7 +1498,7 @@ fn publish_eval(
 }
 
 fn cancel_waiting_item(shared: &Shared, item: WaitingNn) {
-    shared.nn_slot_down();
+    shared.release_eval_claim();
     cancel_evaluation(shared, item.event, item.node);
 }
 
@@ -1891,6 +1935,67 @@ mod tests {
         pipeline.stop_and_finish();
     }
 
+    struct SlowInferenceBackend;
+
+    impl Backend for SlowInferenceBackend {
+        fn attributes(&self) -> BackendAttributes {
+            BackendAttributes::default()
+        }
+
+        fn infer_input_planes_into(
+            &self,
+            samples: &[crate::neural::InputPlanes],
+            logits: &mut Vec<f32>,
+            wdl: &mut Vec<f32>,
+            moves_left: &mut Vec<f32>,
+        ) -> Result<(), EnginError> {
+            thread::sleep(Duration::from_millis(250));
+            UniformBackend::default().infer_input_planes_into(samples, logits, wdl, moves_left)
+        }
+    }
+
+    #[test]
+    fn expired_deadline_does_not_wait_for_in_flight_inference() {
+        let mut pipeline = Search::new(
+            Arc::new(SlowInferenceBackend),
+            31,
+            startpos_history(),
+            SearchConfig {
+                eval_batch_size: 4,
+                gather_workers: 2,
+                eval_workers: 2,
+                ..SearchConfig::default()
+            },
+        );
+        let started = Instant::now();
+        pipeline
+            .run_with_limits(SearchLimits {
+                max_playouts: Some(64),
+                deadline: Some(started + Duration::from_millis(40)),
+            })
+            .expect("deadline is a normal result");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "deadline waited for GPU: {:?}",
+            started.elapsed()
+        );
+        pipeline.stop_and_finish();
+    }
+
+    #[test]
+    fn deadline_in_flight_limit_shrinks_near_the_clock() {
+        let now = Instant::now();
+        assert_eq!(super::deadline_in_flight_limit(None, 160, 64, now), 160);
+        assert_eq!(
+            super::deadline_in_flight_limit(Some(now + Duration::from_millis(200)), 160, 64, now),
+            8
+        );
+        assert_eq!(
+            super::deadline_in_flight_limit(Some(now + Duration::from_secs(2)), 160, 64, now),
+            160
+        );
+    }
+
     #[test]
     fn terminal_root_finishes_after_its_initial_evaluation() {
         let state = GameState::from_fen_moves("4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", &[] as &[&str])
@@ -1970,7 +2075,11 @@ mod tests {
             Move::new(Square::parse("b9").unwrap(), Square::parse("b8").unwrap()),
             1.0,
         )]);
-        child.edges()[0].bind_child_key(root_key);
+        assert!(matches!(
+            tree.repository()
+                .bind_child_or_cut_cycle(&child, &child.edges()[0], root_key),
+            crate::search::graph::ChildLink::Bound
+        ));
 
         let mut search =
             Search::new_with_graph(Arc::new(UniformBackend::default()), 41, &tree, SearchConfig::default());
@@ -2015,7 +2124,11 @@ mod tests {
             Move::new(Square::parse("c0").unwrap(), Square::parse("c1").unwrap()),
             1.0,
         )]);
-        grandchild_node.edges()[0].bind_child_key(child_key);
+        assert!(matches!(
+            tree.repository()
+                .bind_child_or_cut_cycle(&grandchild_node, &grandchild_node.edges()[0], child_key),
+            crate::search::graph::ChildLink::Bound
+        ));
 
         let mut search =
             Search::new_with_graph(Arc::new(UniformBackend::default()), 43, &tree, SearchConfig::default());
@@ -2281,6 +2394,53 @@ mod tests {
         shared.send_eval(PlayoutEvent::root(30, history));
         assert_eq!(root.expansion_state(), ExpansionState::Unexpanded);
         assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn reused_graph_survives_incremental_uci_chase() {
+        // GUI 跨回合 `position fen … moves …` 复用图；一次性直接设到终局 fen+moves 不复现。
+        let fen = "2bakc3/4a3n/4b4/2C1p4/P8/4P2cN/P8/4B1C2/4A4/4KAB2 b - - 0 1";
+        let steps: [&[&str]; 4] = [
+            &[],
+            &["f9f4"],
+            &["f9f4", "g2g4"],
+            &["f9f4", "g2g4", "f4f3"],
+        ];
+        let backend = Arc::new(UniformBackend::default()) as Arc<dyn Backend>;
+        let start = GameState::from_fen_moves(fen, &[] as &[&str]).expect("fen");
+        let mut graph = super::SearchGraph::new(Arc::new(PositionHistory::from_positions(start.positions())));
+        for (generation, moves) in steps.into_iter().enumerate() {
+            let state = GameState::from_fen_moves(fen, moves).expect("replay");
+            let history = Arc::new(PositionHistory::from_positions(state.positions()));
+            graph
+                .reset_to_history_after_drain(Arc::clone(&history))
+                .expect("reuse graph");
+            if let Some(root) = graph.take_pending_gc_root() {
+                graph.repository().retain_from_root(root);
+            }
+            let mut search = Search::new_with_graph(
+                Arc::clone(&backend),
+                40 + generation as u64,
+                &graph,
+                SearchConfig {
+                    eval_batch_size: 8,
+                    gather_workers: 2,
+                    eval_workers: 2,
+                    ..SearchConfig::default()
+                },
+            );
+            search
+                .run_playouts(2000)
+                .unwrap_or_else(|error| panic!("reused search at ply {generation} failed: {error}"));
+            let root_is_black = history.last().is_black_to_move();
+            let mv = best_move(search.repository(), search.root_key(), root_is_black);
+            assert!(
+                mv.is_some_and(|mv| !mv.is_null())
+                    || !history.last().board().generate_legal_moves().is_empty(),
+                "reused root at ply {generation} produced no playable move"
+            );
+            search.stop_and_finish();
+        }
     }
 
     #[test]

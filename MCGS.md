@@ -7,6 +7,7 @@
 reservation 作为 virtual visit（计入 started N，偏转选择）；Gather 每次采集一个叶子，
 collision 先挂起 reservation / μ，该叶子自己的 backprop complete 后再 cancel，不加 completed visit。Eval 持续向 NN 提交已编码 tensor；NN 空闲时立即处理当前
 队列可得请求，不等待逻辑搜索轮次。Gather 在 claim 前把已交给 Eval 的叶子限为两个 `MiniBatchSize`。没有 prefetch 或 tree-batch gather。
+时钟到期后 owner 会 stop 并取消未完成的 Eval/NN claim，不把推荐 batch 的推理时间算进 `go movetime` 之后。剩余预算不足 500ms 时提交窗口收窄，避免第一刀合批单独超过时限。
 
 不用 classic 那种一次评估记 K 次 visit 的 **multivisit**。GPU 合批在 NN 队列，不靠 Gather
 一次收一批。实战以 `μ=FPU` virtual mean 做比纯 virtual visit 更明显、但仍温和的分流；K 份
@@ -183,10 +184,11 @@ variation 中出现两次，不能无限下降，也不能把一次 evidence 重
 
 ## 环、真实重复与 ContinuationTree
 
-普通图允许跨分支汇合，但 shared-Q 的幂等重算不能形成循环依赖。repository 只在**首次绑定普通
-shared edge**时做 DFS：若 candidate child 已能沿既有图边到达 parent，则这条 edge 会闭合 shared-Q
-拓扑环。它被永久标记 `TopologyPruned`，此后 PUCT 完全跳过它；当前 reservation 直接取消，不产生
-N/Q/local-leaf。该 DFS 只读已有 node/edge，并由短链接锁包住“检查 + 标记/绑定”。
+普通图允许跨分支汇合。repository 只在**首次绑定普通
+shared edge**时做拓扑剪枝：每个 node 记下首次到达深度。回边
+`depth(parent) > depth(child)` 永久标记 `TopologyPruned`（PUCT 跳过，reservation 取消）；
+浅层父节点仍可接到已被更深路径先展开的 child。这是 O(1) 的 X7 结构近似，
+不是精确判环。同路径棋规重复不走这里。
 
 若一个非根 shared node 的所有边都已如此过滤，它作为 graph 边界结束本次 playout：只把该 node 自己
 已有的 U/Q 回传给进入它的实际入边；被过滤 edge 仍不获得 N/Q。这避免 fixed-playout 在无候选 node
@@ -205,7 +207,7 @@ idempotent shared-Q。它必须保留为可复查决策；若实战证明长将�
 3. 第一次重复（`repetitions == 1`）继续正常 PUCT / NN evaluation。树内再次出现相同局面后
    `repetitions >= 2`，才调用 `RuleJudge` 得到 path-local terminal。
 
-这样 shared graph 始终无环，而真实循环仍有足够路径历史交给棋规裁判。Graph → Tree entry 不绑定
+这样沿深度向上的回边被剪掉，真实循环仍有足够路径历史交给棋规裁判。Graph → Tree entry 不绑定
 contextual child；Tree → Graph 只在零化 edge 发生并正常绑定 board child。若当前完整 history 自最近
 零化着以来已经出现重复，下一回合的 root 仍使用对应 contextual key；零化后则直接成为本回合已创建或
 复用的普通 Graph root。普通 graph 与 Tree 不迁移 N/Q；只有 Tree 的零化后 descendants 使用 Graph
@@ -225,7 +227,8 @@ contextual child；Tree → Graph 只在零化 edge 发生并正常绑定 board 
 讨论 refcount 或分代；当前不提前引入。
 
 unrelated `position` 仍直接换新 repository。悔棋由完整 UCI `position ... moves` 重建 root，
-不保留旧 root / sibling 作为额外 GC 起点。
+不保留旧 root / sibling 作为额外 GC 起点。Graph→Tree 入口不绑定 child，sweep 看不到这些
+TreeNode；当前 root 的 sibling prune 在 `position` abort 之后同步做，不与下一手搜索重叠。
 
 ## 必须同时改掉的 tree 假设
 
@@ -328,7 +331,7 @@ collision、有效完成 playout、PV 稳定性和 Elo。合并率或 EPS 上升
 图实现的 CPU/NPS 回归不以初始局面单独判断：它的换位负载偏低。固定采用
 `middle_20`（宽换位）、`evasion_05`（强制/窄树但高合并）和 `proof_mate_01`（强制反例）三个
 局面，在相同 ONNX、4/4 Search/Eval、MiniBatchSize、fresh graph 与固定时间下报告多轮 NPS/EPS；初始局面只保留为
-一般流水线冒烟。每次图结构、DFS、GC 或 worker 热路径改变后，都用这组比较，不能由单一局面外推。
+一般流水线冒烟。每次图结构、拓扑插入、GC 或 worker 热路径改变后，都用这组比较，不能由单一局面外推。
 
 #### 2026-08-10：`b7b8` 的 tree/graph 候选分歧
 
@@ -344,7 +347,7 @@ shared child Q 的位置及其后的 edge N/Q，而不是先修改 PUCT 或图�
 
 ## 当前结论
 
-MCGS 不是“加一个 TT”。当前实现已切换普通 board-key、edge-local N、幂等回传、真实重复的 ContinuationTree、首次绑定 edge 的 DFS topology prune、可达 GC 与防环 PV。
+MCGS 不是“加一个 TT”。当前实现已切换普通 board-key、edge-local N、幂等回传、真实重复的 ContinuationTree、首次到达深度的 topology prune、可达 GC 与防环 PV。
 它仍是 board-key 的上下文近似，不是严格 state 合并。下一步评估 reuse/stop 边界、唯一 state 数、NN eval 数、
 稳定性与 Elo；合并率或 EPS 上升本身不是采用理由。
 

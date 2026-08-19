@@ -67,17 +67,17 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 
 ## Stream
 
-- repository 是一个 64 分片的 key-value map。普通 MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。真实 variation 第一次重复时，以该重复局面为根进入 `ContinuationTree`：其 key 纳入自最近零化着以来的规则 history，重复上下文内不换位合并，只复用按棋盘索引的 NN cache；Graph → Tree 的入口 edge 不绑定 contextual child。Tree 内吃子等零化 edge 的 child 立即回到普通 Graph，因此本回合已经展开的零化后子图可跨回合复用，但 Tree 先前的 N/Q 不迁移。第三次出现同一局面才由 `RuleJudge` 终局。首次绑定普通 shared edge 若 DFS 发现会形成 shared-Q 图环，则永久标为 topology-pruned 并从 PUCT 排除，不写 N/Q，也不伪装成棋规和棋。这是为保持 shared-Q 无环的 X7 结构近似，须由残局回归与 Elo 验证。
+- repository 是一个 64 分片的 key-value map。普通 MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。真实 variation 第一次重复时，以该重复局面为根进入 `ContinuationTree`：其 key 纳入自最近零化着以来的规则 history，重复上下文内不换位合并，只复用按棋盘索引的 NN cache；Graph → Tree 的入口 edge 不绑定 contextual child。Tree 内吃子等零化 edge 的 child 立即回到普通 Graph，因此本回合已经展开的零化后子图可跨回合复用，但 Tree 先前的 N/Q 不迁移。第三次出现同一局面才由 `RuleJudge` 终局。首次绑定普通 shared edge 时，只剪回边（`depth(parent) > depth(child)`）；浅层父节点仍可接到已被更深路径先展开的 child。同路径棋规重复仍走 ContinuationTree。须由残局回归与 Elo 验证。
 - NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
 - Engine 直接常驻 Gather×4、Eval×4、NN×1、Backprop×1；UCI `Threads` 只在 Gather/Eval 间近似平分，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、稀疏合批推理，并以整批 `EncodedBatch` 交回；Backprop 回收 reservation 并更新图。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
-  Engine 启动 job 时按固定中性的时间预算（历史上参考 px0 legacy stopper）转换为不可变 deadline，job drain 后才归还剩余时间。
-- graph reuse 只保留当前 root 可达图：确认走子后，旧 root 的 sibling 图由后台 mark/sweep 回收，UCI 可立即启动新
-  `go`。完整 `PositionHistory` 仍由 UCI `position ... moves` 提供；悔棋回到旧局面会重新建立搜索 root，不承诺复用
-  旧 sibling 子树。后台 GC 以 topology 写锁与 node 创建/edge 绑定同步，避免删掉刚由 transposition 接回的 node。
-  当前不做 edge 入度引用计数：多父图下仍须维护解绑，且“从当前 root 可达”才是保留语义。无关 `position` 换图时，
-  整个旧 repository 同样在后台逐 shard 释放。search owner 已输出最小 info 与一次 bestmove。
+  Engine 启动 job 时按固定中性的时间预算（历史上参考 px0 legacy stopper）转换为不可变 deadline，job drain 后才归还剩余时间。`go movetime` / 时钟到期后会 `request_stop` 并取消已 claim 但尚未完成的评估，而不是把当前 NN 窗口整批推理完；剩余时间不足 500ms 时 Gather 不再按推荐 MiniBatch 填满窗口。`position` 打断上一次 `go` 仍会输出 `bestmove`（无搜索结果时回退根合法着），避免 GUI 超时报「未返回合法着法」。
+- graph reuse 只保留当前 root 沿已绑定 `child_key` 可达的图。确认走子后，旧 root 的 sibling
+  在下一次 `position`（已 abort）里同步 mark/sweep：ContinuationTree 入口不绑定 child，不能
+  边搜边扫。完整 `PositionHistory` 仍由 UCI `position ... moves` 提供；悔棋回到旧局面会重新
+  建立搜索 root，不承诺复用旧 sibling 子树。无关 `position` 换图时，整个旧 repository 仍在
+  后台逐 shard 释放。search owner 已输出最小 info 与一次 bestmove。
 - `MultiPV` 只在 search owner 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。Gather 每次一个叶子；pending reservation 同时表示 PUCT 已分配的预算，当前实战的 virtual mean 仅在 reservation 未完成时进入 action Q，完成后 Q 仍只来自 completed Evidence。collision 先挂起该 event 的 reservation，该叶子 complete 后再 cancel，不额外改变 completed `N/Q`。`MiniBatchSize` 限制 NN 一次合并的 tensor 数量，`0` 使用 backend 建议值，并派生 `2 × MiniBatchSize` 的 Eval/NN claim 上限；实际 NN batch 可能因终局、缓存、collision 或队列暂时不足更小。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
 stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 公式，不是 LC3 Policy 的正式公式，也不是 px0 搜索等价实现）。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.75 / 40000 / 4.0`。所有 node 共用一条对数 cPUCT 曲线，`C(0)=1.75`、`C(50k)≈5`，不维护根专用初值或参数。`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。
@@ -101,4 +101,4 @@ PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residua
 - 借鉴外部语义时保留来源标注（px0 路径、LC3 URL、KataGo 本地路径/文档等），并写清是历史参考还是本仓已偏离。
 - 允许本仓自研搜索决策；不要把尚未验证的启发式伪装成“外部参考要求”。
 - `position ... moves ...` 必须保留完整历史。
-- stream UCI 的运行边界是 `position -> go -> stop -> position -> go`：旧 generation 必须不再输出，所有 reservation 必须在 drain 后归还，正常 `go` 恰好输出一次 `bestmove`。
+- stream UCI 的运行边界是 `position -> go -> stop -> position -> go`：旧 generation 的 `info` 不再输出，所有 reservation 必须在 drain 后归还，每次 `go` 恰好输出一次 `bestmove`（含被下一条 `position` 打断时）。

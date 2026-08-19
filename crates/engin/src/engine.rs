@@ -48,17 +48,14 @@ struct ActiveSearch {
     clock_budget: Option<TimeBudget>,
 }
 
-/// 后台回收旧 sibling 图或已被新 position 替换的整张 graph，不占用下一次 `go` 的 UCI 线程。
-///
-/// 走子后的 prune 与新搜索共享 repository，但由 repository topology 锁保证绑定安全；
-/// 无关 position 的 retire 则不与活跃图共享任何 node 或锁。
+/// 后台释放已被整图替换的旧 repository。当前 root 的 sibling prune 在 `position`
+/// 的 abort 之后同步做：ContinuationTree 入口不绑定 child，不能边搜边扫。
 struct GraphReaper {
     sender: Option<crossbeam_channel::Sender<GraphCleanup>>,
     thread: Option<JoinHandle<()>>,
 }
 
 enum GraphCleanup {
-    Prune(Arc<crate::search::NodeRepository>, crate::search::NodeKey),
     Retire(Arc<crate::search::NodeRepository>),
 }
 
@@ -70,11 +67,6 @@ impl GraphReaper {
             .spawn(move || {
                 while let Ok(cleanup) = receiver.recv() {
                     match cleanup {
-                        GraphCleanup::Prune(repository, root) => {
-                            repository.retain_from_root(root);
-                        }
-                        // 正常 reset 已 drain；若还有外部只读 Arc，则保守地交给它最后一次
-                        // drop。常规路径下能独占旧图，按 shard 低干扰释放。
                         GraphCleanup::Retire(repository) => match Arc::try_unwrap(repository) {
                             Ok(repository) => repository.release_incrementally(),
                             Err(repository) => drop(repository),
@@ -94,14 +86,6 @@ impl GraphReaper {
             .as_ref()
             .expect("graph reaper sender lives with engine")
             .send(GraphCleanup::Retire(repository))
-            .expect("graph reaper thread is alive");
-    }
-
-    fn prune(&self, repository: Arc<crate::search::NodeRepository>, root: crate::search::NodeKey) {
-        self.sender
-            .as_ref()
-            .expect("graph reaper sender lives with engine")
-            .send(GraphCleanup::Prune(repository, root))
             .expect("graph reaper thread is alive");
     }
 }
@@ -262,7 +246,7 @@ impl Engine {
                 self.graph_reaper.retire(retired);
             }
             if let Some(root) = graph.take_pending_gc_root() {
-                self.graph_reaper.prune(Arc::clone(graph.repository()), root);
+                graph.repository().retain_from_root(root);
             }
         } else if self.backend.is_some() {
             self.graph = Some(SearchGraph::new(history));
@@ -455,6 +439,12 @@ impl Engine {
         if self.backend.is_none() {
             let reason = self.backend_error.as_deref().unwrap_or("WeightsFile is not configured");
             write_stdout(&[format!("info string cannot search: {reason}")]);
+            let mv = self
+                .position
+                .as_ref()
+                .map(|state| legal_fallback_move(&state.position_history(), &[]))
+                .unwrap_or(Move::NULL);
+            write_stdout_best_move(&BestMoveInfo::new(mv));
             return Ok(());
         }
         self.start_search(params)
@@ -490,7 +480,7 @@ impl Engine {
         self.wait()
     }
 
-    /// 替换 position / backend / 新 `go` 时取消输出并 drain；丢弃上一局结果，避免失败毒化下一条命令。
+    /// 替换 position / backend / 新 `go` 时停止 info，但必须留下 `bestmove` 结束上一次 `go`。
     fn abort(&mut self) -> Result<(), EnginError> {
         if let Some(active) = &self.active {
             let _output = self.stdout_gate.lock();
@@ -559,23 +549,47 @@ fn run_search(
         if let Some(info) = infos.first_mut() {
             info.pv = principal_variation;
         }
+        let best_move = reported_uci_move(
+            best_move,
+            snapshot.root_history.as_ref(),
+            &snapshot.root_move_filter,
+        );
         let _output = output_gate.lock();
         if publish_output.load(Ordering::Acquire) {
             write_stdout_thinking(&infos, &output_options);
-            write_stdout_best_move(&BestMoveInfo::new(best_move.unwrap_or(Move::NULL)));
         }
+        write_stdout_best_move(&BestMoveInfo::new(best_move));
     } else if let Err(error) = &result {
         let info = ThinkingInfo {
             comment: format!("stream search failed: {error}"),
             ..ThinkingInfo::default()
         };
+        let best_move = reported_uci_move(None, snapshot.root_history.as_ref(), &snapshot.root_move_filter);
         let _output = output_gate.lock();
         if publish_output.load(Ordering::Acquire) {
             write_stdout_thinking(&[info], &output_options);
         }
+        write_stdout_best_move(&BestMoveInfo::new(best_move));
     }
     search.stop_and_finish();
     result.map(|_| ())
+}
+
+fn reported_uci_move(chosen: Option<Move>, history: &PositionHistory, root_move_filter: &[Move]) -> Move {
+    match chosen {
+        Some(mv) if !mv.is_null() => mv,
+        _ => legal_fallback_move(history, root_move_filter),
+    }
+}
+
+fn legal_fallback_move(history: &PositionHistory, root_move_filter: &[Move]) -> Move {
+    let legal = history.last().board().generate_legal_moves();
+    if root_move_filter.is_empty() {
+        legal.into_iter().next()
+    } else {
+        root_move_filter.iter().copied().find(|mv| legal.contains(mv))
+    }
+    .unwrap_or(Move::NULL)
 }
 
 impl RootSnapshot {
@@ -692,5 +706,70 @@ impl PublishedInfo {
     fn update(&mut self, progress: SearchProgress, time: i64) {
         self.progress = Some(progress);
         self.time = time;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Engine, legal_fallback_move, reported_uci_move};
+    use crate::uci_loop::GoParams;
+    use xiangqi_core::{GameState, Move, STARTPOS_FEN};
+
+    fn go_nodes(engine: &mut Engine, nodes: i32) {
+        engine
+            .go(&GoParams {
+                nodes: Some(nodes),
+                ..GoParams::default()
+            })
+            .expect("go");
+        engine.wait().expect("search owner");
+    }
+
+    #[test]
+    fn engine_graph_reuse_survives_cannon_knight_chase() {
+        let weights = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/x7.onnx");
+        if !std::path::Path::new(weights).is_file() {
+            return;
+        }
+        let mut engine = Engine::new();
+        engine.set_option("WeightsFile", weights).expect("weights option");
+        let fen = "2bakc3/4a3n/4b4/2C1p4/P8/4P2cN/P8/4B1C2/4A4/4KAB2 b - - 0 1";
+        let prefixes: [&[&str]; 8] = [
+            &[],
+            &["f9f4"],
+            &["f9f4", "g2g4"],
+            &["f9f4", "g2g4", "f4f3"],
+            &["f9f4", "g2g4", "f4f3", "g4g2"],
+            &["f9f4", "g2g4", "f4f3", "g4g2", "f3f4"],
+            &["f9f4", "g2g4", "f4f3", "g4g2", "f3f4", "g2g4"],
+            &["f9f4", "g2g4", "f4f3", "g4g2", "f3f4", "g2g4", "f4f3"],
+        ];
+        for (ply, moves) in prefixes.into_iter().enumerate() {
+            let moves: Vec<String> = moves.iter().map(|mv| (*mv).to_string()).collect();
+            engine
+                .set_position(fen, &moves)
+                .unwrap_or_else(|error| panic!("position at ply {ply}: {error}"));
+            go_nodes(&mut engine, 2000);
+        }
+    }
+
+    #[test]
+    fn unsearched_root_reports_a_legal_move_not_null() {
+        let history = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str])
+            .expect("startpos")
+            .position_history();
+        let mv = reported_uci_move(None, &history, &[]);
+        assert!(!mv.is_null());
+        assert!(history.last().board().generate_legal_moves().contains(&mv));
+    }
+
+    #[test]
+    fn searchmoves_fallback_stays_inside_the_filter() {
+        let history = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str])
+            .expect("startpos")
+            .position_history();
+        let filter = vec![history.last().board().parse_move("b2b3").expect("b2b3")];
+        assert_eq!(legal_fallback_move(&history, &filter), filter[0]);
+        assert_eq!(reported_uci_move(Some(Move::NULL), &history, &filter), filter[0]);
     }
 }

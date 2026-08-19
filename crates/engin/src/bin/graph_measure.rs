@@ -215,51 +215,11 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
-
-    use super::{measure_graph, percent};
-    use engin::search::{NodeKey, NodeRepository};
+    use super::percent;
 
     #[test]
     fn percent_handles_empty_total() {
         assert_eq!(percent(1, 0), 0.0);
         assert_eq!(percent(1, 4), 25.0);
-    }
-
-    #[test]
-    fn measure_counts_two_parents_of_one_child() {
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let history = PositionHistory::from_positions(state.positions());
-        let first = history.last().board().parse_move("a0a1").expect("legal move");
-        let second = history.last().board().parse_move("a3a4").expect("legal move");
-
-        let repository = NodeRepository::default();
-        let root_key = NodeKey::graph_node(history.last().board().hash());
-        let left_key = NodeKey::graph_node(1);
-        let right_key = NodeKey::graph_node(2);
-        let shared_key = NodeKey::graph_node(3);
-        let root = repository.get_or_insert(root_key);
-        assert!(root.try_begin_evaluation());
-        root.publish_edges(vec![(first, 0.5), (second, 0.5)]);
-        root.edges()[0].bind_child_key(left_key);
-        root.edges()[1].bind_child_key(right_key);
-        root.reserve_edge(0).expect("root edge").complete();
-        root.reserve_edge(1).expect("root edge").complete();
-
-        for key in [left_key, right_key] {
-            let node = repository.get_or_insert(key);
-            assert!(node.try_begin_evaluation());
-            node.publish_edges(vec![(first, 1.0)]);
-            node.edges()[0].bind_child_key(shared_key);
-            node.reserve_edge(0).expect("child edge").complete();
-        }
-        repository.get_or_insert(shared_key);
-
-        let measure = measure_graph(&repository, root_key);
-
-        assert_eq!(measure.nodes.len(), 4);
-        assert_eq!(measure.edges, 4);
-        assert_eq!(measure.inbound_edges[&shared_key], 2);
-        assert_eq!(measure.path_terminal_edges, 0);
     }
 }
