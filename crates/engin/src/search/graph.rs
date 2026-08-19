@@ -305,7 +305,7 @@ pub struct Node {
 }
 
 impl Node {
-    fn depth(&self) -> Option<u32> {
+    pub(crate) fn depth(&self) -> Option<u32> {
         match self.depth.load(Ordering::Relaxed) {
             0 => None,
             encoded => Some(encoded - 1),
@@ -314,6 +314,11 @@ impl Node {
 
     fn set_depth(&self, depth: u32) {
         self.depth.store(depth + 1, Ordering::Relaxed);
+    }
+
+    /// 首次到达深度。已有值不覆盖，避免 Continuation 入口稍后当父节点绑边时被写成 0。
+    pub(crate) fn try_set_first_depth(&self, depth: u32) {
+        let _ = self.depth.compare_exchange(0, depth + 1, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// 写入冻住的 U(n)。`value.visits` 是这份样本的权重（通常为 1），与 `stats.visits` 无关。
@@ -1173,6 +1178,33 @@ mod repository_tests {
             repo.bind_child_or_cut_cycle(&d_node, d_edge, b),
             ChildLink::TopologyPruned
         ));
+    }
+
+    #[test]
+    fn continuation_first_arrival_keeps_depth_and_prunes_shallower_graph() {
+        let repo = NodeRepository::default();
+        let root = NodeKey::graph_node(1);
+        let parent = NodeKey::graph_node(3);
+        let tree = NodeKey::tree_node(2, 9);
+        repo.get_or_insert(root).set_depth(0);
+
+        let parent_node = repo.get_or_insert(parent);
+        parent_node.try_set_first_depth(3);
+        parent_node.try_set_first_depth(0);
+        assert_eq!(parent_node.depth(), Some(3));
+
+        let continuation = repo.get_or_insert(tree);
+        continuation.try_set_first_depth(parent_node.depth().unwrap() + 1);
+        assert_eq!(continuation.depth(), Some(4));
+
+        assert!(continuation.try_begin_evaluation());
+        continuation.publish_edges(vec![(b2_b3(), 1.0)]);
+        continuation.set_base_value(ValueDelta::one(0.0, 0.0));
+        let ChildLink::TopologyPruned =
+            repo.bind_child_or_cut_cycle(&continuation, &continuation.edges()[0], root)
+        else {
+            panic!("tree at depth 4 must prune a graph child first reached at depth 0");
+        };
     }
 
     #[test]
