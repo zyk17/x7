@@ -178,10 +178,10 @@ impl Default for SearchConfig {
         Self {
             queue_capacity: 0,
             eval_batch_size: 0,
-            nn_window: 2.5,
+            nn_window: 2.3,
             params: SearchParams::default(),
-            gather_workers: 4,
-            eval_workers: 4,
+            gather_workers: 3,
+            eval_workers: 5,
             root_move_filter: Vec::new(),
         }
     }
@@ -196,6 +196,14 @@ impl SearchConfig {
             self.nn_window.is_finite() && self.nn_window > 0.0,
             "stream nn window factor must be finite and positive"
         );
+    }
+
+    /// UCI `Threads` 尽量按 Gather:Eval = 1:2；除不尽时多给 Gather。
+    /// 3→1/2，4→2/2，5→2/3，6→2/4，7→3/4，8→3/5。
+    pub(crate) fn gather_eval_from_threads(threads: usize) -> (usize, usize) {
+        let eval = ((threads * 2) / 3).max(1);
+        let gather = threads.saturating_sub(eval).max(1);
+        (gather, eval)
     }
 
     /// Fills `0` sentinels from the backend; returns concrete queue/batch sizes.

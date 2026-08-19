@@ -40,7 +40,7 @@ fn main() {
   ██╔╝ ██╗   ██║
   ╚═╝  ╚═╝   ╚═╝
 "#;
-    eprintln!("\x1b[31m{banner}\x1b[0m");
+    println!("\x1b[31m{banner}\x1b[0m");
 
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else {

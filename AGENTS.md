@@ -11,7 +11,7 @@
 - 规则与训练数据格式的历史工程参考：`C:\Users\Administrator\projects\px0`、`C:\Users\Administrator\projects\pxzero-training`。
 - stream / MCGS 可参考 [LC3 公开文档](https://lczero.org/dev/lc0/search/lc3/overview/)；本地没有 LC3 源码，不得宣称 1:1 翻译或行为等价。
 - KataGo 按需参考：本地源码 `C:\Users\Administrator\projects\KataGo`（如 GraphSearch、NN cache、部分搜索细节）；不是默认必读，也不承诺行为等价。
-- 已明确偏离 px0/Lc0 stream 基线：无 prefetch、tree-batch gather，也无一次评估记 K 次 visit 的 multivisit。Gather 每次一个叶子；分流靠 edge reservation 与实战 `μ=FPU` virtual mean。K 会破坏这份温和分流，后续若调分流只改 virtual mean / virtual visit。碰撞先挂起未完成路径的 reservation / μ，该叶子自己的 backprop complete 后再 cancel，不加 completed visit。收集窗口卡已交给 Eval 的叶子（`2 × MiniBatchSize`），在 Gather claim 前占用，不卡 outstanding。NN 只消费连续的已编码 tensor 队列，不等待逻辑搜索轮次。
+- 已明确偏离 px0/Lc0 stream 基线：无 prefetch、tree-batch gather，也无一次评估记 K 次 visit 的 multivisit。Gather 每次一个叶子；分流靠 edge reservation 与实战 `μ=FPU` virtual mean。K 会破坏这份温和分流，后续若调分流只改 virtual mean / virtual visit。碰撞先挂起未完成路径的 reservation / μ，该叶子自己的 backprop complete 后再 cancel，不加 completed visit。收集窗口卡已交给 Eval 的叶子（`2.3 × MiniBatchSize`），在 Gather claim 前占用，不卡 outstanding。NN 只消费连续的已编码 tensor 队列，不等待逻辑搜索轮次。
 - 正式模型契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。
 - 搜索只有 stream；不维护 classic 对照实现或 `TaskWorkers`。
 

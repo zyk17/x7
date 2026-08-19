@@ -353,6 +353,7 @@ impl Engine {
             self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
         }
         self.next_generation = self.next_generation.wrapping_add(1);
+        let (gather_workers, eval_workers) = SearchConfig::gather_eval_from_threads(self.options.threads);
         let config = SearchConfig {
             root_move_filter: root_move_filter.clone(),
             eval_batch_size: self.options.mini_batch_size,
@@ -365,8 +366,8 @@ impl Engine {
                 lcb_stdevs: self.options.lcb_stdevs,
                 lcb_min_visit_fraction: self.options.lcb_min_visit_fraction,
             },
-            gather_workers: self.options.threads.div_ceil(2),
-            eval_workers: self.options.threads / 2,
+            gather_workers,
+            eval_workers,
             ..SearchConfig::default()
         };
         let decision_params = config.params;

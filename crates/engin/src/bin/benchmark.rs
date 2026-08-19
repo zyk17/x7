@@ -34,7 +34,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--eval-batch 64] [--nn-window 2.5] [--cache|--warm-cache] [--virtual-mean-fpu-scale 1.0] [--root-top 8]"
+     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--nn-window 2.3] [--cache|--warm-cache] [--virtual-mean-fpu-scale 1.0] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -45,10 +45,10 @@ fn parse_args() -> Result<Args, String> {
     let mut playouts = Some(20_000);
     let mut movetime = None;
     let mut repeat = 1;
-    let mut gathers = vec![4];
-    let mut evals = vec![4];
+    let mut gathers = vec![3];
+    let mut evals = vec![5];
     let mut eval_batch = None;
-    let mut nn_window = 2.5f32;
+    let mut nn_window = 2.3f32;
     let mut cache = false;
     let mut warm_cache = false;
     let mut virtual_mean_fpu_scale = 1.0f32;

@@ -236,10 +236,11 @@ TreeNode；当前 root 的 sibling prune 在 `position` abort 之后同步做，
   proven-bound / sticky mate 依赖路径语义，不能直接共享给全部入边；首版按 px0 的
   `Node`（局部入边）/`LowNode`（共享局面）分层处理，不把 history-dependent result 或 proof 直接写成
   graph-wide terminal。
-- PV 与 `graph_shape` 必须有 path-local visited set，遇环停止并显示 cycle，不能无限递归。
+- `graph_shape` 与无 history 的 PV 必须有 path-local visited set，遇图回边停止，不能无限递归。
+  UCI `info pv`（带 root history）在回边落到本条 PV 已见节点时改走 ContinuationTree，继续展示岔开后的着法。
 - `subtree_is_settled`、GC 和 root reset 都必须使用 graph traversal 的 visited set；不能通过
   `key.child(move)` 推导 child。
-- UCI `bestmove` 只读取 root edge，故语义可保持；其 PV 需要 graph-safe 路径展开。
+- UCI `bestmove` 只读取 root edge，故语义可保持；其 PV 需要 graph-safe 路径展开。带 history 的 UCI PV 在回边时可改走 ContinuationTree，不在此编造 Graph 上的第二条边。
 
 ## 分阶段验收
 

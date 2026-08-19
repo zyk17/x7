@@ -176,7 +176,7 @@ quit
 ```powershell
 cargo run --release -p engin --bin benchmark -- `
   --movetime 3000 --repeat 3 `
-  --gathers 4 --evals 4
+  --gathers 3 --evals 5
 ```
 
 `search_benchmark` 固定 `4/4` Search/Eval worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-graph 根部分流。使用完整历史诊断评分拐点：

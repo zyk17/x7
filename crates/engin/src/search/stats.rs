@@ -308,8 +308,8 @@ fn mate_from_terminal(child: &Node) -> Option<i32> {
     })
 }
 
-/// 从指定 root edge 出发的 PV。可在 Graph → ContinuationTree 的未绑定入口处按
-/// 本条 PV 的 history 推导临时 TreeNode key。
+/// 从指定 root edge 出发的 PV。Graph 回边若回到本条 PV 已见节点，改走 history 上的
+/// ContinuationTree；未绑定的 Graph→Tree 入口同样用 history 推导 key。
 fn principal_variation_from_root_edge(
     repository: &NodeRepository,
     root_key: NodeKey,
@@ -326,10 +326,10 @@ fn principal_variation_from_root_edge(
         return pv;
     };
     let mut history = root_history.cloned();
-    let Some(mut key) = next_pv_key(repository, &first_edge, &mut history) else {
+    let mut seen = HashSet::from([root_key]);
+    let Some(mut key) = next_pv_key(repository, &first_edge, &mut history, &seen) else {
         return pv;
     };
-    let mut seen = HashSet::from([root_key]);
     let mut flip = !root_is_black;
     while let Some(node) = repository.get(key) {
         if !seen.insert(key) {
@@ -349,7 +349,7 @@ fn principal_variation_from_root_edge(
         let Some(edge) = edges.iter().find(|edge| edge.mv() == abs_mv) else {
             break;
         };
-        let Some(next) = next_pv_key(repository, edge, &mut history) else {
+        let Some(next) = next_pv_key(repository, edge, &mut history, &seen) else {
             break;
         };
         key = next;
@@ -358,16 +358,23 @@ fn principal_variation_from_root_edge(
     pv
 }
 
-fn next_pv_key(repository: &NodeRepository, edge: &Edge, history: &mut Option<PositionHistory>) -> Option<NodeKey> {
+fn next_pv_key(
+    repository: &NodeRepository,
+    edge: &Edge,
+    history: &mut Option<PositionHistory>,
+    seen: &HashSet<NodeKey>,
+) -> Option<NodeKey> {
     if let Some(history) = history {
         history.append(edge.mv());
-        // 普通 Graph 边已绑定 child_key，直接使用；Graph→Tree 入口边未绑定，
-        // 按本条 PV 的完整 history 推导临时 continuation key。
-        if let Some(bound) = edge.child_key() {
+        let path_key = NodeKey::for_history(history);
+        // 未在本条 PV 出现过的 graph child 照常走共享节点。回边指向已走过的局面时，
+        // 改信这条 PV 的 history（ContinuationTree）。
+        if let Some(bound) = edge.child_key()
+            && !seen.contains(&bound)
+        {
             return Some(bound);
         }
-        let key = NodeKey::for_history(history);
-        return repository.get(key).map(|_| key);
+        return repository.get(path_key).map(|_| path_key);
     }
     edge.child_key()
 }
@@ -417,12 +424,10 @@ pub(crate) fn root_variations(
 fn best_edge_absolute(repository: &NodeRepository, root_key: NodeKey, root_move_filter: &[Move]) -> Option<Move> {
     let root = repository.get(root_key)?;
     let edges = root.edges();
+    // 空边终局（将死或三次循环叶子当根）没有可走的 root edge。
+    // 禁止用 a0a0 冒充 bestmove；UCI 有合法着就回退合法着，将死才是空着。
     if edges.is_empty() {
-        return if root.expansion_state() == ExpansionState::Terminal || root.completed_visits() > 0 {
-            Some(Move::NULL)
-        } else {
-            None
-        };
+        return None;
     }
     // 尚无 completed visit 时，edge list 已从合法着生成。返回已验证的 searchmove，
     // 或第一条未被 topology prune 的合法 edge。
@@ -646,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_root_bestmove_is_null_not_none() {
+    fn terminal_root_has_no_best_edge() {
         let state = GameState::from_fen_moves("4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", &[] as &[&str])
             .expect("checkmate fen");
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
@@ -655,7 +660,7 @@ mod tests {
         pipeline.run_playouts(1).expect("terminal");
         assert_eq!(
             best_move(pipeline.repository(), pipeline.root_key(), root_is_black),
-            Some(Move::NULL)
+            None
         );
         assert!(principal_variation(pipeline.repository(), pipeline.root_key(), root_is_black).is_empty());
         pipeline.stop_and_finish();
@@ -1097,5 +1102,60 @@ mod tests {
         );
         assert_eq!(pv.len(), 2);
         assert_eq!(pv[0], entry_move);
+    }
+
+    fn expand_pv_node(repo: &NodeRepository, key: NodeKey, mv: Move, child: Option<NodeKey>) {
+        let node = repo.get_or_insert(key);
+        assert!(node.try_begin_evaluation());
+        node.set_base_value(ValueDelta::one(0.9, 0.0));
+        node.publish_edges(vec![(mv, 1.0)]);
+        if let Some(child) = child {
+            node.edges()[0].bind_child_key(child);
+        }
+        node.reserve_edge(0).expect("pv visit").complete();
+        repo.recompute_node(key);
+    }
+
+    #[test]
+    fn history_pv_continues_past_a_bound_graph_cycle() {
+        let fen = "9/5k1P1/9/4R4/9/9/P8/9/9/4Kr3 w - - 0 1";
+        let root_history = GameState::from_fen_moves(fen, &[] as &[&str])
+            .expect("fen")
+            .position_history();
+        let cycle = ["e0e1", "f0f1", "e1e0", "f1f0"];
+        let mut walked = root_history.clone();
+        let mut keys = vec![NodeKey::for_history(&walked)];
+        let mut moves = Vec::new();
+        for text in cycle {
+            let mv = walked.last().board().parse_move(text).expect(text);
+            moves.push(mv);
+            walked.append(mv);
+            keys.push(NodeKey::for_history(&walked));
+        }
+        assert!(keys[4].is_continuation());
+        let deviate = walked.last().board().parse_move("e6e7").expect("e6e7");
+
+        let repo = NodeRepository::default();
+        for index in 0..3 {
+            expand_pv_node(&repo, keys[index], moves[index], Some(keys[index + 1]));
+        }
+        expand_pv_node(&repo, keys[3], moves[3], Some(keys[0]));
+        expand_pv_node(&repo, keys[4], deviate, None);
+
+        let graph_only = principal_variation(&repo, keys[0], false);
+        assert_eq!(graph_only.len(), 4, "graph PV stops at the bound cycle");
+        assert_eq!(graph_only[0], moves[0]);
+
+        let pv = principal_variation_with_history_and_params(
+            &repo,
+            keys[0],
+            &root_history,
+            false,
+            &[],
+            &SearchParams::default(),
+        );
+        assert_eq!(pv.len(), 5);
+        assert_eq!(pv[0], moves[0]);
+        assert_eq!(pv[4], deviate);
     }
 }
