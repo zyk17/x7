@@ -410,7 +410,7 @@ impl Engine {
         let owner_publish_output = Arc::clone(&publish_output);
         let output_options = self.options.clone();
         let output_gate = Arc::clone(&self.stdout_gate);
-        let owner_thread = std::thread::spawn(move || {
+        let owner_thread = thread::spawn(move || {
             run_search(
                 search,
                 snapshot,
