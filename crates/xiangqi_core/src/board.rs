@@ -43,17 +43,17 @@ pub struct ChessBoard {
 
 impl PartialEq for ChessBoard {
     fn eq(&self, other: &Self) -> bool {
-        self.flipped == other.flipped &&
-        self.our_king == other.our_king &&
-        self.their_king == other.their_king &&
-        self.ours == other.ours &&
-        self.theirs == other.theirs &&
-        self.rooks == other.rooks &&
-        self.advisors == other.advisors &&
-        self.cannons == other.cannons &&
-        self.pawns == other.pawns &&
-        self.knights == other.knights &&
-        self.bishops == other.bishops
+        self.flipped == other.flipped
+            && self.our_king == other.our_king
+            && self.their_king == other.their_king
+            && self.ours == other.ours
+            && self.theirs == other.theirs
+            && self.rooks == other.rooks
+            && self.advisors == other.advisors
+            && self.cannons == other.cannons
+            && self.pawns == other.pawns
+            && self.knights == other.knights
+            && self.bishops == other.bishops
     }
 }
 

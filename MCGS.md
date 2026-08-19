@@ -5,9 +5,8 @@
 
 本实现使用连续 `Gather → Eval → NN → Eval → Backprop`：PUCT 使用 edge in-flight
 reservation 作为 virtual visit（计入 started N，偏转选择）；Gather 每次采集一个叶子，
-collision 直接取消 reservation。Eval 持续向 NN 提交已编码 tensor；NN 空闲时立即处理当前
-队列可得请求，不等待逻辑搜索轮次。owner 将 in-flight owned event 限为两个 `MiniBatchSize`，防止
-无界使用过时统计。没有 prefetch 或 tree-batch gather。
+collision 先挂起 reservation / μ，该叶子自己的 backprop complete 后再 cancel，不加 completed visit。Eval 持续向 NN 提交已编码 tensor；NN 空闲时立即处理当前
+队列可得请求，不等待逻辑搜索轮次。Gather 在 claim 前把已交给 Eval 的叶子限为两个 `MiniBatchSize`。没有 prefetch 或 tree-batch gather。
 
 不用 classic 那种一次评估记 K 次 visit 的 **multivisit**。GPU 合批在 NN 队列，不靠 Gather
 一次收一批。实战以 `μ=FPU` virtual mean 做比纯 virtual visit 更明显、但仍温和的分流；K 份

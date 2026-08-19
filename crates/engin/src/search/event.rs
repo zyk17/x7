@@ -23,7 +23,7 @@ pub struct Variation {
     root_history: Arc<PositionHistory>,
     moves: Vec<Move>,
     /// 首次需要规则或 NN 编码时才重放 root history；之后随 `push` 增量追加。
-    /// 同一个 Gather event 不会在每层 Expanded node 重放整条 variation。
+    /// 同一个 PlayoutEvent 不会在每层 Expanded node 重放整条 variation。
     history: Option<PositionHistory>,
     /// Gather 当前所在局面。MCGS 必须从真实棋盘取得 child board key；保留这份轻量
     /// snapshot 避免每下降一层都从 root 重放整条 variation。
@@ -87,12 +87,12 @@ impl Variation {
     }
 }
 
-/// Gather、Eval 与 Backprop worker 间传递的事件。
+/// 一次完整 playout：从 root 到 leaf 的路径、reservation 与 variation 上下文。
 ///
-/// event 拥有全部搜索专用数据，不持有 graph/backend 的 `&mut` 引用，因此可安全地通过
-/// 有界 worker 队列发送。
+/// Gather、Eval 与 Backprop worker 间传递；不持有 graph/backend 的 `&mut` 引用，因此可
+/// 安全地通过有界 worker 队列发送。
 #[derive(Debug)]
-pub struct NodeEvent {
+pub struct PlayoutEvent {
     /// 拒绝 `position` / `ucinewgame` / 替换 `go` 之后残留的旧 event。
     /// 每次 UCI 搜索单调递增，旧 event 不得更新新的 root。
     pub generation: u64,
@@ -107,7 +107,7 @@ pub struct NodeEvent {
     queued_at: Option<Instant>,
 }
 
-impl NodeEvent {
+impl PlayoutEvent {
     pub fn root(generation: u64, root_history: Arc<PositionHistory>) -> Self {
         Self::at_root(generation, NodeKey::for_history(root_history.as_ref()), root_history)
     }
@@ -183,8 +183,8 @@ impl NodeEvent {
         self
     }
 
-    /// 搜索停止或评估失败后释放全部 edge-local in-flight visit。collision 不应走
-    /// 这条路径——cancel 会拆掉已攒的 virtual mean，使分流几乎作废。消费 `self`
+    /// 搜索停止或评估失败后释放全部 edge-local in-flight visit。撞上 `Evaluating`
+    /// 的 collision 先挂起，等该叶子自己的 backprop `complete` 后再走这里。
     /// 让调用方遗漏 reservation 成为显式错误。
     pub fn cancel(self) {
         for reservation in self.reservations.into_iter().rev() {
@@ -209,16 +209,13 @@ impl NodeEvent {
 }
 
 /// 由 Gather/Eval 路由给 Backprop 的结果。
-///
-/// 参考：LC3 Overview 的 “GatherWorker” 和 “BackpropWorker”：
-/// <https://lczero.org/dev/lc0/search/lc3/overview/>。
 #[derive(Debug)]
 pub struct BackpropEvent {
-    node: NodeEvent,
-    /// 此 event 的 leaf 只是 variation-local 的结果，没有可重算的 shared leaf node。
+    pub(crate) playout: PlayoutEvent,
+    /// 此 playout 的 leaf 只是 variation-local 的结果，没有可重算的 shared leaf node。
     /// 它在完成最后一条 reservation 时成为一个 edge-local 样本，绝不能永久覆盖该
     /// board edge 的其他历史。参见 KataGo `docs/GraphSearch.md` 的 edge-local N。
-    local_leaf: Option<ValueDelta>,
+    pub(crate) local_leaf: Option<ValueDelta>,
     #[cfg(feature = "benchmark")]
     queued_at: Option<Instant>,
 }
@@ -226,25 +223,24 @@ pub struct BackpropEvent {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackpropResult {
     pub completed_playouts: u32,
-    /// 已完成叶子深度之和，root 记为深度一。语义参考自 `cum_depth_` 的计数方式
-    /// （`search.cc:2157-2167`）。
+    /// 已完成叶子深度之和，root 记为深度一。
     pub completed_depth: u64,
     pub max_depth: u64,
 }
 
 impl BackpropEvent {
-    pub(crate) fn evaluation(node: NodeEvent) -> Self {
+    pub(crate) fn evaluation(playout: PlayoutEvent) -> Self {
         Self {
-            node,
+            playout,
             local_leaf: None,
             #[cfg(feature = "benchmark")]
             queued_at: None,
         }
     }
 
-    pub(crate) fn local_leaf(node: NodeEvent, value: ValueDelta) -> Self {
+    pub(crate) fn local_leaf(playout: PlayoutEvent, value: ValueDelta) -> Self {
         Self {
-            node,
+            playout,
             local_leaf: Some(value),
             #[cfg(feature = "benchmark")]
             queued_at: None,
@@ -252,9 +248,6 @@ impl BackpropEvent {
     }
 
     /// 经 Backprop worker 完成一批独立 event。
-    ///
-    /// LC3 Overview, "BackpropWorker":
-    /// <https://lczero.org/dev/lc0/search/lc3/overview/>.
     pub(crate) fn complete_batch(
         events: impl IntoIterator<Item = Self>,
         repository: &super::NodeRepository,
@@ -262,51 +255,42 @@ impl BackpropEvent {
         let mut result = BackpropResult::default();
 
         for event in events {
-            let Self { node, local_leaf, .. } = event;
-            let expected_nodes = node.reservations.len() + usize::from(local_leaf.is_none());
+            let Self {
+                playout,
+                mut local_leaf,
+                ..
+            } = event;
+            let expected_nodes = playout.reservations.len() + usize::from(local_leaf.is_none());
             debug_assert_eq!(
-                node.node_path.len(),
+                playout.node_path.len(),
                 expected_nodes,
                 "shared-leaf path has one more node; local leaf path has no shared leaf"
             );
-            let depth = node.reservations.len() as u64 + 1;
-            let tree_entries = node.continuation_entries;
-            let mut reservations: Vec<_> = node.reservations.into_iter().map(Some).collect();
-            let mut local_leaf = local_leaf;
-            for index in (0..reservations.len()).rev() {
-                if tree_entries.iter().any(|(entry, _)| *entry == index) {
-                    continue;
-                }
-                let reservation = reservations[index].take().expect("one reservation");
+            let depth = playout.reservations.len() as u64 + 1;
+            let continuation_entries = playout.continuation_entries;
+
+            // 从最内层边往外结算。`local_leaf` 只给最靠近叶子的那条边；Graph→Tree
+            // 入口不绑定 child，没有局部样本时先重算内层树再采样树根。
+            for (i, reservation) in playout.reservations.into_iter().enumerate().rev() {
                 if let Some(value) = local_leaf.take() {
                     reservation.complete_local_leaf(value);
+                } else if let Some((_, root)) = continuation_entries.iter().find(|(j, _)| *j == i) {
+                    for node_key in playout.node_path[i + 1..].iter().rev() {
+                        repository.recompute_node(*node_key);
+                        repository.prove_terminal(*node_key);
+                    }
+                    let child = repository.get(*root).expect("continuation root");
+                    let (wl, draw, plies_left) = child.value_snapshot();
+                    reservation.complete_local_leaf(ValueDelta::with_plies_left(wl, draw, plies_left));
                 } else {
                     reservation.complete();
                 }
             }
-            // 从最内层 Tree 开始采样。若零化后又发生第一次重复，内层 Tree 的结果
-            // 先进入其 Graph parent，外层入口随后读到已更新的局部树根。
-            for (index, root) in tree_entries.into_iter().rev() {
-                let entry = reservations[index].take().expect("continuation entry reservation");
-                if let Some(value) = local_leaf.take() {
-                    // GraphNode 的 rule60 终局叶子已被 `discard_leaf_node` 移出
-                    // `node_path`；不能读未展开 node 的默认值，直接把这次裁决写入
-                    // entry edge。ContinuationTree 终局走 `mark_terminal`，不走这条。
-                    entry.complete_local_leaf(value);
-                } else {
-                    for node_key in node.node_path[index + 1..].iter().rev() {
-                        repository.recompute_graph_node(*node_key);
-                        repository.prove_terminal(*node_key);
-                    }
-                    let child = repository.get(root).expect("continuation root");
-                    let (wl, draw, plies_left) = child.value_snapshot();
-                    entry.complete_local_leaf(ValueDelta::with_plies_left(wl, draw, plies_left));
-                }
-            }
+
             // KataGo GraphSearch 的 idempotent 回传：只重算本 variation 上已实际经过的
             // node。共享 child 不向所有 parent 广播，未走到的 parent 以后被访问时再重算。
-            for (index, node_key) in node.node_path.into_iter().enumerate().rev() {
-                repository.recompute_graph_node(node_key);
+            for (index, node_key) in playout.node_path.into_iter().enumerate().rev() {
+                repository.recompute_node(node_key);
                 // 根保留为普通 node；UCI 通过其已证明 terminal child 输出正确的 mate
                 // 距离。其余节点可把已绑定 terminal 沿当前 backprop path 继续证明上去。
                 if index != 0 {
@@ -322,7 +306,7 @@ impl BackpropEvent {
     }
 
     pub fn cancel(self) {
-        self.node.cancel();
+        self.playout.cancel();
     }
 
     #[cfg(feature = "benchmark")]
@@ -345,13 +329,13 @@ mod tests {
 
     use xiangqi_core::{GameState, Move, Position, STARTPOS_FEN};
 
-    use super::{BackpropEvent, NodeEvent, Variation};
+    use super::{BackpropEvent, PlayoutEvent, Variation};
     use crate::search::{ExpansionState, NodeKey, NodeRepository, ValueDelta};
 
     #[test]
     fn variation_keeps_root_history_and_owns_its_path() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let mut root = NodeEvent::root(
+        let mut root = PlayoutEvent::root(
             7,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
@@ -383,7 +367,7 @@ mod tests {
             history.append(mv);
         }
         let history = Arc::new(history);
-        let mut event = NodeEvent::root(8, Arc::clone(&history));
+        let mut event = PlayoutEvent::root(8, Arc::clone(&history));
         let mv = event
             .variation
             .position
@@ -406,7 +390,7 @@ mod tests {
         // `PositionHistory` 的奇偶位置代表不同的行棋方。这里故意放入一个只在
         // 相反 parity 出现的相同 board，模拟旧的全量 hash 扫描误判。
         let history = xiangqi_core::PositionHistory::from_positions(vec![child, parent.clone(), parent]);
-        let mut event = NodeEvent::root(3, Arc::new(history));
+        let mut event = PlayoutEvent::root(3, Arc::new(history));
         let child_hash = Position::after(&event.variation.position, mv).board().hash();
 
         assert!(
@@ -481,7 +465,7 @@ mod tests {
     #[test]
     fn backprop_completes_every_reservation_with_alternating_value() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let root = NodeEvent::root(
+        let root = PlayoutEvent::root(
             1,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
@@ -520,7 +504,7 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
         let repository = NodeRepository::default();
-        let root = NodeEvent::root(18, history);
+        let root = PlayoutEvent::root(18, history);
         let root_node = repository.get_or_insert(root.node_key);
         let first = Move::new(
             xiangqi_core::Square::parse("b2").expect("b2"),
@@ -562,7 +546,7 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
         let repository = NodeRepository::default();
-        let root = NodeEvent::root(19, history);
+        let root = PlayoutEvent::root(19, history);
         let root_node = repository.get_or_insert(root.node_key);
         let first = Move::new(
             xiangqi_core::Square::parse("b2").expect("b2"),
@@ -604,7 +588,7 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let root_history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
         let repository = NodeRepository::default();
-        let first = NodeEvent::root(1, Arc::clone(&root_history));
+        let first = PlayoutEvent::root(1, Arc::clone(&root_history));
         let root_node = repository.get_or_insert(first.node_key);
         assert!(root_node.try_begin_evaluation());
         let mv = Move::new(
@@ -620,7 +604,7 @@ mod tests {
             .set_base_value(ValueDelta::one(0.3, 0.3));
         let first = first.descend(child_key, root_node.reserve_edge(0).expect("first edge"));
         let second =
-            NodeEvent::root(1, root_history).descend(child_key, root_node.reserve_edge(0).expect("second edge"));
+            PlayoutEvent::root(1, root_history).descend(child_key, root_node.reserve_edge(0).expect("second edge"));
 
         let result = BackpropEvent::complete_batch(
             [BackpropEvent::evaluation(first), BackpropEvent::evaluation(second)],
@@ -643,7 +627,7 @@ mod tests {
     #[test]
     fn continuation_tree_backprop_keeps_its_value_local_to_the_entry_edge() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let root = NodeEvent::root(
+        let root = PlayoutEvent::root(
             2,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
@@ -672,7 +656,7 @@ mod tests {
     #[test]
     fn continuation_tree_updates_inside_then_samples_its_root_at_the_shard_entry() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let root = NodeEvent::root(
+        let root = PlayoutEvent::root(
             12,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
@@ -724,7 +708,7 @@ mod tests {
     #[test]
     fn backprop_handles_a_second_tree_after_a_zeroing_graph_segment() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let root = NodeEvent::root(
+        let root = PlayoutEvent::root(
             13,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
@@ -774,7 +758,7 @@ mod tests {
     #[test]
     fn path_terminal_at_continuation_root_uses_its_local_rule_value() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let root = NodeEvent::root(
+        let root = PlayoutEvent::root(
             9,
             Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions())),
         );
@@ -794,10 +778,7 @@ mod tests {
             .discard_leaf_node();
 
         BackpropEvent::complete_batch(
-            [BackpropEvent::local_leaf(
-                event,
-                ValueDelta::one(0.8, 0.0),
-            )],
+            [BackpropEvent::local_leaf(event, ValueDelta::one(0.8, 0.0))],
             &repository,
         );
 
@@ -810,7 +791,7 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
         let repository = NodeRepository::default();
-        let root_key = NodeEvent::root(4, Arc::clone(&history)).node_key;
+        let root_key = PlayoutEvent::root(4, Arc::clone(&history)).node_key;
         let root = repository.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
         let mv = Move::new(
@@ -824,7 +805,7 @@ mod tests {
 
         for value in [0.6, -0.2] {
             let event =
-                NodeEvent::root(4, Arc::clone(&history)).descend(child_key, root.reserve_edge(0).expect("edge"));
+                PlayoutEvent::root(4, Arc::clone(&history)).descend(child_key, root.reserve_edge(0).expect("edge"));
             BackpropEvent::complete_batch(
                 [BackpropEvent::local_leaf(
                     event.discard_leaf_node(),
@@ -843,7 +824,7 @@ mod tests {
     fn path_terminal_discards_its_unshared_leaf_before_backprop() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let root_history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
-        let root_event = NodeEvent::root(3, root_history);
+        let root_event = PlayoutEvent::root(3, root_history);
         let repository = NodeRepository::default();
         let root = repository.get_or_insert(root_event.node_key);
         assert!(root.try_begin_evaluation());

@@ -26,8 +26,8 @@ use crate::neural::{
 use super::extension::{ExtensionKind, classify_extension, path_terminal_value};
 use super::graph::ChildLink;
 use super::{
-    BackpropEvent, ExpansionState, Node, NodeEvent, NodeKey, NodeRepository, SearchGraph, SearchParams, ValueDelta,
-    network_wl_to_node, select_edge,
+    BackpropEvent, ExpansionState, Node, NodeKey, NodeRepository, PlayoutEvent, SearchGraph, SearchParams, ValueDelta,
+    select_edge,
 };
 
 const RECEIVE_POLL: Duration = Duration::from_millis(10);
@@ -76,6 +76,7 @@ pub struct Stats {
     pub cache_hits: u64,
     /// 本次搜索观察到的最大 NN batch。
     pub network_batch_size_max: u64,
+    /// 本次搜索观察到的最大在途 Eval 叶子数（claim 后、NN 回复或提前释放前）。
     #[cfg(feature = "benchmark")]
     pub peak_in_flight: u64,
     /// 按距 root 的 variation 深度统计 collision。
@@ -148,6 +149,8 @@ pub struct SearchConfig {
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
+    /// claim 窗口倍率：`slots = ceil(MiniBatchSize × nn_window)`，启动时算一次。
+    pub nn_window: f32,
     pub params: SearchParams,
     pub gather_workers: usize,
     /// Eval worker 数。它负责准备、缓存、合法着；NN inference 是独立线程。
@@ -161,6 +164,7 @@ impl Default for SearchConfig {
         Self {
             queue_capacity: 0,
             eval_batch_size: 0,
+            nn_window: 2.5,
             params: SearchParams::default(),
             gather_workers: 4,
             eval_workers: 4,
@@ -174,6 +178,10 @@ impl SearchConfig {
         self.params.validate();
         assert!(self.gather_workers > 0, "stream requires at least one gather worker");
         assert!(self.eval_workers > 0, "stream requires at least one eval worker");
+        assert!(
+            self.nn_window.is_finite() && self.nn_window > 0.0,
+            "stream nn window factor must be finite and positive"
+        );
     }
 
     /// Fills `0` sentinels from the backend; returns concrete queue/batch sizes.
@@ -196,9 +204,11 @@ impl SearchConfig {
             eval_batch_size <= queue_capacity,
             "stream eval batch size must fit the queue capacity"
         );
+        let nn_window_slots = ((eval_batch_size as f32) * self.nn_window).ceil().max(1.0) as usize;
         ResolvedSearchConfig {
             queue_capacity,
             eval_batch_size,
+            nn_window_slots,
             params: self.params,
             gather_workers: self.gather_workers,
             eval_workers: self.eval_workers,
@@ -210,18 +220,19 @@ impl SearchConfig {
 struct ResolvedSearchConfig {
     queue_capacity: usize,
     eval_batch_size: usize,
+    nn_window_slots: usize,
     params: SearchParams,
     gather_workers: usize,
     eval_workers: usize,
 }
 
 enum GatherCommand {
-    Run(Arc<Shared>, Receiver<NodeEvent>),
+    Run(Arc<Shared>, Receiver<PlayoutEvent>),
     Shutdown,
 }
 
 enum EvalCommand {
-    Run(Arc<Shared>, Receiver<NodeEvent>, Sender<NnRequest>),
+    Run(Arc<Shared>, Receiver<PlayoutEvent>, Sender<NnRequest>),
     Shutdown,
 }
 
@@ -247,6 +258,7 @@ pub(crate) struct WorkerPool {
     job_done: Receiver<()>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     eval_batch_size: usize,
+    nn_window_slots: usize,
 }
 
 impl WorkerPool {
@@ -260,6 +272,7 @@ impl WorkerPool {
     pub(crate) fn matches_config(&self, backend: &dyn Backend, config: &SearchConfig) -> bool {
         let config = config.resolve(backend);
         self.eval_batch_size == config.eval_batch_size
+            && self.nn_window_slots == config.nn_window_slots
             && self.gather_commands.len() == config.gather_workers
             && self.eval_commands.len() == config.eval_workers
     }
@@ -267,6 +280,7 @@ impl WorkerPool {
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
         let (job_done_tx, job_done) = crossbeam_channel::unbounded();
         let eval_batch_size = config.eval_batch_size;
+        let nn_window_slots = config.nn_window_slots;
         let mut gather_commands = Vec::with_capacity(config.gather_workers);
         let mut eval_commands = Vec::with_capacity(config.eval_workers);
         let (backprop_commands, backprop_rx) = crossbeam_channel::unbounded();
@@ -274,7 +288,9 @@ impl WorkerPool {
         for _ in 0..config.gather_workers {
             let (tx, rx) = crossbeam_channel::unbounded();
             let job_done = job_done_tx.clone();
-            threads.push(thread::spawn(move || persistent_gather_worker(rx, job_done)));
+            threads.push(thread::spawn(move || {
+                persistent_gather_worker(rx, job_done, nn_window_slots)
+            }));
             gather_commands.push(tx);
         }
         let (nn_commands, nn_rx) = crossbeam_channel::unbounded();
@@ -300,14 +316,15 @@ impl WorkerPool {
             job_done,
             threads: Mutex::new(threads),
             eval_batch_size: config.eval_batch_size,
+            nn_window_slots: config.nn_window_slots,
         }
     }
 
     fn start_job(
         &self,
         shared: &Arc<Shared>,
-        gather_rx: &Receiver<NodeEvent>,
-        eval_rx: &Receiver<NodeEvent>,
+        gather_rx: &Receiver<PlayoutEvent>,
+        eval_rx: &Receiver<PlayoutEvent>,
         nn_tx: &Sender<NnRequest>,
         nn_rx: &Receiver<NnRequest>,
         backprop_rx: &Receiver<BackpropEvent>,
@@ -351,6 +368,10 @@ impl WorkerPool {
             self.eval_batch_size, config.eval_batch_size,
             "worker pool batch size changed"
         );
+        assert_eq!(
+            self.nn_window_slots, config.nn_window_slots,
+            "worker pool nn window changed"
+        );
     }
 }
 
@@ -381,7 +402,10 @@ struct Shared {
     /// 当前 root 的 history 已裁决结束，但不能污染同 board 的共享 node。
     root_path_terminal: AtomicBool,
     stopping: AtomicBool,
+    /// 未 `finish` 的 owned event：drain / 节点预算。
     outstanding: AtomicUsize,
+    /// 已交给 Eval 的叶子（编码或 NN）。满窗口就不再 claim 新叶子。
+    nn_inflight: AtomicUsize,
     #[cfg(feature = "benchmark")]
     submitted: AtomicU64,
     #[cfg(feature = "benchmark")]
@@ -408,21 +432,19 @@ struct Shared {
     error: Mutex<Option<EnginError>>,
     idle_lock: Mutex<()>,
     idle: Condvar,
-    gather_tx: Sender<NodeEvent>,
-    eval_tx: Sender<NodeEvent>,
+    gather_tx: Sender<PlayoutEvent>,
+    eval_tx: Sender<PlayoutEvent>,
     backprop_tx: Sender<BackpropEvent>,
+    /// 撞上 `Evaluating` 叶子的 playout。先留着 reservation / μ；该叶子自己的
+    /// backprop `complete` 之后再按 `node_key` 摘出来 cancel。
+    collision_waiters: Mutex<Vec<PlayoutEvent>>,
 }
 
 impl Shared {
     fn start_playout(&self) {
-        let outstanding = self.outstanding.fetch_add(1, Ordering::AcqRel) + 1;
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
         #[cfg(feature = "benchmark")]
-        {
-            self.submitted.fetch_add(1, Ordering::Relaxed);
-            self.peak_in_flight.fetch_max(outstanding as u64, Ordering::Relaxed);
-        }
-        #[cfg(not(feature = "benchmark"))]
-        let _ = outstanding;
+        self.submitted.fetch_add(1, Ordering::Relaxed);
     }
 
     fn complete_root_terminal(&self) {
@@ -441,16 +463,60 @@ impl Shared {
         let _ = previous;
     }
 
-    /// 当前碰撞路径：cancel 整条未完成 reservation。Gather 撞到 `Evaluating` 时
-    /// 不应依赖这一步，见该处注释。
-    fn finish_collision(&self, event: NodeEvent) {
+    fn nn_slot_down(&self) {
+        let previous = self.nn_inflight.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous > 0, "stream nn slot underflow");
+        let _guard = self.idle_lock.lock();
+        self.idle.notify_all();
+    }
+
+    /// 撞上正在评估的叶子：挂起整条 reservation，让 μ 继续分流。
+    fn park_collision(&self, event: PlayoutEvent) {
         #[cfg(feature = "benchmark")]
         {
             self.collisions.fetch_add(1, Ordering::AcqRel);
             self.record_collision_depths(&[event.variation.moves().len()]);
         }
+        {
+            let mut waiters = self.collision_waiters.lock();
+            if !self.stopping.load(Ordering::Acquire)
+                && self
+                    .repository
+                    .get(event.node_key)
+                    .is_some_and(|node| node.expansion_state() == ExpansionState::Evaluating)
+            {
+                waiters.push(event);
+                return;
+            }
+        }
         event.cancel();
         self.finish(false);
+    }
+
+    fn cancel_collisions(&self, key: NodeKey) {
+        let mut waiters = self.collision_waiters.lock();
+        let mut i = 0;
+        let mut parked = Vec::new();
+        while i < waiters.len() {
+            if waiters[i].node_key == key {
+                parked.push(waiters.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        drop(waiters);
+        for event in parked {
+            event.cancel();
+            self.finish(false);
+        }
+    }
+
+    fn cancel_all_collisions(&self) {
+        let parked = std::mem::take(&mut *self.collision_waiters.lock());
+        for event in parked {
+            event.cancel();
+            self.finish(false);
+        }
     }
 
     /// Cancels an event after Gather has claimed its leaf for Eval.
@@ -458,7 +524,7 @@ impl Shared {
     /// Reference: LC3 overview's EvalWorker ownership model. Releasing only
     /// the edge reservations would leave the claimed node permanently
     /// `Evaluating`, so this also restores it to `Unexpanded`.
-    fn cancel_claimed_evaluation(&self, event: NodeEvent) {
+    fn cancel_claimed_evaluation(&self, event: PlayoutEvent) {
         let node = self
             .repository
             .get(event.node_key)
@@ -477,7 +543,7 @@ impl Shared {
 
     /// Non-blocking enqueue: `try_send` + yield instead of parking on a full
     /// queue so Gather can keep polling `stopping` and stay schedulable.
-    fn send_eval(&self, mut event: NodeEvent) {
+    fn send_eval(&self, mut event: PlayoutEvent) {
         #[cfg(feature = "benchmark")]
         event.mark_queued();
         loop {
@@ -486,7 +552,13 @@ impl Shared {
                 return;
             }
             match self.eval_tx.try_send(event) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.nn_inflight.fetch_add(1, Ordering::AcqRel);
+                    #[cfg(feature = "benchmark")]
+                    self.peak_in_flight
+                        .fetch_max(self.nn_inflight.load(Ordering::Relaxed) as u64, Ordering::Relaxed);
+                    return;
+                }
                 Err(TrySendError::Full(returned)) => {
                     event = returned;
                     thread::yield_now();
@@ -504,8 +576,12 @@ impl Shared {
         event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
+                let key = event.local_leaf.is_none().then_some(event.playout.node_key);
                 event.cancel();
                 self.finish(false);
+                if let Some(key) = key {
+                    self.cancel_collisions(key);
+                }
                 return;
             }
             match self.backprop_tx.try_send(event) {
@@ -515,8 +591,12 @@ impl Shared {
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
+                    let key = returned.local_leaf.is_none().then_some(returned.playout.node_key);
                     returned.cancel();
                     self.finish(false);
+                    if let Some(key) = key {
+                        self.cancel_collisions(key);
+                    }
                     return;
                 }
             }
@@ -632,6 +712,7 @@ impl Search {
             root_path_terminal: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
+            nn_inflight: AtomicUsize::new(0),
             #[cfg(feature = "benchmark")]
             submitted: AtomicU64::new(0),
             #[cfg(feature = "benchmark")]
@@ -661,6 +742,7 @@ impl Search {
             gather_tx,
             eval_tx,
             backprop_tx,
+            collision_waiters: Mutex::new(Vec::new()),
         });
         let (nn_tx, nn_rx) = bounded::<NnRequest>(resolved.queue_capacity);
         worker_pool.start_job(&shared, &gather_rx, &eval_rx, &nn_tx, &nn_rx, &backprop_rx);
@@ -723,7 +805,7 @@ impl Search {
             return Err(EnginError::PortIncomplete("stream worker pipeline is stopped"));
         }
         self.shared.start_playout();
-        let mut event = NodeEvent::at_root(self.shared.generation, self.root_key, Arc::clone(&self.root_history));
+        let mut event = PlayoutEvent::at_root(self.shared.generation, self.root_key, Arc::clone(&self.root_history));
         #[cfg(feature = "benchmark")]
         event.mark_queued();
         loop {
@@ -766,7 +848,6 @@ impl Search {
     ) -> Result<Stats, EnginError> {
         let target = limits.max_playouts.unwrap_or(u64::MAX);
         let mut next_report = report_interval.and_then(|interval| Instant::now().checked_add(interval));
-        let in_flight_limit = self.worker_pool.eval_batch_size.saturating_mul(2).max(1);
         while !self.is_stopping()
             && !limits.is_exhausted(
                 self.initial_visits.saturating_add(self.stats().completed_playouts),
@@ -814,8 +895,17 @@ impl Search {
                 self.wait_until_outstanding_below(outstanding)?;
                 continue;
             }
-            if outstanding >= in_flight_limit {
-                self.wait_until_outstanding_below(in_flight_limit)?;
+            if self.shared.nn_inflight.load(Ordering::Acquire) >= self.worker_pool.nn_window_slots {
+                let mut guard = self.shared.idle_lock.lock();
+                while self.shared.nn_inflight.load(Ordering::Acquire) >= self.worker_pool.nn_window_slots
+                    && !self.shared.stopping.load(Ordering::Acquire)
+                    && self.shared.error.lock().is_none()
+                {
+                    self.shared.idle.wait(&mut guard);
+                }
+                if let Some(error) = self.shared.error.lock().clone() {
+                    return Err(error);
+                }
                 continue;
             }
             if let Err(error) = self.submit_playout() {
@@ -835,7 +925,6 @@ impl Search {
         self.wait_until_outstanding_below(1)
     }
 
-    /// Blocks until `outstanding < limit` (or an error/stop drains work).
     fn wait_until_outstanding_below(&self, limit: usize) -> Result<(), EnginError> {
         let mut guard = self.shared.idle_lock.lock();
         while self.shared.outstanding.load(Ordering::Acquire) >= limit && self.shared.error.lock().is_none() {
@@ -865,7 +954,7 @@ impl Drop for Search {
     }
 }
 
-fn gather_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>) {
+fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_window_slots: usize) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
             #[cfg(feature = "benchmark")]
@@ -877,7 +966,7 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>) {
                     event.cancel();
                     shared.finish(false);
                 } else {
-                    process_gather_event(&shared, event);
+                    process_gather_event(&shared, event, nn_window_slots);
                 }
             }
             #[cfg(not(feature = "benchmark"))]
@@ -886,7 +975,7 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>) {
                 shared.finish(false);
             }
             #[cfg(not(feature = "benchmark"))]
-            Ok(event) => process_gather_event(&shared, event),
+            Ok(event) => process_gather_event(&shared, event, nn_window_slots),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -894,11 +983,11 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>) {
     }
 }
 
-fn persistent_gather_worker(commands: Receiver<GatherCommand>, job_done: Sender<()>) {
+fn persistent_gather_worker(commands: Receiver<GatherCommand>, job_done: Sender<()>, nn_window_slots: usize) {
     while let Ok(command) = commands.recv() {
         match command {
             GatherCommand::Run(shared, receiver) => {
-                gather_worker(shared, receiver);
+                gather_worker(shared, receiver, nn_window_slots);
                 let _ = job_done.send(());
             }
             GatherCommand::Shutdown => break,
@@ -912,7 +1001,7 @@ enum ChildTarget {
     Continuation(NodeKey),
 }
 
-fn selected_child(shared: &Shared, event: &mut NodeEvent, node: &Node, edge_index: usize) -> Option<ChildTarget> {
+fn selected_child(shared: &Shared, event: &mut PlayoutEvent, node: &Node, edge_index: usize) -> Option<ChildTarget> {
     let edge = &node.edges()[edge_index];
     if !event.node_key.is_continuation()
         && let Some(child) = event.repeated_child_key(edge.mv())
@@ -933,7 +1022,7 @@ fn selected_child(shared: &Shared, event: &mut NodeEvent, node: &Node, edge_inde
 
 fn branch_at_expanded_node(
     shared: &Shared,
-    event: &mut NodeEvent,
+    event: &mut PlayoutEvent,
     node: &Node,
     depth: usize,
 ) -> Option<(ChildTarget, super::EdgeReservation)> {
@@ -950,7 +1039,11 @@ fn branch_at_expanded_node(
         // 复用本次 PUCT selection 的 FPU。`selected_child` 可能绑定一个已有 graph
         // child；那会改变下一次 selection 的 FPU 参与集合，但不能倒写本次 pending
         // sample 的均值。
-        let virtual_mean = shared.params.virtual_mean_fpu_scale.map(|scale| scale * fpu);
+        let virtual_mean = if shared.params.virtual_mean_fpu_scale > 0.0 {
+            Some(shared.params.virtual_mean_fpu_scale * fpu)
+        } else {
+            None
+        };
         let Some(target) = selected_child(shared, event, node, edge_index) else {
             continue;
         };
@@ -961,7 +1054,7 @@ fn branch_at_expanded_node(
     }
 }
 
-fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
+fn process_gather_event(shared: &Shared, mut event: PlayoutEvent, nn_window_slots: usize) {
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             event.cancel();
@@ -971,15 +1064,23 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
         let node = shared.repository.get_or_insert(event.node_key);
         match node.expansion_state() {
             ExpansionState::Unexpanded => {
+                if shared.nn_inflight.load(Ordering::Acquire) >= nn_window_slots {
+                    let mut guard = shared.idle_lock.lock();
+                    while shared.nn_inflight.load(Ordering::Acquire) >= nn_window_slots
+                        && !shared.stopping.load(Ordering::Acquire)
+                        && shared.error.lock().is_none()
+                    {
+                        shared.idle.wait(&mut guard);
+                    }
+                    continue;
+                }
                 if node.try_begin_evaluation() {
                     shared.send_eval(event);
                     return;
                 }
             }
             ExpansionState::Evaluating => {
-                // 不应直接 cancel：路径上已攒的 in-flight / virtual mean 会被拆掉，
-                // 分流几乎作废。当前仍走 finish_collision。
-                shared.finish_collision(event);
+                shared.park_collision(event);
                 return;
             }
             ExpansionState::Terminal => {
@@ -1013,7 +1114,7 @@ fn process_gather_event(shared: &Shared, mut event: NodeEvent) {
                 // MCGS 的共享 child 可能刚刚由另一条 variation 更新。回传只重算实际
                 // 路径上的 node；因此每次再次访问本 node 前都要按最新 child Q 重算。
                 // 参考 KataGo `docs/GraphSearch.md` “Stale Q Values”。
-                shared.repository.recompute_graph_node(event.node_key);
+                shared.repository.recompute_node(event.node_key);
                 let Some((target, reservation)) = branch_at_expanded_node(shared, &mut event, node.as_ref(), depth)
                 else {
                     if event.reservations.is_empty() {
@@ -1059,7 +1160,7 @@ impl NnRequest {
 
 /// Eval 正在等待此 node 的 NN（LC3：NN 完成后 → Backprop）。
 struct WaitingNn {
-    event: NodeEvent,
+    event: PlayoutEvent,
     node: Arc<Node>,
     legal_moves: Vec<xiangqi_core::Move>,
     cache_key: EvalCacheKey,
@@ -1068,8 +1169,8 @@ struct WaitingNn {
 
 /// LC3 EvalWorker：terminal | cache → Backprop；否则合法着 + 编码 → NN queue；
 /// NN 回复后 → softmax/edges → Backprop。它不会因一次 GPU 调用阻塞整个 worker，
-/// 而是在新 NodeEvent 之间轮询已完成结果。
-fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender<NnRequest>) {
+/// 而是在新 PlayoutEvent 之间轮询已完成结果。
+fn eval_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_tx: Sender<NnRequest>) {
     let mut waiting: Vec<WaitingNn> = Vec::new();
     loop {
         if shared.stopping.load(Ordering::Acquire) {
@@ -1077,8 +1178,10 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender
                 cancel_waiting_item(&shared, item);
             }
             while let Ok(event) = receiver.try_recv() {
+                shared.nn_slot_down();
                 shared.cancel_claimed_evaluation(event);
             }
+            shared.cancel_all_collisions();
             break;
         }
 
@@ -1108,7 +1211,17 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<NodeEvent>, nn_tx: Sender
                 // 没有新叶子：短暂等待至少一个 NN 回复。
                 wait_one_nn_completion(&shared, &mut waiting);
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                for item in waiting.drain(..) {
+                    cancel_waiting_item(&shared, item);
+                }
+                while let Ok(event) = receiver.try_recv() {
+                    shared.nn_slot_down();
+                    shared.cancel_claimed_evaluation(event);
+                }
+                shared.cancel_all_collisions();
+                break;
+            }
         }
     }
 }
@@ -1190,9 +1303,10 @@ fn handle_eval_event(
     shared: &Shared,
     nn_tx: &Sender<NnRequest>,
     waiting: &mut Vec<WaitingNn>,
-    mut event: NodeEvent,
+    mut event: PlayoutEvent,
 ) -> Result<(), EnginError> {
     if shared.stopping.load(Ordering::Acquire) {
+        shared.nn_slot_down();
         shared.cancel_claimed_evaluation(event);
         return Ok(());
     }
@@ -1202,6 +1316,7 @@ fn handle_eval_event(
     match classify_extension(history, depth) {
         ExtensionKind::SharedTerminal { wl, draw, plies_left } => {
             node.mark_terminal(wl, draw, plies_left);
+            shared.nn_slot_down();
             shared.send_backprop(BackpropEvent::evaluation(event));
             Ok(())
         }
@@ -1212,10 +1327,13 @@ fn handle_eval_event(
             // 同一棋盘从另一条 history 进来可以不到 120，只能写本次 edge 的 local leaf。
             if event.node_key.is_continuation() {
                 node.mark_terminal(wl, draw, plies_left);
+                shared.nn_slot_down();
                 shared.send_backprop(BackpropEvent::evaluation(event));
                 return Ok(());
             }
+            shared.nn_slot_down();
             node.abort_evaluation();
+            shared.cancel_collisions(event.node_key);
             if event.reservations.is_empty() {
                 shared.root_path_terminal.store(true, Ordering::Release);
                 shared.finish(true);
@@ -1229,6 +1347,7 @@ fn handle_eval_event(
             let cache_key = EvalCacheKey::new(history.last(), legal_moves.len());
             if let Some(eval) = shared.backend.cached_evaluation(cache_key) {
                 shared.cache_hits.fetch_add(1, Ordering::AcqRel);
+                shared.nn_slot_down();
                 return publish_eval(shared, event, node, legal_moves, eval);
             }
             let planes = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
@@ -1244,6 +1363,7 @@ fn handle_eval_event(
                 },
             ) {
                 cancel_evaluation(shared, event, node);
+                shared.nn_slot_down();
                 return if shared.stopping.load(Ordering::Acquire) {
                     Ok(())
                 } else {
@@ -1283,10 +1403,11 @@ fn send_nn_request(shared: &Shared, nn_tx: &Sender<NnRequest>, mut request: NnRe
 }
 
 fn complete_nn_item(shared: &Shared, item: WaitingNn, batch: Arc<EncodedBatch>, row: usize) -> Result<(), EnginError> {
+    shared.nn_slot_down();
     let eval = match eval_result_from_encoded_row(&batch, row, &item.legal_moves) {
         Ok(eval) => eval,
         Err(error) => {
-            cancel_waiting_item(shared, item);
+            cancel_evaluation(shared, item.event, item.node);
             return Err(error);
         }
     };
@@ -1300,7 +1421,7 @@ fn complete_nn_item(shared: &Shared, item: WaitingNn, batch: Arc<EncodedBatch>, 
 /// LC3 取消路径返回；持有 owned event 后不得 panic。
 fn publish_eval(
     shared: &Shared,
-    event: NodeEvent,
+    event: PlayoutEvent,
     node: Arc<Node>,
     legal_moves: Vec<xiangqi_core::Move>,
     eval: Arc<EvalResult>,
@@ -1321,7 +1442,7 @@ fn publish_eval(
         return Err(EnginError::Onnx("stream backend evaluation is invalid".into()));
     }
     node.set_base_value(ValueDelta::with_plies_left(
-        network_wl_to_node(eval.wl),
+        -eval.wl, // 将 NN 的 side-to-move WDL 转为 node / incoming-edge 视角：取反。
         eval.d,
         eval.plies_left,
     ));
@@ -1333,6 +1454,7 @@ fn publish_eval(
 }
 
 fn cancel_waiting_item(shared: &Shared, item: WaitingNn) {
+    shared.nn_slot_down();
     cancel_evaluation(shared, item.event, item.node);
 }
 
@@ -1340,9 +1462,11 @@ fn cancel_waiting_item(shared: &Shared, item: WaitingNn) {
 ///
 /// 参考：LC3 Overview 的 EvalWorker 所有权模型：每个 owned event 必须经 backpropagation
 /// 完成，或显式取消。
-fn cancel_evaluation(shared: &Shared, event: NodeEvent, node: Arc<Node>) {
+fn cancel_evaluation(shared: &Shared, event: PlayoutEvent, node: Arc<Node>) {
+    let key = event.node_key;
     event.cancel();
     node.abort_evaluation();
+    shared.cancel_collisions(key);
     shared.finish(false);
 }
 
@@ -1472,7 +1596,15 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
                 shared.backprop_queue.record(wait);
             }
         }
+        let leaf_keys: Vec<NodeKey> = events
+            .iter()
+            .filter(|event| event.local_leaf.is_none())
+            .map(|event| event.playout.node_key)
+            .collect();
         let result = BackpropEvent::complete_batch(events, &shared.repository);
+        for key in leaf_keys {
+            shared.cancel_collisions(key);
+        }
         shared
             .completed_depth
             .fetch_add(result.completed_depth, Ordering::AcqRel);
@@ -1506,10 +1638,12 @@ mod tests {
     use parking_lot::{Condvar, Mutex};
     use xiangqi_core::{ChessBoard, GameState, Move, Position, PositionHistory, STARTPOS_FEN, Square};
 
-    use super::{NodeEvent, Search, SearchConfig, SearchLimits, Shared};
+    use super::{BackpropEvent, PlayoutEvent, Search, SearchConfig, SearchLimits, Shared};
     use crate::EnginError;
     use crate::neural::backend::{Backend, BackendAttributes, UniformBackend};
-    use crate::search::{ExpansionState, NodeRepository, SearchGraph, SearchParams, ValueDelta, best_move, root_stats};
+    use crate::search::{
+        ExpansionState, NodeKey, NodeRepository, SearchGraph, SearchParams, ValueDelta, best_move, root_stats,
+    };
 
     struct FailingInferenceBackend;
 
@@ -1558,6 +1692,53 @@ mod tests {
         Arc::new(PositionHistory::from_positions(state.positions()))
     }
 
+    fn detached_shared(repository: Arc<NodeRepository>, outstanding: usize) -> Shared {
+        let (gather_tx, _gather_rx) = bounded(1);
+        let (eval_tx, _eval_rx) = bounded(1);
+        let (backprop_tx, _backprop_rx) = bounded(1);
+        Shared {
+            backend: Arc::new(UniformBackend::default()),
+            repository,
+            generation: 1,
+            params: SearchParams::default(),
+            root_move_filter: Vec::new(),
+            root_path_terminal: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            outstanding: AtomicUsize::new(outstanding),
+            nn_inflight: AtomicUsize::new(0),
+            #[cfg(feature = "benchmark")]
+            submitted: AtomicU64::new(0),
+            #[cfg(feature = "benchmark")]
+            peak_in_flight: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            completed_depth: AtomicU64::new(0),
+            max_depth: AtomicU64::new(0),
+            #[cfg(feature = "benchmark")]
+            collisions: AtomicU64::new(0),
+            network_batches: AtomicU64::new(0),
+            network_evaluations: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            network_batch_size_max: AtomicU64::new(0),
+            #[cfg(feature = "benchmark")]
+            collisions_by_depth: Mutex::new(Vec::new()),
+            #[cfg(feature = "benchmark")]
+            gather_queue: super::QueueMetrics::default(),
+            #[cfg(feature = "benchmark")]
+            eval_queue: super::QueueMetrics::default(),
+            #[cfg(feature = "benchmark")]
+            nn_queue: super::QueueMetrics::default(),
+            #[cfg(feature = "benchmark")]
+            backprop_queue: super::QueueMetrics::default(),
+            error: Mutex::new(None),
+            idle_lock: Mutex::new(()),
+            idle: Condvar::new(),
+            gather_tx,
+            eval_tx,
+            backprop_tx,
+            collision_waiters: Mutex::new(Vec::new()),
+        }
+    }
+
     #[test]
     fn search_completes_batched_playouts_and_returns_workers() {
         let mut pipeline = Search::new(
@@ -1599,6 +1780,8 @@ mod tests {
 
         assert!(stats.submitted_playouts >= stats.completed_playouts);
         assert!(stats.peak_in_flight > 0);
+        // Uniform 默认 batch=1 → 窗口 2；Gather 竞态最多再多几个。
+        assert!(stats.peak_in_flight <= 8);
         assert!(stats.gather_queue.samples >= stats.completed_playouts);
         assert!(stats.eval_queue.samples > 0);
         assert!(stats.backprop_queue.samples > 0);
@@ -1773,7 +1956,7 @@ mod tests {
         let root_key = tree.root_key();
         let mv = history.last().board().parse_move("b2b3").expect("legal root move");
         let fallback = history.last().board().parse_move("g3g4").expect("legal fallback move");
-        let child_key = NodeEvent::root(41, Arc::clone(&history)).variation.child_key(mv);
+        let child_key = PlayoutEvent::root(41, Arc::clone(&history)).variation.child_key(mv);
 
         let root = tree.repository().get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
@@ -1808,9 +1991,7 @@ mod tests {
         let tree = SearchGraph::new(Arc::clone(&history));
         let root_key = tree.root_key();
         let first = history.last().board().parse_move("b2b3").expect("legal first move");
-        let child_key = NodeEvent::root(43, Arc::clone(&history))
-            .variation
-            .child_key(first);
+        let child_key = PlayoutEvent::root(43, Arc::clone(&history)).variation.child_key(first);
         let child_position = Position::after(history.last(), first);
         let reply = child_position.board().parse_move("b9b8").expect("legal reply");
         let grandchild = Position::after(&child_position, reply);
@@ -1863,7 +2044,7 @@ mod tests {
         let tree = SearchGraph::new(Arc::clone(&history));
         let root = tree.repository().get_or_insert(tree.root_key());
         let mv = history.last().board().parse_move("e2d2").expect("repeat move");
-        let mut event = NodeEvent::root(42, Arc::clone(&history));
+        let mut event = PlayoutEvent::root(42, Arc::clone(&history));
         let continuation = event.repeated_child_key(mv).expect("first repetition");
 
         assert!(root.try_begin_evaluation());
@@ -2028,58 +2209,76 @@ mod tests {
     }
 
     #[test]
-    fn failed_eval_enqueue_releases_the_claimed_node() {
+    fn collision_keeps_virtual_mean_until_that_leaf_completes() {
         let history = startpos_history();
-        let root_key = crate::search::NodeKey::graph_node(history.last().board().hash());
+        let root_key = NodeKey::graph_node(history.last().board().hash());
+        let first = history.last().board().parse_move("b2b3").expect("first");
+        let second = history.last().board().parse_move("g3g4").expect("second");
+        let child_a = PlayoutEvent::root(1, Arc::clone(&history)).variation.child_key(first);
+        let child_b = PlayoutEvent::root(1, Arc::clone(&history)).variation.child_key(second);
+
         let repository = Arc::new(NodeRepository::default());
         let root = repository.get_or_insert(root_key);
         assert!(root.try_begin_evaluation());
-        let (gather_tx, _gather_rx) = bounded(1);
-        let (eval_tx, eval_rx) = bounded(1);
-        let (backprop_tx, _backprop_rx) = bounded(1);
-        drop(eval_rx);
-        let shared = Shared {
-            backend: Arc::new(UniformBackend::default()),
-            repository,
-            generation: 30,
-            params: SearchParams::default(),
-            root_move_filter: Vec::new(),
-            root_path_terminal: AtomicBool::new(false),
-            stopping: AtomicBool::new(false),
-            outstanding: AtomicUsize::new(1),
-            #[cfg(feature = "benchmark")]
-            submitted: AtomicU64::new(0),
-            #[cfg(feature = "benchmark")]
-            peak_in_flight: AtomicU64::new(0),
-            completed: AtomicU64::new(0),
-            completed_depth: AtomicU64::new(0),
-            max_depth: AtomicU64::new(0),
-            #[cfg(feature = "benchmark")]
-            collisions: AtomicU64::new(0),
-            network_batches: AtomicU64::new(0),
-            network_evaluations: AtomicU64::new(0),
-            cache_hits: AtomicU64::new(0),
-            network_batch_size_max: AtomicU64::new(0),
-            #[cfg(feature = "benchmark")]
-            collisions_by_depth: Mutex::new(Vec::new()),
-            #[cfg(feature = "benchmark")]
-            gather_queue: super::QueueMetrics::default(),
-            #[cfg(feature = "benchmark")]
-            eval_queue: super::QueueMetrics::default(),
-            #[cfg(feature = "benchmark")]
-            nn_queue: super::QueueMetrics::default(),
-            #[cfg(feature = "benchmark")]
-            backprop_queue: super::QueueMetrics::default(),
-            error: Mutex::new(None),
-            idle_lock: Mutex::new(()),
-            idle: Condvar::new(),
-            gather_tx,
-            eval_tx,
-            backprop_tx,
-        };
+        root.publish_edges(vec![(first, 0.6), (second, 0.4)]);
+        root.set_base_value(ValueDelta::one(0.0, 0.0));
+        root.edges()[0].bind_child_key(child_a);
+        root.edges()[1].bind_child_key(child_b);
+        assert!(repository.get_or_insert(child_a).try_begin_evaluation());
+        assert!(repository.get_or_insert(child_b).try_begin_evaluation());
 
-        shared.send_eval(NodeEvent::root(30, history));
+        let claimer = PlayoutEvent::root(1, Arc::clone(&history)).descend(
+            child_a,
+            root.reserve_edge_with_virtual_mean(0, Some(0.25)).expect("claimer"),
+        );
+        let collider_a = PlayoutEvent::root(1, Arc::clone(&history)).descend(
+            child_a,
+            root.reserve_edge_with_virtual_mean(0, Some(0.5)).expect("collider a"),
+        );
+        let collider_b = PlayoutEvent::root(1, Arc::clone(&history)).descend(
+            child_b,
+            root.reserve_edge_with_virtual_mean(1, Some(0.75)).expect("collider b"),
+        );
 
+        let shared = detached_shared(repository, 3);
+        shared.park_collision(collider_a);
+        shared.park_collision(collider_b);
+
+        let edge_a = root.edges()[0].clone();
+        let edge_b = root.edges()[1].clone();
+        assert_eq!(edge_a.visits(), 2);
+        assert_eq!(edge_a.completed_visits(), 0);
+        assert!((edge_a.stats().virtual_wl_sum - 0.75).abs() < 1e-5);
+        assert_eq!(edge_b.visits(), 1);
+        assert!((edge_b.stats().virtual_wl_sum - 0.75).abs() < 1e-5);
+
+        BackpropEvent::complete_batch([BackpropEvent::evaluation(claimer)], &shared.repository);
+        assert_eq!(edge_a.completed_visits(), 1);
+        assert_eq!(edge_a.visits(), 2);
+        assert!((edge_a.stats().virtual_wl_sum - 0.5).abs() < 1e-5);
+        assert_eq!(edge_b.visits(), 1);
+
+        shared.cancel_collisions(child_a);
+        assert_eq!(edge_a.visits(), 1);
+        assert_eq!(edge_a.completed_visits(), 1);
+        assert_eq!(edge_a.stats().virtual_wl_sum, 0.0);
+        assert_eq!(edge_b.visits(), 1);
+        assert!((edge_b.stats().virtual_wl_sum - 0.75).abs() < 1e-5);
+
+        shared.cancel_collisions(child_b);
+        assert_eq!(edge_b.visits(), 0);
+        assert_eq!(edge_b.stats().virtual_wl_sum, 0.0);
+    }
+
+    #[test]
+    fn failed_eval_enqueue_releases_the_claimed_node() {
+        let history = startpos_history();
+        let root_key = NodeKey::graph_node(history.last().board().hash());
+        let repository = Arc::new(NodeRepository::default());
+        let root = repository.get_or_insert(root_key);
+        assert!(root.try_begin_evaluation());
+        let shared = detached_shared(repository, 1);
+        shared.send_eval(PlayoutEvent::root(30, history));
         assert_eq!(root.expansion_state(), ExpansionState::Unexpanded);
         assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);
     }

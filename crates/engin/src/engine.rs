@@ -13,7 +13,7 @@ use crate::neural::onnx::OnnxBackend;
 use crate::search::{
     Search, SearchConfig, SearchControl, SearchGraph, SearchLimits, SearchParams, Stats, TimeBudget, TimeManager,
     WorkerPool, best_mate_with_params, best_move_filtered_with_params, principal_variation_with_history_and_params,
-    root_stats, root_variations_with_history_and_params,
+    root_stats, root_variations,
 };
 use crate::uci_loop::{
     BestMoveInfo, GoParams, ThinkingInfo, Wdl, write_stdout, write_stdout_best_move, write_stdout_thinking,
@@ -377,8 +377,7 @@ impl Engine {
                 cpuct_base: self.options.cpuct_base,
                 cpuct_factor: self.options.cpuct_factor,
                 fpu_reduction: self.options.fpu_reduction,
-                // 当前实战 A/B；`None` 可直接回退为纯 virtual visit。
-                virtual_mean_fpu_scale: Some(1.0),
+                virtual_mean_fpu_scale: 1.0,
                 lcb_stdevs: self.options.lcb_stdevs,
                 lcb_min_visit_fraction: self.options.lcb_min_visit_fraction,
             },
@@ -623,10 +622,10 @@ impl RootSnapshot {
         };
         let wl = (-root.q).clamp(-1.0, 1.0);
         let draw = root.draw.clamp(0.0, 1.0);
-        let variations = root_variations_with_history_and_params(
+        let variations = root_variations(
             &self.repository,
             self.root_key,
-            self.root_history.as_ref(),
+            Some(self.root_history.as_ref()),
             self.root_is_black,
             &self.root_move_filter,
             self.multi_pv,

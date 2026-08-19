@@ -24,7 +24,7 @@ struct Args {
     cpuct_bases: Vec<f32>,
     cpuct_factors: Vec<f32>,
     fpu_reduction: f32,
-    virtual_mean_fpu_scale: Option<f32>,
+    virtual_mean_fpu_scale: f32,
     lcb_stdevs: f32,
     lcb_min_visit_fraction: f32,
     root_top: usize,
@@ -107,11 +107,11 @@ fn parse_args() -> Result<Args, String> {
                 )?
             }
             "--virtual-mean-fpu-scale" => {
-                virtual_mean_fpu_scale = Some(parse_float(
+                virtual_mean_fpu_scale = parse_float(
                     "--virtual-mean-fpu-scale",
                     &args.next().ok_or("--virtual-mean-fpu-scale needs a value")?,
                     false,
-                )?)
+                )?
             }
             "--lcb-stdevs" => {
                 lcb_stdevs = parse_float(
@@ -298,7 +298,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let filter = root_filter(&history, &args.searchmoves)?;
     let backend = OnnxBackend::from_file(&args.onnx)?;
     println!(
-        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3} virtual_mean_fpu_scale={:?} lcb_stdevs={:.3} lcb_min_visit_fraction={:.3}",
+        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3} virtual_mean_fpu_scale={:.2} lcb_stdevs={:.3} lcb_min_visit_fraction={:.3}",
         args.onnx.display(),
         backend.provider().name(),
         args.playouts,
@@ -328,7 +328,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     lcb_min_visit_fraction: args.lcb_min_visit_fraction,
                 };
                 println!(
-                    "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3} virtual_mean_fpu_scale={:?} lcb={:.3}/{:.3}",
+                    "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3} virtual_mean_fpu_scale={:.2} lcb={:.3}/{:.3}",
                     args.fpu_reduction, args.virtual_mean_fpu_scale, args.lcb_stdevs, args.lcb_min_visit_fraction
                 );
                 let mut search = Search::new(

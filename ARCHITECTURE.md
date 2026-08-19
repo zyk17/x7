@@ -26,7 +26,7 @@
 - 规则、classical 编码、UCI 外围与训练 record 的历史工程参考：`C:\Users\Administrator\projects\px0`、`C:\Users\Administrator\projects\pxzero-training`。
 - stream / MCGS 可参考 [LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/)；本地没有 LC3 源码，不得标称为源码翻译或行为等价。
 - KataGo 按需参考：本地源码 `C:\Users\Administrator\projects\KataGo`（如 `docs/GraphSearch.md`、NN cache、部分搜索细节）；不是每次改搜索都必读，也不承诺行为等价。
-- 本实现使用连续 `Gather → Eval → NN → Eval → Backprop`：Gather 每次采集一个叶子，PUCT 的 edge reservation 作为 pending visit（计入 started N）；当前实战还以 `μ=FPU` 暂入 action Q，完成或取消时精确归还。它不进入 completed Evidence 或 shared node Q。Eval 处理终局、cache、编码和输出解码；NN 只合并 tensor 并推理，空闲时立即执行当前队列可得请求。owner 将 in-flight owned event 限为两个 `MiniBatchSize`，而不是暴露独立 `MaxInFlight`。collision 直接取消 reservation。没有 prefetch 或 tree-batch gather。不用 multivisit：一次评估记 K 次 visit 会把 K 份 FPU 打进 in-flight Q，破坏当前温和分流；GPU 合批已在 NN 队列完成。后续若调分流，改 virtual mean / virtual visit。
+- 本实现使用连续 `Gather → Eval → NN → Eval → Backprop`：Gather 每次采集一个叶子，PUCT 的 edge reservation 作为 pending visit（计入 started N）；当前实战还以 `μ=FPU` 暂入 action Q，完成或取消时精确归还。它不进入 completed Evidence 或 shared node Q。Eval 处理终局、cache、编码和输出解码；NN 只合并 tensor 并推理，空闲时立即执行当前队列可得请求。Gather 在 claim 前把已交给 Eval 的叶子限为两个 `MiniBatchSize`，而不是暴露独立 `MaxInFlight`，也不用 outstanding 当窗口。collision 先挂起 reservation / μ，该叶子自己的 backprop complete 后再 cancel，不加 completed visit。没有 prefetch 或 tree-batch gather。不用 multivisit：一次评估记 K 次 visit 会把 K 份 FPU 打进 in-flight Q，破坏当前温和分流；GPU 合批已在 NN 队列完成。后续若调分流，改 virtual mean / virtual visit。
 
 ## 当前认识
 
@@ -78,7 +78,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
   旧 sibling 子树。后台 GC 以 topology 写锁与 node 创建/edge 绑定同步，避免删掉刚由 transposition 接回的 node。
   当前不做 edge 入度引用计数：多父图下仍须维护解绑，且“从当前 root 可达”才是保留语义。无关 `position` 换图时，
   整个旧 repository 同样在后台逐 shard 释放。search owner 已输出最小 info 与一次 bestmove。
-- `MultiPV` 只在 search owner 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。Gather 每次一个叶子；pending reservation 同时表示 PUCT 已分配的预算，当前实战的 virtual mean 仅在 reservation 未完成时进入 action Q，完成后 Q 仍只来自 completed Evidence。collision 直接取消该 event，不额外改变 completed `N/Q`。`MiniBatchSize` 只限制 NN 一次合并的 tensor 数量，`0` 使用 backend 建议值；实际 NN batch 可能因终局、缓存、collision 或队列暂时不足更小。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
+- `MultiPV` 只在 search owner 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。Gather 每次一个叶子；pending reservation 同时表示 PUCT 已分配的预算，当前实战的 virtual mean 仅在 reservation 未完成时进入 action Q，完成后 Q 仍只来自 completed Evidence。collision 先挂起该 event 的 reservation，该叶子 complete 后再 cancel，不额外改变 completed `N/Q`。`MiniBatchSize` 限制 NN 一次合并的 tensor 数量，`0` 使用 backend 建议值，并派生 `2 × MiniBatchSize` 的 Eval/NN claim 上限；实际 NN batch 可能因终局、缓存、collision 或队列暂时不足更小。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
 stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 公式，不是 LC3 Policy 的正式公式，也不是 px0 搜索等价实现）。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.75 / 40000 / 4.0`。所有 node 共用一条对数 cPUCT 曲线，`C(0)=1.75`、`C(50k)≈5`，不维护根专用初值或参数。`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。
 

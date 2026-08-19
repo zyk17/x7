@@ -6,8 +6,6 @@
 
 use xiangqi_core::{GameResult, PositionHistory};
 
-use super::{rule_judge_wl_for_node, terminal_wl_for_node};
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ExtensionKind {
     /// NN 评估并发布 edge。
@@ -25,10 +23,8 @@ pub(crate) enum ExtensionKind {
 pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> ExtensionKind {
     let board = history.last().board();
     let legal_moves = board.generate_legal_moves();
+    // `wl` 按 incoming edge / 上一走子方视角保存。
     if legal_moves.is_empty() {
-        // `wl` 按 incoming edge / 上一走子方视角保存。因此无合法着的中国象棋局面对它
-        // 总是胜利。语义参考自 px0 的 `WHITE_WON` canonical-board 快径
-        // （`search.cc:1913-1919`、`node.cc:300-317`）。
         return ExtensionKind::SharedTerminal {
             wl: 1.0,
             draw: 0.0,
@@ -73,6 +69,37 @@ pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Op
         }
     }
     None
+}
+
+/// 将**绝对** game result（`compute_game_result`）转为终局叶子 incoming-edge `(wl, d)`。
+///
+/// 先换成 STM 视角，再取反，对齐 NN fetch 与将死快径 `WHITE_WON`→`+1`
+///
+/// 注意：`rule_judge()` 的返回值**不是**绝对胜负，不能走这里；应使用
+/// [`rule_judge_wl_for_node`]。
+pub(crate) fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (f32, f32) {
+    let (stm_wl, draw) = match result {
+        GameResult::WhiteWon => (if black_to_move { -1.0 } else { 1.0 }, 0.0),
+        GameResult::BlackWon => (if black_to_move { 1.0 } else { -1.0 }, 0.0),
+        GameResult::Draw => (0.0, 1.0),
+        GameResult::Undecided => unreachable!("terminal search evaluation requires a result"),
+    };
+    (-stm_wl, draw)
+}
+
+/// 将 `rule_judge` 结果转为 node / incoming-edge `(wl, d)`：
+/// `WHITE_WON`→`+1`，`BLACK_WON`→`-1`。
+///
+/// `rule_judge` 的胜负枚举已是 node / incoming-edge 视角（与 `checkThem`/`checkUs`
+/// 绑定），**不要**再按 `is_black_to_move` 当绝对颜色转换，否则白方行棋时的长将/长捉
+/// 符号会反转。
+pub(crate) fn rule_judge_wl_for_node(result: GameResult) -> (f32, f32) {
+    match result {
+        GameResult::WhiteWon => (1.0, 0.0),
+        GameResult::BlackWon => (-1.0, 0.0),
+        GameResult::Draw => (0.0, 1.0),
+        GameResult::Undecided => unreachable!("rule-judge terminal requires a decided result"),
+    }
 }
 
 #[cfg(test)]

@@ -33,9 +33,6 @@ impl Default for TimeManager {
 
 impl TimeManager {
     /// 计算当前一手的固定中性预算。
-    ///
-    /// 对应 px0 `LegacyTimeManager::GetStopper`（`legacy.cc:92-166`）；只保留
-    /// 固定中性的分配公式，不提供激进或保守倍率。
     pub(crate) fn budget(&mut self, params: &GoParams, position: &Position) -> Option<TimeBudget> {
         let time = if position.is_black_to_move() {
             params.btime
@@ -78,7 +75,7 @@ impl TimeManager {
         })
     }
 
-    /// 新对局清除 px0 legacy 预算中保留的首手与剩余时间状态。
+    /// 新对局清除 legacy 预算中保留的首手与剩余时间状态。
     pub(crate) fn reset(&mut self) {
         *self = Self {
             first_move_of_game: true,

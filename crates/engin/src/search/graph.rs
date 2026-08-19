@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use nohash_hasher::{IsEnabled, NoHashHasher};
@@ -117,7 +117,7 @@ pub struct Edge {
     /// A -> C -> ... -> D 在这条路径D遇到B不连接回去; 不参与本 graph 的 PUCT
     /// 拓扑剪枝, 可能会导致搜索对 move_left 不稳定;
     /// 通常不会造成棋力影响, 需要更多测试 (目前可显著减少复杂度)
-    topology_pruned: OnceLock<()>,
+    topology_pruned: AtomicBool,
     /// policy prior 在 node 创建后后不再变化；
     prior: f32,
     started: AtomicU32,
@@ -131,6 +131,7 @@ pub struct Edge {
 pub(crate) struct EdgeStats {
     /// 已完成 visit。它决定 PUCT 的 N 与 action Q 的权重。
     pub visits: u32,
+    /// 路径终局（重复/连将/rule60）的累计样本；结果依赖历史路径，不能存入共享 child node。
     pub local_leaf: ValueDelta,
     /// 尚未完成的 virtual mean 之和；in-flight 数直接由 `started - visits` 推导。
     pub virtual_wl_sum: f32,
@@ -142,7 +143,7 @@ impl Edge {
         Self {
             mv,
             child_key: OnceLock::new(),
-            topology_pruned: OnceLock::new(),
+            topology_pruned: AtomicBool::new(false),
             prior,
             started: AtomicU32::new(0),
             stats: Mutex::new(EdgeStats::default()),
@@ -189,7 +190,7 @@ impl Edge {
     }
 
     pub(crate) fn topology_pruned(&self) -> bool {
-        self.topology_pruned.get().is_some()
+        self.topology_pruned.load(Ordering::Acquire)
     }
 
     pub fn bind_child_key(&self, key: NodeKey) {
@@ -350,7 +351,8 @@ impl Node {
     }
 
     /// Gather 声称评估未展开 node：恰好一个 caller 将 `Unexpanded → Evaluating` 并把
-    /// event 交给 Eval。其他 Gather 再走到已 `Evaluating` 的同一叶子则记 collision。
+    /// event 交给 Eval。其他 Gather 再走到已 `Evaluating` 的同一叶子则挂起 collision，
+    /// 等这次评估的 backprop 完成后再归还 reservation。
     pub fn try_begin_evaluation(&self) -> bool {
         self.expansion
             .compare_exchange(
@@ -378,7 +380,7 @@ impl Node {
         self.expansion.store(ExpansionState::Expanded as u8, Ordering::Release);
     }
 
-    /// Eval 在发布终局数据或 policy 前失败后恢复 node，避免后续 Gather event 将失败的
+    /// Eval 在发布终局数据或 policy 前失败后恢复 node，避免后续 PlayoutEvent 将失败的
     /// NN 请求当作永久 collision。
     pub fn abort_evaluation(&self) {
         self.expansion
@@ -491,7 +493,7 @@ pub(crate) enum ChildLink {
 impl NodeRepository {
     /// KataGo `GraphSearch.md` 的 idempotent 更新：只读各 edge 的局部 N 与 child
     /// shared Q，从本 node 的首次预测 U 重算统计；不向其他 parent 广播。
-    pub(crate) fn recompute_graph_node(&self, key: NodeKey) {
+    pub(crate) fn recompute_node(&self, key: NodeKey) {
         let Some(node) = self.get(key) else { return };
         if node.expansion_state() == ExpansionState::Terminal {
             return;
@@ -649,9 +651,7 @@ impl NodeRepository {
             return ChildLink::Bound;
         }
         if self.reaches_unlocked(child, parent) {
-            edge.topology_pruned
-                .set(())
-                .expect("cycle-cut edge is initialized once under link lock");
+            edge.topology_pruned.store(true, Ordering::Release);
             return ChildLink::TopologyPruned;
         }
         edge.bind_child_key(child);
@@ -1006,7 +1006,7 @@ mod graph_tests {
         root_node.edges()[0].bind_child_key(expected_child);
         let child_node = graph.repository().get_or_insert(expected_child);
         child_node.set_base_value(crate::search::ValueDelta::one(0.6, 0.0));
-        graph.repository().recompute_graph_node(expected_child);
+        graph.repository().recompute_node(expected_child);
 
         graph.advance(mv).expect("advance contextual root");
         let gc_root = graph.take_pending_gc_root().expect("advance schedules GC");
@@ -1103,12 +1103,12 @@ mod repository_tests {
         repo.get(b).unwrap().edges()[0].bind_child_key(d);
         repo.get(c).unwrap().edges()[0].bind_child_key(d);
         for key in [a, b, c, d] {
-            repo.recompute_graph_node(key);
+            repo.recompute_node(key);
         }
         repo.get(b).unwrap().reserve_edge(0).unwrap().complete();
-        repo.recompute_graph_node(b);
+        repo.recompute_node(b);
         repo.get(a).unwrap().reserve_edge(0).unwrap().complete();
-        repo.recompute_graph_node(a);
+        repo.recompute_node(a);
         assert_eq!(repo.get(c).unwrap().edges()[0].completed_visits(), 0);
         assert_eq!(repo.get(c).unwrap().completed_visits(), 1);
         assert_eq!(repo.get(b).unwrap().completed_visits(), 2);
@@ -1257,7 +1257,7 @@ mod repository_tests {
         child.mark_terminal(1.0, 0.0, 0.0);
         parent.edges()[0].bind_child_key(child_key);
         parent.reserve_edge(0).expect("terminal edge visit").complete();
-        repo.recompute_graph_node(parent_key);
+        repo.recompute_node(parent_key);
 
         assert!(repo.prove_terminal(parent_key));
         assert_eq!(parent.expansion_state(), ExpansionState::Terminal);

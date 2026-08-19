@@ -23,9 +23,10 @@ struct Args {
     gathers: Vec<usize>,
     evals: Vec<usize>,
     eval_batch: Option<usize>,
+    nn_window: f32,
     cache: bool,
     warm_cache: bool,
-    virtual_mean_fpu_scale: Option<f32>,
+    virtual_mean_fpu_scale: f32,
     root_top: usize,
 }
 
@@ -33,7 +34,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--eval-batch 64] [--cache|--warm-cache] [--virtual-mean-fpu-scale 1.0] [--root-top 8]"
+     [--repeat 1] [--gathers 4,8] [--evals 1,2] [--eval-batch 64] [--nn-window 2.5] [--cache|--warm-cache] [--virtual-mean-fpu-scale 1.0] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -47,9 +48,10 @@ fn parse_args() -> Result<Args, String> {
     let mut gathers = vec![4];
     let mut evals = vec![4];
     let mut eval_batch = None;
+    let mut nn_window = 2.5f32;
     let mut cache = false;
     let mut warm_cache = false;
-    let mut virtual_mean_fpu_scale = None;
+    let mut virtual_mean_fpu_scale = 1.0f32;
     let mut root_top = 8;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -100,6 +102,13 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|_| "--eval-batch must be an unsigned integer")?,
                 )
             }
+            "--nn-window" => {
+                nn_window = args
+                    .next()
+                    .ok_or("--nn-window requires a number")?
+                    .parse()
+                    .map_err(|_| "--nn-window must be a number")?;
+            }
             "--cache" => cache = true,
             "--warm-cache" => {
                 cache = true;
@@ -114,7 +123,7 @@ fn parse_args() -> Result<Args, String> {
                 if !scale.is_finite() || scale < 0.0 {
                     return Err("--virtual-mean-fpu-scale must be finite and non-negative".into());
                 }
-                virtual_mean_fpu_scale = Some(scale);
+                virtual_mean_fpu_scale = scale;
             }
             "--root-top" => {
                 root_top = args
@@ -129,6 +138,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if playouts == Some(0) || movetime == Some(0) || repeat == 0 || eval_batch == Some(0) || root_top == 0 {
         return Err("playouts, movetime, repeat, eval-batch, and root-top must be positive".into());
+    }
+    if !nn_window.is_finite() || nn_window <= 0.0 {
+        return Err("--nn-window must be finite and > 0".into());
     }
     if positions.is_some() && !moves.is_empty() {
         return Err("--positions cannot be combined with --moves".into());
@@ -149,6 +161,7 @@ fn parse_args() -> Result<Args, String> {
         gathers,
         evals,
         eval_batch,
+        nn_window,
         cache,
         warm_cache,
         virtual_mean_fpu_scale,
@@ -262,7 +275,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} cache={} warm_cache={} virtual_mean_fpu_scale={:?} recommended_batch={} target_batch={} budget={} repeat={} worker_matrix={} positions={}",
+        "onnx={} provider={} cache={} warm_cache={} virtual_mean_fpu_scale={:.2} recommended_batch={} target_batch={} nn_window={} budget={} repeat={} worker_matrix={} positions={}",
         args.onnx.display(),
         provider,
         args.cache,
@@ -270,6 +283,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.virtual_mean_fpu_scale,
         recommended,
         target_batch,
+        args.nn_window,
         args.playouts
             .map(|n| format!("playouts={n}"))
             .unwrap_or_else(|| format!("movetime={}ms", args.movetime.unwrap_or(0))),
@@ -302,6 +316,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         Arc::clone(&history),
                         SearchConfig {
                             eval_batch_size: target_batch,
+                            nn_window: args.nn_window,
                             gather_workers,
                             eval_workers,
                             params: SearchParams {
