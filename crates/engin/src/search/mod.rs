@@ -1,36 +1,49 @@
-//! X7 stream MCGS。
+//! X7 stream 树搜索。
 //!
-//! 架构形状可参考 LC3 公开文档
-//! - <https://lczero.org/dev/lc0/search/lc3/overview/>
-//! - <https://lczero.org/dev/lc0/search/lc3/policy/>
-//! - <https://lczero.org/dev/lc0/search/lc3/glossary/>
+//! ## 模块分层
 //!
-//! 本模块拥有 MCGS 图与连续的 Gather / Eval / NN / Backprop 生命周期。Gather 每次采集
-//! 一个叶子；实战用 pending reservation 上的 FPU virtual mean 分流。不把一次评估记成
-//! 多次 visit：那会一次打入 K 份 FPU，破坏这份温和分流；后续若调分流，改 virtual mean /
-//! virtual visit。没有 prefetch 或 tree-batch gather。
+//! | 模块 | 负责 |
+//! |------|------|
+//! | `select` / `expand` / `eval` / `backprop` | 算法方法（MCTS 实验改这里） |
+//! | `workerpool` | 事件 + 线程池 + Gather/Eval/NN/Backprop 循环壳 |
+//! | `pipeline` | `Shared` / `Stats` + Gather 树走组装 + `Search` API |
+//! | `tree` | 树 / 节点 / 边 / Repo 数据结构 |
+//! | `decision` | 搜后根选着 / PV / LCB |
+//! | `param` / `time` | 参数与时钟 |
+//!
+//! 硬规则：
+//! - 只有 **Gather**（`pipeline::process_gather_event`，由 `workerpool` 调度）可 `reserve_edge` / `descend`
+//! - 只有 **Eval** 可把 Unexpanded claim 后变成 Expanded（`publish_edges`）或首次 NN 终局
+//! - Gather 在已 Expanded 上仍可用 `path_terminal_value` 标 Terminal（路径规则）
+//! - 只有 **Backprop** 可 `complete` reservation 与 `add_delta`
+//!
+//! `mcts2`：`NodeKey = hash_cat(parent, move)`；`rep==1` 继续搜、`rep>=2` RuleJudge；
+//! NN cache 按棋盘 + repetition + 合法着数。Gather 每次一个叶子；virtual mean 分流。
+//! 无 prefetch / multivisit。
 
-mod event;
-mod extension;
-mod graph;
+mod backprop;
+mod decision;
+mod eval;
+mod expand;
+mod param;
 mod pipeline;
-mod policy;
-mod stats;
+mod select;
 mod time;
+mod tree;
+mod workerpool;
 
-pub use event::{BackpropEvent, PlayoutEvent, Variation};
-pub use graph::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository, SearchGraph};
-#[cfg(feature = "benchmark")]
-pub use pipeline::QueueStats;
-pub(crate) use pipeline::WorkerPool;
-pub use pipeline::{Search, SearchConfig, SearchControl, SearchLimits, Stats};
-pub(crate) use policy::select_edge;
-pub use policy::{SearchParams, ValueDelta};
-pub use stats::{
+pub use decision::{
     RootEdgeStats, RootStats, best_move, best_move_filtered, principal_variation, principal_variation_filtered,
     root_stats,
 };
-pub(crate) use stats::{
+pub(crate) use decision::{
     best_mate_with_params, best_move_filtered_with_params, principal_variation_with_history_and_params, root_variations,
 };
+pub use param::{SearchConfig, SearchParams};
+#[cfg(feature = "benchmark")]
+pub use pipeline::QueueStats;
+pub use pipeline::{Search, SearchControl, SearchLimits, Stats};
 pub(crate) use time::{TimeBudget, TimeManager};
+pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository, SearchTree, ValueDelta};
+pub(crate) use workerpool::WorkerPool;
+pub use workerpool::{BackpropEvent, PlayoutEvent, Variation};

@@ -83,3 +83,11 @@ proof_mate_01 | 5aC2/1P2k4/9/7R1/9/3n5/8r/B3B4/9/4K4 b - - 0 1
 # 强制反例：Pikafish 验证 `h9h4` 为 mate -10；`i4e4` 是相对顽强的败着。
 # 用于观察搜索是否将强制反例变为 terminal evidence，而非只按暂时 Q 选择 `h9h4`。
 proof_mate_02 | 4kabC1/9/3ab4/p5P1N/9/8R/9/1n1ABC3/1c3K3/2Br5 w - - 0 1
+
+# 残局弃子攻杀：高 Q 方差 / 低先验样本。Pikafish：`h8g8` mate 9、`f8f9` mate 18
+#（弃子）、`d8c8` 仅大优非短杀。网常把高 P 压在 `d8c8`，开放搜吃满 visits；
+# `f8f9`/`h8g8` 专搜时 Q 晚成熟、浅层抖动大。属于 **PUCT-v + LCB** 共同样本：
+# PUCT（含后续均值差）要给高方差边证明预算；LCB 则在 Q 已高且方差收敛后，
+# 仍应给这类着当最优解的机会（不能只按 visit 或瞬时均值卡死）。不是吞吐基准，
+# 也不要求网络先验完美。
+proof_variance_01 | 2bak4/3PaP1P1/9/4n4/2b6/6B2/3p5/4BA3/5C3/3K1A3 w - - 0 1

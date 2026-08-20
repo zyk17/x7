@@ -1,52 +1,51 @@
-//! NN 前的局面分类与终局标记。
+//! 叶子终局分类（不是 `publish_edges`，也不是 `ExpansionState::Expanded`）。
 //!
-//! 将死、重复、two-fold、子力和 rule60 等裁决历史上参考过 px0
-//! `evaluate_extension`；路径依赖终局与 board-key shared node 的分离是本仓 MCGS
-//! 约束。终局保存 plies-left `m` 用于排序。
+//! 只回答「要不要 NN」：死/子力不足/重复/rule60 → Terminal，否则 Evaluate。
+//! Eval 编码前调用；Gather 在已 Expanded 节点上复用 `path_terminal_value`。
+//!
+//! `mcts2`：`rep==1` 继续搜；`rep>=2` 才 RuleJudge。终局 `m` 用于排序。
 
-use xiangqi_core::{GameResult, PositionHistory};
+use xiangqi_core::{GameResult, Move, PositionHistory};
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum ExtensionKind {
-    /// NN 评估并发布 edge。
-    Evaluate,
-    /// 只由棋盘决定的终局，可安全发布到共享 node。
-    SharedTerminal { wl: f32, draw: f32, plies_left: f32 },
-    /// 依赖当前 Variation 的终局。GraphNode 落到这里只可能是 rule60；带完整规则
-    /// history 的 TreeNode 则可把第三次重复等固定为 terminal。参见 `MCGS.md` “环与重复”。
-    PathTerminal { wl: f32, draw: f32, plies_left: f32 },
+pub(crate) enum ExpandKind {
+    /// NN 评估并发布 edge；合法着在分类时已生成，避免 Eval 再算一遍。
+    Evaluate { legal_moves: Vec<Move> },
+    /// 终局叶子：`(wl, draw, plies_left)` 按 incoming edge / 上一走子方视角。
+    Terminal { wl: f32, draw: f32, plies_left: f32 },
 }
 
 /// 为 stream Gather/Eval 分类 `history` 的叶子。
 ///
 /// `depth` 是自搜索 root 起的 variation 长度（0 即 root）。
-pub(crate) fn classify_extension(history: &PositionHistory, depth: usize) -> ExtensionKind {
+pub(crate) fn classify_expand(history: &PositionHistory, depth: usize) -> ExpandKind {
     let board = history.last().board();
     let legal_moves = board.generate_legal_moves();
     // `wl` 按 incoming edge / 上一走子方视角保存。
     if legal_moves.is_empty() {
-        return ExtensionKind::SharedTerminal {
+        return ExpandKind::Terminal {
             wl: 1.0,
             draw: 0.0,
             plies_left: 0.0,
         };
     }
     if !board.has_mating_material() {
-        return ExtensionKind::SharedTerminal {
+        return ExpandKind::Terminal {
             wl: 0.0,
             draw: 1.0,
             plies_left: 0.0,
         };
     }
     if let Some((wl, draw, plies_left)) = path_terminal_value(history, depth) {
-        return ExtensionKind::PathTerminal { wl, draw, plies_left };
+        return ExpandKind::Terminal { wl, draw, plies_left };
     }
-    ExtensionKind::Evaluate
+    ExpandKind::Evaluate { legal_moves }
 }
 
-/// 只检查依赖 variation history 的终局。已展开的共享 GraphNode 再次被命中时，
-/// 仍可能因本条路径 `rule60_ply >= 120` 而终局；重复 / 长将长捉只出现在
-/// ContinuationTree（`repetitions >= 2`）。不能因 board node 已存在而跳过。
+/// 依赖完整 variation history 的终局：重复裁决与 rule60。
+///
+/// 已 Expanded 的树 node 再次被命中时仍可能因本条路径 `rule60_ply >= 120`
+/// 或 `repetitions >= 2` 而终局，不能因 node 已存在而跳过。
 pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Option<(f32, f32, f32)> {
     let is_root = depth == 0;
     if !is_root {
@@ -77,7 +76,7 @@ pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Op
 ///
 /// 注意：`rule_judge()` 的返回值**不是**绝对胜负，不能走这里；应使用
 /// [`rule_judge_wl_for_node`]。
-pub(crate) fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (f32, f32) {
+fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (f32, f32) {
     let (stm_wl, draw) = match result {
         GameResult::WhiteWon => (if black_to_move { -1.0 } else { 1.0 }, 0.0),
         GameResult::BlackWon => (if black_to_move { 1.0 } else { -1.0 }, 0.0),
@@ -93,7 +92,7 @@ pub(crate) fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (
 /// `rule_judge` 的胜负枚举已是 node / incoming-edge 视角（与 `checkThem`/`checkUs`
 /// 绑定），**不要**再按 `is_black_to_move` 当绝对颜色转换，否则白方行棋时的长将/长捉
 /// 符号会反转。
-pub(crate) fn rule_judge_wl_for_node(result: GameResult) -> (f32, f32) {
+fn rule_judge_wl_for_node(result: GameResult) -> (f32, f32) {
     match result {
         GameResult::WhiteWon => (1.0, 0.0),
         GameResult::BlackWon => (-1.0, 0.0),
@@ -106,7 +105,7 @@ pub(crate) fn rule_judge_wl_for_node(result: GameResult) -> (f32, f32) {
 mod tests {
     use xiangqi_core::{ChessBoard, GameResult, GameState, PositionHistory};
 
-    use super::{ExtensionKind, classify_extension};
+    use super::{ExpandKind, classify_expand};
 
     #[test]
     fn checkmated_side_to_move_is_a_terminal_win_for_the_incoming_edge() {
@@ -117,8 +116,8 @@ mod tests {
         let history = PositionHistory::from_positions(state.positions());
 
         assert_eq!(
-            classify_extension(&history, 1),
-            ExtensionKind::SharedTerminal {
+            classify_expand(&history, 1),
+            ExpandKind::Terminal {
                 wl: 1.0,
                 draw: 0.0,
                 plies_left: 0.0,
@@ -127,14 +126,14 @@ mod tests {
     }
 
     #[test]
-    fn rule60_terminal_is_path_local() {
+    fn rule60_terminal_at_root() {
         let state =
             GameState::from_fen_moves("4k4/9/9/9/9/9/9/9/R8/4K4 w - - 120 1", &[] as &[&str]).expect("rule60 fen");
         let history = PositionHistory::from_positions(state.positions());
 
         assert!(matches!(
-            classify_extension(&history, 0),
-            ExtensionKind::PathTerminal {
+            classify_expand(&history, 0),
+            ExpandKind::Terminal {
                 wl: 0.0,
                 draw: 1.0,
                 plies_left: 0.0,
@@ -142,7 +141,7 @@ mod tests {
         ));
     }
 
-    /// 首次重复进入 ContinuationTree 继续搜索；只有第二次重复才由 RuleJudge 裁决。
+    /// 首次重复仍可继续搜索；只有第二次重复才由 RuleJudge 裁决。
     #[test]
     fn first_perpetual_check_cycle_remains_evaluable() {
         let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
@@ -158,7 +157,31 @@ mod tests {
 
         let depth = history.len().saturating_sub(1).max(1);
         assert_eq!(history.rule_judge(), GameResult::WhiteWon);
-        assert_eq!(classify_extension(&history, depth), ExtensionKind::Evaluate);
+        assert!(matches!(classify_expand(&history, depth), ExpandKind::Evaluate { .. }));
+    }
+
+    #[test]
+    fn second_perpetual_check_cycle_is_rule_judge_terminal() {
+        let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
+        let mut history = PositionHistory::default();
+        history.reset(board, 2, 30);
+        // 再走一轮半，使当前白走局面 repetitions >= 2。
+        for mv in ["d9e9", "d2e2", "e9d9", "e2d2", "d9e9", "d2e2", "e9d9", "e2d2", "d9e9"] {
+            let parsed = history.last().board().parse_move(mv).expect(mv);
+            history.append(parsed);
+        }
+        assert!(!history.last().is_black_to_move());
+        assert!(history.last().repetitions() >= 2);
+        let depth = history.len().saturating_sub(1).max(1);
+        let (wl, draw) = super::rule_judge_wl_for_node(history.rule_judge());
+        assert_eq!(
+            classify_expand(&history, depth),
+            ExpandKind::Terminal {
+                wl,
+                draw,
+                plies_left: 0.0,
+            }
+        );
     }
 
     #[test]
@@ -181,9 +204,6 @@ mod tests {
             history.last().repetitions() >= 2,
             "second repetition must be visible in full UCI history"
         );
-        assert!(matches!(
-            classify_extension(&history, 0),
-            ExtensionKind::PathTerminal { .. }
-        ));
+        assert!(matches!(classify_expand(&history, 0), ExpandKind::Terminal { .. }));
     }
 }

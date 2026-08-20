@@ -51,22 +51,33 @@ pub struct EvalResult {
     pub policies: Vec<f32>,
 }
 
-/// NN cache 的完整命中校验：当前棋盘与合法着数量。
+/// NN cache 命中键：当前棋盘 + 合法着数 + `Position::repetitions`。
 ///
-/// 完整 history 只用于输入编码和规则裁决；cache 不读取它，不能因此在热路径复制。
+/// `mcts2`（1A+2A）：树节点不按棋盘合并；NN cache 允许**历史路径不同**，但必须区分
+/// repetition 次数（对齐编码平面）。`num_moves` 代价很低，保留作 hash 碰撞护栏
+///（policy 长度对不上则 miss）。不纳入完整 8-ply history；规则终局在 cache 之前裁决。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvalCacheKey {
     board: u64,
     num_moves: usize,
+    repetitions: u32,
 }
 
 impl EvalCacheKey {
-    /// 与 MCGS `NodeKey::board` 一致的 state key。NN cache 刻意只按当前棋盘复用，
-    /// 不纳入完整 history 或 `Position::repetitions`；这是为了与 graph node 一致的取舍。
     pub fn new(position: &Position, num_moves: usize) -> Self {
         Self {
             board: position.board().hash(),
             num_moves,
+            repetitions: position.repetitions(),
+        }
+    }
+
+    /// 直映表 u64：把 repetition 次数混进 board。
+    pub(crate) fn slot_key(self) -> u64 {
+        if self.repetitions == 0 {
+            self.board
+        } else {
+            xiangqi_core::hashcat::hash_cat(self.board, self.repetitions as u64)
         }
     }
 }
@@ -117,7 +128,7 @@ impl CachingBackend {
     }
 
     fn cached(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
-        self.cache.get(key.board, key.num_moves)
+        self.cache.get(key.slot_key(), key.num_moves)
     }
 
     fn resize_cache(&self, size_power_of_two: u8) {
@@ -146,7 +157,7 @@ impl Backend for CachingBackend {
 
     fn store_evaluation(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
         self.cache.insert(
-            key.board,
+            key.slot_key(),
             CachedEval {
                 result,
                 num_moves: key.num_moves,
@@ -198,7 +209,7 @@ impl UniformBackend {
 
 impl Backend for UniformBackend {
     fn cached_evaluation(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
-        self.cache.get(key.board, key.num_moves)
+        self.cache.get(key.slot_key(), key.num_moves)
     }
 
     fn attributes(&self) -> BackendAttributes {
@@ -242,7 +253,7 @@ impl Backend for UniformBackend {
 impl UniformBackend {
     pub fn store_cache(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
         self.cache.insert(
-            key.board,
+            key.slot_key(),
             CachedEval {
                 result,
                 num_moves: key.num_moves,
@@ -298,6 +309,28 @@ mod tests {
 
         backend.clear_cache();
         assert!(backend.cached_evaluation(startpos_key(1)).is_none());
+    }
+
+    #[test]
+    fn caching_backend_distinguishes_repetition_count_not_full_history() {
+        let backend = CachingBackend::new(Box::new(UniformBackend::default()));
+        let mut pos = Position::from_fen(STARTPOS_FEN).expect("startpos");
+        let key0 = EvalCacheKey::new(&pos, 2);
+        backend.store_evaluation(key0, Arc::new(EvalResult::default()));
+        assert!(backend.cached_evaluation(key0).is_some());
+
+        pos.set_repetitions(1, 4);
+        let key1 = EvalCacheKey::new(&pos, 2);
+        assert_ne!(key0, key1);
+        assert!(backend.cached_evaluation(key1).is_none());
+        backend.store_evaluation(key1, Arc::new(EvalResult::default()));
+        assert!(backend.cached_evaluation(key1).is_some());
+        assert!(backend.cached_evaluation(key0).is_some());
+
+        // 同一棋盘、同一 repetition 次数 → 命中（不区分到达历史）。
+        let mut again = Position::from_fen(STARTPOS_FEN).expect("startpos");
+        again.set_repetitions(1, 8);
+        assert!(backend.cached_evaluation(EvalCacheKey::new(&again, 2)).is_some());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use engin::neural::backend::Backend;
 use engin::neural::onnx::OnnxBackend;
-use engin::search::{Search, SearchConfig, SearchParams, root_stats};
+use engin::search::{Search, SearchConfig, SearchLimits, SearchParams, root_stats};
 use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
 struct Args {
@@ -337,7 +337,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Arc::clone(&history),
                     SearchConfig {
                         params,
-                        root_move_filter: filter.clone(),
                         ..SearchConfig::default()
                     },
                 );
@@ -345,12 +344,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // `Search::run_playouts` 的参数是当前 Search 的累计目标；trace
                     // milestone 不能再减去上一项，否则 100→1000 会错误停在 1000 而
                     // 非“额外跑 900”后的 1000。
-                    search.run_playouts(milestone)?;
+                    search.run_with_limits(SearchLimits {
+                        max_playouts: Some(milestone),
+                        root_move_filter: filter.clone(),
+                        ..Default::default()
+                    })?;
                     println!("    trace completed={milestone}");
                     print_roots(&search, root_is_black, args.root_top, &args.track);
                 }
                 if args.trace.last().copied().unwrap_or(0) < args.playouts {
-                    search.run_playouts(args.playouts)?;
+                    search.run_with_limits(SearchLimits {
+                        max_playouts: Some(args.playouts),
+                        root_move_filter: filter.clone(),
+                        ..Default::default()
+                    })?;
                 }
                 print_roots(&search, root_is_black, args.root_top, &args.track);
                 search.stop_and_finish();

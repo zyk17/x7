@@ -1,6 +1,12 @@
 # MCGS 研究设计
 
-本文件属于 `feat/mcgs` 分支，记录当前正式搜索 **stream Monte Carlo Graph Search（MCGS）**
+> **`mcts2` 实验**：stream **树**搜索（`NodeKey = hash_cat(parent, move)`，路径增量回传；保留 virtual mean / nn_window / 根 LCB）。
+>
+> 已确认语义：**1A** 同路径 `rep==1` 继续搜、`rep>=2` 才 RuleJudge；**2A** 换位不合并节点。NN cache = 棋盘 + `repetitions` + 合法着数护栏（允许历史路径不同，不纳入 8-ply history）。
+>
+> 下文大量图/Continuation/topology 叙述是 `feat/mcgs` 历史设计，未整篇改写。
+
+本文件属于 `feat/mcgs` 分支，记录当时正式搜索 **stream Monte Carlo Graph Search（MCGS）**
 的设计边界。它不是 px0/LC3 的等价移植：worker 生命周期、统计回传与 visit 分配以本仓实现为准。
 
 本实现使用连续 `Gather → Eval → NN → Eval → Backprop`：PUCT 使用 edge in-flight
@@ -215,20 +221,20 @@ contextual child；Tree → Graph 只在零化 edge 发生并正常绑定 board 
 
 ## 跨回合复用与 GC
 
-当前“走一步后删除 sibling subtree”只对 tree 正确；图中的 sibling 可能仍从另一条路径可达。
+mcts2 树：走一步后 sibling 子树与新 root 的 path-key 不相交，可异步回收。
 
-第一版不维护 parent refcount，也不复刻 Lc0 classic 的复杂释放器。每次 `position` 已 drain 后：
+每次 `position` 已 drain 后：
 
-1. 只从**当前**搜索 root 做一次 visited-set traversal；
-2. repository 删除未标记（从当前根不可达）的 node；
-3. 不可达 node 的 `Arc` 自然释放。
+1. `wait_idle`：收完上一手异步 prune（避免悔棋回到祖先根时与仍在删的 sibling 竞态）；
+2. `advance` 只把未走 sibling 根记入 `pending_gc_roots`，不同步删除；
+3. 把 pending 交给 graph reaper 后台 `remove_subtrees`；
+4. 下一次 `go` 可与本次 prune 重叠（前进换根时 searchable 子树与待删 sibling 不相交）。
 
-这是 `O(V + E)`，但只发生在跨回合 GC 边界，且 repository 本来就是 map。若测量证明成为瓶颈，再
-讨论 refcount 或分代；当前不提前引入。
+无关 `position` 仍直接换新 repository，旧图 `Retire` 后台释放。悔棋靠完整 UCI
+`position ... moves` 截断/重建 retained 主线；截断时清空尚未交出的 pending。
 
-unrelated `position` 仍直接换新 repository。悔棋由完整 UCI `position ... moves` 重建 root，
-不保留旧 root / sibling 作为额外 GC 起点。Graph→Tree 入口不绑定 child，sweep 看不到这些
-TreeNode；当前 root 的 sibling prune 在 `position` abort 之后同步做，不与下一手搜索重叠。
+（历史备注：MCGS + ContinuationTree 时期入口边不绑定 child，曾改为同步 mark/sweep；
+迁回纯树后恢复异步 prune，并在 `position` 入口加 `wait_idle`。）
 
 ## 必须同时改掉的 tree 假设
 

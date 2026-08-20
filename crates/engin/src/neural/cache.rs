@@ -1,11 +1,10 @@
 //! NN cache 存储。
 //!
-//! key 与 MCGS 的 board node identity 同步：不 hash 完整 history，也不纳入
-//! `Position::repetitions`，以便复用同一 board node。容量与替换方式对齐 KataGo
-//! 风格：固定 `2^N` 直映表，索引碰撞时新结果直接替换旧结果。
+//! key 由 `EvalCacheKey::slot_key()` 提供：棋盘 hash 混入 `repetitions`；
+//! 命中时再校验 `num_moves`（廉价碰撞护栏）。**不**纳入完整 history。
+//! 容量与替换：固定 `2^N` 直映表，槽内新结果替换旧结果（KataGo 风格）。
 //!
-//! 历史参考：px0 `neural/memcache.cc` 同样不把完整 history 放进 key；KataGo
-//! `neuralnet/nneval.cpp` 的直映表替换策略。
+//! 历史参考：px0 `neural/memcache.cc`；KataGo `neuralnet/nneval.cpp`。
 
 use std::sync::Arc;
 

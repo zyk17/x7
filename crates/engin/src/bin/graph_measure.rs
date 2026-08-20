@@ -1,8 +1,7 @@
-//! 在 stream MCGS 图上测量 board-key node 复用。
+//! 在 stream 搜索树上测量可达节点与一跳 fan-in。
 //!
-//! 参考 `MCGS.md`：从 root 的已完成 edge 只遍历一次每个共享 node。`merged_edges`
-//! 表示同一 child 被多个 parent edge 指向的额外入边。这是一跳 fan-in 指标，不能替代
-//! 旧 tree 快照中递归展开后的 board 重复率。
+//! `mcts2` 树 key 不合并换位：同一 child 的入边计数通常为 1；`merged_edges` /
+//! `shared_child_nodes` 接近 0 时说明未发生 board-key 合并。仍保留该指标便于对照。
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -49,23 +48,21 @@ fn parse_args() -> Result<Args, String> {
                     .next()
                     .ok_or("--playouts requires an integer")?
                     .parse()
-                    .map_err(|_| "--playouts must be an unsigned integer")?;
+                    .map_err(|_| "--playouts must be an integer")?;
             }
             "--root-moves" => {
                 root_moves = arguments
                     .next()
                     .ok_or("--root-moves requires comma-separated ICCS moves")?
                     .split(',')
-                    .filter(|mv| !mv.is_empty())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
                     .map(str::to_owned)
                     .collect();
             }
-            "--help" | "-h" => return Err(usage().into()),
-            _ => return Err(format!("unknown argument: {argument}\n{}", usage())),
+            "--help" | "-h" => return Err(usage().to_owned()),
+            other => return Err(format!("unknown argument: {other}\n{}", usage())),
         }
-    }
-    if playouts == 0 {
-        return Err("--playouts must be positive".into());
     }
     Ok(Args {
         onnx,
@@ -81,11 +78,10 @@ struct Measure {
     nodes: HashSet<NodeKey>,
     inbound_edges: HashMap<NodeKey, u64>,
     edges: u64,
-    path_terminal_edges: u64,
+    /// completed edge 的 child 尚未落库（树上极少见）。
+    missing_child_edges: u64,
 }
 
-/// 只看实际 repository，而不枚举图的所有 variation。后者会随着多 parent 组合指数
-/// 膨胀；它是另一种完整展开指标，不能与这里的一跳 fan-in 混为一谈。
 fn measure_graph(repository: &NodeRepository, root: NodeKey) -> Measure {
     let mut measure = Measure::default();
     let mut pending = vec![root];
@@ -98,11 +94,12 @@ fn measure_graph(repository: &NodeRepository, root: NodeKey) -> Measure {
         };
         for edge in node.edges().iter().filter(|edge| edge.completed_visits() > 0) {
             measure.edges += 1;
-            if let Some(child) = edge.child_key() {
+            let child = key.child(edge.mv());
+            if repository.get(child).is_some() {
                 *measure.inbound_edges.entry(child).or_default() += 1;
                 pending.push(child);
             } else {
-                measure.path_terminal_edges += 1;
+                measure.missing_child_edges += 1;
             }
         }
     }
@@ -114,7 +111,7 @@ fn root_child_key(repository: &NodeRepository, root: NodeKey, mv: &str) -> Resul
     node.edges()
         .iter()
         .find(|edge| edge.mv().to_string() == mv)
-        .and_then(|edge| edge.child_key())
+        .map(|edge| root.child(edge.mv()))
         .ok_or_else(|| format!("root move {mv} was not completed"))
 }
 
@@ -127,10 +124,10 @@ fn print_measure(measure: &Measure) {
         .map(|count| count.saturating_sub(1))
         .sum();
     println!(
-        "reachable graph: nodes={} edges={} path_terminal_edges={}",
+        "reachable tree: nodes={} edges={} missing_child_edges={}",
         measure.nodes.len(),
         measure.edges,
-        measure.path_terminal_edges,
+        measure.missing_child_edges,
     );
     println!(
         "direct fan-in: child_edges={child_edges} merged_edges={merged_edges} ({:.1}%) shared_child_nodes={shared_nodes}",

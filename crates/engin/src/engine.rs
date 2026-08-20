@@ -11,7 +11,7 @@ use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 use crate::neural::backend::{Backend, CachingBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::{
-    Search, SearchConfig, SearchControl, SearchGraph, SearchLimits, SearchParams, Stats, TimeBudget, TimeManager,
+    Search, SearchConfig, SearchControl, SearchLimits, SearchParams, SearchTree, Stats, TimeBudget, TimeManager,
     WorkerPool, best_mate_with_params, best_move_filtered_with_params, principal_variation_with_history_and_params,
     root_stats, root_variations,
 };
@@ -24,7 +24,7 @@ use crate::{EnginError, Options};
 pub struct Engine {
     // UCI 进程已启动时 ONNX 初始化仍可能失败；`None` 表示没有可用 backend，刻意不回退到 UniformBackend。
     backend: Option<Arc<dyn Backend>>,
-    graph: Option<SearchGraph>,
+    graph: Option<SearchTree>,
     graph_reaper: GraphReaper,
     worker_pool: Option<Arc<WorkerPool>>,
     next_generation: u64,
@@ -48,15 +48,19 @@ struct ActiveSearch {
     clock_budget: Option<TimeBudget>,
 }
 
-/// 后台释放已被整图替换的旧 repository。当前 root 的 sibling prune 在 `position`
-/// 的 abort 之后同步做：ContinuationTree 入口不绑定 child，不能边搜边扫。
+/// 后台回收旧 sibling 子树，或释放已被新 position 替换的整张 repository。
+///
+/// 前进换根后的 prune 可与下一手 `go` 重叠；下一次 `position` 入口会 `wait_idle`，
+/// 避免悔棋回到仍挂着待删 sibling 的祖先根时与 prune 竞态。
 struct GraphReaper {
     sender: Option<crossbeam_channel::Sender<GraphCleanup>>,
     thread: Option<JoinHandle<()>>,
 }
 
 enum GraphCleanup {
+    Prune(Arc<crate::search::NodeRepository>, Vec<crate::search::NodeKey>),
     Retire(Arc<crate::search::NodeRepository>),
+    Flush(std::sync::mpsc::Sender<()>),
 }
 
 impl GraphReaper {
@@ -67,10 +71,16 @@ impl GraphReaper {
             .spawn(move || {
                 while let Ok(cleanup) = receiver.recv() {
                     match cleanup {
+                        GraphCleanup::Prune(repository, roots) => {
+                            let _ = repository.remove_subtrees(roots);
+                        }
                         GraphCleanup::Retire(repository) => match Arc::try_unwrap(repository) {
                             Ok(repository) => repository.release_incrementally(),
                             Err(repository) => drop(repository),
                         },
+                        GraphCleanup::Flush(done) => {
+                            let _ = done.send(());
+                        }
                     }
                 }
             })
@@ -87,6 +97,28 @@ impl GraphReaper {
             .expect("graph reaper sender lives with engine")
             .send(GraphCleanup::Retire(repository))
             .expect("graph reaper thread is alive");
+    }
+
+    fn prune(&self, repository: Arc<crate::search::NodeRepository>, roots: Vec<crate::search::NodeKey>) {
+        if roots.is_empty() {
+            return;
+        }
+        self.sender
+            .as_ref()
+            .expect("graph reaper sender lives with engine")
+            .send(GraphCleanup::Prune(repository, roots))
+            .expect("graph reaper thread is alive");
+    }
+
+    /// 等到此前已入队的 prune/retire 做完。
+    fn wait_idle(&self) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        self.sender
+            .as_ref()
+            .expect("graph reaper sender lives with engine")
+            .send(GraphCleanup::Flush(done_tx))
+            .expect("graph reaper thread is alive");
+        done_rx.recv().expect("graph reaper flush completes");
     }
 }
 
@@ -220,7 +252,7 @@ impl Engine {
         &self.options
     }
 
-    /// 更新 Engine 生命周期 option。已启动 job 使用自己创建时的 `SearchConfig` 快照。
+    /// 更新 Engine 生命周期 option。已启动 job 使用自己创建时的 `SearchConfig` / `SearchParams` 快照。
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), EnginError> {
         self.options.set_uci_option(name, value)
     }
@@ -235,21 +267,22 @@ impl Engine {
         self.set_position(STARTPOS_FEN, &[])
     }
 
-    /// 先 stop/drain，再用完整 history 复用或重置图。
+    /// 先 stop/drain，再用完整 history 复用或重置树。
     pub(crate) fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), EnginError> {
         self.update_backend_config()?;
         let state = GameState::from_fen_moves(fen, moves)?;
         let history = Arc::new(state.position_history());
         self.abort()?;
+        // 先收完上一手异步 prune，再改 root；否则悔棋回到祖先根时可能与仍在删的 sibling 竞态。
+        self.graph_reaper.wait_idle();
         if let Some(graph) = self.graph.as_mut() {
             if let Some(retired) = graph.reset_to_history_after_drain(Arc::clone(&history))? {
                 self.graph_reaper.retire(retired);
             }
-            if let Some(root) = graph.take_pending_gc_root() {
-                graph.repository().retain_from_root(root);
-            }
+            let pending = graph.take_pending_gc_roots();
+            self.graph_reaper.prune(Arc::clone(graph.repository()), pending);
         } else if self.backend.is_some() {
-            self.graph = Some(SearchGraph::new(history));
+            self.graph = Some(SearchTree::new(history));
         }
         self.position = Some(state);
         Ok(())
@@ -355,7 +388,6 @@ impl Engine {
         self.next_generation = self.next_generation.wrapping_add(1);
         let (gather_workers, eval_workers) = SearchConfig::gather_eval_from_threads(self.options.threads);
         let config = SearchConfig {
-            root_move_filter: root_move_filter.clone(),
             eval_batch_size: self.options.mini_batch_size,
             params: SearchParams {
                 cpuct: self.options.cpuct,
@@ -404,6 +436,7 @@ impl Engine {
                 .movetime
                 .map(|ms| started + Duration::from_millis(ms.max(0) as u64))
                 .or_else(|| clock_budget.map(|budget| budget.deadline_after(started))),
+            root_move_filter,
         };
         let control = search.control();
         let publish_output = Arc::new(AtomicBool::new(true));
@@ -643,8 +676,8 @@ impl RootSnapshot {
             &self.params,
         );
         if variations.is_empty() {
-            let win = ((1.0 - draw + wl) * 0.5).clamp(0.0, 1.0);
-            let loss = ((1.0 - draw - wl) * 0.5).clamp(0.0, 1.0);
+            let win = ((1.0_f32 - draw + wl) * 0.5).clamp(0.0, 1.0);
+            let loss = ((1.0_f32 - draw - wl) * 0.5).clamp(0.0, 1.0);
             let mate = best_mate_with_params(&self.repository, self.root_key, &self.root_move_filter, &self.params);
             return vec![ThinkingInfo {
                 mate,
@@ -670,8 +703,8 @@ impl RootSnapshot {
             .into_iter()
             .enumerate()
             .map(|(index, variation)| {
-                let win = ((1.0 - variation.draw + variation.wl) * 0.5).clamp(0.0, 1.0);
-                let loss = ((1.0 - variation.draw - variation.wl) * 0.5).clamp(0.0, 1.0);
+                let win = ((1.0_f32 - variation.draw + variation.wl) * 0.5).clamp(0.0, 1.0);
+                let loss = ((1.0_f32 - variation.draw - variation.wl) * 0.5).clamp(0.0, 1.0);
                 ThinkingInfo {
                     mate: variation.mate,
                     score: variation

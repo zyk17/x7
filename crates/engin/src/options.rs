@@ -1,7 +1,6 @@
 //! Engine 生命周期的 UCI option。
 //!
-//! `Engine` 持有 option，搜索在启动 job 时读取快照。option 名称与常见 UCI/引擎
-//! 习惯对齐；不是 px0 `OptionsDict` 的翻译层。
+//! `go` 时拍快照：算法 → `SearchParams`，拓扑 → `SearchConfig`，停止条件/`searchmoves` → `SearchLimits`。
 
 use crate::neural::cache::{DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, MAX_NN_CACHE_SIZE_POWER_OF_TWO};
 use crate::search::SearchParams;

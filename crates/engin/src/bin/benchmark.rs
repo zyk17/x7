@@ -292,7 +292,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         positions.len(),
     );
     println!(
-        "note: each run has a fresh graph; --warm-cache alone reuses one NN cache between repeats; nps/done are completed visits, eps/leaf_events are NN work; hit is normal cache hits; q_* is average queue delay in us"
+        "note: each run has a fresh tree; --warm-cache alone reuses one NN cache between repeats; nps/done are completed visits, eps/leaf_events are NN work; hit is normal cache hits; q_* is average queue delay in us"
     );
     println!("  G   E run       ms      nps      eps    done    hit  coll%    peak  root%    q_g    q_e    q_n");
     let mut generation = 0;
@@ -330,6 +330,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let stats = search.run_with_limits(SearchLimits {
                         max_playouts: args.playouts,
                         deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
+                        ..Default::default()
                     })?;
                     let seconds = started.elapsed().as_secs_f64();
                     let total = stats.completed_playouts + stats.collisions;

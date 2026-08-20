@@ -53,7 +53,7 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 | 模块 | 职责 | 当前状态 |
 | --- | --- | --- |
 | `crates/xiangqi_core` | 唯一规则真相：棋盘、合法着、FEN、Position、history、RuleJudge | 已完成 |
-| `crates/engin/src/search` | stream MCGS；`graph.rs` 直接包含 node、edge、repository 与跨回合 graph reuse | `feat/mcgs` 研究实现 |
+| `crates/engin/src/search` | stream 树搜索；`tree.rs` 含 node/edge/repository；`pipeline` 组装 Shared 与 Gather；算法在 select/expand/eval/backprop | `feat/mcgs` / `mcts2` 研究实现 |
 | `crates/engin/src/search/time.rs` | 单一 stream 的固定中性时钟分配 | 已接入 UCI |
 | `crates/engin/src/neural` | 124-plane 编码、policy 映射、ONNX、缓存 | stream 使用的 backend 契约 |
 | `nn/` | 训练数据格式沿用 px0 record；训练、checkpoint、ONNX 导出 | 独立 Python 子项目 |
@@ -73,11 +73,10 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 - Engine 直接常驻 Gather×3、Eval×5、NN×1、Backprop×1（默认 `Threads=8`；Gather/Eval 尽量 1:2，余数给 Gather）；下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、稀疏合批推理，并以整批 `EncodedBatch` 交回；Backprop 回收 reservation 并更新图。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
   Engine 启动 job 时按固定中性的时间预算（历史上参考 px0 legacy stopper）转换为不可变 deadline，job drain 后才归还剩余时间。`go movetime` / 时钟到期后会 `request_stop` 并取消已 claim 但尚未完成的评估，而不是把当前 NN 窗口整批推理完；剩余时间不足 500ms 时 Gather 不再按推荐 MiniBatch 填满窗口。`position` 打断上一次 `go` 仍会输出 `bestmove`（无搜索结果时回退根合法着），避免 GUI 超时报「未返回合法着法」。
-- graph reuse 只保留当前 root 沿已绑定 `child_key` 可达的图。确认走子后，旧 root 的 sibling
-  在下一次 `position`（已 abort）里同步 mark/sweep：ContinuationTree 入口不绑定 child，不能
-  边搜边扫。完整 `PositionHistory` 仍由 UCI `position ... moves` 提供；悔棋回到旧局面会重新
-  建立搜索 root，不承诺复用旧 sibling 子树。无关 `position` 换图时，整个旧 repository 仍在
-  后台逐 shard 释放。search owner 已输出最小 info 与一次 bestmove。
+- tree reuse 保留已走主线；走子后 sibling 挂 pending，由 graph reaper 异步
+  `remove_subtrees`。下一手 `go` 可与 prune 重叠；下一次 `position` 入口 `wait_idle`
+  后再改根，避免悔棋与未完成 prune 竞态。无关 `position` 换树时旧 repository 后台释放。
+  search owner 已输出最小 info 与一次 bestmove。
 - `MultiPV` 只在 search owner 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。Gather 每次一个叶子；pending reservation 同时表示 PUCT 已分配的预算，当前实战的 virtual mean 仅在 reservation 未完成时进入 action Q，完成后 Q 仍只来自 completed Evidence。collision 先挂起该 event 的 reservation，该叶子 complete 后再 cancel，不额外改变 completed `N/Q`。`MiniBatchSize` 限制 NN 一次合并的 tensor 数量，`0` 使用 backend 建议值，并派生 `2.3 × MiniBatchSize` 的 Eval/NN claim 上限；实际 NN batch 可能因终局、缓存、collision 或队列暂时不足更小。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
 stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 公式，不是 LC3 Policy 的正式公式，也不是 px0 搜索等价实现）。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.75 / 40000 / 4.0`。所有 node 共用一条对数 cPUCT 曲线，`C(0)=1.75`、`C(50k)≈5`，不维护根专用初值或参数。`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。
