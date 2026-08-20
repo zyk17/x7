@@ -1063,8 +1063,8 @@ fn selected_child(shared: &Shared, event: &mut PlayoutEvent, node: &Node, edge_i
         let child_node = shared.repository.get_or_insert(child);
         // Graph→Tree 不走 bind，深度不会在那里赋值。入口深度必须是父节点首次到达+1，
         // 否则 Tree 稍后当父节点绑边时会被写成 0，浅层 Graph 回边剪不掉。
-        node.try_set_first_depth(0);
-        child_node.try_set_first_depth(node.depth().unwrap_or(0) + 1);
+        node.set_first_depth(0);
+        child_node.set_first_depth(node.depth().unwrap() + 1);
         return Some(ChildTarget::Continuation(child));
     }
     let child = if event.node_key.is_continuation() {

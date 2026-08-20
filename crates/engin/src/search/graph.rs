@@ -312,13 +312,11 @@ impl Node {
         }
     }
 
-    fn set_depth(&self, depth: u32) {
-        self.depth.store(depth + 1, Ordering::Relaxed);
-    }
-
-    /// 首次到达深度。已有值不覆盖，避免 Continuation 入口稍后当父节点绑边时被写成 0。
-    pub(crate) fn try_set_first_depth(&self, depth: u32) {
-        let _ = self.depth.compare_exchange(0, depth + 1, Ordering::Relaxed, Ordering::Relaxed);
+    /// 首次到达深度；已有值不覆盖。
+    pub(crate) fn set_first_depth(&self, depth: u32) {
+        self.depth
+            .compare_exchange(0, depth + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
     }
 
     /// 写入冻住的 U(n)。`value.visits` 是这份样本的权重（通常为 1），与 `stats.visits` 无关。
@@ -660,10 +658,8 @@ impl NodeRepository {
         if edge.topology_pruned() {
             return ChildLink::TopologyPruned;
         }
-        let parent_depth = parent.depth().unwrap_or_else(|| {
-            parent.set_depth(0);
-            0
-        });
+        parent.set_first_depth(0);
+        let parent_depth = parent.depth().unwrap();
         if let Some(child_node) = self.get_unlocked(child) {
             if let Some(child_depth) = child_node.depth() {
                 if parent_depth > child_depth {
@@ -671,12 +667,12 @@ impl NodeRepository {
                     return ChildLink::TopologyPruned;
                 }
             } else {
-                child_node.set_depth(parent_depth + 1);
+                child_node.set_first_depth(parent_depth + 1);
             }
             edge.write_child_key(child);
             return ChildLink::Bound;
         }
-        self.get_or_insert_unlocked(child).set_depth(parent_depth + 1);
+        self.get_or_insert_unlocked(child).set_first_depth(parent_depth + 1);
         edge.write_child_key(child);
         ChildLink::Bound
     }
@@ -1186,15 +1182,15 @@ mod repository_tests {
         let root = NodeKey::graph_node(1);
         let parent = NodeKey::graph_node(3);
         let tree = NodeKey::tree_node(2, 9);
-        repo.get_or_insert(root).set_depth(0);
+        repo.get_or_insert(root).set_first_depth(0);
 
         let parent_node = repo.get_or_insert(parent);
-        parent_node.try_set_first_depth(3);
-        parent_node.try_set_first_depth(0);
+        parent_node.set_first_depth(3);
+        parent_node.set_first_depth(0);
         assert_eq!(parent_node.depth(), Some(3));
 
         let continuation = repo.get_or_insert(tree);
-        continuation.try_set_first_depth(parent_node.depth().unwrap() + 1);
+        continuation.set_first_depth(parent_node.depth().unwrap() + 1);
         assert_eq!(continuation.depth(), Some(4));
 
         assert!(continuation.try_begin_evaluation());
