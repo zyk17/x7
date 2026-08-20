@@ -36,10 +36,8 @@ pub struct Stats {
     pub completed_playouts: u64,
     pub average_depth: u64,
     pub max_depth: u64,
-    pub network_batches: u64,
+    /// 实际走 NN 的叶子数（不含 cache hit）；UCI `eps` 用。
     pub network_evaluations: u64,
-    pub cache_hits: u64,
-    pub network_batch_size_max: u64,
 }
 
 pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
@@ -48,8 +46,6 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) generation: u64,
     pub(crate) params: SearchParams,
     pub(crate) root_move_filter: Mutex<Vec<Move>>,
-    /// 当前 root 的 history 已裁决结束（UCI 须当终局处理）。
-    pub(crate) root_path_terminal: AtomicBool,
     pub(crate) stopping: AtomicBool,
     /// 未 `finish` 的 owned event：drain / 节点预算。
     pub(crate) outstanding: AtomicUsize,
@@ -58,10 +54,7 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) completed: AtomicU64,
     pub(crate) completed_depth: AtomicU64,
     pub(crate) max_depth: AtomicU64,
-    pub(crate) network_batches: AtomicU64,
     pub(crate) network_evaluations: AtomicU64,
-    pub(crate) cache_hits: AtomicU64,
-    pub(crate) network_batch_size_max: AtomicU64,
     pub(crate) observer: O,
     pub(crate) error: Mutex<Option<EnginError>>,
     pub(crate) idle_lock: Mutex<()>,
@@ -80,10 +73,6 @@ impl<O: SearchObserver> Shared<O> {
         if O::ENABLED {
             self.observer.on_submitted();
         }
-    }
-
-    pub(crate) fn complete_root_terminal(&self) {
-        self.completed.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn finish(&self, n: usize, completed: bool) {
@@ -267,10 +256,7 @@ impl<O: SearchObserver> Shared<O> {
             completed_playouts,
             average_depth: self.completed_depth.load(Ordering::Acquire) / completed_playouts.max(1),
             max_depth: self.max_depth.load(Ordering::Acquire),
-            network_batches: self.network_batches.load(Ordering::Acquire),
             network_evaluations: self.network_evaluations.load(Ordering::Acquire),
-            cache_hits: self.cache_hits.load(Ordering::Acquire),
-            network_batch_size_max: self.network_batch_size_max.load(Ordering::Acquire),
         }
     }
 }
@@ -340,10 +326,11 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
                     path_terminal_value(event.variation.history(), depth)
                 };
                 if let Some((wl, draw, plies_left)) = terminal {
-                    if event.reservations.is_empty() {
-                        shared.root_path_terminal.store(true, Ordering::Release);
-                        shared.complete_root_terminal();
+                    if depth == 0 {
+                        // root 终局应在搜前门禁；落到这里只停 job，不标共享 node。
                         shared.finish(1, false);
+                        shared.stopping.store(true, Ordering::Release);
+                        shared.idle.notify_all();
                         return;
                     }
                     node.mark_terminal(wl, draw, plies_left);
@@ -354,9 +341,10 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
                 }
                 let Some((child, reservation)) = branch_at_expanded_node(shared, &event, node.as_ref(), depth) else {
                     if event.reservations.is_empty() {
-                        shared.root_path_terminal.store(true, Ordering::Release);
-                        shared.complete_root_terminal();
+                        // root 无着可探（空边 / searchmoves 滤空）：停搜，不伪造成路径终局。
                         shared.finish(1, false);
+                        shared.stopping.store(true, Ordering::Release);
+                        shared.idle.notify_all();
                     } else {
                         let (wl, draw, m) = node.value_snapshot();
                         shared.send_backprop(BackpropEvent::evaluation(event, wl, draw, m));
@@ -503,17 +491,13 @@ impl<O: SearchObserver> Search<O> {
             generation,
             params: resolved.params,
             root_move_filter: Mutex::new(Vec::new()),
-            root_path_terminal: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
             nn_inflight: AtomicUsize::new(0),
             completed: AtomicU64::new(0),
             completed_depth: AtomicU64::new(0),
             max_depth: AtomicU64::new(0),
-            network_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
-            cache_hits: AtomicU64::new(0),
-            network_batch_size_max: AtomicU64::new(0),
             observer,
             error: Mutex::new(None),
             idle_lock: Mutex::new(()),
@@ -552,9 +536,16 @@ impl<O: SearchObserver> Search<O> {
         &self.shared.observer
     }
 
-    /// root 在路径规则下已裁决结束（UCI 须把当前 root 当终局处理）。
-    pub(crate) fn root_is_path_terminal(&self) -> bool {
-        self.shared.root_path_terminal.load(Ordering::Acquire)
+    /// root 当前 history（含将死/rule60/重复等 `compute_game_result`）或共享 node
+    /// 已是终局。搜前可门禁；选着时不从旧边回退。UCI 仍可用 legal fallback。
+    /// 之后若要对 rule60/重复「允许继续搜」，再收窄此判定（现不做）。
+    pub(crate) fn root_is_terminal(&self) -> bool {
+        path_terminal_value(self.root_history.as_ref(), 0).is_some()
+            || self
+                .shared
+                .repository
+                .get(self.root_key)
+                .is_some_and(|root| root.expansion_state() == ExpansionState::Terminal)
     }
 
     pub fn stats(&self) -> Stats {
@@ -628,6 +619,10 @@ impl<O: SearchObserver> Search<O> {
         mut report: impl FnMut(Stats),
     ) -> Result<Stats, EnginError> {
         *self.shared.root_move_filter.lock() = limits.root_move_filter.clone();
+        // root 终局 / 共享 Terminal：不进流水线，避免 Gather 再特判。
+        if self.root_is_terminal() {
+            return Ok(self.stats());
+        }
         let target = limits.max_playouts.unwrap_or(u64::MAX);
         let mut next_report = report_interval.and_then(|interval| Instant::now().checked_add(interval));
         loop {
@@ -650,7 +645,7 @@ impl<O: SearchObserver> Search<O> {
                 .repository
                 .get(self.root_key)
                 .map(|root| root.expansion_state());
-            if root_state == Some(ExpansionState::Terminal) || self.shared.root_path_terminal.load(Ordering::Acquire) {
+            if root_state == Some(ExpansionState::Terminal) {
                 break;
             }
             if root_state == Some(ExpansionState::Evaluating) {
@@ -766,7 +761,7 @@ mod tests {
         let mut pipeline = Search::new(Arc::new(UniformBackend::default()), 1, history, SearchConfig::default());
         let stats = pipeline.run_playouts(64).expect("search");
         assert_eq!(stats.completed_playouts, 64);
-        assert!(stats.network_batches > 0);
+        assert!(stats.network_evaluations > 0);
         let root = root_stats(pipeline.repository(), pipeline.root_key()).expect("root");
         assert!(root.completed_visits >= 64);
         assert!(root.edges.iter().all(|e| e.started_visits == e.completed_visits));

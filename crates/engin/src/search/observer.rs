@@ -62,6 +62,7 @@ pub trait SearchObserver: Send + Sync + 'static {
     fn on_collision(&self, _depth: usize) {}
     fn on_peak_inflight(&self, _n: usize) {}
     fn on_queue_wait(&self, _kind: QueueKind, _wait: Duration) {}
+    fn on_cache_hit(&self) {}
     /// 一次 NN 合批推理的实际 batch size。
     fn on_batch(&self, _size: usize) {}
 }
@@ -112,6 +113,9 @@ pub struct BenchObserver {
     submitted: AtomicU64,
     collisions: AtomicU64,
     peak_in_flight: AtomicU64,
+    cache_hits: AtomicU64,
+    network_batches: AtomicU64,
+    network_batch_size_max: AtomicU64,
     collisions_by_depth: Mutex<Vec<u64>>,
     batches_by_size: Mutex<Vec<u64>>,
     gather_queue: QueueMetrics,
@@ -130,6 +134,9 @@ impl BenchObserver {
             submitted_playouts: self.submitted.load(Ordering::Acquire),
             collisions: self.collisions.load(Ordering::Acquire),
             peak_in_flight: self.peak_in_flight.load(Ordering::Acquire),
+            cache_hits: self.cache_hits.load(Ordering::Acquire),
+            network_batches: self.network_batches.load(Ordering::Acquire),
+            network_batch_size_max: self.network_batch_size_max.load(Ordering::Acquire),
             collisions_by_depth: self.collisions_by_depth.lock().clone(),
             batches_by_size: self.batches_by_size.lock().clone(),
             gather_queue: self.gather_queue.snapshot(),
@@ -170,10 +177,16 @@ impl SearchObserver for BenchObserver {
         }
     }
 
+    fn on_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn on_batch(&self, size: usize) {
         if size == 0 {
             return;
         }
+        self.network_batches.fetch_add(1, Ordering::Relaxed);
+        self.network_batch_size_max.fetch_max(size as u64, Ordering::Relaxed);
         let mut counts = self.batches_by_size.lock();
         if counts.len() <= size {
             counts.resize(size + 1, 0);
@@ -188,6 +201,9 @@ pub struct BenchStats {
     pub submitted_playouts: u64,
     pub collisions: u64,
     pub peak_in_flight: u64,
+    pub cache_hits: u64,
+    pub network_batches: u64,
+    pub network_batch_size_max: u64,
     pub collisions_by_depth: Vec<u64>,
     /// 下标 = batch size，值 = 该 size 出现次数；`[0]` 恒为 0。
     pub batches_by_size: Vec<u64>,

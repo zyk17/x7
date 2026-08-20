@@ -557,9 +557,9 @@ fn run_search(
         }
     });
     if let Ok(stats) = &result {
-        // path-local repetition/rule60 不能标记共享 board node，但对这次 UCI root 已是
-        // 真正终局；不得从旧图的 edge 回退出一着看似合法的棋。
-        let (best_move, principal_variation) = if search.root_is_path_terminal() {
+        // root 终局：不从旧图 edge 选着。GUI 未必实现完整规则（重复/rule60），
+        // UCI 仍可用 legal fallback 回一着；将死无着才是 a0a0。
+        let (chosen, principal_variation) = if search.root_is_terminal() {
             (None, Vec::new())
         } else {
             (
@@ -584,7 +584,7 @@ fn run_search(
         if let Some(info) = infos.first_mut() {
             info.pv = principal_variation;
         }
-        let best_move = reported_uci_move(best_move, snapshot.root_history.as_ref(), &snapshot.root_move_filter);
+        let best_move = reported_uci_move(chosen, snapshot.root_history.as_ref(), &snapshot.root_move_filter);
         let _output = output_gate.lock();
         if publish_output.load(Ordering::Acquire) {
             write_stdout_thinking(&infos, &output_options);

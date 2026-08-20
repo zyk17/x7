@@ -145,7 +145,9 @@ pub(crate) fn handle_eval_event<O: SearchObserver>(
         ExpandKind::Evaluate { legal_moves } => {
             let cache_key = EvalCacheKey::new(history.last(), legal_moves.len());
             if let Some(eval) = shared.backend.cached_evaluation(cache_key) {
-                shared.cache_hits.fetch_add(1, Ordering::AcqRel);
+                if O::ENABLED {
+                    shared.observer.on_cache_hit();
+                }
                 shared.release_eval_claim();
                 return publish_eval(shared, event, node, legal_moves, eval);
             }
@@ -225,7 +227,7 @@ fn publish_eval<O: SearchObserver>(
     shared: &Shared<O>,
     event: PlayoutEvent<O::Stamp>,
     node: Arc<Node>,
-    legal_moves: Vec<xiangqi_core::Move>,
+    legal_moves: Vec<Move>,
     eval: Arc<EvalResult>,
 ) -> Result<(), EnginError> {
     let value_is_valid = eval.wl.is_finite()
@@ -289,9 +291,7 @@ pub(crate) fn infer_nn_batch<O: SearchObserver>(shared: &Shared<O>, requests: Ve
                 reject_nn_requests(requests, error);
                 return;
             }
-            shared.network_batches.fetch_add(1, Ordering::AcqRel);
             shared.network_evaluations.fetch_add(batch as u64, Ordering::AcqRel);
-            shared.network_batch_size_max.fetch_max(batch as u64, Ordering::AcqRel);
             if O::ENABLED {
                 shared.observer.on_batch(batch);
             }

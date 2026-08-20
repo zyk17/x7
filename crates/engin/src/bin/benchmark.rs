@@ -530,12 +530,12 @@ fn print_run_report(
     let eps = stats.network_evaluations as f64 / seconds;
     let attempts = bench.submitted_playouts.max(1);
     let collision_rate = bench.collisions as f64 * 100.0 / attempts as f64;
-    let cache_denom = (stats.network_evaluations + stats.cache_hits).max(1);
-    let cache_hit_rate = stats.cache_hits as f64 * 100.0 / cache_denom as f64;
-    let batch_avg = if stats.network_batches == 0 {
+    let cache_denom = (stats.network_evaluations + bench.cache_hits).max(1);
+    let cache_hit_rate = bench.cache_hits as f64 * 100.0 / cache_denom as f64;
+    let batch_avg = if bench.network_batches == 0 {
         0.0
     } else {
-        stats.network_evaluations as f64 / stats.network_batches as f64
+        stats.network_evaluations as f64 / bench.network_batches as f64
     };
 
     println!("=== G={gather_workers} E={eval_workers} run={run_index} ===");
@@ -562,9 +562,9 @@ fn print_run_report(
     println!(
         "  n_eval={}  cache_hits={} ({cache_hit_rate:.1}%)  batches={}  batch avg={batch_avg:.2} max={}",
         stats.network_evaluations,
-        stats.cache_hits,
-        stats.network_batches,
-        stats.network_batch_size_max
+        bench.cache_hits,
+        bench.network_batches,
+        bench.network_batch_size_max
     );
     println!(
         "  batch dist (size×times)  {}",
