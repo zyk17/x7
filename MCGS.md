@@ -6,12 +6,26 @@
 本实现使用连续 `Gather → Eval → NN → Eval → Backprop`：PUCT 使用 edge in-flight
 reservation 作为 virtual visit（计入 started N，偏转选择）；Gather 每次采集一个叶子，
 collision 先挂起 reservation / μ，该叶子自己的 backprop complete 后再 cancel，不加 completed visit。Eval 持续向 NN 提交已编码 tensor；NN 空闲时立即处理当前
-队列可得请求，不等待逻辑搜索轮次。Gather 在 claim 前把已交给 Eval 的叶子限为两个 `MiniBatchSize`。没有 prefetch 或 tree-batch gather。
+队列可得请求，不等待逻辑搜索轮次。Gather 在 claim 前把已交给 Eval 的叶子限为 `2.3 × MiniBatchSize`。没有 prefetch 或 tree-batch gather。
 时钟到期后 owner 会 stop 并取消未完成的 Eval/NN claim，不把推荐 batch 的推理时间算进 `go movetime` 之后。剩余预算不足 500ms 时提交窗口收窄，避免第一刀合批单独超过时限。
 
 不用 classic 那种一次评估记 K 次 visit 的 **multivisit**。GPU 合批在 NN 队列，不靠 Gather
 一次收一批。实战以 `μ=FPU` virtual mean 做比纯 virtual visit 更明显、但仍温和的分流；K 份
 假样本会一次打偏 in-flight Q/N。后续若研究分流强度，改 virtual mean / virtual visit，不加 K。
+
+## 当前限制：图环与拓扑剪枝
+
+本分支曾以 Gather DFS 检测 board-key 图环；在窄而深的局面中，这成为明显 CPU 瓶颈。当前改为
+首次到达深度的 O(1) 拓扑剪枝：若新 edge 指向一个首次深度更浅的 node，就不绑定该 edge。
+
+这是刻意保留的**不正确近似**，不是中国象棋规则，也不是严格的 MCGS 环处理：它会删去某些本来合法的
+换位边；当一个 node 的所有 edge 都被这样删去时，现实现还会以已有 shared-Q 结束该 playout，因而可能
+把没有新 Evidence 的结果记入父 edge 的 completed N。若该 node 是规则上下文 root，还可能被当作
+path-local terminal，导致本次 UCI 不再给出正常候选。
+
+因此这版 `feat/mcgs` 只能保留为数据结构与实验记录，不能再据此调 PUCT、LCB、batch 或做 Elo 结论。
+后续主线回到 `mcts2` 的树搜索；若重启 MCGS 研究，应先重新设计环、规则上下文与 completed Evidence 的
+语义，不能继续把 Graph + ContinuationTree + 深度剪枝当作可接受的正式方案。
 
 ## 目标
 
