@@ -8,7 +8,7 @@ use std::thread;
 #[cfg(feature = "benchmark")]
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use xiangqi_core::Move;
 
 use crate::EnginError;
@@ -103,8 +103,8 @@ pub(crate) fn wait_one_nn_completion(shared: &Shared, waiting: &mut Vec<WaitingN
                 shared.fail(error);
             }
         }
-        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+        Err(RecvTimeoutError::Timeout) => {}
+        Err(RecvTimeoutError::Disconnected) => {
             let item = waiting.remove(0);
             cancel_waiting_item(shared, item);
             if !shared.stopping.load(Ordering::Acquire) {
@@ -254,7 +254,7 @@ pub(crate) fn cancel_evaluation(shared: &Shared, event: PlayoutEvent, node: Arc<
     event.cancel();
     node.abort_evaluation();
     shared.cancel_collisions(key);
-    shared.finish(false);
+    shared.finish(1, false);
 }
 
 /// 合批推理一批已编码请求（不含取队列循环）。

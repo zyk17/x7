@@ -149,12 +149,15 @@ impl Shared {
         self.completed.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub(crate) fn finish(&self, completed: bool) {
-        if completed {
-            self.completed.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn finish(&self, n: usize, completed: bool) {
+        if n == 0 {
+            return;
         }
-        let previous = self.outstanding.fetch_sub(1, Ordering::AcqRel);
-        assert!(previous > 0, "stream outstanding task underflow");
+        if completed {
+            self.completed.fetch_add(n as u64, Ordering::AcqRel);
+        }
+        let previous = self.outstanding.fetch_sub(n, Ordering::AcqRel);
+        assert!(previous >= n, "stream outstanding task underflow");
         // 唤醒等待本轮真实 leaf 完成的 owner。
         let _guard = self.idle_lock.lock();
         self.idle.notify_all();
@@ -213,7 +216,7 @@ impl Shared {
             }
         }
         event.cancel();
-        self.finish(false);
+        self.finish(1, false);
     }
 
     pub(crate) fn cancel_collisions(&self, key: NodeKey) {
@@ -228,18 +231,20 @@ impl Shared {
             }
         }
         drop(waiters);
+        let n = parked.len();
         for event in parked {
             event.cancel();
-            self.finish(false);
         }
+        self.finish(n, false);
     }
 
     pub(crate) fn cancel_all_collisions(&self) {
         let parked = std::mem::take(&mut *self.collision_waiters.lock());
+        let n = parked.len();
         for event in parked {
             event.cancel();
-            self.finish(false);
         }
+        self.finish(n, false);
     }
 
     /// Cancels an event after Gather has claimed its leaf for Eval.
@@ -250,7 +255,7 @@ impl Shared {
     pub(crate) fn cancel_claimed_evaluation(&self, event: PlayoutEvent) {
         let Some(node) = self.repository.get(event.node_key) else {
             event.cancel();
-            self.finish(false);
+            self.finish(1, false);
             return;
         };
         cancel_evaluation(self, event, node);
@@ -302,7 +307,7 @@ impl Shared {
             if self.stopping.load(Ordering::Acquire) {
                 let key = event.playout.node_key;
                 event.cancel();
-                self.finish(false);
+                self.finish(1, false);
                 self.cancel_collisions(key);
                 return;
             }
@@ -315,7 +320,7 @@ impl Shared {
                 Err(TrySendError::Disconnected(returned)) => {
                     let key = returned.playout.node_key;
                     returned.cancel();
-                    self.finish(false);
+                    self.finish(1, false);
                     self.cancel_collisions(key);
                     return;
                 }
@@ -394,7 +399,7 @@ pub(crate) fn process_gather_event(shared: &Shared, mut event: PlayoutEvent, eva
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             event.cancel();
-            shared.finish(false);
+            shared.finish(1, false);
             return;
         }
         let node = shared.repository.get_or_insert(event.node_key);
@@ -431,7 +436,7 @@ pub(crate) fn process_gather_event(shared: &Shared, mut event: PlayoutEvent, eva
                     if event.reservations.is_empty() {
                         shared.root_path_terminal.store(true, Ordering::Release);
                         shared.complete_root_terminal();
-                        shared.finish(false);
+                        shared.finish(1, false);
                         return;
                     }
                     node.mark_terminal(wl, draw, plies_left);
@@ -444,7 +449,7 @@ pub(crate) fn process_gather_event(shared: &Shared, mut event: PlayoutEvent, eva
                     if event.reservations.is_empty() {
                         shared.root_path_terminal.store(true, Ordering::Release);
                         shared.complete_root_terminal();
-                        shared.finish(false);
+                        shared.finish(1, false);
                     } else {
                         let (wl, draw, m) = node.value_snapshot();
                         shared.send_backprop(BackpropEvent::evaluation(event, wl, draw, m));
@@ -668,7 +673,7 @@ impl Search {
         loop {
             if self.shared.stopping.load(Ordering::Acquire) {
                 event.cancel();
-                self.shared.finish(false);
+                self.shared.finish(1, false);
                 return Err(EnginError::PortIncomplete("stream worker pipeline is stopped"));
             }
             match self.shared.gather_tx.send_timeout(event, RECEIVE_POLL) {
@@ -676,7 +681,7 @@ impl Search {
                 Err(SendTimeoutError::Timeout(returned)) => event = returned,
                 Err(SendTimeoutError::Disconnected(returned)) => {
                     returned.cancel();
-                    self.shared.finish(false);
+                    self.shared.finish(1, false);
                     return Err(EnginError::PortIncomplete("stream gather queue disconnected"));
                 }
             }

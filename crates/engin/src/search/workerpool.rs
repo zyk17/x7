@@ -8,11 +8,12 @@ use std::thread::{self, JoinHandle};
 #[cfg(feature = "benchmark")]
 use std::time::Instant;
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
 use parking_lot::Mutex;
 use xiangqi_core::{Move, Position, PositionHistory};
 
 use crate::neural::backend::Backend;
+use crate::search::EdgeReservation;
 
 use super::backprop::complete_batch;
 use super::eval::{
@@ -78,7 +79,7 @@ pub struct PlayoutEvent {
     pub node_key: NodeKey,
     pub(crate) node_path: Vec<NodeKey>,
     pub variation: Variation,
-    pub reservations: Vec<super::EdgeReservation>,
+    pub reservations: Vec<EdgeReservation>,
     #[cfg(feature = "benchmark")]
     queued_at: Option<Instant>,
 }
@@ -100,7 +101,7 @@ impl PlayoutEvent {
         }
     }
 
-    pub fn descend(mut self, child_key: NodeKey, reservation: super::EdgeReservation) -> Self {
+    pub fn descend(mut self, child_key: NodeKey, reservation: EdgeReservation) -> Self {
         self.variation.push(reservation.mv());
         self.node_key = child_key;
         self.node_path.push(child_key);
@@ -216,32 +217,32 @@ impl WorkerPool {
     }
 
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
-        let (job_done_tx, job_done) = crossbeam_channel::unbounded();
+        let (job_done_tx, job_done) = unbounded();
         let eval_batch_size = config.eval_batch_size;
         let eval_claim_limit = config.eval_claim_limit;
         let mut gather_commands = Vec::with_capacity(config.gather_workers);
         let mut eval_commands = Vec::with_capacity(config.eval_workers);
-        let (backprop_commands, backprop_rx) = crossbeam_channel::unbounded();
+        let (nn_commands, nn_rx) = unbounded();
+        let (backprop_commands, backprop_rx) = unbounded();
         let mut threads = Vec::with_capacity(config.gather_workers + config.eval_workers + 2);
         for _ in 0..config.gather_workers {
-            let (tx, rx) = crossbeam_channel::unbounded();
+            let (tx, rx) = unbounded();
             let job_done = job_done_tx.clone();
             threads.push(thread::spawn(move || {
                 persistent_gather_worker(rx, job_done, eval_claim_limit)
             }));
             gather_commands.push(tx);
         }
-        let (nn_commands, nn_rx) = crossbeam_channel::unbounded();
-        threads.push(thread::spawn({
-            let job_done = job_done_tx.clone();
-            move || persistent_nn_worker(nn_rx, job_done, eval_batch_size)
-        }));
         for _ in 0..config.eval_workers {
-            let (tx, rx) = crossbeam_channel::unbounded();
+            let (tx, rx) = unbounded();
             let job_done = job_done_tx.clone();
             threads.push(thread::spawn(move || persistent_eval_worker(rx, job_done)));
             eval_commands.push(tx);
         }
+        threads.push(thread::spawn({
+            let job_done = job_done_tx.clone();
+            move || persistent_nn_worker(nn_rx, job_done, eval_batch_size)
+        }));
         threads.push(thread::spawn({
             let job_done = job_done_tx.clone();
             move || persistent_backprop_worker(backprop_rx, job_done)
@@ -280,13 +281,15 @@ impl WorkerPool {
                 .send(EvalCommand::Run(Arc::clone(shared), eval_rx.clone(), nn_tx.clone()))
                 .expect("persistent eval worker is alive");
         }
-        self.backprop_commands[0]
-            .send(BackpropCommand::Run(Arc::clone(shared), backprop_rx.clone()))
-            .expect("persistent backprop worker is alive");
+        for sender in &self.backprop_commands {
+            sender
+                .send(BackpropCommand::Run(Arc::clone(shared), backprop_rx.clone()))
+                .expect("persistent backprop worker is alive");
+        }
     }
 
     pub(crate) fn finish_job(&self) {
-        for _ in 0..self.gather_commands.len() + self.eval_commands.len() + 2 {
+        for _ in 0..self.gather_commands.len() + self.eval_commands.len() + self.backprop_commands.len() + 1 {
             self.job_done.recv().expect("persistent worker completion");
         }
     }
@@ -339,7 +342,7 @@ impl Drop for WorkerPool {
     }
 }
 
-// --- Gather loops ------------------------------------------------------------
+// --- Gather / Eval / NN / Backprop loops
 
 fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, eval_claim_limit: usize) {
     loop {
@@ -351,7 +354,7 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, eval_cla
                 }
                 if shared.stopping.load(Ordering::Acquire) {
                     event.cancel();
-                    shared.finish(false);
+                    shared.finish(1, false);
                 } else {
                     process_gather_event(&shared, event, eval_claim_limit);
                 }
@@ -359,13 +362,13 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, eval_cla
             #[cfg(not(feature = "benchmark"))]
             Ok(event) if shared.stopping.load(Ordering::Acquire) => {
                 event.cancel();
-                shared.finish(false);
+                shared.finish(1, false);
             }
             #[cfg(not(feature = "benchmark"))]
             Ok(event) => process_gather_event(&shared, event, eval_claim_limit),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -381,8 +384,6 @@ fn persistent_gather_worker(commands: Receiver<GatherCommand>, job_done: Sender<
         }
     }
 }
-
-// --- Eval / NN / Backprop loops（壳；算法在 eval / backprop）----------------
 
 fn eval_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_tx: Sender<NnRequest>) {
     let mut waiting: Vec<WaitingNn> = Vec::new();
@@ -415,13 +416,13 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_tx: Sen
                     shared.fail(error);
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            Err(RecvTimeoutError::Timeout) => {
                 if waiting.is_empty() || shared.stopping.load(Ordering::Acquire) {
                     continue;
                 }
                 wait_one_nn_completion(&shared, &mut waiting);
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err(RecvTimeoutError::Disconnected) => {
                 drain_waiting(&shared, &mut waiting);
                 while let Ok(event) = receiver.try_recv() {
                     shared.release_eval_claim();
@@ -451,16 +452,16 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
         #[cfg(feature = "benchmark")]
         let mut first = match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(request) => request,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         #[cfg(not(feature = "benchmark"))]
         let first = match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(request) => request,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         #[cfg(feature = "benchmark")]
         if let Some(wait) = first.take_queue_wait() {
@@ -501,9 +502,9 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
     loop {
         let first = match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(event) => event,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         let mut events = Vec::with_capacity(1 + receiver.len());
         events.push(first);
@@ -512,10 +513,11 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
             continue;
         }
         if shared.stopping.load(Ordering::Acquire) {
+            let n = events.len();
             for event in events {
                 event.cancel();
-                shared.finish(false);
             }
+            shared.finish(n, false);
             continue;
         }
         #[cfg(feature = "benchmark")]
@@ -533,9 +535,7 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
             .completed_depth
             .fetch_add(result.completed_depth, Ordering::AcqRel);
         shared.max_depth.fetch_max(result.max_depth, Ordering::AcqRel);
-        for _ in 0..result.completed_playouts {
-            shared.finish(true);
-        }
+        shared.finish(result.completed_playouts as usize, true);
     }
 }
 
