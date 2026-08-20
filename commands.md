@@ -97,7 +97,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test
 
 ## 9. 当前引擎 UCI 冒烟
 
-当前引擎提供正式 UCI stdin/stdout 入口；另有 `nn_eval`、`benchmark`、`search_benchmark`、`tree_shape` 和 Pikafish 对照脚本用于本地诊断。权重由 `WeightsFile` 在下一条 `position` 前加载。
+当前引擎提供正式 UCI stdin/stdout 入口；另有 `nn_eval`、`benchmark`、`search_benchmark` 和 Pikafish 对照脚本用于本地诊断。权重由 `WeightsFile` 在下一条 `position` 前加载。
 
 ```powershell
 @'
@@ -171,7 +171,8 @@ quit
 
 ## 10. 搜索与 ONNX 诊断
 
-`stream` 已是正式 UCI 搜索。`benchmark` 从 fresh tree 运行，用于观察吞吐、NN batch 和 collision：
+`stream` 已是正式 UCI 搜索。`benchmark` 从 fresh tree 运行，输出吞吐 / NN·cache / 队列 / 深度 / root；
+可选 `--collision-dist`、`--tree-depth`、`--trace`：
 
 ```powershell
 cargo run --release -p engin --bin benchmark -- `
@@ -188,14 +189,6 @@ cargo run --release -p engin --bin search_benchmark -- `
 
 `benchmark` 输出正常 cache hit（`hit`）和流水线队列数据；`search_benchmark` 输出根候选的
 `P / completed-N / in-flight / Q`，可加 `--trace` 和 `--track` 观察固定节点轨迹。两者都不模拟实战 tree reuse。`nn_eval` 可单独检查 ONNX：
-
-查看固定节点后的 tree 形状：
-
-```powershell
-cargo run --release -p engin --bin tree_shape -- --playouts 2000 --depth 4 --top 8
-```
-
-它首行显示总 collision 和比例，之后只递归已访问 node：每行显示 `P/N/Q/M`（root 没有入边，只显示 `N/Q/M`）；`M` 是 moves-left 的平均 ply 数。
 
 ```powershell
 cargo run --release -p engin --bin nn_eval -- --onnx data\x7.onnx --bench 20

@@ -25,6 +25,7 @@ mod backprop;
 mod decision;
 mod eval;
 mod expand;
+mod observer;
 mod param;
 mod pipeline;
 mod select;
@@ -39,9 +40,11 @@ pub use decision::{
 pub(crate) use decision::{
     best_mate_with_params, best_move_filtered_with_params, principal_variation_with_history_and_params, root_variations,
 };
+pub use observer::{
+    BenchObserver, BenchStats, InstantQueueStamp, NoQueueStamp, NoopObserver, QueueKind, QueueStamp, QueueStats,
+    SearchObserver,
+};
 pub use param::{SearchConfig, SearchParams};
-#[cfg(feature = "benchmark")]
-pub use pipeline::QueueStats;
 pub use pipeline::{Search, SearchControl, SearchLimits, Stats};
 pub(crate) use time::{TimeBudget, TimeManager};
 pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository, SearchTree, ValueDelta};

@@ -11,9 +11,9 @@ use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 use crate::neural::backend::{Backend, CachingBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::{
-    Search, SearchConfig, SearchControl, SearchLimits, SearchParams, SearchTree, Stats, TimeBudget, TimeManager,
-    WorkerPool, best_mate_with_params, best_move_filtered_with_params, principal_variation_with_history_and_params,
-    root_stats, root_variations,
+    NoopObserver, Search, SearchConfig, SearchControl, SearchLimits, SearchParams, SearchTree, Stats, TimeBudget,
+    TimeManager, WorkerPool, best_mate_with_params, best_move_filtered_with_params,
+    principal_variation_with_history_and_params, root_stats, root_variations,
 };
 use crate::uci_loop::{
     BestMoveInfo, GoParams, ThinkingInfo, Wdl, write_stdout, write_stdout_best_move, write_stdout_thinking,
@@ -413,7 +413,8 @@ impl Engine {
         };
         let graph = self.graph.as_ref().expect("position creates a graph with a backend");
         let root_is_black = graph.root_history().last().is_black_to_move();
-        let search = Search::new_with_graph_in_pool(backend, self.next_generation, graph, config, pool);
+        let search =
+            Search::new_with_graph_in_pool(backend, self.next_generation, graph, config, NoopObserver, pool);
         let snapshot = RootSnapshot {
             repository: Arc::clone(search.repository()),
             root_key: search.root_key(),

@@ -13,8 +13,6 @@ default = ["directml"]
 directml = ["ort/directml", "ort/download-binaries", "ort/copy-dylibs", "ort/tls-native"]
 # NVIDIA 线：ORT TensorRT EP。需 CUDA 13（nvcc）+ cuDNN 9 + TensorRT 10。
 tensorrt = ["ort/tensorrt", "ort/load-dynamic", "ort/api-24"]
-# 仅基准诊断：队列等待、collision 深度与 in-flight 分布不进入正式 UCI 热路径。
-benchmark = []
 
 [[bin]]
 name = "x7"
@@ -23,16 +21,6 @@ path = "src/main.rs"
 [[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
-required-features = ["benchmark"]
-
-[[bin]]
-name = "graph_shape"
-path = "src/bin/graph_shape.rs"
-required-features = ["benchmark"]
-
-[[bin]]
-name = "graph_measure"
-path = "src/bin/graph_measure.rs"
 
 [[bin]]
 name = "nn_eval"

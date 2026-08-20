@@ -70,12 +70,13 @@ KataGo LCB 思路的简化借鉴，不是其围棋 utility/weight 公式的移�
 `data/benchmark_positions.txt`；每行是“名称 | FEN”，使用时只复制 `|` 后的完整 FEN：
 
 ```powershell
-cargo run -p engin --release --features benchmark --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4
+cargo run -p engin --release --bin benchmark -- --fen "<FEN>" --movetime 3000 --repeat 3 --gathers 4 --evals 4
 ```
 
-`benchmark` 默认每轮都使用 fresh graph 与 fresh backend/cache，适合比较流水线本身。仅诊断 NN
-cache 跨图复用时加入 `--warm-cache`：每个 worker 配置的首轮填表，后续 `--repeat` 轮仍使用 fresh
-graph、但共享同一 NN cache；输出的 `hit` 是实际跳过 NN 的次数，不能与 graph reuse 混淆。
+`benchmark` 共用一个 CachingBackend：启动后默认做几次 NN 推理预热（ORT/TRT），
+每轮 fresh tree 并 `clear_cache`。输出分块：吞吐、NN/cache、队列、collision 数量、
+搜索深度 avg/max、默认 root。可选 `--collision-dist` / `--tree-depth` 看分布形状；
+`--trace` 在固定 `--playouts` 下按 completed 里程碑打印 root 快照。
 
 需要对照 pure virtual visit 与 virtual mean 时，传入 `--virtual-mean-fpu-scale <x>`；不传就是
 pure virtual visit。正式引擎当前固定 `x=1.0`，不暴露 UCI option。
@@ -103,14 +104,6 @@ completed-visit 里程碑的 root `P/N/Q`，用于比较“新 Q 证据出现后
 
 `--searchmoves "g6g9 i0g0 ..."` 与 UCI `go searchmoves` 使用相同的根过滤语义，可将比较限制在
 指定候选中；它用于诊断候选获得预算后的 Q/N 轨迹，不把外部引擎的候选当作真值。
-
-`graph_shape` 从固定节点预算后的 fresh graph 递归打印形状：每一行是一个已访问 node，只显示进入该 node
-的 `P/N/Q/M`；root 没有入边，故只显示 `N/Q/M`。`M` 是 moves-left 的平均 ply 数。`--depth` 限制展示深度，`--top` 限制每个节点展示的
-已访问子节点数。首行同时给出总 collision 及其占所有提交尝试的比例；它用于看图的访问形状，而不是记录运行中的 collision 热点：
-
-```powershell
-cargo run -p engin --release --features benchmark --bin graph_shape -- --fen "<FEN>" --playouts 2000 --depth 4 --top 8
-```
 
 `--moves` 从 startpos（或指定的 `--fen`）依次应用 ICCS 着法；它保留重复与规则历史，
 但每次 benchmark 仍从 fresh graph 开始，不模拟前几回合的 graph reuse。

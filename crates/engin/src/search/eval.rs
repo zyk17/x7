@@ -5,8 +5,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
-#[cfg(feature = "benchmark")]
-use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use xiangqi_core::Move;
@@ -19,41 +17,41 @@ use crate::neural::{
 
 use super::Node;
 use super::expand::{ExpandKind, classify_expand};
+use super::observer::{QueueKind, QueueStamp, SearchObserver};
 use super::pipeline::{RECEIVE_POLL, Shared};
 use super::workerpool::{BackpropEvent, PlayoutEvent};
 
 type NnReply = Result<(Arc<EncodedBatch>, usize), EnginError>;
 
 /// 交给 NN 线程的一个已编码局面（稀疏 InputPlanes；ORT 前再 expand）。
-pub(crate) struct NnRequest {
+pub(crate) struct NnRequest<S: QueueStamp = super::observer::NoQueueStamp> {
     planes: InputPlanes,
     reply: Sender<NnReply>,
-    #[cfg(feature = "benchmark")]
-    queued_at: Option<Instant>,
+    queued_at: S,
 }
 
-impl NnRequest {
-    #[cfg(feature = "benchmark")]
+impl<S: QueueStamp> NnRequest<S> {
     fn mark_queued(&mut self) {
-        self.queued_at = Some(Instant::now());
+        self.queued_at.mark();
     }
 
-    #[cfg(feature = "benchmark")]
-    pub(crate) fn take_queue_wait(&mut self) -> Option<Duration> {
-        self.queued_at.take().map(|queued_at| queued_at.elapsed())
+    pub(crate) fn observe_wait<O: SearchObserver<Stamp = S>>(&mut self, obs: &O, kind: QueueKind) {
+        if let Some(wait) = self.queued_at.take_wait() {
+            obs.on_queue_wait(kind, wait);
+        }
     }
 }
 
 /// Eval 正在等待此 node 的 NN。
-pub(crate) struct WaitingNn {
-    event: PlayoutEvent,
+pub(crate) struct WaitingNn<S: QueueStamp = super::observer::NoQueueStamp> {
+    event: PlayoutEvent<S>,
     node: Arc<Node>,
     legal_moves: Vec<Move>,
     cache_key: EvalCacheKey,
     reply: Receiver<NnReply>,
 }
 
-pub(crate) fn poll_nn_completions(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
+pub(crate) fn poll_nn_completions<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<WaitingNn<O::Stamp>>) {
     let mut i = 0;
     while i < waiting.len() {
         match waiting[i].reply.try_recv() {
@@ -85,7 +83,7 @@ pub(crate) fn poll_nn_completions(shared: &Shared, waiting: &mut Vec<WaitingNn>)
     }
 }
 
-pub(crate) fn wait_one_nn_completion(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
+pub(crate) fn wait_one_nn_completion<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<WaitingNn<O::Stamp>>) {
     if waiting.is_empty() || shared.stopping.load(Ordering::Acquire) {
         return;
     }
@@ -114,18 +112,18 @@ pub(crate) fn wait_one_nn_completion(shared: &Shared, waiting: &mut Vec<WaitingN
     }
 }
 
-pub(crate) fn drain_waiting(shared: &Shared, waiting: &mut Vec<WaitingNn>) {
+pub(crate) fn drain_waiting<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<WaitingNn<O::Stamp>>) {
     for item in waiting.drain(..) {
         cancel_waiting_item(shared, item);
     }
 }
 
 /// 处理一个 Gather claim 来的叶子：终局 / cache / 排队 NN。
-pub(crate) fn handle_eval_event(
-    shared: &Shared,
-    nn_tx: &Sender<NnRequest>,
-    waiting: &mut Vec<WaitingNn>,
-    mut event: PlayoutEvent,
+pub(crate) fn handle_eval_event<O: SearchObserver>(
+    shared: &Shared<O>,
+    nn_tx: &Sender<NnRequest<O::Stamp>>,
+    waiting: &mut Vec<WaitingNn<O::Stamp>>,
+    mut event: PlayoutEvent<O::Stamp>,
 ) -> Result<(), EnginError> {
     if shared.stopping.load(Ordering::Acquire) {
         shared.release_eval_claim();
@@ -159,8 +157,7 @@ pub(crate) fn handle_eval_event(
                 NnRequest {
                     planes,
                     reply: reply_tx,
-                    #[cfg(feature = "benchmark")]
-                    queued_at: None,
+                    queued_at: Default::default(),
                 },
             ) {
                 cancel_evaluation(shared, event, node);
@@ -183,8 +180,11 @@ pub(crate) fn handle_eval_event(
     }
 }
 
-fn send_nn_request(shared: &Shared, nn_tx: &Sender<NnRequest>, mut request: NnRequest) -> Result<(), EnginError> {
-    #[cfg(feature = "benchmark")]
+fn send_nn_request<O: SearchObserver>(
+    shared: &Shared<O>,
+    nn_tx: &Sender<NnRequest<O::Stamp>>,
+    mut request: NnRequest<O::Stamp>,
+) -> Result<(), EnginError> {
     request.mark_queued();
     loop {
         if shared.stopping.load(Ordering::Acquire) {
@@ -203,7 +203,12 @@ fn send_nn_request(shared: &Shared, nn_tx: &Sender<NnRequest>, mut request: NnRe
     }
 }
 
-fn complete_nn_item(shared: &Shared, item: WaitingNn, batch: Arc<EncodedBatch>, row: usize) -> Result<(), EnginError> {
+fn complete_nn_item<O: SearchObserver>(
+    shared: &Shared<O>,
+    item: WaitingNn<O::Stamp>,
+    batch: Arc<EncodedBatch>,
+    row: usize,
+) -> Result<(), EnginError> {
     shared.release_eval_claim();
     let eval = match eval_result_from_encoded_row(&batch, row, &item.legal_moves) {
         Ok(eval) => eval,
@@ -216,9 +221,9 @@ fn complete_nn_item(shared: &Shared, item: WaitingNn, batch: Arc<EncodedBatch>, 
     publish_eval(shared, item.event, item.node, item.legal_moves, eval)
 }
 
-fn publish_eval(
-    shared: &Shared,
-    event: PlayoutEvent,
+fn publish_eval<O: SearchObserver>(
+    shared: &Shared<O>,
+    event: PlayoutEvent<O::Stamp>,
     node: Arc<Node>,
     legal_moves: Vec<xiangqi_core::Move>,
     eval: Arc<EvalResult>,
@@ -243,13 +248,13 @@ fn publish_eval(
     Ok(())
 }
 
-fn cancel_waiting_item(shared: &Shared, item: WaitingNn) {
+fn cancel_waiting_item<O: SearchObserver>(shared: &Shared<O>, item: WaitingNn<O::Stamp>) {
     shared.release_eval_claim();
     cancel_evaluation(shared, item.event, item.node);
 }
 
 /// 释放已 claim 但不会发布结果的 evaluation event。
-pub(crate) fn cancel_evaluation(shared: &Shared, event: PlayoutEvent, node: Arc<Node>) {
+pub(crate) fn cancel_evaluation<O: SearchObserver>(shared: &Shared<O>, event: PlayoutEvent<O::Stamp>, node: Arc<Node>) {
     let key = event.node_key;
     event.cancel();
     node.abort_evaluation();
@@ -258,7 +263,7 @@ pub(crate) fn cancel_evaluation(shared: &Shared, event: PlayoutEvent, node: Arc<
 }
 
 /// 合批推理一批已编码请求（不含取队列循环）。
-pub(crate) fn infer_nn_batch(shared: &Shared, requests: Vec<NnRequest>) {
+pub(crate) fn infer_nn_batch<O: SearchObserver>(shared: &Shared<O>, requests: Vec<NnRequest<O::Stamp>>) {
     if requests.is_empty() {
         return;
     }
@@ -287,6 +292,9 @@ pub(crate) fn infer_nn_batch(shared: &Shared, requests: Vec<NnRequest>) {
             shared.network_batches.fetch_add(1, Ordering::AcqRel);
             shared.network_evaluations.fetch_add(batch as u64, Ordering::AcqRel);
             shared.network_batch_size_max.fetch_max(batch as u64, Ordering::AcqRel);
+            if O::ENABLED {
+                shared.observer.on_batch(batch);
+            }
             let output = Arc::new(output);
             for (row, request) in requests.into_iter().enumerate() {
                 let _ = request.reply.send(Ok((Arc::clone(&output), row)));
@@ -296,7 +304,7 @@ pub(crate) fn infer_nn_batch(shared: &Shared, requests: Vec<NnRequest>) {
     }
 }
 
-fn reject_nn_requests(requests: Vec<NnRequest>, error: EnginError) {
+fn reject_nn_requests<S: QueueStamp>(requests: Vec<NnRequest<S>>, error: EnginError) {
     for request in requests {
         let _ = request.reply.send(Err(error.clone()));
     }

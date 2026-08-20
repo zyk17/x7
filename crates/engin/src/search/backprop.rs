@@ -20,8 +20,8 @@ pub(crate) struct BackpropResult {
 }
 
 /// 路径增量回传：同路径 node 合并 delta，再一次写入；edge 按层 complete。
-pub(crate) fn complete_batch(
-    events: impl IntoIterator<Item = BackpropEvent>,
+pub(crate) fn complete_batch<S: super::observer::QueueStamp>(
+    events: impl IntoIterator<Item = BackpropEvent<S>>,
     repository: &NodeRepository,
 ) -> BackpropResult {
     let mut node_deltas = NodeDeltaMap::default();
@@ -75,12 +75,12 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
         let repository = NodeRepository::default();
-        let root_key = PlayoutEvent::root(1, Arc::clone(&history)).node_key;
+        let root_key = PlayoutEvent::<crate::search::NoQueueStamp>::root(1, Arc::clone(&history)).node_key;
         let root_node = repository.get_or_insert(root_key);
         assert!(root_node.try_begin_evaluation());
         let mv = Move::new(Square::parse("b2").expect("b2"), Square::parse("b3").expect("b3"));
         root_node.publish_edges(vec![(mv, 1.0)]);
-        let child = PlayoutEvent::root(1, Arc::clone(&history))
+        let child = PlayoutEvent::<crate::search::NoQueueStamp>::root(1, Arc::clone(&history))
             .descend(root_key.child(mv), root_node.reserve_edge(0).expect("edge"));
 
         complete_batch([BackpropEvent::evaluation(child, 0.4, 0.2, 2.0)], &repository);

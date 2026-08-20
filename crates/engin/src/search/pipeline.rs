@@ -18,6 +18,7 @@ use crate::neural::backend::Backend;
 
 use super::eval::{NnRequest, cancel_evaluation};
 use super::expand::path_terminal_value;
+use super::observer::{NoopObserver, SearchObserver};
 use super::param::{SearchConfig, SearchParams};
 use super::select::select_edge;
 use super::workerpool::{BackpropEvent, PlayoutEvent, WorkerPool};
@@ -30,68 +31,18 @@ const SHORT_CLOCK_IN_FLIGHT_CAP: usize = 8;
 
 // --- Stats / Shared ----------------------------------------------------------
 
-#[cfg(feature = "benchmark")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct QueueStats {
-    pub samples: u64,
-    pub total_wait_ns: u64,
-    pub max_wait_ns: u64,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Stats {
-    #[cfg(feature = "benchmark")]
-    pub submitted_playouts: u64,
     pub completed_playouts: u64,
     pub average_depth: u64,
     pub max_depth: u64,
-    #[cfg(feature = "benchmark")]
-    pub collisions: u64,
     pub network_batches: u64,
     pub network_evaluations: u64,
     pub cache_hits: u64,
     pub network_batch_size_max: u64,
-    #[cfg(feature = "benchmark")]
-    pub peak_in_flight: u64,
-    #[cfg(feature = "benchmark")]
-    pub collisions_by_depth: Vec<u64>,
-    #[cfg(feature = "benchmark")]
-    pub gather_queue: QueueStats,
-    #[cfg(feature = "benchmark")]
-    pub eval_queue: QueueStats,
-    #[cfg(feature = "benchmark")]
-    pub nn_queue: QueueStats,
-    #[cfg(feature = "benchmark")]
-    pub backprop_queue: QueueStats,
 }
 
-#[cfg(feature = "benchmark")]
-#[derive(Default)]
-pub(crate) struct QueueMetrics {
-    samples: AtomicU64,
-    total_wait_ns: AtomicU64,
-    max_wait_ns: AtomicU64,
-}
-
-#[cfg(feature = "benchmark")]
-impl QueueMetrics {
-    pub(crate) fn record(&self, wait: Duration) {
-        let nanos = wait.as_nanos().min(u64::MAX as u128) as u64;
-        self.samples.fetch_add(1, Ordering::Relaxed);
-        self.total_wait_ns.fetch_add(nanos, Ordering::Relaxed);
-        self.max_wait_ns.fetch_max(nanos, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> QueueStats {
-        QueueStats {
-            samples: self.samples.load(Ordering::Relaxed),
-            total_wait_ns: self.total_wait_ns.load(Ordering::Relaxed),
-            max_wait_ns: self.max_wait_ns.load(Ordering::Relaxed),
-        }
-    }
-}
-
-pub(crate) struct Shared {
+pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) backend: Arc<dyn Backend>,
     pub(crate) repository: Arc<NodeRepository>,
     pub(crate) generation: u64,
@@ -104,45 +55,31 @@ pub(crate) struct Shared {
     pub(crate) outstanding: AtomicUsize,
     /// 已交给 Eval 的叶子（编码或 NN）。满窗口就不再 claim 新叶子。
     pub(crate) nn_inflight: AtomicUsize,
-    #[cfg(feature = "benchmark")]
-    pub(crate) submitted: AtomicU64,
-    #[cfg(feature = "benchmark")]
-    pub(crate) peak_in_flight: AtomicU64,
     pub(crate) completed: AtomicU64,
     pub(crate) completed_depth: AtomicU64,
     pub(crate) max_depth: AtomicU64,
-    #[cfg(feature = "benchmark")]
-    pub(crate) collisions: AtomicU64,
     pub(crate) network_batches: AtomicU64,
     pub(crate) network_evaluations: AtomicU64,
     pub(crate) cache_hits: AtomicU64,
     pub(crate) network_batch_size_max: AtomicU64,
-    #[cfg(feature = "benchmark")]
-    pub(crate) collisions_by_depth: Mutex<Vec<u64>>,
-    #[cfg(feature = "benchmark")]
-    pub(crate) gather_queue: QueueMetrics,
-    #[cfg(feature = "benchmark")]
-    pub(crate) eval_queue: QueueMetrics,
-    #[cfg(feature = "benchmark")]
-    pub(crate) nn_queue: QueueMetrics,
-    #[cfg(feature = "benchmark")]
-    pub(crate) backprop_queue: QueueMetrics,
+    pub(crate) observer: O,
     pub(crate) error: Mutex<Option<EnginError>>,
     pub(crate) idle_lock: Mutex<()>,
     pub(crate) idle: Condvar,
-    pub(crate) gather_tx: crossbeam_channel::Sender<PlayoutEvent>,
-    pub(crate) eval_tx: crossbeam_channel::Sender<PlayoutEvent>,
-    pub(crate) backprop_tx: crossbeam_channel::Sender<BackpropEvent>,
+    pub(crate) gather_tx: crossbeam_channel::Sender<PlayoutEvent<O::Stamp>>,
+    pub(crate) eval_tx: crossbeam_channel::Sender<PlayoutEvent<O::Stamp>>,
+    pub(crate) backprop_tx: crossbeam_channel::Sender<BackpropEvent<O::Stamp>>,
     /// 撞上 `Evaluating` 叶子的 playout。先留着 reservation / μ；该叶子自己的
     /// backprop `complete` 之后再按 `node_key` 摘出来 cancel。
-    pub(crate) collision_waiters: Mutex<Vec<PlayoutEvent>>,
+    pub(crate) collision_waiters: Mutex<Vec<PlayoutEvent<O::Stamp>>>,
 }
 
-impl Shared {
+impl<O: SearchObserver> Shared<O> {
     pub(crate) fn start_playout(&self) {
         self.outstanding.fetch_add(1, Ordering::AcqRel);
-        #[cfg(feature = "benchmark")]
-        self.submitted.fetch_add(1, Ordering::Relaxed);
+        if O::ENABLED {
+            self.observer.on_submitted();
+        }
     }
 
     pub(crate) fn complete_root_terminal(&self) {
@@ -197,11 +134,9 @@ impl Shared {
     }
 
     /// 撞上正在评估的叶子：挂起整条 reservation，让 μ 继续分流。
-    pub(crate) fn park_collision(&self, event: PlayoutEvent) {
-        #[cfg(feature = "benchmark")]
-        {
-            self.collisions.fetch_add(1, Ordering::AcqRel);
-            self.record_collision_depths(&[event.variation.moves().len()]);
+    pub(crate) fn park_collision(&self, event: PlayoutEvent<O::Stamp>) {
+        if O::ENABLED {
+            self.observer.on_collision(event.variation.moves().len());
         }
         {
             let mut waiters = self.collision_waiters.lock();
@@ -252,7 +187,7 @@ impl Shared {
     /// Reference: LC3 overview's EvalWorker ownership model. Releasing only
     /// the edge reservations would leave the claimed node permanently
     /// `Evaluating`, so this also restores it to `Unexpanded`.
-    pub(crate) fn cancel_claimed_evaluation(&self, event: PlayoutEvent) {
+    pub(crate) fn cancel_claimed_evaluation(&self, event: PlayoutEvent<O::Stamp>) {
         let Some(node) = self.repository.get(event.node_key) else {
             event.cancel();
             self.finish(1, false);
@@ -272,13 +207,12 @@ impl Shared {
 
     /// 先增加 `nn_inflight` 再入队：图复用后 cache hit 极快，若 `try_send` 成功后才 +1，
     /// Eval 可能已经 `release_eval_claim`，第二手 `go` 就会 underflow 闪退。
-    pub(crate) fn send_eval(&self, mut event: PlayoutEvent) {
-        #[cfg(feature = "benchmark")]
+    pub(crate) fn send_eval(&self, mut event: PlayoutEvent<O::Stamp>) {
         event.mark_queued();
         self.nn_inflight.fetch_add(1, Ordering::AcqRel);
-        #[cfg(feature = "benchmark")]
-        self.peak_in_flight
-            .fetch_max(self.nn_inflight.load(Ordering::Relaxed) as u64, Ordering::Relaxed);
+        if O::ENABLED {
+            self.observer.on_peak_inflight(self.nn_inflight.load(Ordering::Relaxed));
+        }
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 self.release_eval_claim();
@@ -300,8 +234,7 @@ impl Shared {
         }
     }
 
-    pub(crate) fn send_backprop(&self, mut event: BackpropEvent) {
-        #[cfg(feature = "benchmark")]
+    pub(crate) fn send_backprop(&self, mut event: BackpropEvent<O::Stamp>) {
         event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
@@ -331,52 +264,22 @@ impl Shared {
     pub(crate) fn stats(&self) -> Stats {
         let completed_playouts = self.completed.load(Ordering::Acquire);
         Stats {
-            #[cfg(feature = "benchmark")]
-            submitted_playouts: self.submitted.load(Ordering::Acquire),
             completed_playouts,
             average_depth: self.completed_depth.load(Ordering::Acquire) / completed_playouts.max(1),
             max_depth: self.max_depth.load(Ordering::Acquire),
-            #[cfg(feature = "benchmark")]
-            collisions: self.collisions.load(Ordering::Acquire),
             network_batches: self.network_batches.load(Ordering::Acquire),
             network_evaluations: self.network_evaluations.load(Ordering::Acquire),
             cache_hits: self.cache_hits.load(Ordering::Acquire),
             network_batch_size_max: self.network_batch_size_max.load(Ordering::Acquire),
-            #[cfg(feature = "benchmark")]
-            peak_in_flight: self.peak_in_flight.load(Ordering::Acquire),
-            #[cfg(feature = "benchmark")]
-            collisions_by_depth: self.collisions_by_depth.lock().clone(),
-            #[cfg(feature = "benchmark")]
-            gather_queue: self.gather_queue.snapshot(),
-            #[cfg(feature = "benchmark")]
-            eval_queue: self.eval_queue.snapshot(),
-            #[cfg(feature = "benchmark")]
-            nn_queue: self.nn_queue.snapshot(),
-            #[cfg(feature = "benchmark")]
-            backprop_queue: self.backprop_queue.snapshot(),
-        }
-    }
-
-    /// Adds per-depth collision counts without changing selection behavior.
-    ///
-    /// Reference: LC3 overview, "Stats Collection".
-    #[cfg(feature = "benchmark")]
-    pub(crate) fn record_collision_depths(&self, depths: &[usize]) {
-        let mut counts = self.collisions_by_depth.lock();
-        for &depth in depths {
-            if counts.len() <= depth {
-                counts.resize(depth + 1, 0);
-            }
-            counts[depth] += 1;
         }
     }
 }
 
 // --- Gather 组装 -------------------------------------------------------------
 
-fn branch_at_expanded_node(
-    shared: &Shared,
-    event: &PlayoutEvent,
+fn branch_at_expanded_node<O: SearchObserver>(
+    shared: &Shared<O>,
+    event: &PlayoutEvent<O::Stamp>,
     node: &Node,
     depth: usize,
 ) -> Option<(NodeKey, EdgeReservation)> {
@@ -395,7 +298,11 @@ fn branch_at_expanded_node(
     Some((child, reservation))
 }
 
-pub(crate) fn process_gather_event(shared: &Shared, mut event: PlayoutEvent, eval_claim_limit: usize) {
+pub(crate) fn process_gather_event<O: SearchObserver>(
+    shared: &Shared<O>,
+    mut event: PlayoutEvent<O::Stamp>,
+    eval_claim_limit: usize,
+) {
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             event.cancel();
@@ -495,11 +402,11 @@ fn deadline_in_flight_limit(deadline: Option<Instant>, window: usize, batch: usi
 
 /// 运行中搜索可克隆的 stop 句柄。
 #[derive(Clone)]
-pub struct SearchControl {
-    shared: Arc<Shared>,
+pub struct SearchControl<O: SearchObserver = NoopObserver> {
+    shared: Arc<Shared<O>>,
 }
 
-impl SearchControl {
+impl<O: SearchObserver> SearchControl<O> {
     pub fn request_stop(&self) {
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.idle.notify_all();
@@ -513,17 +420,17 @@ impl SearchControl {
 /// 连续流式搜索：Gather / Eval / NN / Backprop。
 /// Eval：terminal | cache → Backprop；否则稀疏编码 → NN queue；NN expand + 合批推理后
 /// 整批交回 → Eval 切行/softmax/edges → Backprop。
-pub struct Search {
-    shared: Arc<Shared>,
+pub struct Search<O: SearchObserver = NoopObserver> {
+    shared: Arc<Shared<O>>,
     root_history: Arc<PositionHistory>,
     root_key: NodeKey,
     /// 启动本次 job 前 root 已有的 completed N。它计入 UCI `go nodes`，但不计入本次 NPS。
     initial_visits: u64,
-    worker_pool: Arc<WorkerPool>,
+    worker_pool: Arc<WorkerPool<O>>,
     workers_idle: bool,
 }
 
-impl Search {
+impl Search<NoopObserver> {
     pub fn new(
         backend: Arc<dyn Backend>,
         generation: u64,
@@ -541,8 +448,31 @@ impl Search {
         graph: &SearchTree,
         config: SearchConfig,
     ) -> Self {
+        Self::new_with_graph_with_observer(backend, generation, graph, config, NoopObserver)
+    }
+}
+
+impl<O: SearchObserver> Search<O> {
+    pub fn new_with_observer(
+        backend: Arc<dyn Backend>,
+        generation: u64,
+        root_history: Arc<PositionHistory>,
+        config: SearchConfig,
+        observer: O,
+    ) -> Self {
+        let tree = SearchTree::new(root_history);
+        Self::new_with_graph_with_observer(backend, generation, &tree, config, observer)
+    }
+
+    pub fn new_with_graph_with_observer(
+        backend: Arc<dyn Backend>,
+        generation: u64,
+        graph: &SearchTree,
+        config: SearchConfig,
+        observer: O,
+    ) -> Self {
         let worker_pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
-        Self::new_with_graph_in_pool(backend, generation, graph, config, worker_pool)
+        Self::new_with_graph_in_pool(backend, generation, graph, config, observer, worker_pool)
     }
 
     pub(crate) fn new_with_graph_in_pool(
@@ -550,7 +480,8 @@ impl Search {
         generation: u64,
         graph: &SearchTree,
         config: SearchConfig,
-        worker_pool: Arc<WorkerPool>,
+        observer: O,
+        worker_pool: Arc<WorkerPool<O>>,
     ) -> Self {
         config.validate();
         let resolved = config.resolve(backend.as_ref());
@@ -576,29 +507,14 @@ impl Search {
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
             nn_inflight: AtomicUsize::new(0),
-            #[cfg(feature = "benchmark")]
-            submitted: AtomicU64::new(0),
-            #[cfg(feature = "benchmark")]
-            peak_in_flight: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             completed_depth: AtomicU64::new(0),
             max_depth: AtomicU64::new(0),
-            #[cfg(feature = "benchmark")]
-            collisions: AtomicU64::new(0),
             network_batches: AtomicU64::new(0),
             network_evaluations: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             network_batch_size_max: AtomicU64::new(0),
-            #[cfg(feature = "benchmark")]
-            collisions_by_depth: Mutex::new(Vec::new()),
-            #[cfg(feature = "benchmark")]
-            gather_queue: QueueMetrics::default(),
-            #[cfg(feature = "benchmark")]
-            eval_queue: QueueMetrics::default(),
-            #[cfg(feature = "benchmark")]
-            nn_queue: QueueMetrics::default(),
-            #[cfg(feature = "benchmark")]
-            backprop_queue: QueueMetrics::default(),
+            observer,
             error: Mutex::new(None),
             idle_lock: Mutex::new(()),
             idle: Condvar::new(),
@@ -607,7 +523,7 @@ impl Search {
             backprop_tx,
             collision_waiters: Mutex::new(Vec::new()),
         });
-        let (nn_tx, nn_rx) = bounded::<NnRequest>(resolved.queue_capacity);
+        let (nn_tx, nn_rx) = bounded::<NnRequest<O::Stamp>>(resolved.queue_capacity);
         worker_pool.start_job(&shared, &gather_rx, &eval_rx, &nn_tx, &nn_rx, &backprop_rx);
         drop(nn_tx);
         Self {
@@ -632,6 +548,10 @@ impl Search {
         self.initial_visits
     }
 
+    pub fn observer(&self) -> &O {
+        &self.shared.observer
+    }
+
     /// root 在路径规则下已裁决结束（UCI 须把当前 root 当终局处理）。
     pub(crate) fn root_is_path_terminal(&self) -> bool {
         self.shared.root_path_terminal.load(Ordering::Acquire)
@@ -641,7 +561,7 @@ impl Search {
         self.shared.stats()
     }
 
-    pub fn control(&self) -> SearchControl {
+    pub fn control(&self) -> SearchControl<O> {
         SearchControl {
             shared: Arc::clone(&self.shared),
         }
@@ -668,7 +588,6 @@ impl Search {
         }
         self.shared.start_playout();
         let mut event = PlayoutEvent::at_root(self.shared.generation, self.root_key, Arc::clone(&self.root_history));
-        #[cfg(feature = "benchmark")]
         event.mark_queued();
         loop {
             if self.shared.stopping.load(Ordering::Acquire) {
@@ -822,7 +741,7 @@ impl Search {
     }
 }
 
-impl Drop for Search {
+impl<O: SearchObserver> Drop for Search<O> {
     fn drop(&mut self) {
         self.stop_and_finish();
     }

@@ -5,8 +5,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
-#[cfg(feature = "benchmark")]
-use std::time::Instant;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
 use parking_lot::Mutex;
@@ -19,6 +17,7 @@ use super::backprop::complete_batch;
 use super::eval::{
     NnRequest, WaitingNn, drain_waiting, handle_eval_event, infer_nn_batch, poll_nn_completions, wait_one_nn_completion,
 };
+use super::observer::{NoopObserver, NoQueueStamp, QueueKind, QueueStamp, SearchObserver};
 use super::param::{ResolvedSearchConfig, SearchConfig};
 use super::pipeline::{RECEIVE_POLL, Shared, process_gather_event};
 use super::{NodeKey, ValueDelta};
@@ -74,17 +73,16 @@ impl Variation {
 
 /// 一次完整 playout：从 root 到 leaf 的路径、reservation 与 variation 上下文。
 #[derive(Debug)]
-pub struct PlayoutEvent {
+pub struct PlayoutEvent<S: QueueStamp = NoQueueStamp> {
     pub generation: u64,
     pub node_key: NodeKey,
     pub(crate) node_path: Vec<NodeKey>,
     pub variation: Variation,
     pub reservations: Vec<EdgeReservation>,
-    #[cfg(feature = "benchmark")]
-    queued_at: Option<Instant>,
+    queued_at: S,
 }
 
-impl PlayoutEvent {
+impl<S: QueueStamp> PlayoutEvent<S> {
     pub fn root(generation: u64, root_history: Arc<PositionHistory>) -> Self {
         Self::at_root(generation, NodeKey::root(root_history.last().hash()), root_history)
     }
@@ -96,8 +94,7 @@ impl PlayoutEvent {
             node_path: vec![root_key],
             variation: Variation::root(root_history),
             reservations: Vec::new(),
-            #[cfg(feature = "benchmark")]
-            queued_at: None,
+            queued_at: S::default(),
         }
     }
 
@@ -119,33 +116,31 @@ impl PlayoutEvent {
         &self.node_path
     }
 
-    #[cfg(feature = "benchmark")]
     pub(crate) fn mark_queued(&mut self) {
-        self.queued_at = Some(Instant::now());
+        self.queued_at.mark();
     }
 
-    #[cfg(feature = "benchmark")]
-    pub(crate) fn take_queue_wait(&mut self) -> Option<std::time::Duration> {
-        self.queued_at.take().map(|queued_at| queued_at.elapsed())
+    pub(crate) fn observe_wait<O: SearchObserver<Stamp = S>>(&mut self, obs: &O, kind: QueueKind) {
+        if let Some(wait) = self.queued_at.take_wait() {
+            obs.on_queue_wait(kind, wait);
+        }
     }
 }
 
 /// 由 Gather/Eval 路由给 Backprop 的结果（算法在 `backprop::complete_batch`）。
 #[derive(Debug)]
-pub struct BackpropEvent {
-    pub(crate) playout: PlayoutEvent,
+pub struct BackpropEvent<S: QueueStamp = NoQueueStamp> {
+    pub(crate) playout: PlayoutEvent<S>,
     pub(crate) value: ValueDelta,
-    #[cfg(feature = "benchmark")]
-    queued_at: Option<Instant>,
+    queued_at: S,
 }
 
-impl BackpropEvent {
-    pub(crate) fn evaluation(playout: PlayoutEvent, wl: f32, draw: f32, plies_left: f32) -> Self {
+impl<S: QueueStamp> BackpropEvent<S> {
+    pub(crate) fn evaluation(playout: PlayoutEvent<S>, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
             playout,
             value: ValueDelta::with_plies_left(wl, draw, plies_left),
-            #[cfg(feature = "benchmark")]
-            queued_at: None,
+            queued_at: S::default(),
         }
     }
 
@@ -153,54 +148,54 @@ impl BackpropEvent {
         self.playout.cancel();
     }
 
-    #[cfg(feature = "benchmark")]
     pub(crate) fn mark_queued(&mut self) {
-        self.queued_at = Some(Instant::now());
+        self.queued_at.mark();
     }
 
-    #[cfg(feature = "benchmark")]
-    pub(crate) fn take_queue_wait(&mut self) -> Option<std::time::Duration> {
-        self.queued_at.take().map(|queued_at| queued_at.elapsed())
+    pub(crate) fn observe_wait<O: SearchObserver<Stamp = S>>(&mut self, obs: &O, kind: QueueKind) {
+        if let Some(wait) = self.queued_at.take_wait() {
+            obs.on_queue_wait(kind, wait);
+        }
     }
 }
 
 // --- Pool --------------------------------------------------------------------
 
-enum GatherCommand {
-    Run(Arc<Shared>, Receiver<PlayoutEvent>),
+enum GatherCommand<O: SearchObserver> {
+    Run(Arc<Shared<O>>, Receiver<PlayoutEvent<O::Stamp>>),
     Shutdown,
 }
 
-enum EvalCommand {
-    Run(Arc<Shared>, Receiver<PlayoutEvent>, Sender<NnRequest>),
+enum EvalCommand<O: SearchObserver> {
+    Run(Arc<Shared<O>>, Receiver<PlayoutEvent<O::Stamp>>, Sender<NnRequest<O::Stamp>>),
     Shutdown,
 }
 
-enum NnCommand {
-    Run(Arc<Shared>, Receiver<NnRequest>),
+enum NnCommand<O: SearchObserver> {
+    Run(Arc<Shared<O>>, Receiver<NnRequest<O::Stamp>>),
     Shutdown,
 }
 
-enum BackpropCommand {
-    Run(Arc<Shared>, Receiver<BackpropEvent>),
+enum BackpropCommand<O: SearchObserver> {
+    Run(Arc<Shared<O>>, Receiver<BackpropEvent<O::Stamp>>),
     Shutdown,
 }
 
 /// Engine 持有的固定 worker 拓扑。
 ///
 /// 每个 job 独占树视图、队列与 generation；线程池只跨 job 保留线程。
-pub(crate) struct WorkerPool {
-    gather_commands: Vec<Sender<GatherCommand>>,
-    eval_commands: Vec<Sender<EvalCommand>>,
-    nn_commands: Sender<NnCommand>,
-    backprop_commands: Vec<Sender<BackpropCommand>>,
+pub(crate) struct WorkerPool<O: SearchObserver = NoopObserver> {
+    gather_commands: Vec<Sender<GatherCommand<O>>>,
+    eval_commands: Vec<Sender<EvalCommand<O>>>,
+    nn_commands: Sender<NnCommand<O>>,
+    backprop_commands: Vec<Sender<BackpropCommand<O>>>,
     job_done: Receiver<()>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     eval_batch_size: usize,
     eval_claim_limit: usize,
 }
 
-impl WorkerPool {
+impl<O: SearchObserver> WorkerPool<O> {
     pub(crate) fn new(backend: &dyn Backend, config: &SearchConfig) -> Self {
         config.validate();
         Self::from_resolved(&config.resolve(backend))
@@ -229,23 +224,23 @@ impl WorkerPool {
             let (tx, rx) = unbounded();
             let job_done = job_done_tx.clone();
             threads.push(thread::spawn(move || {
-                persistent_gather_worker(rx, job_done, eval_claim_limit)
+                persistent_gather_worker::<O>(rx, job_done, eval_claim_limit)
             }));
             gather_commands.push(tx);
         }
         for _ in 0..config.eval_workers {
             let (tx, rx) = unbounded();
             let job_done = job_done_tx.clone();
-            threads.push(thread::spawn(move || persistent_eval_worker(rx, job_done)));
+            threads.push(thread::spawn(move || persistent_eval_worker::<O>(rx, job_done)));
             eval_commands.push(tx);
         }
         threads.push(thread::spawn({
             let job_done = job_done_tx.clone();
-            move || persistent_nn_worker(nn_rx, job_done, eval_batch_size)
+            move || persistent_nn_worker::<O>(nn_rx, job_done, eval_batch_size)
         }));
         threads.push(thread::spawn({
             let job_done = job_done_tx.clone();
-            move || persistent_backprop_worker(backprop_rx, job_done)
+            move || persistent_backprop_worker::<O>(backprop_rx, job_done)
         }));
         Self {
             gather_commands,
@@ -261,12 +256,12 @@ impl WorkerPool {
 
     pub(crate) fn start_job(
         &self,
-        shared: &Arc<Shared>,
-        gather_rx: &Receiver<PlayoutEvent>,
-        eval_rx: &Receiver<PlayoutEvent>,
-        nn_tx: &Sender<NnRequest>,
-        nn_rx: &Receiver<NnRequest>,
-        backprop_rx: &Receiver<BackpropEvent>,
+        shared: &Arc<Shared<O>>,
+        gather_rx: &Receiver<PlayoutEvent<O::Stamp>>,
+        eval_rx: &Receiver<PlayoutEvent<O::Stamp>>,
+        nn_tx: &Sender<NnRequest<O::Stamp>>,
+        nn_rx: &Receiver<NnRequest<O::Stamp>>,
+        backprop_rx: &Receiver<BackpropEvent<O::Stamp>>,
     ) {
         for sender in &self.gather_commands {
             sender
@@ -324,7 +319,7 @@ impl WorkerPool {
     }
 }
 
-impl Drop for WorkerPool {
+impl<O: SearchObserver> Drop for WorkerPool<O> {
     fn drop(&mut self) {
         for sender in &self.gather_commands {
             let _ = sender.send(GatherCommand::Shutdown);
@@ -344,14 +339,15 @@ impl Drop for WorkerPool {
 
 // --- Gather / Eval / NN / Backprop loops
 
-fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, eval_claim_limit: usize) {
+fn gather_worker<O: SearchObserver>(
+    shared: Arc<Shared<O>>,
+    receiver: Receiver<PlayoutEvent<O::Stamp>>,
+    eval_claim_limit: usize,
+) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
-            #[cfg(feature = "benchmark")]
             Ok(mut event) => {
-                if let Some(wait) = event.take_queue_wait() {
-                    shared.gather_queue.record(wait);
-                }
+                event.observe_wait(&shared.observer, QueueKind::Gather);
                 if shared.stopping.load(Ordering::Acquire) {
                     event.cancel();
                     shared.finish(1, false);
@@ -359,13 +355,6 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, eval_cla
                     process_gather_event(&shared, event, eval_claim_limit);
                 }
             }
-            #[cfg(not(feature = "benchmark"))]
-            Ok(event) if shared.stopping.load(Ordering::Acquire) => {
-                event.cancel();
-                shared.finish(1, false);
-            }
-            #[cfg(not(feature = "benchmark"))]
-            Ok(event) => process_gather_event(&shared, event, eval_claim_limit),
             Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -373,7 +362,11 @@ fn gather_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, eval_cla
     }
 }
 
-fn persistent_gather_worker(commands: Receiver<GatherCommand>, job_done: Sender<()>, eval_claim_limit: usize) {
+fn persistent_gather_worker<O: SearchObserver>(
+    commands: Receiver<GatherCommand<O>>,
+    job_done: Sender<()>,
+    eval_claim_limit: usize,
+) {
     while let Ok(command) = commands.recv() {
         match command {
             GatherCommand::Run(shared, receiver) => {
@@ -385,8 +378,12 @@ fn persistent_gather_worker(commands: Receiver<GatherCommand>, job_done: Sender<
     }
 }
 
-fn eval_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_tx: Sender<NnRequest>) {
-    let mut waiting: Vec<WaitingNn> = Vec::new();
+fn eval_worker<O: SearchObserver>(
+    shared: Arc<Shared<O>>,
+    receiver: Receiver<PlayoutEvent<O::Stamp>>,
+    nn_tx: Sender<NnRequest<O::Stamp>>,
+) {
+    let mut waiting: Vec<WaitingNn<O::Stamp>> = Vec::new();
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             drain_waiting(&shared, &mut waiting);
@@ -401,17 +398,8 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_tx: Sen
         poll_nn_completions(&shared, &mut waiting);
 
         match receiver.recv_timeout(RECEIVE_POLL) {
-            #[cfg(feature = "benchmark")]
             Ok(mut event) => {
-                if let Some(wait) = event.take_queue_wait() {
-                    shared.eval_queue.record(wait);
-                }
-                if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
-                    shared.fail(error);
-                }
-            }
-            #[cfg(not(feature = "benchmark"))]
-            Ok(event) => {
+                event.observe_wait(&shared.observer, QueueKind::Eval);
                 if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
                     shared.fail(error);
                 }
@@ -435,7 +423,7 @@ fn eval_worker(shared: Arc<Shared>, receiver: Receiver<PlayoutEvent>, nn_tx: Sen
     }
 }
 
-fn persistent_eval_worker(commands: Receiver<EvalCommand>, job_done: Sender<()>) {
+fn persistent_eval_worker<O: SearchObserver>(commands: Receiver<EvalCommand<O>>, job_done: Sender<()>) {
     while let Ok(command) = commands.recv() {
         match command {
             EvalCommand::Run(shared, receiver, nn_tx) => {
@@ -447,38 +435,22 @@ fn persistent_eval_worker(commands: Receiver<EvalCommand>, job_done: Sender<()>)
     }
 }
 
-fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usize) {
+fn nn_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver<NnRequest<O::Stamp>>, batch_size: usize) {
     loop {
-        #[cfg(feature = "benchmark")]
         let mut first = match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(request) => request,
             Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        #[cfg(not(feature = "benchmark"))]
-        let first = match receiver.recv_timeout(RECEIVE_POLL) {
-            Ok(request) => request,
-            Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        #[cfg(feature = "benchmark")]
-        if let Some(wait) = first.take_queue_wait() {
-            shared.nn_queue.record(wait);
-        }
+        first.observe_wait(&shared.observer, QueueKind::Nn);
         let mut requests = vec![first];
         while requests.len() < batch_size {
             match receiver.try_recv() {
-                #[cfg(feature = "benchmark")]
                 Ok(mut request) => {
-                    if let Some(wait) = request.take_queue_wait() {
-                        shared.nn_queue.record(wait);
-                    }
+                    request.observe_wait(&shared.observer, QueueKind::Nn);
                     requests.push(request);
                 }
-                #[cfg(not(feature = "benchmark"))]
-                Ok(request) => requests.push(request),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
@@ -486,7 +458,11 @@ fn nn_worker(shared: Arc<Shared>, receiver: Receiver<NnRequest>, batch_size: usi
     }
 }
 
-fn persistent_nn_worker(commands: Receiver<NnCommand>, job_done: Sender<()>, batch_size: usize) {
+fn persistent_nn_worker<O: SearchObserver>(
+    commands: Receiver<NnCommand<O>>,
+    job_done: Sender<()>,
+    batch_size: usize,
+) {
     while let Ok(command) = commands.recv() {
         match command {
             NnCommand::Run(shared, receiver) => {
@@ -498,7 +474,7 @@ fn persistent_nn_worker(commands: Receiver<NnCommand>, job_done: Sender<()>, bat
     }
 }
 
-fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
+fn backprop_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver<BackpropEvent<O::Stamp>>) {
     loop {
         let first = match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(event) => event,
@@ -520,11 +496,8 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
             shared.finish(n, false);
             continue;
         }
-        #[cfg(feature = "benchmark")]
         for event in &mut events {
-            if let Some(wait) = event.take_queue_wait() {
-                shared.backprop_queue.record(wait);
-            }
+            event.observe_wait(&shared.observer, QueueKind::Backprop);
         }
         let leaf_keys: Vec<NodeKey> = events.iter().map(|event| event.playout.node_key).collect();
         let result = complete_batch(events, &shared.repository);
@@ -539,7 +512,7 @@ fn backprop_worker(shared: Arc<Shared>, receiver: Receiver<BackpropEvent>) {
     }
 }
 
-fn persistent_backprop_worker(commands: Receiver<BackpropCommand>, job_done: Sender<()>) {
+fn persistent_backprop_worker<O: SearchObserver>(commands: Receiver<BackpropCommand<O>>, job_done: Sender<()>) {
     while let Ok(command) = commands.recv() {
         match command {
             BackpropCommand::Run(shared, receiver) => {

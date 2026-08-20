@@ -242,40 +242,13 @@ mcts2 树：走一步后 sibling 子树与新 root 的 path-key 不相交，可�
   proven-bound / sticky mate 依赖路径语义，不能直接共享给全部入边；首版按 px0 的
   `Node`（局部入边）/`LowNode`（共享局面）分层处理，不把 history-dependent result 或 proof 直接写成
   graph-wide terminal。
-- `graph_shape` 与无 history 的 PV 必须有 path-local visited set，遇图回边停止，不能无限递归。
+- 无 history 的 PV 必须有 path-local visited set，遇图回边停止，不能无限递归。
   UCI `info pv`（带 root history）在回边落到本条 PV 已见节点时改走 ContinuationTree，继续展示岔开后的着法。
 - `subtree_is_settled`、GC 和 root reset 都必须使用 graph traversal 的 visited set；不能通过
   `key.child(move)` 推导 child。
 - UCI `bestmove` 只读取 root edge，故语义可保持；其 PV 需要 graph-safe 路径展开。带 history 的 UCI PV 在回边时可改走 ContinuationTree，不在此编造 Graph 上的第二条边。
 
 ## 分阶段验收
-
-### Phase 0：结构测量
-
-迁移前先在 tree 快照上按 board key 测量重复 node，得到 `mergeable` 基线；它回答的是：若保留该次
-tree 搜索的所有 path，合并相同棋盘后可去掉多少物理 tree node。
-
-迁移后 `graph_measure` 从实际 repository 的已完成 edge 只遍历一次每个共享 node。它统计 reachable
-node/edge、path-local terminal edge，以及同一 child 被多个 parent 指向的 `merged_edges`。后者只是一跳
-fan-in，不能替代 tree 基线中的递归 path 展开率；不枚举所有 variation 是为避免 DAG 的路径组合指数膨胀。
-
-```powershell
-cargo run -p engin --release --bin graph_measure -- --fen "<FEN>" --moves "..." --playouts 10000
-```
-
-两种指标都不自动等价为固定时间收益：NN cache、collision、不同选择路径都会影响实际 evaluation
-数和 Elo。历史、rule60、重复冲突仍由 Variation 在 path-local 层裁决，不由本工具把它们混入共享 node
-的统计。
-
-当前 `data/x7.onnx`、DirectML、fresh graph、25,000 completed playout 的第一组结构基线：
-
-| 局面 | graph node | completed child edge | direct merged edge | NN eval |
-| --- | ---: | ---: | ---: | ---: |
-| `initial` | 24,984 | 29,723 | 4,740 (15.9%) | 24,984 |
-| `middle_01` | 23,211 | 24,414 | 1,204 (4.9%) | 23,051 |
-| `middle_30` | 24,650 | 26,180 | 1,531 (5.8%) | 24,649 |
-| `evasion_01` | 6,096 | 6,277 | 182 (2.9%) | 5,771 |
-| `proof_mate_01` | 24,567 | 28,304 | 3,738 (13.2%) | 24,514 |
 
 随预算从 1,000 到 25,000，`initial` 的 direct fan-in 从 10.1% 升至 15.9%，
 `proof_mate_01` 从 6.5% 升至 13.2%；`evasion_01` 始终约 3%。这说明当前 MCGS 的直接汇合主要
@@ -327,7 +300,7 @@ cargo run -p engin --release --bin graph_measure -- --fen "<FEN>" --moves "..." 
 
 ### Phase 3：图 GC、PV 与 terminal（已完成）
 
-改为当前-root 可达 mark/sweep GC；PV/graph-shape 防环；明确 history-dependent terminal 的局部语义。
+改为当前-root 可达 mark/sweep GC；PV 防环；明确 history-dependent terminal 的局部语义。
 流式路径与 UCI 生命周期回归已通过；在此基础上才能开始固定时间 Elo 比较。
 
 ### Phase 4：评估
