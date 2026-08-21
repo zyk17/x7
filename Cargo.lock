@@ -3,19 +3,6 @@
 version = 4
 
 [[package]]
-name = "ahash"
-version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
-dependencies = [
- "cfg-if",
- "getrandom",
- "once_cell",
- "version_check",
- "zerocopy",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -117,15 +104,8 @@ dependencies = [
  "nohash-hasher",
  "ort",
  "parking_lot",
- "quick_cache",
  "xiangqi_core",
 ]
-
-[[package]]
-name = "equivalent"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "errno"
@@ -175,12 +155,6 @@ dependencies = [
  "r-efi",
  "wasip2",
 ]
-
-[[package]]
-name = "hashbrown"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "hmac-sha256"
@@ -477,18 +451,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quick_cache"
-version = "0.6.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9c6658afe513a3b484e3abfdaa0d03ef3c0bbf017542c178dd55f94eb3051f9"
-dependencies = [
- "ahash",
- "equivalent",
- "hashbrown",
- "parking_lot",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -693,12 +655,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
-name = "version_check"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
 name = "wasip2"
 version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -762,26 +718,6 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "xiangqi_core"
 version = "0.1.0"
-
-[[package]]
-name = "zerocopy"
-version = "0.8.54"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7cbbc0a705a0fd05cc3676525980d2bf5a9bc4adac6d6475209a7887cf59d19"
-dependencies = [
- "zerocopy-derive",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.8.54"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e817b7b52d0c7358d3246da9d69935ebb18116b2b102b4230dac079b4862f5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "zeroize"

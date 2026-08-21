@@ -9,6 +9,17 @@
 # 初始局面。
 initial | rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1
 
+# 固定窄访问漏斗：3 秒下 collision 很高、NN batch 吃不满；只用于后续
+# MaxInFlight / batch 实验，不作为走法质量或规则样本。
+funnel_slow_01 | r1bakar2/9/nc2b2c1/2p1p3p/p5pn1/2P3P2/P3P3P/1CN1B1C2/6R2/2BAKA1NR w - - 0 1
+funnel_slow_02 | 2bakar2/8n/n3b4/1cp1p1P1p/p8/2P4N1/P2rPN2P/1C2B4/6R2/2BAKA2R w - - 0 1
+
+# 20260813 实战复测的漏斗候选。实战的跨回合 reuse 在相邻残局阶段曾降至约
+# 0.5–2k；fresh 基线显示二者分别是 batch 饿死与 batch 饱和的不同形态。保留为
+# MaxInFlight / batch 性能回归输入，不把它们当作走法质量或规则样本。
+funnel_reuse_01 | 4kabr1/2c1a4/2n3n2/p1N1pC1cp/2R3p2/9/P2rP1P1P/4C4/6N2/2BAKABR1 w - - 0 1
+funnel_reuse_02 | 4ka3/4a4/4R4/9/7P1/9/6c2/B4A3/9/3K1AB2 w - - 0 1
+
 # 子力和战术结构各异的中局。
 middle_01 | r1ba1a3/4kn3/2n1b4/pNp1p1p1p/4c4/6P2/P1P2R2P/1CcC5/9/2BAKAB2 w - - 0 1
 middle_02 | 1cbak4/9/n2a5/2p1p3p/5cp2/2n2N3/6PCP/3AB4/2C6/3A1K1N1 w - - 0 1
@@ -72,3 +83,11 @@ proof_mate_01 | 5aC2/1P2k4/9/7R1/9/3n5/8r/B3B4/9/4K4 b - - 0 1
 # 强制反例：Pikafish 验证 `h9h4` 为 mate -10；`i4e4` 是相对顽强的败着。
 # 用于观察搜索是否将强制反例变为 terminal evidence，而非只按暂时 Q 选择 `h9h4`。
 proof_mate_02 | 4kabC1/9/3ab4/p5P1N/9/8R/9/1n1ABC3/1c3K3/2Br5 w - - 0 1
+
+# 残局弃子攻杀：高 Q 方差 / 低先验样本。Pikafish：`h8g8` mate 9、`f8f9` mate 18
+#（弃子）、`d8c8` 仅大优非短杀。网常把高 P 压在 `d8c8`，开放搜吃满 visits；
+# `f8f9`/`h8g8` 专搜时 Q 晚成熟、浅层抖动大。属于 **PUCT-v + LCB** 共同样本：
+# PUCT（含后续均值差）要给高方差边证明预算；LCB 则在 Q 已高且方差收敛后，
+# 仍应给这类着当最优解的机会（不能只按 visit 或瞬时均值卡死）。不是吞吐基准，
+# 也不要求网络先验完美。
+proof_variance_01 | 2bak4/3PaP1P1/9/4n4/2b6/6B2/3p5/4BA3/5C3/3K1A3 w - - 0 1

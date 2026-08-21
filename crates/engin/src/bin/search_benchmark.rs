@@ -1,15 +1,15 @@
 //! 固定节点下观察 cPUCT/FPU 对根边分流的影响。
 //!
 //! worker、batch、缓存吞吐实验见 `benchmark`。本工具固定正式默认的 worker
-//! 拓扑，只改变 `SearchParams`，并始终从 fresh tree 开始。
-//! 根过滤沿用 `SearchState::begin_search` 的 `searchmoves` 语义。
+//! 拓扑，只改变 `SearchParams`，并始终从 fresh graph 开始。
+//! 根过滤沿用 Engine 的 `searchmoves` 语义。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use engin::neural::backend::Backend;
 use engin::neural::onnx::OnnxBackend;
-use engin::search::{Search, SearchConfig, SearchGeneration, SearchParams, root_stats};
+use engin::search::{Search, SearchConfig, SearchLimits, SearchParams, root_stats};
 use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
 struct Args {
@@ -24,13 +24,17 @@ struct Args {
     cpuct_bases: Vec<f32>,
     cpuct_factors: Vec<f32>,
     fpu_reduction: f32,
+    virtual_mean_fpu_scale: f32,
+    lcb_stdevs: f32,
+    lcb_min_visit_fraction: f32,
     root_top: usize,
 }
 
 fn usage() -> &'static str {
     "usage: search_benchmark [--onnx data/x7.onnx] [--fen \"...\"] [--moves \"c3c4 h7h3 ...\"] [--playouts 2048] \\
      [--trace 128,256,512] [--track g6g9,i0g0] [--searchmoves \"g6g9 i0g0\"] [--cpuct 1.0,1.745] \\
-     [--cpuct-base 20000,38739] [--cpuct-factor 2.5,3.894] [--fpu-reduction 0.330] [--root-top 8]"
+     [--cpuct-base 20000,38739] [--cpuct-factor 2.5,3.894] [--fpu-reduction 0.330] [--virtual-mean-fpu-scale 1.0] \\
+     [--lcb-stdevs 5] [--lcb-min-visit-fraction 0.15] [--root-top 8]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -46,6 +50,9 @@ fn parse_args() -> Result<Args, String> {
     let mut cpuct_bases = vec![defaults.cpuct_base];
     let mut cpuct_factors = vec![defaults.cpuct_factor];
     let mut fpu_reduction = defaults.fpu_reduction;
+    let mut virtual_mean_fpu_scale = defaults.virtual_mean_fpu_scale;
+    let mut lcb_stdevs = defaults.lcb_stdevs;
+    let mut lcb_min_visit_fraction = defaults.lcb_min_visit_fraction;
     let mut root_top = 8;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -99,6 +106,30 @@ fn parse_args() -> Result<Args, String> {
                     false,
                 )?
             }
+            "--virtual-mean-fpu-scale" => {
+                virtual_mean_fpu_scale = parse_float(
+                    "--virtual-mean-fpu-scale",
+                    &args.next().ok_or("--virtual-mean-fpu-scale needs a value")?,
+                    false,
+                )?
+            }
+            "--lcb-stdevs" => {
+                lcb_stdevs = parse_float(
+                    "--lcb-stdevs",
+                    &args.next().ok_or("--lcb-stdevs requires a number")?,
+                    false,
+                )?
+            }
+            "--lcb-min-visit-fraction" => {
+                lcb_min_visit_fraction = parse_float(
+                    "--lcb-min-visit-fraction",
+                    &args.next().ok_or("--lcb-min-visit-fraction requires a number")?,
+                    false,
+                )?;
+                if lcb_min_visit_fraction > 1.0 {
+                    return Err("--lcb-min-visit-fraction must not exceed 1".into());
+                }
+            }
             "--root-top" => {
                 root_top = args
                     .next()
@@ -128,6 +159,9 @@ fn parse_args() -> Result<Args, String> {
         cpuct_bases,
         cpuct_factors,
         fpu_reduction,
+        virtual_mean_fpu_scale,
+        lcb_stdevs,
+        lcb_min_visit_fraction,
         root_top,
     })
 }
@@ -180,7 +214,7 @@ fn parse_move_list(text: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// 与 `SearchState::begin_search` 保持相同的根着过滤语义。
+/// 与 Engine 保持相同的根着过滤语义。
 fn root_filter(history: &PositionHistory, requested: &[String]) -> Result<Vec<xiangqi_core::Move>, String> {
     let board = history.last().board();
     let legal = board.generate_legal_moves();
@@ -226,7 +260,7 @@ fn print_roots(search: &Search, root_is_black: bool, top: usize, tracked: &[Stri
             edge.prior,
             edge.completed_visits,
             edge.started_visits.saturating_sub(edge.completed_visits),
-            edge.q
+            edge.q,
         );
     }
     if tracked.is_empty() {
@@ -246,7 +280,7 @@ fn print_roots(search: &Search, root_is_black: bool, top: usize, tracked: &[Stri
                 edge.prior,
                 edge.completed_visits,
                 edge.started_visits.saturating_sub(edge.completed_visits),
-                edge.q
+                edge.q,
             ),
             None => println!("                       {:<6}  --  not legal at root", move_text),
         }
@@ -264,16 +298,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let filter = root_filter(&history, &args.searchmoves)?;
     let backend = OnnxBackend::from_file(&args.onnx)?;
     println!(
-        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3}",
+        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3} virtual_mean_fpu_scale={:.2} lcb_stdevs={:.3} lcb_min_visit_fraction={:.3}",
         args.onnx.display(),
         backend.provider().name(),
         args.playouts,
         args.cpucts,
         args.cpuct_bases,
         args.cpuct_factors,
-        args.fpu_reduction
+        args.fpu_reduction,
+        args.virtual_mean_fpu_scale,
+        args.lcb_stdevs,
+        args.lcb_min_visit_fraction,
     );
-    println!("note: fresh tree; worker=4/4/1; batch uses backend default; trace drains at each milestone");
+    println!(
+        "note: fresh graph; workers=4 Search / 4 Eval; batch uses backend default; trace drains at each milestone"
+    );
     let mut generation = 0;
     for &cpuct in &args.cpucts {
         for &cpuct_base in &args.cpuct_bases {
@@ -284,30 +323,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cpuct_base,
                     cpuct_factor,
                     fpu_reduction: args.fpu_reduction,
+                    virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
+                    lcb_stdevs: args.lcb_stdevs,
+                    lcb_min_visit_fraction: args.lcb_min_visit_fraction,
                 };
                 println!(
-                    "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3}",
-                    args.fpu_reduction
+                    "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3} virtual_mean_fpu_scale={:.2} lcb={:.3}/{:.3}",
+                    args.fpu_reduction, args.virtual_mean_fpu_scale, args.lcb_stdevs, args.lcb_min_visit_fraction
                 );
                 let mut search = Search::new(
                     Arc::new(OnnxBackend::from_file(&args.onnx)?) as Arc<dyn Backend>,
-                    SearchGeneration(generation),
+                    generation,
                     Arc::clone(&history),
                     SearchConfig {
                         params,
-                        root_move_filter: filter.clone(),
                         ..SearchConfig::default()
                     },
                 );
-                let mut previous = 0;
                 for &milestone in &args.trace {
-                    search.run_playouts(milestone - previous)?;
-                    previous = milestone;
+                    // `Search::run_playouts` 的参数是当前 Search 的累计目标；trace
+                    // milestone 不能再减去上一项，否则 100→1000 会错误停在 1000 而
+                    // 非“额外跑 900”后的 1000。
+                    search.run_with_limits(SearchLimits {
+                        max_playouts: Some(milestone),
+                        root_move_filter: filter.clone(),
+                        ..Default::default()
+                    })?;
                     println!("    trace completed={milestone}");
                     print_roots(&search, root_is_black, args.root_top, &args.track);
                 }
-                if previous < args.playouts {
-                    search.run_playouts(args.playouts - previous)?;
+                if args.trace.last().copied().unwrap_or(0) < args.playouts {
+                    search.run_with_limits(SearchLimits {
+                        max_playouts: Some(args.playouts),
+                        root_move_filter: filter.clone(),
+                        ..Default::default()
+                    })?;
                 }
                 print_roots(&search, root_is_black, args.root_top, &args.track);
                 search.stop_and_finish();

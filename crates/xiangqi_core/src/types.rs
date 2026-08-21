@@ -1,4 +1,4 @@
-//! px0 `src/chess/types.h:31-222`。
+//! 棋子、坐标、着法类型。来源：px0 types。
 
 use std::fmt;
 
@@ -6,7 +6,7 @@ pub const FILE_NB: u8 = 9;
 pub const RANK_NB: u8 = 10;
 pub const SQUARE_NB: u8 = FILE_NB * RANK_NB;
 
-/// px0 `PieceType`：索引和字符表必须保持一致。
+/// 棋子类型：索引和字符表必须保持一致。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(u8)]
 pub enum PieceType {
@@ -286,7 +286,6 @@ impl Square {
     }
 }
 
-/// px0 `board.cc:79`：`(rank_delta, file_delta)`。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Direction(pub i32, pub i32);
 

@@ -162,6 +162,40 @@ def test_v3_mixed_fp16_onnx_export_keeps_source_model_float32(tmp_path: Path):
     assert not any("soft_policy_head" in name or "root_value_out" in name for name in names)
 
 
+def test_v3_mixed_fp16_onnx_keeps_homogeneous_layernorm_dtype(tmp_path: Path):
+    """ORT LayerNormalization 要求激活与权重同 dtype；mixed 图里 LN 应随 trunk 为 FP16。"""
+    onnx = pytest.importorskip("onnx")
+    from onnx import helper
+
+    model = KnowledgeTransformer(
+        width=32,
+        num_blocks=2,
+        heads=4,
+        ffn_channels=96,
+        value_head=True,
+        moves_left_head=True,
+    ).eval()
+    out = tmp_path / "v3_ln.onnx"
+    torch.onnx.export(
+        KnowledgeOnnxExport(model, mixed_fp16=True).eval(),
+        torch.zeros((1, 124, 10, 9)),
+        str(out),
+        input_names=["board"],
+        output_names=["logits", "value", "moves_left"],
+        opset_version=17,
+        dynamo=False,
+    )
+    graph = onnx.load(str(out)).graph
+    ln_inits = [t for t in graph.initializer if "norm" in t.name.lower()]
+    assert ln_inits, "expected LayerNorm initializers in exported graph"
+    for tensor in ln_inits:
+        assert helper.tensor_dtype_to_string(tensor.data_type) == "TensorProto.FLOAT16", tensor.name
+    assert any(
+        helper.tensor_dtype_to_string(t.data_type) == "TensorProto.FLOAT16" for t in graph.initializer
+    )
+    assert sum(1 for n in graph.node if n.op_type == "Cast") >= 2
+
+
 def test_pure_cnn_policy_head_forward_shape():
     m = KnowledgeResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
     x = torch.zeros((2, 124, 10, 9), dtype=torch.float32)

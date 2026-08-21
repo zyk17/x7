@@ -1,5 +1,3 @@
-//! px0 `src/chess/gamestate.h/.cc` 与 `engine.cc:65-78` 的位置序列验收。
-
 use std::sync::Once;
 
 use xiangqi_core::{GameState, Position, PositionHistory, STARTPOS_FEN, initialize_magic_bitboards};

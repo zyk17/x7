@@ -97,7 +97,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pytest nn\tests\test
 
 ## 9. 当前引擎 UCI 冒烟
 
-当前引擎提供正式 UCI stdin/stdout 入口；另有 `nn_eval`、`benchmark`、`search_benchmark`、`tree_shape` 和 Pikafish 对照脚本用于本地诊断。权重由 `WeightsFile` 在下一条 `position` 前加载。
+当前引擎提供正式 UCI stdin/stdout 入口；另有 `nn_eval`、`benchmark`、`search_benchmark` 和 Pikafish 对照脚本用于本地诊断。权重由 `WeightsFile` 在下一条 `position` 前加载。
 
 ```powershell
 @'
@@ -107,7 +107,7 @@ isready
 position startpos
 go nodes 64
 quit
-'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+'@ | C:\projects\77xiangqi_engine\target\release\x7.exe
 ```
 
 验证真实 history：
@@ -120,7 +120,7 @@ isready
 position startpos moves h2e2 h7e7
 go nodes 64
 quit
-'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+'@ | C:\projects\77xiangqi_engine\target\release\x7.exe
 ```
 
 默认不指定 `--bin` 时，`cargo run -p engin` 仍然启动主 UCI 引擎：
@@ -129,11 +129,11 @@ quit
 cargo run --release -p engin
 ```
 
-当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
-`CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`GatherWorkers`、`EvalWorkers`、`BackpropWorkers`。
+当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`NNCacheSizePowerOfTwo`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
+`CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`LcbStdevs`、`LcbMinVisitFraction`、`Threads`。
 `MiniBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
-搜索参数默认采用 LC0 的 `CPuct=1.745`、`CPuctBase=38739`、`CPuctFactor=3.894`、`FpuReduction=0.330`；
-worker 默认 `4/4/1`。option 名称和布尔值大小写不敏感。
+搜索参数默认 `CPuct=1.75`、`CPuctBase=40000`、`CPuctFactor=4.0`、`FpuReduction=0.200`；
+`Threads=8` 只在 Gather/Eval 间近似平分，NN 与 Backprop 固定各一条线程。option 名称和布尔值大小写不敏感。
 
 当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
 `movetime` 不可与时钟字段混用；`infinite` 不可与其他预算混用。`depth`、`mate`、`ponder` 仍会明确报错。
@@ -152,7 +152,7 @@ position startpos moves h2e2 h7e7
 go nodes 64
 wait
 quit
-'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+'@ | C:\projects\77xiangqi_engine\target\release\x7.exe
 ```
 
 `setoption` 示例：
@@ -166,20 +166,21 @@ isready
 position startpos
 go nodes 64
 quit
-'@ | C:\projects\77xiangqi_engine\target\release\engin.exe
+'@ | C:\projects\77xiangqi_engine\target\release\x7.exe
 ```
 
 ## 10. 搜索与 ONNX 诊断
 
-`stream` 已是正式 UCI 搜索。`benchmark` 从 fresh tree 运行，用于观察吞吐、NN batch 和 collision：
+`stream` 已是正式 UCI 搜索。`benchmark` 从 fresh tree 运行，输出吞吐 / NN·cache / 队列 / 深度 / root；
+可选 `--collision-dist`、`--tree-depth`、`--trace`：
 
 ```powershell
 cargo run --release -p engin --bin benchmark -- `
   --movetime 3000 --repeat 3 `
-  --gathers 4 --evals 4 --backprops 1
+  --gathers 3 --evals 5
 ```
 
-`search_benchmark` 固定 `4/4/1` worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-tree 根部分流。使用完整历史诊断评分拐点：
+`search_benchmark` 固定 `4/4` Search/Eval worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-graph 根部分流。使用完整历史诊断评分拐点：
 
 ```powershell
 cargo run --release -p engin --bin search_benchmark -- `
@@ -188,14 +189,6 @@ cargo run --release -p engin --bin search_benchmark -- `
 
 `benchmark` 输出正常 cache hit（`hit`）和流水线队列数据；`search_benchmark` 输出根候选的
 `P / completed-N / in-flight / Q`，可加 `--trace` 和 `--track` 观察固定节点轨迹。两者都不模拟实战 tree reuse。`nn_eval` 可单独检查 ONNX：
-
-查看固定节点后的 tree 形状：
-
-```powershell
-cargo run --release -p engin --bin tree_shape -- --playouts 2000 --depth 4 --top 8
-```
-
-它首行显示总 collision 和比例，之后只递归已访问 node：每行显示 `P/N/Q/M`（root 没有入边，只显示 `N/Q/M`）；`M` 是 moves-left 的平均 ply 数。
 
 ```powershell
 cargo run --release -p engin --bin nn_eval -- --onnx data\x7.onnx --bench 20
@@ -207,6 +200,9 @@ cargo run --release -p engin --bin nn_eval -- --onnx data\x7.onnx --bench 20
 python scripts\pikafish_compare.py --moves "c3c4 g6g5 ..." --movetime 3000 --multipv 3
 ```
 
+脚本固定设置 Pikafish `Threads=4`、`Hash=512 MB`；不要把其原始默认的 `1` thread、`16 MB`
+当作搜索质量对照。
+
 ## 11. 质量检查
 
 在仓库根目录执行：
@@ -214,7 +210,6 @@ python scripts\pikafish_compare.py --moves "c3c4 g6g5 ..." --movetime 3000 --mul
 ```powershell
 cargo fmt --check
 cargo test -p engin --lib
-cargo test -p engin --test uci_search_test
 cargo clippy -p engin --all-targets -- -D warnings
 ```
 
@@ -254,10 +249,25 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-directml.ps1 `
   -BundleDir C:\dist\x7-directml
 ```
 
-CUDA 是 NVIDIA 专用备用包，需要 CUDA 13、cuDNN 9 和脚本中配置的 ONNX Runtime 目录：
+本机日常开发默认使用 DirectML。大量 playout 的 benchmark 才显式使用 TensorRT；它需要 CUDA 13（含
+nvcc）、cuDNN 9、TensorRT 10（`nvinfer_10.dll`）。路径写在 `scripts/build-tensorrt.ps1` 与
+`crates/engin/build.rs` 头部（`CUDA_PATH` / `X7_MSVC_BIN` 可覆盖）。
+
+开发构建：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build-cuda.ps1
+cargo run -p engin --release
+
+# 大节点 benchmark：显式切 TensorRT。
+cargo run -p engin --release --no-default-features --features tensorrt --bin search_benchmark -- --playouts 25000
 ```
 
-它输出到 `bundle-cuda\`；CUDA 与 DirectML 是两份互斥包，不构成运行时回退链。
+打包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-tensorrt.ps1
+```
+
+它输出到 `bundle-tensorrt\`，并复制配置 `tensorrt_libs` 目录的全部 DLL（包括
+`nvinfer_builder_resource_*`）；目标机仍须提供 CUDA 13 / cuDNN 9。TensorRT 与 DirectML 是两份互斥包，不构成运行时回退链。
+发行包里的 `trt_cache` 保持为空；engine 由用户首跑按本机 GPU 构建。

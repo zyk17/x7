@@ -1,198 +1,260 @@
-//! 对照 px0 `src/engine.cc:137-250` 的 UCI Engine 生命周期。
+//! UCI Engine：拥有 graph、worker pool 与每次搜索 job。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use xiangqi_core::{GameState, STARTPOS_FEN};
+use parking_lot::Mutex;
+use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
-use crate::EnginError;
-use crate::Options;
-use crate::callbacks::SearchResponder;
-use crate::neural::backend::{Backend, CachingBackend, UniformBackend};
+use crate::neural::backend::{Backend, CachingBackend};
 use crate::neural::onnx::OnnxBackend;
-use crate::search::SearchSession;
-use crate::uci_loop::{GoParams, StringUciResponder};
+use crate::search::{
+    NoopObserver, Search, SearchConfig, SearchControl, SearchLimits, SearchParams, SearchTree, Stats, TimeBudget,
+    TimeManager, WorkerPool, best_mate_with_params, best_move_filtered_with_params,
+    principal_variation_with_history_and_params, root_stats, root_variations,
+};
+use crate::uci_loop::{
+    BestMoveInfo, GoParams, ThinkingInfo, Wdl, write_stdout, write_stdout_best_move, write_stdout_thinking,
+};
+use crate::{EnginError, Options};
 
-/// px0 `Engine` 的 P3 子集：搜索与 UCI 调度。
+/// UCI、图、worker 与单次搜索的唯一 owner。
 pub struct Engine {
-    // UCI 进程已启动时 ONNX 初始化仍可能失败；`None` 表示没有可用的 stream
-    // session，刻意不回退到 UniformBackend。
-    search: Option<SearchSession>,
+    // UCI 进程已启动时 ONNX 初始化仍可能失败；`None` 表示没有可用 backend，刻意不回退到 UniformBackend。
+    backend: Option<Arc<dyn Backend>>,
+    graph: Option<SearchTree>,
+    graph_reaper: GraphReaper,
+    worker_pool: Option<Arc<WorkerPool>>,
+    next_generation: u64,
+    applied_nn_cache_size: Option<u8>,
+    time_manager: TimeManager,
+    active: Option<ActiveSearch>,
     options: Options,
     position: Option<GameState>,
     manages_weights_file: bool,
     backend_error: Option<String>,
     loaded_weights_file: Option<String>,
-    responder: Option<Arc<dyn SearchResponder>>,
+    /// 让 abort 与 owner 的整组输出线性化，避免新命令之后漏出旧 generation 的结果。
+    stdout_gate: Arc<Mutex<()>>,
+}
+
+struct ActiveSearch {
+    control: SearchControl,
+    publish_output: Arc<AtomicBool>,
+    owner_thread: JoinHandle<Result<(), EnginError>>,
+    started: Instant,
+    clock_budget: Option<TimeBudget>,
+}
+
+/// 后台回收旧 sibling 子树，或释放已被新 position 替换的整张 repository。
+///
+/// 前进换根后的 prune 可与下一手 `go` 重叠；下一次 `position` 入口会 `wait_idle`，
+/// 避免悔棋回到仍挂着待删 sibling 的祖先根时与 prune 竞态。
+struct GraphReaper {
+    sender: Option<crossbeam_channel::Sender<GraphCleanup>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+enum GraphCleanup {
+    Prune(Arc<crate::search::NodeRepository>, Vec<crate::search::NodeKey>),
+    Retire(Arc<crate::search::NodeRepository>),
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+impl GraphReaper {
+    fn new() -> Self {
+        let (sender, receiver) = crossbeam_channel::unbounded::<GraphCleanup>();
+        let thread = thread::Builder::new()
+            .name("engin-graph-reaper".into())
+            .spawn(move || {
+                while let Ok(cleanup) = receiver.recv() {
+                    match cleanup {
+                        GraphCleanup::Prune(repository, roots) => {
+                            let _ = repository.remove_subtrees(roots);
+                        }
+                        GraphCleanup::Retire(repository) => match Arc::try_unwrap(repository) {
+                            Ok(repository) => repository.release_incrementally(),
+                            Err(repository) => drop(repository),
+                        },
+                        GraphCleanup::Flush(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            })
+            .expect("graph reaper thread starts");
+        Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        }
+    }
+
+    fn retire(&self, repository: Arc<crate::search::NodeRepository>) {
+        self.sender
+            .as_ref()
+            .expect("graph reaper sender lives with engine")
+            .send(GraphCleanup::Retire(repository))
+            .expect("graph reaper thread is alive");
+    }
+
+    fn prune(&self, repository: Arc<crate::search::NodeRepository>, roots: Vec<crate::search::NodeKey>) {
+        if roots.is_empty() {
+            return;
+        }
+        self.sender
+            .as_ref()
+            .expect("graph reaper sender lives with engine")
+            .send(GraphCleanup::Prune(repository, roots))
+            .expect("graph reaper thread is alive");
+    }
+
+    /// 等到此前已入队的 prune/retire 做完。
+    fn wait_idle(&self) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        self.sender
+            .as_ref()
+            .expect("graph reaper sender lives with engine")
+            .send(GraphCleanup::Flush(done_tx))
+            .expect("graph reaper thread is alive");
+        done_rx.recv().expect("graph reaper flush completes");
+    }
+}
+
+impl Drop for GraphReaper {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// UCI info 最小输出间隔（毫秒）。
+const UCI_INFO_MINIMUM_FREQUENCY: Duration = Duration::from_secs(5);
+/// owner 在 stream 等待在途 event 时，最多每 100ms 检查一次是否值得输出进度。
+const OWNER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// search owner 持有的只读 root view，不参与 worker 的搜索状态。
+#[derive(Clone)]
+struct RootSnapshot {
+    repository: Arc<crate::search::NodeRepository>,
+    root_key: crate::search::NodeKey,
+    root_history: Arc<PositionHistory>,
+    initial_visits: u64,
+    root_is_black: bool,
+    root_move_filter: Vec<Move>,
+    multi_pv: usize,
+    params: SearchParams,
+}
+
+/// 仅用于判断是否值得构造完整 UCI `info` 的 root marker。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SearchProgress {
+    best_move: Option<Move>,
+    depth: i32,
+    seldepth: i32,
+}
+
+/// 上次已经输出的 root marker。
+#[derive(Default)]
+struct PublishedInfo {
+    progress: Option<SearchProgress>,
+    time: i64,
 }
 
 impl Default for Engine {
-    /// Rust adapter for the formal px0 `Engine::Engine` constructor
-    /// (`src/engine.cc:137-167`); it adds no separate initialization path.
+    /// 构造空 Engine；不另设初始化路径。
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Engine {
-    /// px0 `Engine::Engine` + `Engine::UpdateBackendConfig`
-    /// (`src/engine.cc:137-167`), with ONNX initialization deferred until
-    /// `SetPosition`. This is the formal UCI constructor.
+    /// UCI 启动时立即创建空 Engine。
+    /// 正式 ONNX backend 则由首次 `set_position` 中的 `UpdateBackendConfig` 加载。
     pub fn new() -> Self {
         Self {
-            search: None,
+            backend: None,
+            graph: None,
+            graph_reaper: GraphReaper::new(),
+            worker_pool: None,
+            next_generation: 0,
+            applied_nn_cache_size: None,
+            time_manager: TimeManager::default(),
+            active: None,
             options: Options::default(),
             position: None,
             manages_weights_file: true,
             backend_error: None,
             loaded_weights_file: None,
-            responder: None,
+            stdout_gate: Arc::new(Mutex::new(())),
         }
     }
 
-    pub fn with_backend(backend: Box<dyn Backend>) -> Self {
-        let backend: Arc<dyn Backend> = Arc::from(backend);
-        let search = SearchSession::new(Arc::clone(&backend));
-        Self {
-            search: Some(search),
-            options: Options::default(),
-            position: None,
-            manages_weights_file: false,
-            backend_error: None,
-            loaded_weights_file: None,
-            responder: None,
-        }
+    /// 安装新 backend 时丢弃旧图与旧 worker；调用方已先 stop/drain。
+    /// 按当前 option 重建或更新 NN backend。
+    fn install_backend(&mut self, backend: Arc<dyn Backend>) {
+        self.backend = Some(backend);
+        self.graph = None;
+        self.worker_pool = None;
+        self.next_generation = 0;
+        self.applied_nn_cache_size = None;
     }
 
-    /// Explicit backend construction for tests and direct callers. Formal UCI
-    /// startup uses `new` and receives its model through `WeightsFile`.
-    pub fn from_onnx_file(path: impl AsRef<std::path::Path>) -> Result<Self, EnginError> {
-        Ok(Self::with_backend(Box::new(CachingBackend::new(Box::new(
-            OnnxBackend::from_file(path)?,
-        )))))
-    }
-
-    /// Deterministic test-only constructor. It never participates in the
-    /// formal UCI `WeightsFile` lifecycle.
-    pub fn uniform() -> Self {
-        Self::with_backend(Box::new(UniformBackend::default()))
-    }
-
-    pub fn has_search(&self) -> bool {
-        self.search.is_some()
-    }
-
-    /// Installs the structured search output callback for library users.
-    /// UCI uses the same API with its queue-backed text adapter.
-    pub fn set_search_responder(&mut self, responder: Option<Arc<dyn SearchResponder>>) {
-        self.responder = responder;
-        if let Some(search) = self.search.as_mut() {
-            search.set_responder(self.responder.clone());
-        }
-    }
-
-    /// px0 `Engine::UpdateBackendConfig` (`src/engine.cc:153-167`), restricted
-    /// to this port's single formal ONNX backend. A failed backend result
-    /// removes the old search, so a changed/broken `WeightsFile` cannot keep
-    /// searching with stale weights.
+    /// 加载失败时不保留旧权重。
     fn update_backend_config(&mut self) -> Result<(), EnginError> {
         if !self.manages_weights_file {
             return Ok(());
         }
-        // 在停止或替换搜索前快照 OptionsDict 值。px0 的 `std::string` option 值同样在
-        // 整个 `UpdateBackendConfig` 调用中稳定（`src/engine.cc:153-167`）。
         let path = self.options.weights_file.trim().to_string();
         if path.is_empty() {
-            self.stop_and_drop_search()?;
+            self.stop_and_drop_backend()?;
             self.loaded_weights_file = None;
             self.backend_error = Some("WeightsFile is not configured".into());
             return Ok(());
         }
-        if self.loaded_weights_file.as_deref() == Some(path.as_str()) && self.search.is_some() {
+        if self.loaded_weights_file.as_deref() == Some(path.as_str()) && self.backend.is_some() {
             return Ok(());
         }
 
-        self.stop_and_drop_search()?;
+        self.stop_and_drop_backend()?;
         match OnnxBackend::from_file(&path) {
             Ok(backend) => {
-                let backend: Arc<dyn Backend> = Arc::new(CachingBackend::new(Box::new(backend)));
-                let mut search = SearchSession::new(Arc::clone(&backend));
-                search.set_multi_pv(self.options.multi_pv);
-                search.set_mini_batch_size(self.options.mini_batch_size);
-                search.set_search_params(
-                    self.options.cpuct,
-                    self.options.cpuct_base,
-                    self.options.cpuct_factor,
-                    self.options.fpu_reduction,
-                );
-                search.set_worker_counts(
-                    self.options.gather_workers,
-                    self.options.eval_workers,
-                    self.options.backprop_workers,
-                );
-                search.set_responder(self.responder.clone());
-                self.search = Some(search);
-                self.loaded_weights_file = Some(path.clone());
+                self.install_backend(Arc::new(CachingBackend::with_cache_size_power_of_two(
+                    Box::new(backend),
+                    self.options.nn_cache_size_power_of_two,
+                )));
+                self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
+                self.loaded_weights_file = Some(path);
                 self.backend_error = None;
-                Ok(())
             }
             Err(error) => {
                 self.loaded_weights_file = None;
                 self.backend_error = Some(format!("cannot load WeightsFile {path}: {error}"));
-                Ok(())
             }
-        }
-    }
-
-    /// px0 `Engine::EnsureSearchStopped` (`src/engine.cc:149-151`).
-    fn stop_and_drop_search(&mut self) -> Result<(), EnginError> {
-        if let Some(mut search) = self.search.take() {
-            search.abort()?;
         }
         Ok(())
     }
-}
 
-impl Engine {
+    /// 换权重前停止当前 job。
+    fn stop_and_drop_backend(&mut self) -> Result<(), EnginError> {
+        self.abort()?;
+        self.backend = None;
+        self.graph = None;
+        self.worker_pool = None;
+        self.applied_nn_cache_size = None;
+        Ok(())
+    }
+
     pub fn options(&self) -> &Options {
         &self.options
     }
 
+    /// 更新 Engine 生命周期 option。已启动 job 使用自己创建时的 `SearchConfig` / `SearchParams` 快照。
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), EnginError> {
-        self.options.set_uci_option(name, value)?;
-        let option_name = name.to_ascii_lowercase();
-        match option_name.as_str() {
-            "multipv" => {
-                if let Some(search) = self.search.as_mut() {
-                    search.set_multi_pv(self.options.multi_pv);
-                }
-            }
-            "minibatchsize" => {
-                if let Some(search) = self.search.as_mut() {
-                    search.set_mini_batch_size(self.options.mini_batch_size);
-                }
-            }
-            "cpuct" | "cpuctbase" | "cpuctfactor" | "fpureduction" => {
-                if let Some(search) = self.search.as_mut() {
-                    search.set_search_params(
-                        self.options.cpuct,
-                        self.options.cpuct_base,
-                        self.options.cpuct_factor,
-                        self.options.fpu_reduction,
-                    );
-                }
-            }
-            "gatherworkers" | "evalworkers" | "backpropworkers" => {
-                if let Some(search) = self.search.as_mut() {
-                    search.set_worker_counts(
-                        self.options.gather_workers,
-                        self.options.eval_workers,
-                        self.options.backprop_workers,
-                    );
-                }
-            }
-            _ => {}
-        }
-        Ok(())
+        self.options.set_uci_option(name, value)
     }
 
     pub(crate) fn ensure_ready(&mut self) -> Result<(), EnginError> {
@@ -200,66 +262,545 @@ impl Engine {
     }
 
     pub(crate) fn new_game(&mut self) -> Result<(), EnginError> {
-        if let Some(search) = self.search.as_mut() {
-            search.abort()?;
-            search.reset_clock();
-        }
+        self.abort()?;
+        self.time_manager.reset();
         self.set_position(STARTPOS_FEN, &[])
     }
 
+    /// 先 stop/drain，再用完整 history 复用或重置树。
     pub(crate) fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), EnginError> {
-        // SearchSession 先结束当前 job、drain reservation，再替换可复用树。
-        // px0 `Engine::SetPosition` 在停止搜索后、新建 `GameState` 前更新 backend
-        // 配置（`src/engine.cc:187-197`）。此处重试也处理先前 `setoption` 失败后才出现的
-        // 文件。
         self.update_backend_config()?;
         let state = GameState::from_fen_moves(fen, moves)?;
-        if let Some(search) = self.search.as_mut() {
-            search.set_position(&state)?;
+        let history = Arc::new(state.position_history());
+        self.abort()?;
+        // 先收完上一手异步 prune，再改 root；否则悔棋回到祖先根时可能与仍在删的 sibling 竞态。
+        self.graph_reaper.wait_idle();
+        if let Some(graph) = self.graph.as_mut() {
+            if let Some(retired) = graph.reset_to_history_after_drain(Arc::clone(&history))? {
+                self.graph_reaper.retire(retired);
+            }
+            let pending = graph.take_pending_gc_roots();
+            self.graph_reaper.prune(Arc::clone(graph.repository()), pending);
+        } else if self.backend.is_some() {
+            self.graph = Some(SearchTree::new(history));
         }
         self.position = Some(state);
         Ok(())
     }
 
-    pub(crate) fn go(&mut self, params: &GoParams, responder: &mut dyn StringUciResponder) -> Result<(), EnginError> {
-        // px0 只有在 Ponder option 启用完整 position/ponderhit 生命周期时才接受
-        // `go ponder`（`src/engine.cc:205-215`）。本实现尚未翻译该 option 与生命周期，
-        // 因此接受 token 后静默运行普通搜索会构成伪 UCI 功能。
-        if params.ponder {
-            return Err(EnginError::Uci("Ponder is not enabled.".into()));
+    /// 检查 stream 已实现的 UCI `go` 子集；未支持项明确拒绝。
+    fn validate_go(&self, params: &GoParams) -> Result<(), EnginError> {
+        if params.depth.is_some() {
+            return Err(EnginError::PortIncomplete("go depth is not supported"));
         }
-        // px0 `Engine::Go` 调用 `StartSearch` 前会经 `NewGame` 初始化缺失的 position
-        // （`src/engine.cc:206-219`）。NewGame 随后运行 SetPosition 和
-        // UpdateBackendConfig，因此先检查 backend 会错误拒绝合法的裸 `go` 命令。
-        if self.position.is_none() {
-            self.new_game()?;
+        if params.mate.is_some() {
+            return Err(EnginError::PortIncomplete("go mate is not supported"));
         }
-        let Some(search) = self.search.as_mut() else {
-            let reason = self.backend_error.as_deref().unwrap_or("WeightsFile is not configured");
-            responder.send_raw_response(&format!("info string cannot search: {reason}"));
-            return Ok(());
-        };
-        search.start(params)?;
+        if params.nodes.is_some_and(|nodes| nodes <= 0) {
+            return Err(EnginError::Uci("go nodes must be positive".into()));
+        }
+        if params.movetime.is_some_and(|time| time < 0) {
+            return Err(EnginError::Uci("go movetime must not be negative".into()));
+        }
+        let has_clock = params.wtime.is_some()
+            || params.btime.is_some()
+            || params.winc.is_some()
+            || params.binc.is_some()
+            || params.movestogo.is_some();
+        if [params.wtime, params.btime, params.winc, params.binc]
+            .into_iter()
+            .flatten()
+            .any(|value| value < 0)
+            || params.movestogo.is_some_and(|value| value <= 0)
+        {
+            return Err(EnginError::Uci(
+                "go clock values must be non-negative and movestogo positive".into(),
+            ));
+        }
+        if has_clock {
+            let root = self
+                .graph
+                .as_ref()
+                .ok_or(EnginError::Uci("position is not configured".into()))?
+                .root_history()
+                .last();
+            let side_time = if root.is_black_to_move() {
+                params.btime
+            } else {
+                params.wtime
+            };
+            if side_time.is_none() {
+                return Err(EnginError::Uci("go clock is missing side-to-move time".into()));
+            }
+        }
+        if params.movetime.is_some() && has_clock {
+            return Err(EnginError::Uci(
+                "go movetime cannot be combined with clock fields".into(),
+            ));
+        }
+        if params.infinite && (params.nodes.is_some() || params.movetime.is_some() || has_clock) {
+            return Err(EnginError::Uci(
+                "go infinite cannot be combined with nodes, movetime, or clock fields".into(),
+            ));
+        }
+        if !params.infinite && params.nodes.is_none() && params.movetime.is_none() && !has_clock {
+            return Err(EnginError::Uci(
+                "go requires nodes, movetime, clock fields, or infinite".into(),
+            ));
+        }
         Ok(())
     }
 
+    /// `go searchmoves` 根着过滤。
+    fn root_move_filter(&self, searchmoves: &[String]) -> Result<Vec<Move>, EnginError> {
+        let graph = self
+            .graph
+            .as_ref()
+            .ok_or(EnginError::Uci("position is not configured".into()))?;
+        let board = graph.root_history().last().board();
+        let legal_moves = board.generate_legal_moves();
+        let moves: Vec<_> = searchmoves
+            .iter()
+            .filter_map(|move_text| board.parse_move(move_text).ok())
+            .filter(|mv| legal_moves.contains(mv))
+            .collect();
+        if !searchmoves.is_empty() && moves.is_empty() {
+            return Err(EnginError::Uci("No legal searchmoves.".into()));
+        }
+        Ok(moves)
+    }
+
+    /// 启动一个独占 job。worker pool 跨 job 常驻，图和配置均由 Engine 直接持有。
+    /// 参考 LC3 Overview 的 "Search" / "Workers"。
+    fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError> {
+        self.validate_go(params)?;
+        self.abort()?;
+        let root_move_filter = self.root_move_filter(&params.searchmoves)?;
+        let backend = Arc::clone(
+            self.backend
+                .as_ref()
+                .ok_or(EnginError::Uci("position is not configured".into()))?,
+        );
+        if self.applied_nn_cache_size != Some(self.options.nn_cache_size_power_of_two) {
+            backend.set_cache_size_power_of_two(self.options.nn_cache_size_power_of_two);
+            self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let (gather_workers, eval_workers) = SearchConfig::gather_eval_from_threads(self.options.threads);
+        let config = SearchConfig {
+            eval_batch_size: self.options.mini_batch_size,
+            params: SearchParams {
+                cpuct: self.options.cpuct,
+                cpuct_base: self.options.cpuct_base,
+                cpuct_factor: self.options.cpuct_factor,
+                fpu_reduction: self.options.fpu_reduction,
+                virtual_mean_fpu_scale: 1.0,
+                lcb_stdevs: self.options.lcb_stdevs,
+                lcb_min_visit_fraction: self.options.lcb_min_visit_fraction,
+            },
+            gather_workers,
+            eval_workers,
+            ..SearchConfig::default()
+        };
+        let decision_params = config.params;
+        let pool = match self.worker_pool.as_ref() {
+            Some(pool) if pool.matches_config(backend.as_ref(), &config) => Arc::clone(pool),
+            _ => {
+                let pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
+                self.worker_pool = Some(Arc::clone(&pool));
+                pool
+            }
+        };
+        let graph = self.graph.as_ref().expect("position creates a graph with a backend");
+        let root_is_black = graph.root_history().last().is_black_to_move();
+        let search =
+            Search::new_with_graph_in_pool(backend, self.next_generation, graph, config, NoopObserver, pool);
+        let snapshot = RootSnapshot {
+            repository: Arc::clone(search.repository()),
+            root_key: search.root_key(),
+            root_history: Arc::clone(graph.root_history()),
+            initial_visits: search.initial_visits(),
+            root_is_black,
+            root_move_filter: root_move_filter.clone(),
+            multi_pv: self.options.multi_pv,
+            params: decision_params,
+        };
+        let started = Instant::now();
+        let clock_budget = if params.movetime.is_none() {
+            self.time_manager.budget(params, graph.root_history().last())
+        } else {
+            None
+        };
+        let limits = SearchLimits {
+            max_playouts: params.nodes.map(|nodes| nodes.max(1) as u64),
+            deadline: params
+                .movetime
+                .map(|ms| started + Duration::from_millis(ms.max(0) as u64))
+                .or_else(|| clock_budget.map(|budget| budget.deadline_after(started))),
+            root_move_filter,
+        };
+        let control = search.control();
+        let publish_output = Arc::new(AtomicBool::new(true));
+        let owner_publish_output = Arc::clone(&publish_output);
+        let output_options = self.options.clone();
+        let output_gate = Arc::clone(&self.stdout_gate);
+        let owner_thread = thread::spawn(move || {
+            run_search(
+                search,
+                snapshot,
+                output_options,
+                output_gate,
+                owner_publish_output,
+                limits,
+            )
+        });
+        self.active = Some(ActiveSearch {
+            control,
+            publish_output,
+            owner_thread,
+            started,
+            clock_budget,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn go(&mut self, params: &GoParams) -> Result<(), EnginError> {
+        if params.ponder {
+            return Err(EnginError::Uci("Ponder is not enabled.".into()));
+        }
+        if self.position.is_none() {
+            self.new_game()?;
+        }
+        if self.backend.is_none() {
+            let reason = self.backend_error.as_deref().unwrap_or("WeightsFile is not configured");
+            write_stdout(&[format!("info string cannot search: {reason}")]);
+            let mv = self
+                .position
+                .as_ref()
+                .map(|state| legal_fallback_move(&state.position_history(), &[]))
+                .unwrap_or(Move::NULL);
+            write_stdout_best_move(&BestMoveInfo::new(mv));
+            return Ok(());
+        }
+        self.start_search(params)
+    }
+
     pub(crate) fn ponder_hit(&mut self) -> Result<(), EnginError> {
-        // px0 `Engine::PonderHit` 在活跃 ponder 搜索外拒绝此命令（`src/engine.cc:226-235`）。
-        // 此处刻意不提供 Ponder。
         Err(EnginError::Uci("ponderhit while not pondering".into()))
     }
 
     pub(crate) fn wait(&mut self) -> Result<(), EnginError> {
-        let Some(search) = self.search.as_mut() else {
+        let Some(active) = self.active.take() else {
             return Ok(());
         };
-        search.wait()
+        let ActiveSearch {
+            owner_thread,
+            started,
+            clock_budget,
+            ..
+        } = active;
+        let result = owner_thread
+            .join()
+            .map_err(|_| EnginError::Uci("search owner thread panicked".into()))?;
+        if let Some(clock_budget) = clock_budget {
+            self.time_manager.finish(clock_budget, started.elapsed());
+        }
+        result
     }
 
     pub(crate) fn stop(&mut self) -> Result<(), EnginError> {
-        if let Some(search) = self.search.as_mut() {
-            search.stop();
+        if let Some(active) = &self.active {
+            active.control.request_stop();
         }
         self.wait()
+    }
+
+    /// 替换 position / backend / 新 `go` 时停止 info，但必须留下 `bestmove` 结束上一次 `go`。
+    fn abort(&mut self) -> Result<(), EnginError> {
+        if let Some(active) = &self.active {
+            let _output = self.stdout_gate.lock();
+            active.publish_output.store(false, Ordering::Release);
+            active.control.request_stop();
+        }
+        if let Err(error) = self.wait() {
+            eprintln!("info string abort drain ignored previous search error: {error}");
+        }
+        Ok(())
+    }
+}
+
+/// 单次 job 的唯一 owner：运行搜索、按进度输出、drain 后输出最终结果并归还 worker。
+/// 参考 LC3 Overview 的 Search/Watchdog 角色，但不另开 watchdog 线程。
+fn run_search(
+    mut search: Search,
+    snapshot: RootSnapshot,
+    output_options: Options,
+    output_gate: Arc<Mutex<()>>,
+    publish_output: Arc<AtomicBool>,
+    limits: SearchLimits,
+) -> Result<(), EnginError> {
+    let started = Instant::now();
+    let mut published = PublishedInfo::default();
+    let result = search.run_with_limits_reporting(limits, Some(OWNER_PROGRESS_INTERVAL), |stats| {
+        if !publish_output.load(Ordering::Acquire) {
+            return;
+        }
+        let time = started.elapsed().as_millis() as i64;
+        let progress = snapshot.progress(&stats);
+        if published.should_publish(progress, time) {
+            let infos = snapshot.thinking_infos(stats, started);
+            let _output = output_gate.lock();
+            if publish_output.load(Ordering::Acquire) {
+                write_stdout_thinking(&infos, &output_options);
+                published.update(progress, time);
+            }
+        }
+    });
+    if let Ok(stats) = &result {
+        // root 终局：不从旧图 edge 选着。GUI 未必实现完整规则（重复/rule60），
+        // UCI 仍可用 legal fallback 回一着；将死无着才是 a0a0。
+        let (chosen, principal_variation) = if search.root_is_terminal() {
+            (None, Vec::new())
+        } else {
+            (
+                best_move_filtered_with_params(
+                    search.repository(),
+                    search.root_key(),
+                    snapshot.root_is_black,
+                    &snapshot.root_move_filter,
+                    &snapshot.params,
+                ),
+                principal_variation_with_history_and_params(
+                    search.repository(),
+                    search.root_key(),
+                    snapshot.root_history.as_ref(),
+                    snapshot.root_is_black,
+                    &snapshot.root_move_filter,
+                    &snapshot.params,
+                ),
+            )
+        };
+        let mut infos = snapshot.thinking_infos(stats.clone(), started);
+        if let Some(info) = infos.first_mut() {
+            info.pv = principal_variation;
+        }
+        let best_move = reported_uci_move(chosen, snapshot.root_history.as_ref(), &snapshot.root_move_filter);
+        let _output = output_gate.lock();
+        if publish_output.load(Ordering::Acquire) {
+            write_stdout_thinking(&infos, &output_options);
+        }
+        write_stdout_best_move(&BestMoveInfo::new(best_move));
+    } else if let Err(error) = &result {
+        let info = ThinkingInfo {
+            comment: format!("stream search failed: {error}"),
+            ..ThinkingInfo::default()
+        };
+        let best_move = reported_uci_move(None, snapshot.root_history.as_ref(), &snapshot.root_move_filter);
+        let _output = output_gate.lock();
+        if publish_output.load(Ordering::Acquire) {
+            write_stdout_thinking(&[info], &output_options);
+        }
+        write_stdout_best_move(&BestMoveInfo::new(best_move));
+    }
+    search.stop_and_finish();
+    result.map(|_| ())
+}
+
+fn reported_uci_move(chosen: Option<Move>, history: &PositionHistory, root_move_filter: &[Move]) -> Move {
+    match chosen {
+        Some(mv) if !mv.is_null() => mv,
+        _ => legal_fallback_move(history, root_move_filter),
+    }
+}
+
+fn legal_fallback_move(history: &PositionHistory, root_move_filter: &[Move]) -> Move {
+    let legal = history.last().board().generate_legal_moves();
+    if root_move_filter.is_empty() {
+        legal.into_iter().next()
+    } else {
+        root_move_filter.iter().copied().find(|mv| legal.contains(mv))
+    }
+    .unwrap_or(Move::NULL)
+}
+
+impl RootSnapshot {
+    /// info 输出门槛：marker 未变化时不生成 PV/MultiPV。
+    fn progress(&self, stats: &Stats) -> SearchProgress {
+        SearchProgress {
+            best_move: best_move_filtered_with_params(
+                &self.repository,
+                self.root_key,
+                self.root_is_black,
+                &self.root_move_filter,
+                &self.params,
+            ),
+            depth: stats.average_depth.min(i32::MAX as u64) as i32,
+            seldepth: stats.max_depth.min(i32::MAX as u64) as i32,
+        }
+    }
+
+    /// 同一 root 快照按根边排序输出 MultiPV。
+    fn thinking_infos(&self, stats: Stats, started: Instant) -> Vec<ThinkingInfo> {
+        let time = started.elapsed().as_millis() as i64;
+        let nodes = self.initial_visits.saturating_add(stats.completed_playouts) as i64;
+        let nps = if time == 0 {
+            0
+        } else {
+            (stats.completed_playouts as i64 * 1000 / time) as i32
+        };
+        let eps = if time == 0 {
+            0
+        } else {
+            (stats.network_evaluations as i64 * 1000 / time) as i32
+        };
+        let common = ThinkingInfo {
+            depth: stats.average_depth.min(i32::MAX as u64) as i32,
+            seldepth: stats.max_depth.min(i32::MAX as u64) as i32,
+            time,
+            nodes,
+            nps,
+            eps,
+            ..ThinkingInfo::default()
+        };
+        let Some(root) = root_stats(&self.repository, self.root_key) else {
+            return vec![common];
+        };
+        let wl = (-root.q).clamp(-1.0, 1.0);
+        let draw = root.draw.clamp(0.0, 1.0);
+        let variations = root_variations(
+            &self.repository,
+            self.root_key,
+            Some(self.root_history.as_ref()),
+            self.root_is_black,
+            &self.root_move_filter,
+            self.multi_pv,
+            &self.params,
+        );
+        if variations.is_empty() {
+            let win = ((1.0_f32 - draw + wl) * 0.5).clamp(0.0, 1.0);
+            let loss = ((1.0_f32 - draw - wl) * 0.5).clamp(0.0, 1.0);
+            let mate = best_mate_with_params(&self.repository, self.root_key, &self.root_move_filter, &self.params);
+            return vec![ThinkingInfo {
+                mate,
+                score: mate.is_none().then_some((wl * 1000.0).round() as i32),
+                wdl: Some(Wdl {
+                    w: (win * 1000.0).round() as i32,
+                    d: (draw * 1000.0).round() as i32,
+                    l: (loss * 1000.0).round() as i32,
+                }),
+                pv: principal_variation_with_history_and_params(
+                    &self.repository,
+                    self.root_key,
+                    self.root_history.as_ref(),
+                    self.root_is_black,
+                    &self.root_move_filter,
+                    &self.params,
+                ),
+                ..common
+            }];
+        }
+        let show_multipv = variations.len() > 1;
+        variations
+            .into_iter()
+            .enumerate()
+            .map(|(index, variation)| {
+                let win = ((1.0_f32 - variation.draw + variation.wl) * 0.5).clamp(0.0, 1.0);
+                let loss = ((1.0_f32 - variation.draw - variation.wl) * 0.5).clamp(0.0, 1.0);
+                ThinkingInfo {
+                    mate: variation.mate,
+                    score: variation
+                        .mate
+                        .is_none()
+                        .then_some((variation.wl * 1000.0).round() as i32),
+                    wdl: Some(Wdl {
+                        w: (win * 1000.0).round() as i32,
+                        d: (variation.draw * 1000.0).round() as i32,
+                        l: (loss * 1000.0).round() as i32,
+                    }),
+                    pv: variation.pv,
+                    multipv: if show_multipv { (index + 1) as i32 } else { -1 },
+                    ..common.clone()
+                }
+            })
+            .collect()
+    }
+}
+
+impl PublishedInfo {
+    /// 周期性 info 输出门槛。
+    fn should_publish(&self, progress: SearchProgress, time: i64) -> bool {
+        progress.best_move.is_some()
+            && (self.progress != Some(progress)
+                || time.saturating_sub(self.time) > UCI_INFO_MINIMUM_FREQUENCY.as_millis() as i64)
+    }
+
+    fn update(&mut self, progress: SearchProgress, time: i64) {
+        self.progress = Some(progress);
+        self.time = time;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Engine, legal_fallback_move, reported_uci_move};
+    use crate::uci_loop::GoParams;
+    use xiangqi_core::{GameState, Move, STARTPOS_FEN};
+
+    fn go_nodes(engine: &mut Engine, nodes: i32) {
+        engine
+            .go(&GoParams {
+                nodes: Some(nodes),
+                ..GoParams::default()
+            })
+            .expect("go");
+        engine.wait().expect("search owner");
+    }
+
+    #[test]
+    fn engine_graph_reuse_survives_cannon_knight_chase() {
+        let weights = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/x7.onnx");
+        if !std::path::Path::new(weights).is_file() {
+            return;
+        }
+        let mut engine = Engine::new();
+        engine.set_option("WeightsFile", weights).expect("weights option");
+        let fen = "2bakc3/4a3n/4b4/2C1p4/P8/4P2cN/P8/4B1C2/4A4/4KAB2 b - - 0 1";
+        let prefixes: [&[&str]; 8] = [
+            &[],
+            &["f9f4"],
+            &["f9f4", "g2g4"],
+            &["f9f4", "g2g4", "f4f3"],
+            &["f9f4", "g2g4", "f4f3", "g4g2"],
+            &["f9f4", "g2g4", "f4f3", "g4g2", "f3f4"],
+            &["f9f4", "g2g4", "f4f3", "g4g2", "f3f4", "g2g4"],
+            &["f9f4", "g2g4", "f4f3", "g4g2", "f3f4", "g2g4", "f4f3"],
+        ];
+        for (ply, moves) in prefixes.into_iter().enumerate() {
+            let moves: Vec<String> = moves.iter().map(|mv| (*mv).to_string()).collect();
+            engine
+                .set_position(fen, &moves)
+                .unwrap_or_else(|error| panic!("position at ply {ply}: {error}"));
+            go_nodes(&mut engine, 2000);
+        }
+    }
+
+    #[test]
+    fn unsearched_root_reports_a_legal_move_not_null() {
+        let history = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str])
+            .expect("startpos")
+            .position_history();
+        let mv = reported_uci_move(None, &history, &[]);
+        assert!(!mv.is_null());
+        assert!(history.last().board().generate_legal_moves().contains(&mv));
+    }
+
+    #[test]
+    fn searchmoves_fallback_stays_inside_the_filter() {
+        let history = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str])
+            .expect("startpos")
+            .position_history();
+        let filter = vec![history.last().board().parse_move("b2b3").expect("b2b3")];
+        assert_eq!(legal_fallback_move(&history, &filter), filter[0]);
+        assert_eq!(reported_uci_move(Some(Move::NULL), &history, &filter), filter[0]);
     }
 }

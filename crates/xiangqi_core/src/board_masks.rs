@@ -1,4 +1,4 @@
-//! px0 `board.cc:96-121, 368-386` 几何 mask 与距离辅助。
+//! 几何 mask 与距离辅助。来源：px0 board.cc。
 
 use crate::bitboard::BitBoard;
 use crate::types::{Direction, EAST, NORTH, SOUTH, Square, WEST, file_distance, rank_distance};
@@ -6,7 +6,7 @@ use crate::types::{Direction, EAST, NORTH, SOUTH, Square, WEST, file_distance, r
 pub const PALACE: u128 = (0x0000_0000_0070_381Cu128 << 64) | 0x0000_0000_00E0_7038u128;
 /// 士只能停在九宫的五个斜线交点；`PALACE` 还包含将可走、但士不可停的四个边点。
 ///
-/// px0 的 FEN 校验只要求士在九宫内。Rust 在合法着生成前额外区分士位，防止
+/// px0 的 FEN 校验只要求士在九宫内。x7 在合法着生成前额外区分士位，防止
 /// `f1e0` 这类从九宫边点出发的非法士着进入 policy 与搜索。
 pub const ADVISOR_SQUARES: u128 = (1u128 << 3)
     | (1u128 << 5)

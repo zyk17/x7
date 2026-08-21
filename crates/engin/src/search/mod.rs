@@ -1,73 +1,52 @@
-//! LC3 风格的流式搜索。
+//! X7 stream 树搜索。
 //!
-//! 设计参考（本地没有 LC3 源码）：
-//! - <https://lczero.org/dev/lc0/search/lc3/overview/>
-//! - <https://lczero.org/dev/lc0/search/lc3/policy/>
-//! - <https://lczero.org/dev/lc0/search/lc3/glossary/>
+//! ## 模块分层
 //!
-//! 本模块拥有 tree 与 worker 生命周期。LC3 未公开公式时，选择和最终着法使用
-//! 有文档的 px0 PUCT / N-Q-P 语义。
+//! | 模块 | 负责 |
+//! |------|------|
+//! | `select` / `expand` / `eval` / `backprop` | 算法方法（MCTS 实验改这里） |
+//! | `workerpool` | 事件 + 线程池 + Gather/Eval/NN/Backprop 循环壳 |
+//! | `pipeline` | `Shared` / `Stats` + Gather 树走组装 + `Search` API |
+//! | `tree` | 树 / 节点 / 边 / Repo 数据结构 |
+//! | `decision` | 搜后根选着 / PV / LCB |
+//! | `param` / `time` | 参数与时钟 |
+//!
+//! 硬规则：
+//! - 只有 **Gather**（`pipeline::process_gather_event`，由 `workerpool` 调度）可 `reserve_edge` / `descend`
+//! - 只有 **Eval** 可把 Unexpanded claim 后变成 Expanded（`publish_edges`）或首次 NN 终局
+//! - Gather 在已 Expanded 上仍可用 `path_terminal_value` 标 Terminal（路径规则）
+//! - 只有 **Backprop** 可 `complete` reservation 与 `add_delta`
+//!
+//! `mcts2`：`NodeKey = hash_cat(parent, move)`；`rep==1` 继续搜、`rep>=2` RuleJudge；
+//! NN cache 按棋盘 + repetition + 合法着数。Gather 每次一个叶子；virtual mean 分流。
+//! 无 prefetch / multivisit。
 
-use xiangqi_core::GameResult;
-
-mod event;
-mod extension;
+mod backprop;
+mod decision;
+mod eval;
+mod expand;
+mod observer;
+mod param;
 mod pipeline;
-mod policy;
-mod session;
-mod state;
-mod stats;
+mod select;
 mod time;
 mod tree;
+mod workerpool;
 
-pub use event::{BackpropEvent, NodeEvent, SearchGeneration, Variation};
-pub(crate) use pipeline::WorkerPool;
-pub use pipeline::{QueueStats, Search, SearchConfig, SearchControl, SearchLimits, Stats};
-pub use policy::{SearchParams, ValueDelta, select_edge, select_edge_from_node};
-pub(crate) use session::SearchSession;
-pub use state::SearchResult;
-pub(crate) use state::{SearchState, WatchdogSnapshot};
-pub(crate) use stats::best_mate;
-pub(crate) use stats::root_variations;
-pub use stats::{
+pub use decision::{
     RootEdgeStats, RootStats, best_move, best_move_filtered, principal_variation, principal_variation_filtered,
     root_stats,
 };
-pub use tree::{Edge, EdgeReservation, ExpansionState, GcStats, Node, NodeKey, NodeRepository, Tree};
-
-/// px0 `FetchSingleNodeResult`：`eval->q = -eval->q`（`search.cc:2129`）。NN WDL
-/// 按 side-to-move 表示；node 统计按 incoming-edge / 走子方视角表示，对齐 px0 `Node::wl_`。
-pub(crate) fn network_wl_to_node(stm_wl: f32) -> f32 {
-    -stm_wl
-}
-
-/// 将**绝对** game result（`compute_game_result`）转为终局叶子 incoming-edge `(wl, d)`。
-///
-/// 先换成 STM 视角，再取反，对齐 NN fetch 与将死快径 `WHITE_WON`→`+1`
-///（`search.cc:1913-1919`、`node.cc:300-317`）。
-///
-/// 注意：`rule_judge()` 的返回值**不是**绝对胜负，不能走这里；应使用
-/// [`rule_judge_wl_for_node`]。
-pub(crate) fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (f32, f32) {
-    let (stm_wl, draw) = match result {
-        GameResult::WhiteWon => (if black_to_move { -1.0 } else { 1.0 }, 0.0),
-        GameResult::BlackWon => (if black_to_move { 1.0 } else { -1.0 }, 0.0),
-        GameResult::Draw => (0.0, 1.0),
-        GameResult::Undecided => unreachable!("terminal search evaluation requires a result"),
-    };
-    (-stm_wl, draw)
-}
-
-/// px0 `Node::MakeTerminal(RuleJudge())`：`WHITE_WON`→`+1`，`BLACK_WON`→`-1`。
-///
-/// `rule_judge` 的胜负枚举已是 node / incoming-edge 视角（与 `checkThem`/`checkUs`
-/// 绑定），**不要**再按 `is_black_to_move` 当绝对颜色转换，否则白方行棋时的长将/长捉
-/// 符号会反转。
-pub(crate) fn rule_judge_wl_for_node(result: GameResult) -> (f32, f32) {
-    match result {
-        GameResult::WhiteWon => (1.0, 0.0),
-        GameResult::BlackWon => (-1.0, 0.0),
-        GameResult::Draw => (0.0, 1.0),
-        GameResult::Undecided => unreachable!("rule-judge terminal requires a decided result"),
-    }
-}
+pub(crate) use decision::{
+    best_mate_with_params, best_move_filtered_with_params, principal_variation_with_history_and_params, root_variations,
+};
+pub use observer::{
+    BenchObserver, BenchStats, InstantQueueStamp, NoQueueStamp, NoopObserver, QueueKind, QueueStamp, QueueStats,
+    SearchObserver,
+};
+pub use param::{SearchConfig, SearchParams};
+pub use pipeline::{Search, SearchControl, SearchLimits, Stats};
+pub(crate) use time::{TimeBudget, TimeManager};
+pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository, SearchTree, ValueDelta};
+pub(crate) use workerpool::WorkerPool;
+pub use workerpool::{BackpropEvent, PlayoutEvent, Variation};

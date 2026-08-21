@@ -1,4 +1,4 @@
-//! px0 `board.cc:156-346` 的 magic number（`NO_PEXT` 路径）。
+//! Magic bitboard 常数（`NO_PEXT` 路径）。来源：[px0 board.cc](https://github.com/official-pikafish/px0/blob/master/src/chess/board.cc)。
 
 #[inline]
 const fn magic_u128(hi: u64, lo: u64) -> u128 {

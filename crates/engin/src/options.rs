@@ -1,8 +1,8 @@
 //! Engine 生命周期的 UCI option。
 //!
-//! 对照 px0 `src/engine.h` 的 `OptionsDict`：`Engine` 持有 option，搜索在
-//! 启动 job 时读取需要的快照。
+//! `go` 时拍快照：算法 → `SearchParams`，拓扑 → `SearchConfig`，停止条件/`searchmoves` → `SearchLimits`。
 
+use crate::neural::cache::{DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, MAX_NN_CACHE_SIZE_POWER_OF_TWO};
 use crate::search::SearchParams;
 
 /// 正式 UCI 的最小 option 集。
@@ -15,17 +15,20 @@ pub struct Options {
     pub multi_pv: usize,
     /// UCI `MiniBatchSize`：单次 NN 调用最多合并的局面数；0 使用 backend 建议值。
     pub mini_batch_size: usize,
-    /// UCI `CPuct`：PUCT 的初始探索系数。
+    /// UCI `NNCacheSizePowerOfTwo`：NN cache 固定保存 `2^N` 个直映槽。
+    pub nn_cache_size_power_of_two: u8,
+    /// UCI `CPuct`：所有节点共用的 PUCT 初始探索系数。
     pub cpuct: f32,
     /// UCI `CPuctBase`/`CPuctFactor`：PUCT 随访问数增长的形状。
     pub cpuct_base: f32,
     pub cpuct_factor: f32,
     /// UCI `FpuReduction`：未访问边相对 parent Q 的 FPU 降幅。
     pub fpu_reduction: f32,
-    /// 三类 stream worker 的常驻线程数。
-    pub gather_workers: usize,
-    pub eval_workers: usize,
-    pub backprop_workers: usize,
+    /// 根最终 Decision 的 LCB 参数；不参与 PUCT。
+    pub lcb_stdevs: f32,
+    pub lcb_min_visit_fraction: f32,
+    /// UCI `Threads` 只分配 Gather + Eval；Backprop 和 NN 各固定一条线程。
+    pub threads: usize,
 }
 
 impl Default for Options {
@@ -37,13 +40,14 @@ impl Default for Options {
             show_eps: false,
             multi_pv: 1,
             mini_batch_size: 0,
+            nn_cache_size_power_of_two: DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO,
             cpuct: search.cpuct,
             cpuct_base: search.cpuct_base,
             cpuct_factor: search.cpuct_factor,
             fpu_reduction: search.fpu_reduction,
-            gather_workers: 4,
-            eval_workers: 4,
-            backprop_workers: 1,
+            lcb_stdevs: search.lcb_stdevs,
+            lcb_min_visit_fraction: search.lcb_min_visit_fraction,
+            threads: 8,
         }
     }
 }
@@ -51,8 +55,11 @@ impl Default for Options {
 impl Options {
     pub fn list_options_uci(&self) -> Vec<String> {
         vec![
-            format!("option name UCI_ShowWDL type check default {}", self.show_wdl),
-            format!("option name UCI_ShowEPS type check default {}", self.show_eps),
+            format!("option name Threads type spin default {} min 2 max 128", self.threads),
+            format!(
+                "option name NNCacheSizePowerOfTwo type spin default {} min 0 max {}",
+                self.nn_cache_size_power_of_two, MAX_NN_CACHE_SIZE_POWER_OF_TWO
+            ),
             format!("option name MultiPV type spin default {} min 1 max 500", self.multi_pv),
             format!(
                 "option name MiniBatchSize type spin default {} min 0 max 1024",
@@ -62,18 +69,13 @@ impl Options {
             format!("option name CPuctBase type string default {}", self.cpuct_base),
             format!("option name CPuctFactor type string default {}", self.cpuct_factor),
             format!("option name FpuReduction type string default {}", self.fpu_reduction),
+            format!("option name LcbStdevs type string default {}", self.lcb_stdevs),
             format!(
-                "option name GatherWorkers type spin default {} min 1 max 64",
-                self.gather_workers
+                "option name LcbMinVisitFraction type string default {}",
+                self.lcb_min_visit_fraction
             ),
-            format!(
-                "option name EvalWorkers type spin default {} min 1 max 64",
-                self.eval_workers
-            ),
-            format!(
-                "option name BackpropWorkers type spin default {} min 1 max 64",
-                self.backprop_workers
-            ),
+            format!("option name UCI_ShowWDL type check default {}", self.show_wdl),
+            format!("option name UCI_ShowEPS type check default {}", self.show_eps),
             format!("option name WeightsFile type string default {}", self.weights_file),
         ]
     }
@@ -109,13 +111,28 @@ impl Options {
                 }
                 self.mini_batch_size = value;
             }
+            "nncachesizepoweroftwo" => {
+                let value = value.parse::<u8>().map_err(|_| {
+                    crate::EnginError::Uci(format!(
+                        "NNCacheSizePowerOfTwo must be an integer within [0, {MAX_NN_CACHE_SIZE_POWER_OF_TWO}]"
+                    ))
+                })?;
+                if value > MAX_NN_CACHE_SIZE_POWER_OF_TWO {
+                    return Err(crate::EnginError::Uci(format!(
+                        "NNCacheSizePowerOfTwo must be within [0, {MAX_NN_CACHE_SIZE_POWER_OF_TWO}]"
+                    )));
+                }
+                self.nn_cache_size_power_of_two = value;
+            }
             "cpuctbase" => self.cpuct_base = parse_positive_float("CPuctBase", value)?,
             "cpuctfactor" => self.cpuct_factor = parse_non_negative_float("CPuctFactor", value)?,
             "cpuct" => self.cpuct = parse_non_negative_float("CPuct", value)?,
             "fpureduction" => self.fpu_reduction = parse_non_negative_float("FpuReduction", value)?,
-            "gatherworkers" => self.gather_workers = parse_worker_count(name, value)?,
-            "evalworkers" => self.eval_workers = parse_worker_count(name, value)?,
-            "backpropworkers" => self.backprop_workers = parse_worker_count(name, value)?,
+            "lcbstdevs" => self.lcb_stdevs = parse_non_negative_float("LcbStdevs", value)?,
+            "lcbminvisitfraction" => {
+                self.lcb_min_visit_fraction = parse_unit_interval_float("LcbMinVisitFraction", value)?
+            }
+            "threads" => self.threads = parse_thread_count(value)?,
             _ => return Err(crate::EnginError::Uci(format!("Unknown option: {name}"))),
         }
         Ok(())
@@ -134,6 +151,14 @@ fn parse_non_negative_float(name: &str, value: &str) -> Result<f32, crate::Engin
     Ok(value)
 }
 
+fn parse_unit_interval_float(name: &str, value: &str) -> Result<f32, crate::EnginError> {
+    let value = parse_non_negative_float(name, value)?;
+    if value > 1.0 {
+        return Err(crate::EnginError::Uci(format!("{name} must be within [0, 1]")));
+    }
+    Ok(value)
+}
+
 fn parse_positive_float(name: &str, value: &str) -> Result<f32, crate::EnginError> {
     let value = parse_non_negative_float(name, value)?;
     if value == 0.0 {
@@ -142,12 +167,12 @@ fn parse_positive_float(name: &str, value: &str) -> Result<f32, crate::EnginErro
     Ok(value)
 }
 
-fn parse_worker_count(name: &str, value: &str) -> Result<usize, crate::EnginError> {
+fn parse_thread_count(value: &str) -> Result<usize, crate::EnginError> {
     let value = value
         .parse::<usize>()
-        .map_err(|_| crate::EnginError::Uci(format!("{name} must be an integer within [1, 64]")))?;
-    if !(1..=64).contains(&value) {
-        return Err(crate::EnginError::Uci(format!("{name} must be within [1, 64]")));
+        .map_err(|_| crate::EnginError::Uci("Threads must be an integer no greater than 128".into()))?;
+    if value > 128 {
+        return Err(crate::EnginError::Uci("Threads must be no greater than 128".into()));
     }
-    Ok(value)
+    Ok(value.max(2))
 }

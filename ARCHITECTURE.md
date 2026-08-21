@@ -19,11 +19,14 @@
 
 ## 参考边界
 
-当前阶段是 px0 的 Rust 重写。参考用于约束实现语义，不能替代项目目标：
+第一版实现参考过 px0 / Lc0 / LC3；**当前仓库是独立的 X7 引擎，不是 px0 的 Rust 重写，也不承诺搜索行为等价**。
 
-- 规则与网络外围按 px0 逐函数对照：`C:\Users\Administrator\projects\px0`。
-- 训练格式与导出参考 pxzero-training：`C:\Users\Administrator\projects\pxzero-training`。
-- stream 按 [LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/) 的公开架构文档实现等价设计；LC3 未公开公式时参考对应 px0 语义，不能标称为源码翻译。
+外部材料只作历史或语义参考，不能替代项目目标：
+
+- 规则、classical 编码、UCI 外围与训练 record 的历史工程参考：`C:\Users\Administrator\projects\px0`、`C:\Users\Administrator\projects\pxzero-training`。
+- stream / MCGS 可参考 [LC3 Overview](https://lczero.org/dev/lc0/search/lc3/overview/)、[Policy](https://lczero.org/dev/lc0/search/lc3/policy/)、[Glossary](https://lczero.org/dev/lc0/search/lc3/glossary/)；本地没有 LC3 源码，不得标称为源码翻译或行为等价。
+- KataGo 按需参考：本地源码 `C:\Users\Administrator\projects\KataGo`（如 `docs/GraphSearch.md`、NN cache、部分搜索细节）；不是每次改搜索都必读，也不承诺行为等价。
+- 本实现使用连续 `Gather → Eval → NN → Eval → Backprop`：Gather 每次采集一个叶子，PUCT 的 edge reservation 作为 pending visit（计入 started N）；当前实战还以 `μ=FPU` 暂入 action Q，完成或取消时精确归还。它不进入 completed Evidence 或 shared node Q。Eval 处理终局、cache、编码和输出解码；NN 只合并 tensor 并推理，空闲时立即执行当前队列可得请求。Gather 在 claim 前把已交给 Eval 的叶子限为 `2.3 × MiniBatchSize`，而不是暴露独立 `MaxInFlight`，也不用 outstanding 当窗口。collision 先挂起 reservation / μ，该叶子自己的 backprop complete 后再 cancel，不加 completed visit。没有 prefetch 或 tree-batch gather。不用 multivisit：一次评估记 K 次 visit 会把 K 份 FPU 打进 in-flight Q，破坏当前温和分流；GPU 合批已在 NN 队列完成。后续若调分流，改 virtual mean / virtual visit。
 
 ## 当前认识
 
@@ -50,33 +53,41 @@ NN 只负责 Knowledge Representation：学习 policy、最终 WDL 与 moves-lef
 | 模块 | 职责 | 当前状态 |
 | --- | --- | --- |
 | `crates/xiangqi_core` | 唯一规则真相：棋盘、合法着、FEN、Position、history、RuleJudge | 已完成 |
-| `crates/engin/src/search` | 唯一的 LC3-style tree MCTS 与正式 UCI 主线；`tree.rs` 直接包含 node、edge、repository 与 tree reuse | 已接入 UCI，持续验证 |
+| `crates/engin/src/search` | stream 树搜索；`tree.rs` 含 node/edge/repository；`pipeline` 组装 Shared 与 Gather；算法在 select/expand/eval/backprop | `feat/mcgs` / `mcts2` 研究实现 |
 | `crates/engin/src/search/time.rs` | 单一 stream 的固定中性时钟分配 | 已接入 UCI |
 | `crates/engin/src/neural` | 124-plane 编码、policy 映射、ONNX、缓存 | stream 使用的 backend 契约 |
-| `nn/` | px0 record、训练、checkpoint、ONNX 导出 | 独立 Python 子项目 |
+| `nn/` | 训练数据格式沿用 px0 record；训练、checkpoint、ONNX 导出 | 独立 Python 子项目 |
 
 ## 单一搜索
 
-仓库只维护 stream 搜索。`Engine` 直接拥有其搜索会话，不保留 `SearchBase`、`SearchFactory` 或 classic 对照实现。`UniformBackend` 仅用于 stream 测试；正式 UCI 必须加载 ONNX。
+仓库只维护 stream 搜索。`Engine` 直接拥有 graph、worker pool 与每次 job，不保留 `SearchBase`、`SearchFactory`、`SearchSession` 或 classic 对照实现。`UniformBackend` 仅用于 stream 测试；正式 UCI 必须加载 ONNX。
 
-`search/time.rs` 独立于 tree/worker：只在 session 启动时计算 deadline、在 drain 后归还未用时间；
+`search/time.rs` 独立于 graph/worker：只在 Engine 启动 job 时计算 deadline、在 drain 后归还未用时间；
 它不是第二套搜索实现，也不提供策略化调参。
 
 ## Stream
 
-- repository 是一个 64 分片的 key-value map，使用 `parent-key + move` 的 tree key；首版不做 DAG/TT。跨回合只保留已走主线及其子树，GC 先收集不可达 sibling subtree 的 key，再按分片批量删除；不为每个 root 创建独立 map。
+- repository 是一个 64 分片的 key-value map。普通 MCGS 只以棋盘（含行棋方）作为共享 node key；每条 edge 仍保存自己的 action N/in-flight。没有单独 TT。真实 variation 第一次重复时，以该重复局面为根进入 `ContinuationTree`：其 key 纳入自最近零化着以来的规则 history，重复上下文内不换位合并，只复用按棋盘索引的 NN cache；Graph → Tree 的入口 edge 不绑定 contextual child。Tree 内吃子等零化 edge 的 child 立即回到普通 Graph，因此本回合已经展开的零化后子图可跨回合复用，但 Tree 先前的 N/Q 不迁移。第三次出现同一局面才由 `RuleJudge` 终局。首次绑定普通 shared edge 时，只剪回边（`depth(parent) > depth(child)`）；浅层父节点仍可接到已被更深路径先展开的 child。同路径棋规重复仍走 ContinuationTree。须由残局回归与 Elo 验证。
+- NN cache 使用同一 board key，不纳入完整 history 或 repetition；容量是 KataGo 风格的 `2^NNCacheSizePowerOfTwo` 直映表，槽冲突由后写结果覆盖。它只缓存 Prediction，不参与路径规则裁决。
 - 事件拥有完整 root history、variation、generation 和 edge reservation。
-- Engine session 常驻 Gather×4、Eval×4、NN×1、Backprop×1；Gather/Eval/Backprop 数可通过 UCI 生命周期 option 调整，下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/tree view），drain 后 worker 回到等待。Eval 处理终局、缓存、编码、合法 policy；NN 只执行 `infer_encoded` 与队列 batch。
+- Engine 直接常驻 Gather×3、Eval×5、NN×1、Backprop×1（默认 `Threads=8`；Gather/Eval 尽量 1:2，余数给 Gather）；下一次 `go` 必要时重建 pool。每次 `go` 只下发独占 job（新的 queues、generation、root/graph view），drain 后 worker 回到等待。Eval 处理终局、缓存、稀疏编码、合法 policy；NN 做 ORT 前 expand、稀疏合批推理，并以整批 `EncodedBatch` 交回；Backprop 回收 reservation 并更新图。
 - `SearchLimits`、generation gate、stop/drain 与 edge reservation 回收已实现；UCI 时钟在
-  session 启动时按固定中性的 px0 预算转换为不可变 deadline，job drain 后才归还剩余时间。
-- tree reuse 会保留已走主线及旧根，并遍历 repository 删除不可达兄弟子树；UCI/Watchdog 已输出最小 info 与一次 bestmove。
-- `MultiPV` 只在 watchdog 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 tree、PUCT、worker 或 visit 分配。碰撞会立即取消其未完成路径的 reservation，不额外改变 `N/Q`；未来是否把这段 CPU 时间用于 Proof 是研究问题，而不是当前 MCTS 的既定策略。`MiniBatchSize` 只限制单次 NN 合批上限，`0` 使用 backend 建议值；它可能改变 collision 和固定时间棋力，须以对拍验证。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
+  Engine 启动 job 时按固定中性的时间预算（历史上参考 px0 legacy stopper）转换为不可变 deadline，job drain 后才归还剩余时间。`go movetime` / 时钟到期后会 `request_stop` 并取消已 claim 但尚未完成的评估，而不是把当前 NN 窗口整批推理完；剩余时间不足 500ms 时 Gather 不再按推荐 MiniBatch 填满窗口。`position` 打断上一次 `go` 仍会输出 `bestmove`（无搜索结果时回退根合法着），避免 GUI 超时报「未返回合法着法」。
+- tree reuse 保留已走主线；走子后 sibling 挂 pending，由 graph reaper 异步
+  `remove_subtrees`。下一手 `go` 可与 prune 重叠；下一次 `position` 入口 `wait_idle`
+  后再改根，避免悔棋与未完成 prune 竞态。无关 `position` 换树时旧 repository 后台释放。
+  search owner 已输出最小 info 与一次 bestmove。
+- `MultiPV` 只在 search owner 的 root snapshot 中按既有 bestmove 排名输出多条 PV，不改变 graph、PUCT、worker 或 visit 分配。Gather 每次一个叶子；pending reservation 同时表示 PUCT 已分配的预算，当前实战的 virtual mean 仅在 reservation 未完成时进入 action Q，完成后 Q 仍只来自 completed Evidence。collision 先挂起该 event 的 reservation，该叶子 complete 后再 cancel，不额外改变 completed `N/Q`。`MiniBatchSize` 限制 NN 一次合并的 tensor 数量，`0` 使用 backend 建议值，并派生 `2.3 × MiniBatchSize` 的 Eval/NN claim 上限；实际 NN batch 可能因终局、缓存、collision 或队列暂时不足更小。NN `m` 已进入 backup 与已证明终局距离。`draw_score` 固定为零，不做 contempt。
 
-stream 的 selection 使用 px0 PUCT/N-Q-P 语义，不是 LC3 Policy 的正式公式。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认采用固定 `CPuct=e≈2.7182817` 与 `CPuctFactor=0`，使低先验候选可较早获得验证、又不在后期持续打散已有证据；`CPuctBase` 在此默认下无效。`FpuReduction=0.330` 为 LC0 对照值，原 X7 `1.0/0.220` 与动态 cPUCT 形状均保留为实验基线。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
+stream 的 selection 使用本仓 PUCT / N-Q-P 形状（历史上参考过 px0 公式，不是 LC3 Policy 的正式公式，也不是 px0 搜索等价实现）。当前 UCI 暴露 `CPuct`、`CPuctBase`、`CPuctFactor` 与 `FpuReduction`；默认 `1.75 / 40000 / 4.0`。所有 node 共用一条对数 cPUCT 曲线，`C(0)=1.75`、`C(50k)≈5`，不维护根专用初值或参数。`CPuctBase` 决定增长何时显著，`CPuctFactor` 决定增长幅度；固定时间 Elo 仍待配对对局确认。`FpuReduction=0.200`：小网络可能有系统性偏差，未知候选应较早获得首次 Evidence；LC0 对照值 `0.330` 与原 X7 `1.0/0.220` 均保留为实验基线。
+
+根最终 Decision 额外使用最小 LCB：仅在非终局根候选的 completed N 达到 N 第一候选的 `15%` 后，按其 shared-Q 一、二阶矩计算 `LCB = Q - 5·标准误`；`LcbStdevs=0` 退回 N→Q→P。它不改变 PUCT、FPU、edge N、MCGS 回传或 worker。二阶矩按 shared child 的当前 Q² 与 path-local leaf 的 WDL² 递归重算；当前每次 NN leaf 恰好是一份 visit，故 LCB 的样本量直接使用 completed N。该形状借鉴 KataGo `cpp/search/searchhelpers.cpp` 的 LCB 保守半径和最小访问筛选，但未移植其围棋 utility、weight 或 play-selection 机制。参数调整必须以固定节点质量锚点与固定时间 Elo 验证。
 
 ## 模型
 
-正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。CNN 对照基线为
+正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。Eval 编码产出与 px0 同系的稀疏
+`InputPlane{mask,value}`。DirectML：host expand 后 `Session::run`；TensorRT：GPU expand + IoBinding。
+CNN 对照基线为
 `width=384`、`blocks=15`、`bottleneck_channels=192`，带两次 Global Broadcast。v3 开始试验
 PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residual scale、LayerNorm、FFN 与 from-to policy，
 默认 `width=512`、`blocks=12`、`heads=16`、`ffn=768`。v3 使用 PX0/Lc0 AttentionBody
@@ -86,7 +97,7 @@ PX0/Lc0 AttentionBody：90-token MHA、Smolgen attention bias、DeepNorm residua
 
 ## 纪律
 
-- px0 路径的新 Rust 函数必须记录连续 px0 参考区间；stream 新函数记录 LC3 URL 与对应标题。
-- 找不到参考语义时记录缺口，不自行添加搜索启发式。
+- 借鉴外部语义时保留来源标注（px0 路径、LC3 URL、KataGo 本地路径/文档等），并写清是历史参考还是本仓已偏离。
+- 允许本仓自研搜索决策；不要把尚未验证的启发式伪装成“外部参考要求”。
 - `position ... moves ...` 必须保留完整历史。
-- stream UCI 持续验证 `position -> go -> stop -> position -> go` 无旧 generation、无 reservation 泄漏且恰好一次 `bestmove`；真实 ONNX 回归仅在本地 `data/x7.onnx` 存在时运行。
+- stream UCI 的运行边界是 `position -> go -> stop -> position -> go`：旧 generation 的 `info` 不再输出，所有 reservation 必须在 drain 后归还，每次 `go` 恰好输出一次 `bestmove`（含被下一条 `position` 打断时）。

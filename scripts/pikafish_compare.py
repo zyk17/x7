@@ -4,7 +4,6 @@
 仅用于本地搜索诊断。协议参考 UCI 的 ``uci/isready/position/go`` 生命周期；
 不参与 Rust 引擎、训练或正式基准吞吐。
 """
-
 from __future__ import annotations
 
 import argparse
@@ -15,6 +14,8 @@ from pathlib import Path
 
 
 DEFAULT_ENGINE = Path(r"C:\games\xiangqi\engines\pikafish-bmi2.exe")
+THREADS = 4
+HASH_MB = 512
 MULTIPV_RE = re.compile(r"(?:^|\s)multipv\s+(\d+)(?:\s|$)")
 
 
@@ -75,9 +76,12 @@ def main() -> int:
     try:
         send(process, "uci")
         read_until(process, "uciok", args.raw)
+        send(process, f"setoption name Threads value {THREADS}")
+        send(process, f"setoption name Hash value {HASH_MB}")
         send(process, f"setoption name MultiPV value {args.multipv}")
         send(process, "isready")
         read_until(process, "readyok", args.raw)
+        print(f"pikafish threads={THREADS} hash={HASH_MB}MB multipv={args.multipv}")
 
         position = f"position fen {args.fen}" if args.fen else "position startpos"
         moves = args.moves.split()

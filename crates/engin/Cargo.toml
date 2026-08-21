@@ -4,13 +4,31 @@ version = "0.1.0"
 edition.workspace = true
 description = "End-user UCI chess engine: search + xiangqi_core + NN backend (ONNX)."
 publish = false
-default-run = "engin"
+autobins = false
+default-run = "x7"
 
 [features]
-# 本机默认 DirectML；CUDA 只由独立脚本构建，二者不混入同一二进制。
+# 日常开发默认 DirectML；大节点实验才显式切 TensorRT，二者不混入同一二进制。
 default = ["directml"]
 directml = ["ort/directml", "ort/download-binaries", "ort/copy-dylibs", "ort/tls-native"]
-cuda = ["ort/cuda", "ort/load-dynamic", "ort/api-24"]
+# NVIDIA 线：ORT TensorRT EP。需 CUDA 13（nvcc）+ cuDNN 9 + TensorRT 10。
+tensorrt = ["ort/tensorrt", "ort/load-dynamic", "ort/api-24"]
+
+[[bin]]
+name = "x7"
+path = "src/main.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+
+[[bin]]
+name = "nn_eval"
+path = "src/bin/nn_eval.rs"
+
+[[bin]]
+name = "search_benchmark"
+path = "src/bin/search_benchmark.rs"
 
 [dependencies]
 crossbeam-channel = "0.5"
@@ -18,5 +36,4 @@ ndarray = "0.17"
 nohash-hasher = "0.2"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray"] }
 parking_lot = "0.12"
-quick_cache = "0.6.22"
 xiangqi_core = { path = "../xiangqi_core" }

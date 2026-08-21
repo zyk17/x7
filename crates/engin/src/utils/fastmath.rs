@@ -1,9 +1,9 @@
-//! px0 `src/utils/fastmath.h:38-103`。
+//! 快速数学近似，供 PUCT 与分数换算使用。
 //!
-//! 这些近似是 px0 PUCT 语义的一部分：`FastLog` 参与 PUCT 和 WDL 分数换算，因此改用
-//! 平台 `libm` 会改变决胜顺序和输出分数。
+//! `FastLog` 参与 PUCT 和 WDL
+//! 分数换算，改用平台 `libm` 会改变决胜顺序和输出分数。
 
-/// px0 `FastLog2`（`fastmath.h:42-57`）。不检查范围。
+/// 快速 log2；不检查范围。
 pub fn fast_log2(value: f32) -> f32 {
     let mut bits = value.to_bits();
     let exponent = bits >> 23;
@@ -12,7 +12,7 @@ pub fn fast_log2(value: f32) -> f32 {
     mantissa * (1.346_555_2 - 0.346_555_23 * mantissa) - 127.0 + exponent as f32
 }
 
-/// px0 `FastExp2` (`fastmath.h:64-79`).
+/// 快速 exp2。
 pub fn fast_exp2(value: f32) -> f32 {
     if value < -126.0 {
         return 0.0;
@@ -24,19 +24,19 @@ pub fn fast_exp2(value: f32) -> f32 {
     f32::from_bits(bits)
 }
 
-/// px0 `FastLog` (`fastmath.h:81-83`).
+/// 快速自然对数。
 #[allow(clippy::approx_constant)] // Keep px0's deliberately rounded f32 coefficient.
 pub fn fast_log(value: f32) -> f32 {
     0.693_147_2 * fast_log2(value)
 }
 
-/// px0 `FastExp` (`fastmath.h:85-86`).
+/// 快速 e^x。
 #[allow(clippy::approx_constant)] // Keep px0's deliberately rounded f32 coefficient.
 pub fn fast_exp(value: f32) -> f32 {
     fast_exp2(1.442_695 * value)
 }
 
-/// px0 `FastLogistic` (`fastmath.h:88-92`).
+/// 快速 logistic。
 pub fn fast_logistic(value: f32) -> f32 {
     if value > 20.0 {
         return 1.0;

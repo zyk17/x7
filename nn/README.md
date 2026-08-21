@@ -1,5 +1,8 @@
 # nn
 
+本目录是独立的 Knowledge 训练子项目：数据格式与导出契约历史上源于 px0 / pxzero-training，
+但引擎搜索不是 px0 重写；训练侧不承担 Proof / MCGS 语义。
+
 当前 Python 训练栈主线已经固定为：
 
 - `PX0 v6 chunks`

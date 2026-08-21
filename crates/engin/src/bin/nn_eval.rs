@@ -11,9 +11,12 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use engin::neural::backend::{Backend, EvalPosition};
+use engin::neural::backend::Backend;
 use engin::neural::onnx::OnnxBackend;
-use xiangqi_core::{GameState, Move, Position, PositionHistory, STARTPOS_FEN};
+use engin::neural::{
+    EncodedBatch, FillEmptyHistory, InputPlanes, encode_position_input_planes, eval_result_from_encoded_row,
+};
+use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
 struct Args {
     onnx: PathBuf,
@@ -118,7 +121,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let legal = history.last().board().generate_legal_moves();
     println!(
         "fen={} moves={} side={} legal={}",
-        args.fen,
+        state.current_position().to_fen(),
         if args.moves.is_empty() {
             "-".to_owned()
         } else {
@@ -129,7 +132,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let t0 = Instant::now();
-    let eval = backend.evaluate(&history, &legal);
+    let eval = evaluate(&backend, &history, &legal)?;
     let eval_ms = t0.elapsed().as_secs_f64() * 1e3;
     let (w, d, l) = wdl_from_eval(eval.wl, eval.d);
     println!(
@@ -148,7 +151,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("policy_sum={policy_sum:.6}");
 
     if let Some(iters) = args.bench_iters {
-        run_bench(&backend, &history, &legal, iters, &args.batches)?;
+        run_bench(&backend, &history, iters, &args.batches)?;
     }
     Ok(())
 }
@@ -156,19 +159,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn run_bench(
     backend: &OnnxBackend,
     history: &PositionHistory,
-    legal: &[Move],
     iters: usize,
     batches: &[usize],
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("bench iters={iters} (warmup 3, exclude from stats)");
-    let positions = history.positions().to_vec();
+    let planes = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
     for &batch in batches {
         for _ in 0..3 {
-            timed_batch(backend, &positions, legal, batch)?;
+            timed_batch(backend, &planes, batch)?;
         }
         let mut samples = Vec::with_capacity(iters);
         for _ in 0..iters {
-            samples.push(timed_batch(backend, &positions, legal, batch)?);
+            samples.push(timed_batch(backend, &planes, batch)?);
         }
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let sum: f64 = samples.iter().sum();
@@ -181,22 +183,32 @@ fn run_bench(
     Ok(())
 }
 
-fn timed_batch(
-    backend: &OnnxBackend,
-    positions: &[Position],
-    legal: &[Move],
-    batch: usize,
-) -> Result<f64, Box<dyn std::error::Error>> {
-    let computation = backend.create_computation()?;
-    for _ in 0..batch {
-        computation.add_input(EvalPosition {
-            positions: positions.to_vec(),
-            legal_moves: legal.to_vec(),
-        })?;
-    }
+fn timed_batch(backend: &OnnxBackend, planes: &InputPlanes, batch: usize) -> Result<f64, Box<dyn std::error::Error>> {
+    let samples = vec![*planes; batch];
+    let mut logits = Vec::new();
+    let mut wdl = Vec::new();
+    let mut moves_left = Vec::new();
     let t0 = Instant::now();
-    computation.compute_blocking()?;
+    backend.infer_input_planes_into(&samples, &mut logits, &mut wdl, &mut moves_left)?;
     Ok(t0.elapsed().as_secs_f64() * 1e3)
+}
+
+fn evaluate(
+    backend: &OnnxBackend,
+    history: &PositionHistory,
+    legal_moves: &[Move],
+) -> Result<std::sync::Arc<engin::neural::backend::EvalResult>, Box<dyn std::error::Error>> {
+    let sample = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
+    let mut logits = Vec::new();
+    let mut wdl = Vec::new();
+    let mut moves_left = Vec::new();
+    backend.infer_input_planes_into(&[sample], &mut logits, &mut wdl, &mut moves_left)?;
+    let output = EncodedBatch {
+        logits,
+        wdl,
+        moves_left,
+    };
+    Ok(eval_result_from_encoded_row(&output, 0, legal_moves)?)
 }
 
 fn main() {

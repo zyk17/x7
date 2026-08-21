@@ -1,75 +1,106 @@
-//! px0 `src/neural/memcache.cc:38-190` 的 NN cache 存储。
+//! NN cache 存储。
 //!
-//! px0 `HashKeyedCache` 不维护 LRU，插入已有 key 时不替换，并按 FIFO 淘汰
-//! （`src/utils/cache.h:35-57,69-105,214-230`）。本项目改用 `quick_cache`
-//! 的分片 S3-FIFO 容器，淘汰策略因此不再逐项等同 px0；key、collision guard
-//! 与 completed-only 回填时序仍由 `CachingBackend` 保持。
+//! key 由 `EvalCacheKey::slot_key()` 提供：棋盘 hash 混入 `repetitions`；
+//! 命中时再校验 `num_moves`（廉价碰撞护栏）。**不**纳入完整 history。
+//! 容量与替换：固定 `2^N` 直映表，槽内新结果替换旧结果（KataGo 风格）。
+//!
+//! 历史参考：px0 `neural/memcache.cc`；KataGo `neuralnet/nneval.cpp`。
 
 use std::sync::Arc;
 
+use parking_lot::{Mutex, RwLock};
+
 use super::backend::EvalResult;
-use quick_cache::sync::{Cache, EntryAction, EntryResult};
 
-/// px0 `SharedBackendParams::kNNCacheSizeId` 的默认值
-/// (`src/neural/shared_params.cc:63-82`)。
-pub const DEFAULT_NN_CACHE_SIZE: usize = 2_000_000;
+/// KataGo GTP 默认值（`cpp/program/setup.cpp:248-255`）：`2^20 = 1,048,576` 槽。
+pub const DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO: u8 = 20;
+/// KataGo `setup.cpp` 对该配置接受 `0..=48`。超大值仍受实际可分配内存约束。
+pub const MAX_NN_CACHE_SIZE_POWER_OF_TWO: u8 = 48;
 
-/// px0 `CachedValue` (`src/neural/memcache.cc:48-55`) 的 Rust 所有权版本。
+/// cache 中保存的评估结果。
 #[derive(Clone, Debug)]
 pub(crate) struct CachedEval {
     pub result: Arc<EvalResult>,
     pub num_moves: usize,
 }
 
-/// 共享 NN 结果缓存。`quick_cache` 提供通用并发容器；wrapper 保留 px0 专用的 key 和
-/// 合法着数量规则。
+#[derive(Debug)]
+struct CacheEntry {
+    key: u64,
+    value: CachedEval,
+}
+
+#[derive(Debug, Default)]
+struct CacheSlot(Mutex<Option<CacheEntry>>);
+
+/// KataGo 风格的直映 NN cache。每个槽只保留一个完整 key；不同 key 映射到同一槽时，
+/// 后写结果替换先前结果。表大小只在 UCI option 改动时重建，查找只锁定目标槽。
 #[derive(Debug)]
 pub(crate) struct EvalCache {
-    values: Cache<u64, CachedEval>,
+    slots: RwLock<Arc<[CacheSlot]>>,
 }
 
 impl EvalCache {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(size_power_of_two: u8) -> Self {
         Self {
-            values: Cache::new(capacity),
+            slots: RwLock::new(Self::allocate_slots(size_power_of_two)),
         }
     }
 
-    /// px0 `MemCache::GetCachedEvaluation` / collision guard
+    fn allocate_slots(size_power_of_two: u8) -> Arc<[CacheSlot]> {
+        assert!(
+            size_power_of_two <= MAX_NN_CACHE_SIZE_POWER_OF_TWO,
+            "NN cache size power is out of range"
+        );
+        let size = 1usize << size_power_of_two;
+        let mut slots = Vec::with_capacity(size);
+        slots.resize_with(size, CacheSlot::default);
+        slots.into()
+    }
+
+    fn slots(&self) -> Arc<[CacheSlot]> {
+        Arc::clone(&self.slots.read())
+    }
+
+    /// 查找 cache；key 冲突时校验完整 key / 合法着数。
     /// （`memcache.cc:130-150`）。空合法着列表可接受缓存结果；否则只有相同 policy
     /// 长度才安全。
     pub(crate) fn get(&self, key: u64, requested_moves: usize) -> Option<Arc<EvalResult>> {
-        self.values
-            .get(&key)
-            .filter(|cached| requested_moves == 0 || cached.num_moves == requested_moves)
-            .map(|cached| cached.result)
+        let slots = self.slots();
+        let slot = slots[key as usize & (slots.len() - 1)].0.lock();
+        let entry = slot.as_ref()?;
+        (entry.key == key && (requested_moves == 0 || entry.value.num_moves == requested_moves))
+            .then(|| Arc::clone(&entry.value.result))
     }
 
-    /// 保留一个 key 的第一份完整结果。`quick_cache` 负责 S3-FIFO 淘汰策略；px0
-    /// `HashKeyedCache::Insert` 只作为不替换缓存契约的参考（`utils/cache.h:69-105`）。
-    pub(crate) fn insert_if_absent(&self, key: u64, value: CachedEval) {
-        match self.values.entry(&key, None, |_, _| EntryAction::Retain(())) {
-            EntryResult::Vacant(guard) => {
-                let _ = guard.insert(value);
-            }
-            EntryResult::Retained(()) | EntryResult::Timeout => {}
-            EntryResult::Removed(_, _) | EntryResult::Replaced(_, _) => unreachable!("retain-only cache entry"),
-        }
+    /// KataGo `NNCacheTable::set`：同一槽内的新结果替换旧结果。旧 `Arc` 在离开锁后
+    /// 才释放，避免析构占用槽锁。
+    pub(crate) fn insert(&self, key: u64, value: CachedEval) {
+        let slots = self.slots();
+        let previous = {
+            let mut slot = slots[key as usize & (slots.len() - 1)].0.lock();
+            slot.replace(CacheEntry { key, value })
+        };
+        drop(previous);
     }
 
-    /// px0 `HashKeyedCache::SetCapacity` (`src/utils/cache.h:143-167`).
-    pub(crate) fn set_capacity(&self, capacity: usize) {
-        self.values.set_capacity(capacity as u64);
+    /// 仅供 Engine 生命周期 option 调用。先分配新表再交换，已有查找继续持有旧表快照。
+    pub(crate) fn set_size_power_of_two(&self, size_power_of_two: u8) {
+        let slots = Self::allocate_slots(size_power_of_two);
+        *self.slots.write() = slots;
     }
 
-    /// px0 `HashKeyedCache::Clear` (`utils/cache.h:169-173`).
+    /// 清空时直接交换同尺寸空表，避免逐槽加锁。
     pub(crate) fn clear(&self) {
-        self.values.clear();
+        let size = self.slots.read().len();
+        let mut slots = Vec::with_capacity(size);
+        slots.resize_with(size, CacheSlot::default);
+        *self.slots.write() = slots.into();
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.values.len()
+        self.slots.read().iter().filter(|slot| slot.0.lock().is_some()).count()
     }
 }
 
@@ -78,50 +109,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_preserves_first_value_for_an_existing_key() {
+    fn direct_slot_replaces_an_older_key() {
         let result = Arc::new(EvalResult::default());
-        let cache = EvalCache::new(2);
-        cache.insert_if_absent(
+        let cache = EvalCache::new(0);
+        cache.insert(
             1,
             CachedEval {
                 result: Arc::clone(&result),
                 num_moves: 1,
             },
         );
-        cache.insert_if_absent(
+        cache.insert(
             2,
             CachedEval {
                 result: Arc::clone(&result),
                 num_moves: 2,
             },
         );
-        cache.insert_if_absent(
-            1,
-            CachedEval {
-                result: Arc::clone(&result),
-                num_moves: 9,
-            },
-        );
-        assert!(cache.get(1, 1).is_some());
-        assert!(cache.get(1, 9).is_none());
+        assert!(cache.get(1, 1).is_none());
         assert!(cache.get(2, 2).is_some());
-        assert!(Arc::ptr_eq(&cache.get(1, 1).expect("cached value"), &result));
-        assert_eq!(cache.len(), 2);
+        assert!(Arc::ptr_eq(&cache.get(2, 2).expect("cached value"), &result));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
-    fn cache_capacity_shrinks_to_requested_limit() {
-        let cache = EvalCache::new(2);
-        for key in 1..=2 {
-            cache.insert_if_absent(
-                key,
-                CachedEval {
-                    result: Arc::new(EvalResult::default()),
-                    num_moves: 0,
-                },
-            );
-        }
-        cache.set_capacity(1);
-        assert!(cache.len() <= 1);
+    fn cache_checks_the_full_key_inside_a_slot() {
+        let cache = EvalCache::new(0);
+        cache.insert(
+            1,
+            CachedEval {
+                result: Arc::new(EvalResult::default()),
+                num_moves: 1,
+            },
+        );
+        assert!(cache.get(3, 1).is_none());
+        assert!(cache.get(1, 2).is_none());
+        assert!(cache.get(1, 1).is_some());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cache_resize_replaces_all_entries() {
+        let cache = EvalCache::new(1);
+        cache.insert(
+            1,
+            CachedEval {
+                result: Arc::new(EvalResult::default()),
+                num_moves: 0,
+            },
+        );
+        cache.set_size_power_of_two(0);
+        assert_eq!(cache.len(), 0);
     }
 }
