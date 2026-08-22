@@ -93,7 +93,7 @@ impl Default for SearchConfig {
         Self {
             queue_capacity: 0,
             eval_batch_size: 0,
-            nn_window: 2.3,
+            nn_window: 2.25,
             params: SearchParams::default(),
             gather_workers: 3,
             eval_workers: 5,
