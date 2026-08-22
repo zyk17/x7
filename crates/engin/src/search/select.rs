@@ -94,8 +94,8 @@ mod tests {
     use xiangqi_core::{Move, Square};
 
     use super::{compute_cpuct, edge_utility, select_edge, visited_policy};
+    use crate::search::NodeArena;
     use crate::search::param::SearchParams;
-    use crate::search::{NodeKey, NodeRepository};
 
     fn mv(from: &str, to: &str) -> Move {
         Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
@@ -126,9 +126,8 @@ mod tests {
 
     #[test]
     fn in_flight_visit_deflects_selection_without_changing_completed_q() {
-        let repo = NodeRepository::default();
-        let key = NodeKey::root(9);
-        let node = repo.get_or_insert(key);
+        let arena = NodeArena::default();
+        let node = arena.get(arena.allocate()).expect("node");
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("b2", "b3"), 0.6), (mv("c3", "c4"), 0.4)]);
         let edges = node.edges();
@@ -149,9 +148,8 @@ mod tests {
 
     #[test]
     fn root_move_filter_restricts_selection() {
-        let repo = NodeRepository::default();
-        let key = NodeKey::root(9);
-        let node = repo.get_or_insert(key);
+        let arena = NodeArena::default();
+        let node = arena.get(arena.allocate()).expect("node");
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("b2", "b3"), 0.9), (mv("c3", "c4"), 0.1)]);
         let edges = node.edges();
@@ -165,9 +163,8 @@ mod tests {
 
     #[test]
     fn visited_edge_utility_reads_edge_q() {
-        let repo = NodeRepository::default();
-        let key = NodeKey::root(3);
-        let node = repo.get_or_insert(key);
+        let arena = NodeArena::default();
+        let node = arena.get(arena.allocate()).expect("node");
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();
@@ -178,9 +175,8 @@ mod tests {
 
     #[test]
     fn virtual_fpu_mean_is_temporary_action_q_only() {
-        let repo = NodeRepository::default();
-        let key = NodeKey::root(50);
-        let node = repo.get_or_insert(key);
+        let arena = NodeArena::default();
+        let node = arena.get(arena.allocate()).expect("node");
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edge = node.edges()[0].clone();

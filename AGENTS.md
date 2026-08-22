@@ -8,8 +8,8 @@
 ## 工程共识
 
 - X7 是独立 Rust 象棋引擎，不是 px0 重写，也不以兼容 px0/LC3 为目标。
-- 当前正式搜索是 stream 路径树：`NodeKey = hash_cat(parent, move)`，不合并换位；规则历史随
-  variation/event 裁决，不依赖树拓扑。
+- 当前正式搜索是 stream 路径树：edge 首次下探时绑定 arena `NodeId`，不合并换位；规则历史随
+  variation/event 裁决，不依赖树拓扑。跨回合只向前复用已展开 child；旧 job drain 后才后台回收 sibling。
 - 规则与训练格式的历史工程参考为 `C:\Users\Administrator\projects\px0` 和
   `C:\Users\Administrator\projects\pxzero-training`；LC3、KataGo 只按需参考，不能宣称等价。
 - 正式模型契约固定为 `124x10x9 -> 2062 + WDL + moves-left`。正式 UCI 不得使用

@@ -22,7 +22,7 @@ use super::observer::{NoopObserver, SearchObserver};
 use super::param::{SearchConfig, SearchParams};
 use super::select::select_edge;
 use super::workerpool::{BackpropEvent, PlayoutEvent, WorkerPool};
-use super::{EdgeReservation, ExpansionState, Node, NodeKey, NodeRepository, SearchTree};
+use super::{EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree};
 
 pub(crate) const RECEIVE_POLL: Duration = Duration::from_millis(10);
 
@@ -42,7 +42,7 @@ pub struct Stats {
 
 pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) backend: Arc<dyn Backend>,
-    pub(crate) repository: Arc<NodeRepository>,
+    pub(crate) arena: Arc<NodeArena>,
     pub(crate) generation: u64,
     pub(crate) params: SearchParams,
     pub(crate) root_move_filter: Mutex<Vec<Move>>,
@@ -63,7 +63,7 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) eval_tx: crossbeam_channel::Sender<PlayoutEvent<O::Stamp>>,
     pub(crate) backprop_tx: crossbeam_channel::Sender<BackpropEvent<O::Stamp>>,
     /// 撞上 `Evaluating` 叶子的 playout。先留着 reservation / μ；该叶子自己的
-    /// backprop `complete` 之后再按 `node_key` 摘出来 cancel。
+    /// backprop `complete` 之后再按 `node_id` 摘出来 cancel。
     pub(crate) collision_waiters: Mutex<Vec<PlayoutEvent<O::Stamp>>>,
 }
 
@@ -131,8 +131,8 @@ impl<O: SearchObserver> Shared<O> {
             let mut waiters = self.collision_waiters.lock();
             if !self.stopping.load(Ordering::Acquire)
                 && self
-                    .repository
-                    .get(event.node_key)
+                    .arena
+                    .get(event.node_id)
                     .is_some_and(|node| node.expansion_state() == ExpansionState::Evaluating)
             {
                 waiters.push(event);
@@ -143,12 +143,12 @@ impl<O: SearchObserver> Shared<O> {
         self.finish(1, false);
     }
 
-    pub(crate) fn cancel_collisions(&self, key: NodeKey) {
+    pub(crate) fn cancel_collisions(&self, id: NodeId) {
         let mut waiters = self.collision_waiters.lock();
         let mut i = 0;
         let mut parked = Vec::new();
         while i < waiters.len() {
-            if waiters[i].node_key == key {
+            if waiters[i].node_id == id {
                 parked.push(waiters.swap_remove(i));
             } else {
                 i += 1;
@@ -177,12 +177,12 @@ impl<O: SearchObserver> Shared<O> {
     /// the edge reservations would leave the claimed node permanently
     /// `Evaluating`, so this also restores it to `Unexpanded`.
     pub(crate) fn cancel_claimed_evaluation(&self, event: PlayoutEvent<O::Stamp>) {
-        let Some(node) = self.repository.get(event.node_key) else {
+        let Some(_node) = self.arena.get(event.node_id) else {
             event.cancel();
             self.finish(1, false);
             return;
         };
-        cancel_evaluation(self, event, node);
+        cancel_evaluation(self, event);
     }
 
     pub(crate) fn fail(&self, error: EnginError) {
@@ -227,10 +227,10 @@ impl<O: SearchObserver> Shared<O> {
         event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
-                let key = event.playout.node_key;
+                let id = event.playout.node_id;
                 event.cancel();
                 self.finish(1, false);
-                self.cancel_collisions(key);
+                self.cancel_collisions(id);
                 return;
             }
             match self.backprop_tx.try_send(event) {
@@ -240,10 +240,10 @@ impl<O: SearchObserver> Shared<O> {
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    let key = returned.playout.node_key;
+                    let id = returned.playout.node_id;
                     returned.cancel();
                     self.finish(1, false);
-                    self.cancel_collisions(key);
+                    self.cancel_collisions(id);
                     return;
                 }
             }
@@ -265,10 +265,10 @@ impl<O: SearchObserver> Shared<O> {
 
 fn branch_at_expanded_node<O: SearchObserver>(
     shared: &Shared<O>,
-    event: &PlayoutEvent<O::Stamp>,
+    _event: &PlayoutEvent<O::Stamp>,
     node: &Node,
     depth: usize,
-) -> Option<(NodeKey, EdgeReservation)> {
+) -> Option<(NodeId, EdgeReservation)> {
     let (edge_index, virtual_mean) = select_edge(
         &node.edges(),
         node.completed_visits(),
@@ -277,7 +277,8 @@ fn branch_at_expanded_node<O: SearchObserver>(
         &shared.params,
         &shared.root_move_filter.lock(),
     )?;
-    let child = event.node_key.child(node.edges()[edge_index].mv());
+    let edge = &node.edges()[edge_index];
+    let child = shared.arena.child_or_create(edge);
     let reservation = node
         .reserve_edge_with_virtual_mean(edge_index, virtual_mean)
         .expect("selected stream edge");
@@ -295,7 +296,10 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
             shared.finish(1, false);
             return;
         }
-        let node = shared.repository.get_or_insert(event.node_key);
+        let node = shared
+            .arena
+            .get(event.node_id)
+            .expect("event node lives until job drain");
         match node.expansion_state() {
             ExpansionState::Unexpanded => {
                 if shared.nn_inflight.load(Ordering::Acquire) >= eval_claim_limit {
@@ -320,7 +324,7 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
             }
             ExpansionState::Expanded => {
                 let depth = event.variation.moves().len();
-                let Some((child, reservation)) = branch_at_expanded_node(shared, &event, node.as_ref(), depth) else {
+                let Some((child, reservation)) = branch_at_expanded_node(shared, &event, node, depth) else {
                     if event.reservations.is_empty() {
                         // root 无着可探（空边 / searchmoves 滤空）：停搜，不伪造成路径终局。
                         shared.finish(1, false);
@@ -392,7 +396,7 @@ impl<O: SearchObserver> SearchControl<O> {
 pub struct Search<O: SearchObserver = NoopObserver> {
     shared: Arc<Shared<O>>,
     root_history: Arc<PositionHistory>,
-    root_key: NodeKey,
+    root_id: NodeId,
     /// 启动本次 job 前 root 已有的 completed N。它计入 UCI `go nodes`，但不计入本次 NPS。
     initial_visits: u64,
     worker_pool: Arc<WorkerPool<O>>,
@@ -461,14 +465,14 @@ impl<O: SearchObserver> Search<O> {
         // UCI/graph 持有完整 history 用于跨回合定位；每个 event 只需要重复规则自
         // 最近零化着以来的后缀，以及 NN 的最近 8 层。这里一次裁剪后由整次 job 共享。
         let root_history = Arc::new(graph.root_history().search_window(MOVE_HISTORY));
-        let root_key = graph.root_key();
+        let root_id = graph.root_id();
         let initial_visits = graph
-            .repository()
-            .get(root_key)
+            .arena()
+            .get(root_id)
             .map_or(0, |root| root.completed_visits() as u64);
         let shared = Arc::new(Shared {
             backend,
-            repository: Arc::clone(graph.repository()),
+            arena: Arc::clone(graph.arena()),
             generation,
             params: resolved.params,
             root_move_filter: Mutex::new(Vec::new()),
@@ -494,19 +498,19 @@ impl<O: SearchObserver> Search<O> {
         Self {
             shared,
             root_history,
-            root_key,
+            root_id,
             initial_visits,
             worker_pool,
             workers_idle: false,
         }
     }
 
-    pub fn repository(&self) -> &Arc<NodeRepository> {
-        &self.shared.repository
+    pub fn arena(&self) -> &Arc<NodeArena> {
+        &self.shared.arena
     }
 
-    pub fn root_key(&self) -> NodeKey {
-        self.root_key
+    pub fn root_id(&self) -> NodeId {
+        self.root_id
     }
 
     pub fn initial_visits(&self) -> u64 {
@@ -524,8 +528,8 @@ impl<O: SearchObserver> Search<O> {
         path_terminal_value(self.root_history.as_ref(), 0).is_some()
             || self
                 .shared
-                .repository
-                .get(self.root_key)
+                .arena
+                .get(self.root_id)
                 .is_some_and(|root| root.expansion_state() == ExpansionState::Terminal)
     }
 
@@ -559,7 +563,7 @@ impl<O: SearchObserver> Search<O> {
             return Err(EnginError::PortIncomplete("stream worker pipeline is stopped"));
         }
         self.shared.start_playout();
-        let mut event = PlayoutEvent::at_root(self.shared.generation, self.root_key, Arc::clone(&self.root_history));
+        let mut event = PlayoutEvent::at_root(self.shared.generation, self.root_id, Arc::clone(&self.root_history));
         event.mark_queued();
         loop {
             if self.shared.stopping.load(Ordering::Acquire) {
@@ -621,11 +625,7 @@ impl<O: SearchObserver> Search<O> {
                 report(self.stats());
                 next_report = report_interval.and_then(|interval| now.checked_add(interval));
             }
-            let root_state = self
-                .shared
-                .repository
-                .get(self.root_key)
-                .map(|root| root.expansion_state());
+            let root_state = self.shared.arena.get(self.root_id).map(|root| root.expansion_state());
             if root_state == Some(ExpansionState::Terminal) {
                 break;
             }
@@ -743,10 +743,10 @@ mod tests {
         let stats = pipeline.run_playouts(64).expect("search");
         assert_eq!(stats.completed_playouts, 64);
         assert!(stats.network_evaluations > 0);
-        let root = root_stats(pipeline.repository(), pipeline.root_key()).expect("root");
+        let root = root_stats(pipeline.arena(), pipeline.root_id()).expect("root");
         assert!(root.completed_visits >= 64);
         assert!(root.edges.iter().all(|e| e.started_visits == e.completed_visits));
-        assert!(best_move(pipeline.repository(), pipeline.root_key(), root_is_black).is_some());
+        assert!(best_move(pipeline.arena(), pipeline.root_id(), root_is_black).is_some());
         pipeline.stop_and_finish();
     }
 
@@ -757,12 +757,12 @@ mod tests {
         let mut tree = super::SearchTree::new(history);
         let mut first = Search::new_with_graph(Arc::new(UniformBackend::default()), 1, &tree, SearchConfig::default());
         first.run_playouts(32).expect("first");
-        let played = best_move(first.repository(), first.root_key(), false).expect("best");
+        let played = best_move(first.arena(), first.root_id(), false).expect("best");
         first.stop_and_finish();
-        let old_root = tree.root_key();
+        let old_root = tree.root_id();
         tree.advance(played).expect("advance");
-        assert_ne!(tree.root_key(), old_root);
-        assert!(tree.repository().get(old_root).is_some());
-        assert!(tree.repository().get(tree.root_key()).is_some());
+        assert_ne!(tree.root_id(), old_root);
+        assert!(tree.arena().get(old_root).is_some());
+        assert!(tree.arena().get(tree.root_id()).is_some());
     }
 }

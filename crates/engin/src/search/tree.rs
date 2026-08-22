@@ -1,13 +1,13 @@
-//! 搜索树数据面：`NodeKey` / `Edge` / `Node` / `NodeRepository` / reservation。
+//! 搜索树数据面：`NodeId` / `Edge` / `Node` / `NodeArena` / reservation。
 //!
-//! 只定义结构与原子操作，不调度流水线。`child = hash_cat(parent, move)`，不合并换位。
+//! 只定义结构与原子操作，不调度流水线。child 由 edge 一次性绑定 arena slot，不合并换位。
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
-use nohash_hasher::{IsEnabled, NoHashHasher};
 use parking_lot::{Mutex, RwLock};
 use xiangqi_core::{Move, PositionHistory};
 
@@ -83,30 +83,24 @@ impl ValueDelta {
     }
 }
 
-/// repository 的标识。它是 tree key 而非仅按局面划分的 transposition key：不同路径
-/// 到达的相同局面仍是不同 node。
-///
-/// `u64` 已由 `hash_cat` 混合。分片 map 使用 `nohash_hasher::NoHashHasher`，直接
-/// 以此值为 bucket index，不再进行第二次 hash。
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
-pub struct NodeKey(u64);
+/// 路径树 node 的稳定地址。它只用于 arena 寻址，不携带棋盘或路径 hash。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct NodeId(u64);
 
-impl Hash for NodeKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.0);
-    }
-}
+impl NodeId {
+    const SLOT_BITS: u32 = 10;
+    const SLOT_MASK: u64 = (1 << Self::SLOT_BITS) - 1;
 
-// 断言 `Hash` 只调用一次 `write_u64`，这是 `NoHashHasher` 的要求。
-impl IsEnabled for NodeKey {}
-
-impl NodeKey {
-    pub const fn root(position_hash: u64) -> Self {
-        Self(position_hash)
+    const fn new(page: u32, slot: u16) -> Self {
+        Self(((page as u64) << Self::SLOT_BITS) | slot as u64)
     }
 
-    pub const fn child(self, mv: Move) -> Self {
-        Self(xiangqi_core::hashcat::hash_cat(self.0, mv.raw() as u64))
+    const fn page(self) -> usize {
+        (self.0 >> Self::SLOT_BITS) as usize
+    }
+
+    const fn slot(self) -> usize {
+        (self.0 & Self::SLOT_MASK) as usize
     }
 }
 
@@ -116,6 +110,7 @@ pub struct Edge {
     mv: Move,
     prior: f32,
     started: AtomicU32,
+    child: OnceLock<NodeId>,
     /// 已完成 N/Q 与尚未完成的 virtual mean；选边要一起读。
     stats: Mutex<EdgeStats>,
 }
@@ -136,6 +131,7 @@ impl Edge {
             mv,
             prior,
             started: AtomicU32::new(0),
+            child: OnceLock::new(),
             stats: Mutex::new(EdgeStats::default()),
         }
     }
@@ -146,6 +142,14 @@ impl Edge {
 
     pub fn prior(&self) -> f32 {
         self.prior
+    }
+
+    pub fn child(&self) -> Option<NodeId> {
+        self.child.get().copied()
+    }
+
+    fn install_child(&self, child: NodeId) -> Result<(), NodeId> {
+        self.child.set(child)
     }
 
     /// edge N 包含 in-flight visit。
@@ -235,7 +239,7 @@ impl EdgeReservation {
     }
 }
 
-/// repository node 不可逆的展开生命周期。
+/// node 不可逆的展开生命周期。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ExpansionState {
@@ -268,14 +272,14 @@ struct NodeStats {
     m_sum: f32,
 }
 
-/// repository 的 node 值。展开时只发布一次 edge vector；之后各 edge 统计可独立推进，
+/// arena 的 node 值。展开时只发布一次 edge vector；之后各 edge 统计可独立推进，
 /// 不需要整棵 tree 锁。
 #[derive(Debug, Default)]
 pub struct Node {
     /// 生命周期：Unexpanded → Evaluating → Expanded|Terminal（`ExpansionState` 以 u8
     /// 供 CAS 使用）。
     expansion: AtomicU8,
-    edges: RwLock<Arc<[Arc<Edge>]>>,
+    edges: OnceLock<Arc<[Arc<Edge>]>>,
     /// LC3 node 保留其 completed 聚合值。in-flight visit 保持在 edge-local，刻意不计入
     /// 此值。
     stats: Mutex<NodeStats>,
@@ -376,7 +380,7 @@ impl Node {
             .into_iter()
             .map(|(mv, prior)| Arc::new(Edge::new(mv, prior)))
             .collect();
-        *self.edges.write() = edges;
+        self.edges.set(edges).expect("stream node publishes edges once");
         self.expansion.store(ExpansionState::Expanded as u8, Ordering::Release);
     }
 
@@ -447,7 +451,7 @@ impl Node {
     }
 
     pub fn edges(&self) -> Arc<[Arc<Edge>]> {
-        Arc::clone(&self.edges.read())
+        self.edges.get().cloned().unwrap_or_default()
     }
 
     pub fn reserve_edge(&self, edge_index: usize) -> Option<EdgeReservation> {
@@ -463,62 +467,144 @@ impl Node {
     }
 }
 
-#[derive(Debug)]
-struct RepositoryShard {
-    /// `NoHashHasher`：`NodeKey` 已经 `hash_cat`，不得再次 hash。
-    nodes: RwLock<HashMap<NodeKey, Arc<Node>, BuildHasherDefault<NoHashHasher<u64>>>>,
+const NODES_PER_PAGE: usize = 1 << NodeId::SLOT_BITS;
+
+struct NodeSlot {
+    initialized: AtomicBool,
+    value: UnsafeCell<MaybeUninit<Node>>,
 }
 
-/// 分片 key-value repository。分片锁只保护 map 查找和插入；node 统计存放在各自的
-/// node/edge 对象之后。
-#[derive(Debug)]
-pub struct NodeRepository {
-    shards: Box<[RepositoryShard]>,
-}
+// `Node` 的可变部分自身由原子量和锁保护。slot 的初始化、回收与复用只发生在
+// arena 的 allocator 锁下；GC 只处理已不可达且已 settled 的 subtree。
+unsafe impl Sync for NodeSlot {}
 
-impl NodeRepository {
-    pub fn new(shard_count: usize) -> Self {
-        assert!(
-            shard_count.is_power_of_two(),
-            "stream shard count must be a power of two"
-        );
-        assert!(shard_count > 0, "stream shard count must be non-zero");
+impl NodeSlot {
+    fn empty() -> Self {
         Self {
-            shards: (0..shard_count)
-                .map(|_| RepositoryShard {
-                    nodes: RwLock::new(HashMap::default()),
-                })
-                .collect(),
+            initialized: AtomicBool::new(false),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+}
+
+struct NodePage {
+    slots: Box<[NodeSlot]>,
+}
+
+impl NodePage {
+    fn new() -> Self {
+        Self {
+            slots: std::iter::repeat_with(NodeSlot::empty).take(NODES_PER_PAGE).collect(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ArenaAllocator {
+    free: Vec<NodeId>,
+    next_page: u32,
+    next_slot: u16,
+}
+
+/// append-only page arena。page 永不搬迁，`NodeId` 只在 stop/drain 后的 GC 确认
+/// 无任何旧 event 可达时才会被复用。
+pub struct NodeArena {
+    pages: RwLock<Vec<Arc<NodePage>>>,
+    allocator: Mutex<ArenaAllocator>,
+}
+
+impl NodeArena {
+    pub fn new() -> Self {
+        Self {
+            pages: RwLock::new(Vec::new()),
+            allocator: Mutex::new(ArenaAllocator::default()),
         }
     }
 
-    pub fn get_or_insert(&self, key: NodeKey) -> Arc<Node> {
-        let shard = &self.shards[self.shard_index(key)];
-        if let Some(node) = shard.nodes.read().get(&key) {
-            return Arc::clone(node);
+    fn page(&self, id: NodeId) -> Option<Arc<NodePage>> {
+        self.pages.read().get(id.page()).cloned()
+    }
+
+    pub fn allocate(&self) -> NodeId {
+        let (id, page) = {
+            let mut allocator = self.allocator.lock();
+            if let Some(id) = allocator.free.pop() {
+                let page = self.page(id).expect("reusable node page exists");
+                (id, page)
+            } else {
+                if allocator.next_slot as usize == NODES_PER_PAGE {
+                    allocator.next_page += 1;
+                    allocator.next_slot = 0;
+                }
+                let page_index = allocator.next_page;
+                let slot = allocator.next_slot;
+                allocator.next_slot += 1;
+                let id = NodeId::new(page_index, slot);
+                let page = {
+                    let mut pages = self.pages.write();
+                    while pages.len() <= page_index as usize {
+                        pages.push(Arc::new(NodePage::new()));
+                    }
+                    Arc::clone(&pages[page_index as usize])
+                };
+                (id, page)
+            }
+        };
+        let slot = &page.slots[id.slot()];
+        assert!(!slot.initialized.load(Ordering::Acquire), "arena slot is free");
+        // SAFETY: allocator gives each live slot to exactly one initializer; page storage is stable.
+        unsafe { (*slot.value.get()).write(Node::default()) };
+        slot.initialized.store(true, Ordering::Release);
+        id
+    }
+
+    pub fn get(&self, id: NodeId) -> Option<&Node> {
+        let page = self.page(id)?;
+        let slot = page.slots.get(id.slot())?;
+        if !slot.initialized.load(Ordering::Acquire) {
+            return None;
         }
-        let mut nodes = shard.nodes.write();
-        Arc::clone(nodes.entry(key).or_insert_with(|| Arc::new(Node::default())))
+        // SAFETY: initialized slots are never moved. GC only frees unreachable slots after the
+        // owning search job has drained, so no caller can retain a reference to a freed slot.
+        Some(unsafe { (&*slot.value.get()).assume_init_ref() })
     }
 
-    pub fn get(&self, key: NodeKey) -> Option<Arc<Node>> {
-        let shard = &self.shards[self.shard_index(key)];
-        shard.nodes.read().get(&key).cloned()
+    pub fn child_or_create(&self, edge: &Edge) -> NodeId {
+        if let Some(child) = edge.child() {
+            return child;
+        }
+        let candidate = self.allocate();
+        match edge.install_child(candidate) {
+            Ok(()) => candidate,
+            Err(_) => {
+                self.free(candidate);
+                edge.child().expect("racing edge installs a child")
+            }
+        }
     }
 
-    fn shard_index(&self, key: NodeKey) -> usize {
-        key.0 as usize & (self.shards.len() - 1)
+    fn free(&self, id: NodeId) {
+        let Some(page) = self.page(id) else {
+            return;
+        };
+        let slot = &page.slots[id.slot()];
+        if !slot.initialized.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        // SAFETY: GC reaches only settled, unreachable nodes and removes each slot once.
+        unsafe { std::ptr::drop_in_place((*slot.value.get()).as_mut_ptr()) };
+        self.allocator.lock().free.push(id);
     }
 
     /// 沿 path 向上传播强制终局（不存半开 bounds）。每层扫父的全部边：
     /// 任一儿子对父 STM 必胜 → 立刻钉父；必败/必和要全部儿子都 Terminal。
     /// `root` 不钉死。
-    pub(crate) fn propagate_proven_terminals(&self, node_path: &[NodeKey], root: NodeKey) {
-        for &parent_key in node_path.iter().rev().skip(1) {
-            if parent_key == root {
+    pub(crate) fn propagate_proven_terminals(&self, node_path: &[NodeId], root: NodeId) {
+        for &parent_id in node_path.iter().rev().skip(1) {
+            if parent_id == root {
                 break;
             }
-            let Some(parent) = self.get(parent_key) else {
+            let Some(parent) = self.get(parent_id) else {
                 continue;
             };
             let edges = parent.edges();
@@ -532,10 +618,14 @@ impl NodeRepository {
             let mut min_plies = f32::INFINITY;
             let mut max_plies = f32::NEG_INFINITY;
             for edge in edges.iter() {
+                let Some(child_id) = edge.child() else {
+                    all_terminal = false;
+                    continue;
+                };
                 let Some((wl, _, plies)) = self
-                    .get(parent_key.child(edge.mv()))
+                    .get(child_id)
                     .filter(|child| child.expansion_state() == ExpansionState::Terminal)
-                    .and_then(|child| child.terminal_value())
+                    .and_then(Node::terminal_value)
                 else {
                     all_terminal = false;
                     continue;
@@ -565,111 +655,121 @@ impl NodeRepository {
 
     /// 批量删除已脱离的 tree subtree，并返回实际删除的 node 数。
     ///
-    /// 跨回合由 reaper 异步调用：root 已推进后，待删 sibling 与下一手搜索 key 空间不相交；
-    /// 按 shard 写锁删除，可与活跃搜索重叠，不挡 `go`。
-    pub(crate) fn remove_subtrees(&self, roots: impl IntoIterator<Item = NodeKey>) -> usize {
+    /// 跨回合由 reaper 异步调用：root 已推进后，待删 sibling 与新 root 不相交；
+    /// 只在旧 job drain 后入队，可与下一手搜索重叠，不挡 `go`。
+    pub(crate) fn remove_subtrees(&self, roots: impl IntoIterator<Item = NodeId>) -> usize {
         let mut pending: Vec<_> = roots.into_iter().collect();
-        let mut keys_by_shard: Vec<Vec<NodeKey>> = (0..self.shards.len()).map(|_| Vec::new()).collect();
-        while let Some(key) = pending.pop() {
-            let Some(node) = self.get(key) else {
+        let mut removed = 0;
+        while let Some(id) = pending.pop() {
+            let Some(node) = self.get(id) else {
                 continue;
             };
-            keys_by_shard[self.shard_index(key)].push(key);
-            pending.extend(node.edges().iter().map(|edge| key.child(edge.mv())));
-        }
-
-        let mut removed = 0;
-        for (shard, keys) in self.shards.iter().zip(keys_by_shard) {
-            if keys.is_empty() {
-                continue;
-            }
-            let mut nodes = shard.nodes.write();
-            for key in keys {
-                removed += usize::from(nodes.remove(&key).is_some());
-            }
+            pending.extend(node.edges().iter().filter_map(|edge| edge.child()));
+            self.free(id);
+            removed += 1;
         }
         removed
     }
 
+    /// 回收已与当前 root 脱钩、但其某个 child 被保留的祖先 slot。
+    pub(crate) fn remove_nodes(&self, nodes: impl IntoIterator<Item = NodeId>) {
+        for id in nodes {
+            self.free(id);
+        }
+    }
+
     /// 检查 `root` 以下的 edge-local reservation 不变量。
-    pub(crate) fn subtree_is_settled(&self, root: NodeKey) -> bool {
+    pub(crate) fn subtree_is_settled(&self, root: NodeId) -> bool {
         let mut pending = vec![root];
-        while let Some(key) = pending.pop() {
-            let Some(node) = self.get(key) else {
+        while let Some(id) = pending.pop() {
+            let Some(node) = self.get(id) else {
                 continue;
             };
             let edges = node.edges();
             if edges.iter().any(|edge| edge.visits() != edge.completed_visits()) {
                 return false;
             }
-            pending.extend(edges.iter().map(|edge| key.child(edge.mv())));
+            pending.extend(edges.iter().filter_map(|edge| edge.child()));
         }
         true
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.shards.iter().map(|shard| shard.nodes.read().len()).sum()
+        self.pages
+            .read()
+            .iter()
+            .flat_map(|page| page.slots.iter())
+            .filter(|slot| slot.initialized.load(Ordering::Acquire))
+            .count()
     }
 
-    /// 无关 position 换图后由后台线程逐 shard 释放整张旧图。
+    /// 无关 position 换图后由后台线程释放整张旧 arena。
     pub(crate) fn release_incrementally(self) {
-        for shard in self.shards {
-            drop(shard);
-            std::thread::yield_now();
+        drop(self);
+    }
+}
+
+impl Default for NodeArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for NodeArena {
+    fn drop(&mut self) {
+        for page in self.pages.get_mut().iter() {
+            for slot in page.slots.iter() {
+                if slot.initialized.swap(false, Ordering::AcqRel) {
+                    // SAFETY: arena 销毁时已不存在外部引用；每个 live slot 恰好 drop 一次。
+                    unsafe { std::ptr::drop_in_place((*slot.value.get()).as_mut_ptr()) };
+                }
+            }
         }
     }
 }
 
-impl Default for NodeRepository {
-    fn default() -> Self {
-        Self::new(64)
-    }
-}
-
-/// 两次已完成 stream 搜索之间保留的 tree 状态。
-#[derive(Debug)]
+/// 两次已完成 stream 搜索之间保留的 tree 状态。只支持向前复用；悔棋或无关
+/// `position` 直接换一棵新 tree。
 pub struct SearchTree {
-    repository: Arc<NodeRepository>,
-    /// 保留的已走主线：从最早 root 到当前 root。
-    root_keys: Vec<NodeKey>,
-    /// 与 `root_keys` 对齐的完整历史；末项就是当前 root。快照使 UCI 能精确悔棋和
-    /// 复用，不必根据 hash 重建局面。
-    root_histories: Vec<Arc<PositionHistory>>,
+    arena: Arc<NodeArena>,
+    root: NodeId,
+    root_history: Arc<PositionHistory>,
     /// `advance` 后待后台删除的 sibling 子树根；由 `take_pending_gc_roots` 交给 reaper。
-    pending_gc_roots: Vec<NodeKey>,
+    pending_gc_roots: Vec<NodeId>,
+    /// 已推进的旧 root 不能 DFS 删除（chosen child 仍存活），单独回收其 slot。
+    pending_gc_nodes: Vec<NodeId>,
 }
 
 impl SearchTree {
     pub fn new(root_history: Arc<PositionHistory>) -> Self {
-        let root = NodeKey::root(root_history.last().hash());
+        let arena = Arc::new(NodeArena::default());
         Self {
-            repository: Arc::new(NodeRepository::default()),
-            root_keys: vec![root],
-            root_histories: vec![root_history],
+            root: arena.allocate(),
+            arena,
+            root_history,
             pending_gc_roots: Vec::new(),
+            pending_gc_nodes: Vec::new(),
         }
     }
 
-    pub fn repository(&self) -> &Arc<NodeRepository> {
-        &self.repository
+    pub fn arena(&self) -> &Arc<NodeArena> {
+        &self.arena
     }
 
-    pub fn root_key(&self) -> NodeKey {
-        *self.root_keys.last().expect("stream tree always has a root")
+    pub fn root_id(&self) -> NodeId {
+        self.root
     }
 
     pub fn root_history(&self) -> &Arc<PositionHistory> {
-        self.root_histories
-            .last()
-            .expect("stream tree always has a root history")
+        &self.root_history
     }
 
     /// 在当前 root 以下的 event 都完成或取消后，推进到一个合法 child。
     /// 旧 root 留在已走主线；sibling 子树只挂到 `pending_gc_roots`，不在此同步删除。
     pub fn advance(&mut self, mv: Move) -> Result<(), EnginError> {
-        let old_root = self.root_key();
-        if !self.repository.subtree_is_settled(old_root) {
+        let old_root = self.root_id();
+        if !self.arena.subtree_is_settled(old_root) {
             return Err(EnginError::PortIncomplete(
                 "stream tree advance requires settled reservations",
             ));
@@ -679,93 +779,57 @@ impl SearchTree {
 
     /// Engine 已停止并 drain worker 后使用的推进路径。
     fn advance_after_drain(&mut self, mv: Move) -> Result<(), EnginError> {
-        debug_assert!(self.repository.subtree_is_settled(self.root_key()));
+        debug_assert!(self.arena.subtree_is_settled(self.root_id()));
         self.advance_settled(mv)
     }
 
     fn advance_settled(&mut self, mv: Move) -> Result<(), EnginError> {
-        let old_root = self.root_key();
+        let old_root = self.root_id();
         if !self.root_history().last().board().is_legal_move(mv) {
             return Err(EnginError::PortIncomplete("stream tree advance requires a legal move"));
         }
 
-        if let Some(root) = self.repository.get(old_root) {
-            self.pending_gc_roots.extend(
-                root.edges()
-                    .iter()
-                    .filter(|edge| edge.mv() != mv)
-                    .map(|edge| old_root.child(edge.mv())),
-            );
-        }
-
-        let new_root = old_root.child(mv);
-        self.repository.get_or_insert(new_root);
+        let root = self
+            .arena
+            .get(old_root)
+            .ok_or(EnginError::PortIncomplete("stream tree root is unavailable"))?;
+        let edges = root.edges();
+        let chosen = edges
+            .iter()
+            .find(|edge| edge.mv() == mv)
+            .and_then(|edge| edge.child())
+            .ok_or(EnginError::PortIncomplete(
+                "stream tree cannot reuse an unexpanded child",
+            ))?;
+        self.pending_gc_roots.extend(
+            edges
+                .iter()
+                .filter(|edge| edge.mv() != mv)
+                .filter_map(|edge| edge.child()),
+        );
+        self.pending_gc_nodes.push(old_root);
         let mut history = self.root_history().as_ref().clone();
         history.append(mv);
-        self.root_keys.push(new_root);
-        self.root_histories.push(Arc::new(history));
+        self.root = chosen;
+        self.root_history = Arc::new(history);
         Ok(())
     }
 
     /// 取出 `advance` 挂起的 sibling 子树根，交给 Engine reaper 异步 `remove_subtrees`。
-    pub(crate) fn take_pending_gc_roots(&mut self) -> Vec<NodeKey> {
-        std::mem::take(&mut self.pending_gc_roots)
-    }
-
-    /// Returns to the immediately previous retained root. It does not reclaim
-    /// the future child; a later different `advance` will prune it as a sibling.
-    pub fn rewind_one(&mut self) -> Result<bool, EnginError> {
-        if self.root_keys.len() == 1 {
-            return Ok(false);
-        }
-        if !self.repository.subtree_is_settled(self.root_key()) {
-            return Err(EnginError::PortIncomplete(
-                "stream tree rewind requires settled reservations",
-            ));
-        }
-        self.root_keys.pop();
-        self.root_histories.pop();
-        self.pending_gc_roots.clear();
-        Ok(true)
-    }
-
-    /// 将可复用树定位到完整 UCI history。已保留前缀复用；无关 history 换新
-    /// repository，并把旧图交给调用方后台释放。
-    pub fn reset_to_history(
-        &mut self,
-        target: Arc<PositionHistory>,
-    ) -> Result<Option<Arc<NodeRepository>>, EnginError> {
-        if !self.repository.subtree_is_settled(self.root_key()) {
-            return Err(EnginError::PortIncomplete(
-                "stream tree reset requires settled reservations",
-            ));
-        }
-        self.reset_to_history_settled(target, false)
+    pub(crate) fn take_pending_gc(&mut self) -> (Vec<NodeId>, Vec<NodeId>) {
+        (
+            std::mem::take(&mut self.pending_gc_roots),
+            std::mem::take(&mut self.pending_gc_nodes),
+        )
     }
 
     /// Engine 的 `position` 路径在调用前已经 abort 并 drain 当前 job。
     pub(crate) fn reset_to_history_after_drain(
         &mut self,
         target: Arc<PositionHistory>,
-    ) -> Result<Option<Arc<NodeRepository>>, EnginError> {
-        debug_assert!(self.repository.subtree_is_settled(self.root_key()));
-        self.reset_to_history_settled(target, true)
-    }
-
-    fn reset_to_history_settled(
-        &mut self,
-        target: Arc<PositionHistory>,
-        after_drain: bool,
-    ) -> Result<Option<Arc<NodeRepository>>, EnginError> {
-        if let Some(index) = self.root_histories.iter().position(|history| history == &target) {
-            self.root_keys.truncate(index + 1);
-            self.root_histories.truncate(index + 1);
-            // 悔棋后这些 sibling 仍可能从保留根走到；丢掉 pending，避免误删。
-            self.pending_gc_roots.clear();
-            return Ok(None);
-        }
-
-        if target.len() > self.root_history().len()
+    ) -> Result<Option<Arc<NodeArena>>, EnginError> {
+        debug_assert!(self.arena.subtree_is_settled(self.root_id()));
+        if target.len() >= self.root_history().len()
             && target.positions()[..self.root_history().len()] == *self.root_history().positions()
         {
             while self.root_history().len() < target.len() {
@@ -784,25 +848,27 @@ impl SearchTree {
                     .ok_or(EnginError::PortIncomplete(
                         "stream tree reset could not derive legal move",
                     ))?;
-                if after_drain {
-                    self.advance_after_drain(mv)?;
-                } else {
-                    self.advance(mv)?;
+                if self.advance_after_drain(mv).is_err() {
+                    return Ok(Some(self.replace_with_fresh(target)));
                 }
             }
             return Ok(None);
         }
+        Ok(Some(self.replace_with_fresh(target)))
+    }
 
-        let root = NodeKey::root(target.last().hash());
-        let retired = std::mem::replace(&mut self.repository, Arc::new(NodeRepository::default()));
-        self.root_keys = vec![root];
-        self.root_histories = vec![target];
+    fn replace_with_fresh(&mut self, target: Arc<PositionHistory>) -> Arc<NodeArena> {
+        let arena = Arc::new(NodeArena::default());
+        let retired = std::mem::replace(&mut self.arena, arena);
+        self.root = self.arena.allocate();
+        self.root_history = target;
         self.pending_gc_roots.clear();
-        Ok(Some(retired))
+        self.pending_gc_nodes.clear();
+        retired
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tree_tests {
     use std::sync::Arc;
 
@@ -915,7 +981,7 @@ mod tree_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod repository_tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1109,5 +1175,64 @@ mod repository_tests {
         root.abort_evaluation();
         assert_eq!(root.expansion_state(), ExpansionState::Unexpanded);
         assert!(root.try_begin_evaluation());
+    }
+}
+
+#[cfg(test)]
+mod arena_tests {
+    use std::sync::Arc;
+
+    use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
+
+    use super::SearchTree;
+
+    #[test]
+    fn edge_binds_one_child_and_advance_reclaims_siblings() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(PositionHistory::from_positions(state.positions()));
+        let mut tree = SearchTree::new(history);
+        let root_id = tree.root_id();
+        let root = tree.arena().get(root_id).expect("root");
+        let moves = tree.root_history().last().board().generate_legal_moves();
+        root.try_begin_evaluation();
+        root.publish_edges(vec![(moves[0], 0.6), (moves[1], 0.4)]);
+
+        let edges = root.edges();
+        let kept = tree.arena().child_or_create(&edges[0]);
+        assert_eq!(kept, tree.arena().child_or_create(&edges[0]));
+        let dropped = tree.arena().child_or_create(&edges[1]);
+        assert_eq!(tree.arena().len(), 3);
+
+        tree.advance(moves[0]).expect("settled advance");
+        assert_eq!(tree.root_id(), kept);
+        let (roots, nodes) = tree.take_pending_gc();
+        assert_eq!(roots, vec![dropped]);
+        assert_eq!(nodes, vec![root_id]);
+        assert_eq!(tree.arena().remove_subtrees(roots), 1);
+        tree.arena().remove_nodes(nodes);
+        assert!(tree.arena().get(root_id).is_none());
+        assert!(tree.arena().get(kept).is_some());
+        assert!(tree.arena().get(dropped).is_none());
+    }
+
+    #[test]
+    fn fresh_arena_drops_pending_gc_ids_from_the_retired_arena() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let initial = Arc::new(PositionHistory::from_positions(state.positions()));
+        let mut tree = SearchTree::new(Arc::clone(&initial));
+        let root = tree.arena().get(tree.root_id()).expect("root");
+        let mv = tree.root_history().last().board().generate_legal_moves()[0];
+        root.try_begin_evaluation();
+        root.publish_edges(vec![(mv, 1.0)]);
+        tree.arena().child_or_create(&root.edges()[0]);
+        tree.advance(mv).expect("advance");
+
+        let retired = tree
+            .reset_to_history_after_drain(initial)
+            .expect("reset")
+            .expect("fresh arena");
+        assert!(retired.get(tree.root_id()).is_some());
+        assert!(tree.arena().get(tree.root_id()).is_some());
+        assert_eq!(tree.take_pending_gc(), (Vec::new(), Vec::new()));
     }
 }

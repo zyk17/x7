@@ -10,12 +10,10 @@ use std::time::{Duration, Instant};
 
 use engin::neural::backend::{Backend, CachingBackend, EvalResult};
 use engin::neural::onnx::OnnxBackend;
-use engin::neural::{
-    EncodedBatch, FillEmptyHistory, encode_position_input_planes, eval_result_from_encoded_row,
-};
+use engin::neural::{EncodedBatch, FillEmptyHistory, encode_position_input_planes, eval_result_from_encoded_row};
 use engin::search::{
-    BenchObserver, BenchStats, NodeKey, QueueStats, RootEdgeStats, Search, SearchConfig, SearchLimits,
-    SearchParams, Stats, root_stats,
+    BenchObserver, BenchStats, NodeId, QueueStats, RootEdgeStats, Search, SearchConfig, SearchLimits, SearchParams,
+    Stats, root_stats,
 };
 use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
@@ -176,8 +174,7 @@ fn parse_args() -> Result<Args, String> {
         let Some(playouts) = playouts else {
             return Err("--trace requires --playouts".into());
         };
-        if trace.windows(2).any(|pair| pair[0] >= pair[1])
-            || trace.iter().any(|&value| value == 0 || value > playouts)
+        if trace.windows(2).any(|pair| pair[0] >= pair[1]) || trace.iter().any(|&value| value == 0 || value > playouts)
         {
             return Err("--trace milestones must be strictly increasing and within --playouts".into());
         }
@@ -216,11 +213,7 @@ fn parse_list(text: &str) -> Result<Vec<usize>, String> {
 
 fn parse_u64_list(text: &str) -> Result<Vec<u64>, String> {
     text.split(',')
-        .map(|part| {
-            part.trim()
-                .parse()
-                .map_err(|_| format!("invalid list entry: {part}"))
-        })
+        .map(|part| part.trim().parse().map_err(|_| format!("invalid list entry: {part}")))
         .collect()
 }
 
@@ -266,7 +259,10 @@ fn make_backend(path: &PathBuf) -> Result<BackendSetup, Box<dyn std::error::Erro
     Ok((backend, provider, recommended))
 }
 
-fn evaluate_root(backend: &dyn Backend, history: &PositionHistory) -> Result<Arc<EvalResult>, Box<dyn std::error::Error>> {
+fn evaluate_root(
+    backend: &dyn Backend,
+    history: &PositionHistory,
+) -> Result<Arc<EvalResult>, Box<dyn std::error::Error>> {
     let legal = history.last().board().generate_legal_moves();
     let sample = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
     let mut logits = Vec::new();
@@ -332,7 +328,7 @@ fn max_wait_us(queue: QueueStats) -> f64 {
 }
 
 fn sorted_root_edges(search: &Search<BenchObserver>) -> Option<Vec<RootEdgeStats>> {
-    let root = root_stats(search.repository(), search.root_key())?;
+    let root = root_stats(search.arena(), search.root_id())?;
     let mut edges = root.edges;
     edges.sort_unstable_by(|left, right| {
         right
@@ -352,11 +348,7 @@ fn format_batch_dist(batches_by_size: &[u64]) -> String {
         .filter(|(_, count)| **count > 0)
         .map(|(size, count)| format!("{size}×{count}"))
         .collect();
-    if parts.is_empty() {
-        "-".into()
-    } else {
-        parts.join(" ")
-    }
+    if parts.is_empty() { "-".into() } else { parts.join(" ") }
 }
 
 fn format_collision_dist(counts: &[u64]) -> String {
@@ -366,11 +358,7 @@ fn format_collision_dist(counts: &[u64]) -> String {
         .filter(|(_, count)| **count > 0)
         .map(|(depth, count)| format!("d{depth}:{count}"))
         .collect();
-    if parts.is_empty() {
-        "-".into()
-    } else {
-        parts.join(" ")
-    }
+    if parts.is_empty() { "-".into() } else { parts.join(" ") }
 }
 
 fn print_queue(label: &str, queue: QueueStats) {
@@ -392,9 +380,16 @@ fn print_root_block(
     let Some(edges) = sorted_root_edges(search) else {
         return;
     };
-    let root = root_stats(search.repository(), search.root_key());
-    let root_n = edges.iter().map(|edge| edge.completed_visits as u64).sum::<u64>().max(1);
-    let top1 = edges.first().map(|edge| edge.completed_visits as f64 * 100.0 / root_n as f64).unwrap_or(0.0);
+    let root = root_stats(search.arena(), search.root_id());
+    let root_n = edges
+        .iter()
+        .map(|edge| edge.completed_visits as u64)
+        .sum::<u64>()
+        .max(1);
+    let top1 = edges
+        .first()
+        .map(|edge| edge.completed_visits as f64 * 100.0 / root_n as f64)
+        .unwrap_or(0.0);
     let top3 = edges
         .iter()
         .take(3)
@@ -404,10 +399,7 @@ fn print_root_block(
         / root_n as f64;
     println!("{heading}");
     if let Some(nn) = nn {
-        println!(
-            "  nn:     Q={:.4} M={:.1}",
-            nn.wl, nn.plies_left
-        );
+        println!("  nn:     Q={:.4} M={:.1}", nn.wl, nn.plies_left);
     }
     if let Some(root) = &root {
         println!(
@@ -447,24 +439,34 @@ fn print_root_block(
 fn print_tree_funnel(search: &Search<BenchObserver>, root_is_black: bool, max_depth: usize, top: usize) {
     println!("Tree funnel (depth<={max_depth}, top={top}/node; path-local cycle stop)");
     let mut path = HashSet::new();
-    print_tree_node(search, search.root_key(), root_is_black, 0, max_depth, top, None, &mut path);
+    print_tree_node(
+        search,
+        search.root_id(),
+        root_is_black,
+        0,
+        max_depth,
+        top,
+        None,
+        &mut path,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_tree_node(
     search: &Search<BenchObserver>,
-    key: NodeKey,
+    node_id: NodeId,
     root_is_black: bool,
     depth: usize,
     max_depth: usize,
     top: usize,
     via: Option<(String, f32, u32, f32)>,
-    path: &mut HashSet<NodeKey>,
+    path: &mut HashSet<NodeId>,
 ) {
-    if depth > max_depth || !path.insert(key) {
+    if depth > max_depth || !path.insert(node_id) {
         return;
     }
-    let Some(node) = search.repository().get(key) else {
-        path.remove(&key);
+    let Some(node) = search.arena().get(node_id) else {
+        path.remove(&node_id);
         return;
     };
     let indent = "  ".repeat(depth + 1);
@@ -482,7 +484,7 @@ fn print_tree_node(
         ),
     }
     if depth == max_depth {
-        path.remove(&key);
+        path.remove(&node_id);
         return;
     }
     let mut edges: Vec<_> = node.edges().iter().cloned().collect();
@@ -498,7 +500,9 @@ fn print_tree_node(
             continue;
         }
         let mv = if root_is_black { edge.mv().flip() } else { edge.mv() };
-        let child = key.child(edge.mv());
+        let Some(child) = edge.child() else {
+            continue;
+        };
         print_tree_node(
             search,
             child,
@@ -510,9 +514,10 @@ fn print_tree_node(
             path,
         );
     }
-    path.remove(&key);
+    path.remove(&node_id);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_run_report(
     gather_workers: usize,
     eval_workers: usize,
@@ -561,10 +566,7 @@ fn print_run_report(
     println!("NN / Cache");
     println!(
         "  n_eval={}  cache_hits={} ({cache_hit_rate:.1}%)  batches={}  batch avg={batch_avg:.2} max={}",
-        stats.network_evaluations,
-        bench.cache_hits,
-        bench.network_batches,
-        bench.network_batch_size_max
+        stats.network_evaluations, bench.cache_hits, bench.network_batches, bench.network_batch_size_max
     );
     println!(
         "  batch dist (size×times)  {}",
