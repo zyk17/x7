@@ -62,7 +62,7 @@ pub(crate) fn poll_nn_completions<O: SearchObserver>(shared: &Shared<O>, waiting
             }
             Ok(Err(error)) => {
                 let item = waiting.swap_remove(i);
-                cancel_waiting_item(shared, item);
+                cancel_evaluation(shared, item.event);
                 if !shared.stopping.load(Ordering::Acquire) {
                     shared.fail(error);
                 }
@@ -71,7 +71,7 @@ pub(crate) fn poll_nn_completions<O: SearchObserver>(shared: &Shared<O>, waiting
             Err(TryRecvError::Empty) => i += 1,
             Err(TryRecvError::Disconnected) => {
                 let item = waiting.swap_remove(i);
-                cancel_waiting_item(shared, item);
+                cancel_evaluation(shared, item.event);
                 if !shared.stopping.load(Ordering::Acquire) {
                     shared.fail(EnginError::PortIncomplete("stream nn reply disconnected"));
                 }
@@ -94,7 +94,7 @@ pub(crate) fn wait_one_nn_completion<O: SearchObserver>(shared: &Shared<O>, wait
         }
         Ok(Err(error)) => {
             let item = waiting.remove(0);
-            cancel_waiting_item(shared, item);
+            cancel_evaluation(shared, item.event);
             if !shared.stopping.load(Ordering::Acquire) {
                 shared.fail(error);
             }
@@ -102,7 +102,7 @@ pub(crate) fn wait_one_nn_completion<O: SearchObserver>(shared: &Shared<O>, wait
         Err(RecvTimeoutError::Timeout) => {}
         Err(RecvTimeoutError::Disconnected) => {
             let item = waiting.remove(0);
-            cancel_waiting_item(shared, item);
+            cancel_evaluation(shared, item.event);
             if !shared.stopping.load(Ordering::Acquire) {
                 shared.fail(EnginError::PortIncomplete("stream nn reply disconnected"));
             }
@@ -112,7 +112,7 @@ pub(crate) fn wait_one_nn_completion<O: SearchObserver>(shared: &Shared<O>, wait
 
 pub(crate) fn drain_waiting<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<WaitingNn<O::Stamp>>) {
     for item in waiting.drain(..) {
-        cancel_waiting_item(shared, item);
+        cancel_evaluation(shared, item.event);
     }
 }
 
@@ -124,8 +124,7 @@ pub(crate) fn handle_eval_event<O: SearchObserver>(
     mut event: PlayoutEvent<O::Stamp>,
 ) -> Result<(), EnginError> {
     if shared.stopping.load(Ordering::Acquire) {
-        shared.release_eval_claim();
-        shared.cancel_claimed_evaluation(event);
+        cancel_evaluation(shared, event);
         return Ok(());
     }
     let node = shared
@@ -139,8 +138,7 @@ pub(crate) fn handle_eval_event<O: SearchObserver>(
             node.mark_terminal(wl, draw, plies_left);
             let root = event.node_path()[0];
             shared.arena.propagate_proven_terminals(event.node_path(), root);
-            shared.release_eval_claim();
-            shared.send_backprop(BackpropEvent::evaluation(event, wl, draw, plies_left));
+            shared.send_backprop(BackpropEvent::from_eval(event, wl, draw, plies_left));
             Ok(())
         }
         ExpandKind::Evaluate { legal_moves } => {
@@ -149,7 +147,6 @@ pub(crate) fn handle_eval_event<O: SearchObserver>(
                 if O::ENABLED {
                     shared.observer.on_cache_hit();
                 }
-                shared.release_eval_claim();
                 return publish_eval(shared, event, legal_moves, eval);
             }
             let planes = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
@@ -164,7 +161,6 @@ pub(crate) fn handle_eval_event<O: SearchObserver>(
                 },
             ) {
                 cancel_evaluation(shared, event);
-                shared.release_eval_claim();
                 return if shared.stopping.load(Ordering::Acquire) {
                     Ok(())
                 } else {
@@ -211,7 +207,6 @@ fn complete_nn_item<O: SearchObserver>(
     batch: Arc<EncodedBatch>,
     row: usize,
 ) -> Result<(), EnginError> {
-    shared.release_eval_claim();
     let eval = match eval_result_from_encoded_row(&batch, row, &item.legal_moves) {
         Ok(eval) => eval,
         Err(error) => {
@@ -249,17 +244,13 @@ fn publish_eval<O: SearchObserver>(
         .get(event.node_id)
         .expect("eval node lives until job drain")
         .publish_edges(legal_moves.iter().copied().zip(eval.policies.iter().copied()));
-    shared.send_backprop(BackpropEvent::evaluation(event, -eval.wl, eval.d, eval.plies_left));
+    shared.send_backprop(BackpropEvent::from_eval(event, -eval.wl, eval.d, eval.plies_left));
     Ok(())
-}
-
-fn cancel_waiting_item<O: SearchObserver>(shared: &Shared<O>, item: WaitingNn<O::Stamp>) {
-    shared.release_eval_claim();
-    cancel_evaluation(shared, item.event);
 }
 
 /// 释放已 claim 但不会发布结果的 evaluation event。
 pub(crate) fn cancel_evaluation<O: SearchObserver>(shared: &Shared<O>, event: PlayoutEvent<O::Stamp>) {
+    shared.release_eval_claims(1);
     let id = event.node_id;
     event.cancel();
     if let Some(node) = shared.arena.get(id) {

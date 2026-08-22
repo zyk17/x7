@@ -83,16 +83,19 @@ impl<O: SearchObserver> Shared<O> {
             self.completed.fetch_add(n as u64, Ordering::AcqRel);
         }
         let previous = self.outstanding.fetch_sub(n, Ordering::AcqRel);
-        assert!(previous >= n, "stream outstanding task underflow");
+        debug_assert!(previous >= n, "stream outstanding task underflow");
         // 唤醒等待本轮真实 leaf 完成的 owner。
         let _guard = self.idle_lock.lock();
         self.idle.notify_all();
         let _ = previous;
     }
 
-    pub(crate) fn release_eval_claim(&self) {
-        let previous = self.nn_inflight.fetch_sub(1, Ordering::AcqRel);
-        assert!(previous > 0, "stream eval claim underflow");
+    pub(crate) fn release_eval_claims(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let previous = self.nn_inflight.fetch_sub(count, Ordering::AcqRel);
+        debug_assert!(previous >= count, "stream eval claim underflow");
         let _guard = self.idle_lock.lock();
         self.idle.notify_all();
     }
@@ -171,20 +174,6 @@ impl<O: SearchObserver> Shared<O> {
         self.finish(n, false);
     }
 
-    /// Cancels an event after Gather has claimed its leaf for Eval.
-    ///
-    /// Reference: LC3 overview's EvalWorker ownership model. Releasing only
-    /// the edge reservations would leave the claimed node permanently
-    /// `Evaluating`, so this also restores it to `Unexpanded`.
-    pub(crate) fn cancel_claimed_evaluation(&self, event: PlayoutEvent<O::Stamp>) {
-        let Some(_node) = self.arena.get(event.node_id) else {
-            event.cancel();
-            self.finish(1, false);
-            return;
-        };
-        cancel_evaluation(self, event);
-    }
-
     pub(crate) fn fail(&self, error: EnginError) {
         let mut current = self.error.lock();
         if current.is_none() {
@@ -195,17 +184,16 @@ impl<O: SearchObserver> Shared<O> {
     }
 
     /// 先增加 `nn_inflight` 再入队：图复用后 cache hit 极快，若 `try_send` 成功后才 +1，
-    /// Eval 可能已经 `release_eval_claim`，第二手 `go` 就会 underflow 闪退。
+    /// Eval 可能已经 `release_eval_claims`，第二手 `go` 就会 underflow 闪退。
     pub(crate) fn send_eval(&self, mut event: PlayoutEvent<O::Stamp>) {
         event.mark_queued();
-        self.nn_inflight.fetch_add(1, Ordering::AcqRel);
+        let inflight = self.nn_inflight.fetch_add(1, Ordering::AcqRel) + 1;
         if O::ENABLED {
-            self.observer.on_peak_inflight(self.nn_inflight.load(Ordering::Relaxed));
+            self.observer.on_peak_inflight(inflight);
         }
         loop {
             if self.stopping.load(Ordering::Acquire) {
-                self.release_eval_claim();
-                self.cancel_claimed_evaluation(event);
+                cancel_evaluation(self, event);
                 return;
             }
             match self.eval_tx.try_send(event) {
@@ -215,8 +203,7 @@ impl<O: SearchObserver> Shared<O> {
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    self.release_eval_claim();
-                    self.cancel_claimed_evaluation(returned);
+                    cancel_evaluation(self, returned);
                     return;
                 }
             }
@@ -227,6 +214,7 @@ impl<O: SearchObserver> Shared<O> {
         event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
+                self.release_eval_claims(usize::from(event.held_eval_claim));
                 let id = event.playout.node_id;
                 event.cancel();
                 self.finish(1, false);
@@ -240,6 +228,7 @@ impl<O: SearchObserver> Shared<O> {
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
+                    self.release_eval_claims(usize::from(returned.held_eval_claim));
                     let id = returned.playout.node_id;
                     returned.cancel();
                     self.finish(1, false);
@@ -319,23 +308,13 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
             }
             ExpansionState::Terminal => {
                 let (wl, draw, plies_left) = node.terminal_value().unwrap_or((0.0, 1.0, 0.0));
-                shared.send_backprop(BackpropEvent::evaluation(event, wl, draw, plies_left));
+                shared.send_backprop(BackpropEvent::from_gather(event, wl, draw, plies_left));
                 return;
             }
             ExpansionState::Expanded => {
                 let depth = event.variation.moves().len();
-                let Some((child, reservation)) = branch_at_expanded_node(shared, &event, node, depth) else {
-                    if event.reservations.is_empty() {
-                        // root 无着可探（空边 / searchmoves 滤空）：停搜，不伪造成路径终局。
-                        shared.finish(1, false);
-                        shared.stopping.store(true, Ordering::Release);
-                        shared.idle.notify_all();
-                    } else {
-                        let (wl, draw, m) = node.value_snapshot();
-                        shared.send_backprop(BackpropEvent::evaluation(event, wl, draw, m));
-                    }
-                    return;
-                };
+                let (child, reservation) = branch_at_expanded_node(shared, &event, node, depth)
+                    .expect("expanded node must have a selectable edge");
                 event = event.descend(child, reservation);
             }
         }

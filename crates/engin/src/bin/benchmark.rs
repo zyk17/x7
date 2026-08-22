@@ -41,7 +41,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--nn-window 2.3] [--virtual-mean-fpu-scale 1.0] \\
+     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] \\
      [--root-top 8] [--trace 128,256,512] [--collision-dist] [--tree-depth 4] [--tree-top 4]"
 }
 
@@ -56,7 +56,7 @@ fn parse_args() -> Result<Args, String> {
     let mut gathers = vec![3];
     let mut evals = vec![5];
     let mut eval_batch = None;
-    let mut nn_window = 2.3f32;
+    let mut nn_window = 2.25f32;
     let mut virtual_mean_fpu_scale = 1.0f32;
     let mut root_top = 8;
     let mut trace = Vec::new();

@@ -15,7 +15,8 @@ use crate::search::EdgeReservation;
 
 use super::backprop::complete_batch;
 use super::eval::{
-    NnRequest, WaitingNn, drain_waiting, handle_eval_event, infer_nn_batch, poll_nn_completions, wait_one_nn_completion,
+    NnRequest, WaitingNn, cancel_evaluation, drain_waiting, handle_eval_event, infer_nn_batch, poll_nn_completions,
+    wait_one_nn_completion,
 };
 use super::observer::{NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver};
 use super::param::{ResolvedSearchConfig, SearchConfig};
@@ -128,14 +129,28 @@ impl<S: QueueStamp> PlayoutEvent<S> {
 pub struct BackpropEvent<S: QueueStamp = NoQueueStamp> {
     pub(crate) playout: PlayoutEvent<S>,
     pub(crate) value: ValueDelta,
+    /// 走过 `send_eval` 的叶子；backprop 完成后释放对应 claim slot。
+    pub(crate) held_eval_claim: bool,
     queued_at: S,
 }
 
 impl<S: QueueStamp> BackpropEvent<S> {
-    pub(crate) fn evaluation(playout: PlayoutEvent<S>, wl: f32, draw: f32, plies_left: f32) -> Self {
+    /// Eval 路径：走过 `send_eval`，backprop 后释放 claim。
+    pub(crate) fn from_eval(playout: PlayoutEvent<S>, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
             playout,
             value: ValueDelta::with_plies_left(wl, draw, plies_left),
+            held_eval_claim: true,
+            queued_at: S::default(),
+        }
+    }
+
+    /// Gather 直发：未占 eval claim。
+    pub(crate) fn from_gather(playout: PlayoutEvent<S>, wl: f32, draw: f32, plies_left: f32) -> Self {
+        Self {
+            playout,
+            value: ValueDelta::with_plies_left(wl, draw, plies_left),
+            held_eval_claim: false,
             queued_at: S::default(),
         }
     }
@@ -298,21 +313,21 @@ impl<O: SearchObserver> WorkerPool<O> {
     }
 
     pub(crate) fn assert_compatible(&self, config: &ResolvedSearchConfig) {
-        assert_eq!(
+        debug_assert_eq!(
             self.gather_commands.len(),
             config.gather_workers,
             "worker pool gather topology changed"
         );
-        assert_eq!(
+        debug_assert_eq!(
             self.eval_commands.len(),
             config.eval_workers,
             "worker pool eval topology changed"
         );
-        assert_eq!(
+        debug_assert_eq!(
             self.eval_batch_size, config.eval_batch_size,
             "worker pool batch size changed"
         );
-        assert_eq!(
+        debug_assert_eq!(
             self.eval_claim_limit, config.eval_claim_limit,
             "worker pool nn window changed"
         );
@@ -347,7 +362,9 @@ fn gather_worker<O: SearchObserver>(
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(mut event) => {
-                event.observe_wait(&shared.observer, QueueKind::Gather);
+                if O::ENABLED {
+                    event.observe_wait(&shared.observer, QueueKind::Gather);
+                }
                 if shared.stopping.load(Ordering::Acquire) {
                     event.cancel();
                     shared.finish(1, false);
@@ -388,8 +405,7 @@ fn eval_worker<O: SearchObserver>(
         if shared.stopping.load(Ordering::Acquire) {
             drain_waiting(&shared, &mut waiting);
             while let Ok(event) = receiver.try_recv() {
-                shared.release_eval_claim();
-                shared.cancel_claimed_evaluation(event);
+                cancel_evaluation(&shared, event);
             }
             shared.cancel_all_collisions();
             break;
@@ -399,7 +415,9 @@ fn eval_worker<O: SearchObserver>(
 
         match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(mut event) => {
-                event.observe_wait(&shared.observer, QueueKind::Eval);
+                if O::ENABLED {
+                    event.observe_wait(&shared.observer, QueueKind::Eval);
+                }
                 if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
                     shared.fail(error);
                 }
@@ -413,8 +431,7 @@ fn eval_worker<O: SearchObserver>(
             Err(RecvTimeoutError::Disconnected) => {
                 drain_waiting(&shared, &mut waiting);
                 while let Ok(event) = receiver.try_recv() {
-                    shared.release_eval_claim();
-                    shared.cancel_claimed_evaluation(event);
+                    cancel_evaluation(&shared, event);
                 }
                 shared.cancel_all_collisions();
                 break;
@@ -443,12 +460,16 @@ fn nn_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver<NnReq
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        first.observe_wait(&shared.observer, QueueKind::Nn);
+        if O::ENABLED {
+            first.observe_wait(&shared.observer, QueueKind::Nn);
+        }
         let mut requests = vec![first];
         while requests.len() < batch_size {
             match receiver.try_recv() {
                 Ok(mut request) => {
-                    request.observe_wait(&shared.observer, QueueKind::Nn);
+                    if O::ENABLED {
+                        request.observe_wait(&shared.observer, QueueKind::Nn);
+                    }
                     requests.push(request);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -486,20 +507,29 @@ fn backprop_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver
         }
         if shared.stopping.load(Ordering::Acquire) {
             let n = events.len();
+            let held = events.iter().filter(|event| event.held_eval_claim).count();
             for event in events {
                 event.cancel();
             }
+            shared.release_eval_claims(held);
             shared.finish(n, false);
             continue;
         }
-        for event in &mut events {
-            event.observe_wait(&shared.observer, QueueKind::Backprop);
+        if O::ENABLED {
+            for event in &mut events {
+                event.observe_wait(&shared.observer, QueueKind::Backprop);
+            }
         }
-        let leaf_ids: Vec<NodeId> = events.iter().map(|event| event.playout.node_id).collect();
+        let claims: Vec<(bool, NodeId)> = events
+            .iter()
+            .map(|event| (event.held_eval_claim, event.playout.node_id))
+            .collect();
         let result = complete_batch(events, &shared.arena);
-        for id in leaf_ids {
-            shared.cancel_collisions(id);
+        for (_, id) in &claims {
+            shared.cancel_collisions(*id);
         }
+        let held = claims.iter().filter(|(held, _)| *held).count();
+        shared.release_eval_claims(held);
         shared
             .completed_depth
             .fetch_add(result.completed_depth, Ordering::AcqRel);
@@ -517,5 +547,75 @@ fn persistent_backprop_worker<O: SearchObserver>(commands: Receiver<BackpropComm
             }
             BackpropCommand::Shutdown => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::thread;
+
+    use crossbeam_channel::bounded;
+    use parking_lot::{Condvar, Mutex};
+    use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
+
+    use super::{BackpropEvent, PlayoutEvent, backprop_worker};
+    use crate::neural::backend::{Backend, UniformBackend};
+    use crate::search::NodeArena;
+    use crate::search::observer::NoopObserver;
+    use crate::search::param::SearchParams;
+    use crate::search::pipeline::Shared;
+
+    #[test]
+    fn backprop_completion_releases_the_eval_claim() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(PositionHistory::from_positions(state.positions()));
+        let arena = Arc::new(NodeArena::default());
+        let root = arena.allocate();
+        let (gather_tx, _) = bounded(1);
+        let (eval_tx, _) = bounded(1);
+        let (backprop_tx, backprop_rx) = bounded(1);
+        let shared = Arc::new(Shared {
+            backend: Arc::new(UniformBackend::default()) as Arc<dyn Backend>,
+            arena: Arc::clone(&arena),
+            generation: 1,
+            params: SearchParams::default(),
+            root_move_filter: Mutex::new(Vec::new()),
+            stopping: AtomicBool::new(false),
+            outstanding: AtomicUsize::new(1),
+            nn_inflight: AtomicUsize::new(1),
+            completed: AtomicU64::new(0),
+            completed_depth: AtomicU64::new(0),
+            max_depth: AtomicU64::new(0),
+            network_evaluations: AtomicU64::new(0),
+            observer: NoopObserver,
+            error: Mutex::new(None),
+            idle_lock: Mutex::new(()),
+            idle: Condvar::new(),
+            gather_tx,
+            eval_tx,
+            backprop_tx: backprop_tx.clone(),
+            collision_waiters: Mutex::new(Vec::new()),
+        });
+        backprop_tx
+            .send(BackpropEvent::from_eval(
+                PlayoutEvent::at_root(1, root, history),
+                0.4,
+                0.2,
+                2.0,
+            ))
+            .expect("backprop event");
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::spawn(move || backprop_worker(worker_shared, backprop_rx));
+        while shared.completed.load(Ordering::Acquire) == 0 {
+            thread::yield_now();
+        }
+        shared.stopping.store(true, Ordering::Release);
+        worker.join().expect("backprop worker");
+
+        assert_eq!(arena.get(root).expect("root").completed_visits(), 1);
+        assert_eq!(shared.nn_inflight.load(Ordering::Acquire), 0);
+        assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);
     }
 }
