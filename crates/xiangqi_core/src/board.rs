@@ -6,7 +6,7 @@ use crate::bitboard::BitBoard;
 use crate::board_attacks::get_attacks;
 use crate::board_masks::{ADVISOR_SQUARES, PALACE, bishop_bb, pawn_bb};
 use crate::hashcat::hash_cat_u128s;
-use crate::{CoreError, File, Move, MoveList, PieceType, Rank, Square};
+use crate::{CoreError, File, LegalMoveList, Move, PieceType, Rank, Square};
 
 pub use crate::board_attacks::initialize_magic_bitboards;
 
@@ -271,10 +271,10 @@ impl ChessBoard {
         self.flipped = !self.flipped;
     }
 
-    pub fn generate_pseudolegal_moves(&self) -> MoveList {
+    pub fn generate_pseudolegal_moves(&self) -> LegalMoveList {
         initialize_magic_bitboards();
         let occupied = self.ours.union(self.theirs);
-        let mut result = Vec::with_capacity(60);
+        let mut result = LegalMoveList::new();
 
         for source in self.ours.into_iter() {
             if self.rooks.contains(source) {
@@ -405,11 +405,10 @@ impl ChessBoard {
         checkers.is_empty()
     }
 
-    pub fn generate_legal_moves(&self) -> MoveList {
-        self.generate_pseudolegal_moves()
-            .into_iter()
-            .filter(|mv| self.is_legal_move(*mv))
-            .collect()
+    pub fn generate_legal_moves(&self) -> LegalMoveList {
+        let mut moves = self.generate_pseudolegal_moves();
+        moves.retain(|mv| self.is_legal_move(*mv));
+        moves
     }
 
     pub fn is_under_check(&self) -> bool {

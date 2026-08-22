@@ -20,8 +20,6 @@ use crate::neural::backend::{Backend, BackendAttributes};
 #[cfg(feature = "tensorrt")]
 use crate::neural::cuda_trt::{CudaStream, DeviceBuffer, PinnedBuffer, download_device_async, expand_planes_async};
 #[cfg(feature = "tensorrt")]
-use ndarray::Array4;
-#[cfg(feature = "tensorrt")]
 use ort::ep::TensorRT;
 #[cfg(feature = "directml")]
 use ort::ep::{DirectML, directml::PerformancePreference};
@@ -351,7 +349,7 @@ fn create_tensorrt_sessions(path: &Path) -> Result<OnnxSessions, EnginError> {
     let board = format!("board:{TRT_PROFILE_MIN_BATCH}x{INPUT_PLANES}x{BOARD_ROWS}x{BOARD_COLS}");
     let board_opt = format!("board:{TRT_MAX_BATCH}x{INPUT_PLANES}x{BOARD_ROWS}x{BOARD_COLS}");
     let board_max = format!("board:{TRT_MAX_BATCH}x{INPUT_PLANES}x{BOARD_ROWS}x{BOARD_COLS}");
-    let mut session = Session::builder()
+    let session = Session::builder()
         .map_err(onnx_error)?
         .with_execution_providers([unsafe {
             TensorRT::default()
@@ -375,7 +373,6 @@ fn create_tensorrt_sessions(path: &Path) -> Result<OnnxSessions, EnginError> {
         .map_err(onnx_error)?
         .commit_from_file(path)
         .map_err(onnx_error)?;
-    validate_tensorrt_session(&mut session)?;
     let allocator = Allocator::new(
         &session,
         MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default).map_err(onnx_error)?,
@@ -395,15 +392,6 @@ fn trt_cache_dir() -> Result<std::path::PathBuf, EnginError> {
         .unwrap_or_else(|| Path::new("trt_cache").to_path_buf());
     std::fs::create_dir_all(&dir).map_err(|error| EnginError::Onnx(format!("create trt_cache: {error}")))?;
     Ok(dir)
-}
-
-/// TensorRT EP 注册成功不代表首个 engine 能构建/执行；启动时以最小输入验证。
-#[cfg(feature = "tensorrt")]
-fn validate_tensorrt_session(session: &mut Session) -> Result<(), EnginError> {
-    let board = Array4::<f32>::zeros((1, INPUT_PLANES, BOARD_ROWS, BOARD_COLS));
-    let tensor = TensorRef::from_array_view(&board).map_err(onnx_error)?;
-    session.run(ort::inputs!["board" => tensor]).map_err(onnx_error)?;
-    Ok(())
 }
 
 /// 固定形状 DirectML session。

@@ -3,14 +3,11 @@
 //! MCTS 回传实验改这里。worker 循环壳在 `workerpool`。
 
 use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-
-use nohash_hasher::NoHashHasher;
 
 use super::workerpool::BackpropEvent;
-use super::{NodeKey, NodeRepository, ValueDelta};
+use super::{Node, NodeArena, NodeId, ValueDelta};
 
-type NodeDeltaMap = HashMap<NodeKey, ValueDelta, BuildHasherDefault<NoHashHasher<u64>>>;
+type NodeDeltaMap = HashMap<NodeId, ValueDelta>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackpropResult {
@@ -22,7 +19,7 @@ pub(crate) struct BackpropResult {
 /// 路径增量回传：同路径 node 合并 delta，再一次写入；edge 按层 complete。
 pub(crate) fn complete_batch<S: super::observer::QueueStamp>(
     events: impl IntoIterator<Item = BackpropEvent<S>>,
-    repository: &NodeRepository,
+    arena: &NodeArena,
 ) -> BackpropResult {
     let mut node_deltas = NodeDeltaMap::default();
     let mut result = BackpropResult::default();
@@ -33,14 +30,12 @@ pub(crate) fn complete_batch<S: super::observer::QueueStamp>(
         let depth = playout.node_path.len() as u64;
         let mut delta = value;
         let mut reservations = playout.reservations.into_iter().rev();
-        for (node_index, node_key) in playout.node_path.into_iter().enumerate().rev() {
-            if let Some((terminal_wl, terminal_draw, terminal_m)) =
-                repository.get(node_key).and_then(|node| node.terminal_value())
-            {
+        for (node_index, node_id) in playout.node_path.into_iter().enumerate().rev() {
+            if let Some((terminal_wl, terminal_draw, terminal_m)) = arena.get(node_id).and_then(Node::terminal_value) {
                 delta = ValueDelta::with_plies_left(terminal_wl, terminal_draw, terminal_m);
             }
             node_deltas
-                .entry(node_key)
+                .entry(node_id)
                 .and_modify(|aggregate| *aggregate = aggregate.merge(delta))
                 .or_insert(delta);
             if node_index == 0 {
@@ -54,8 +49,11 @@ pub(crate) fn complete_batch<S: super::observer::QueueStamp>(
         result.max_depth = result.max_depth.max(depth);
     }
 
-    for (node_key, delta) in node_deltas {
-        repository.get_or_insert(node_key).add_delta(delta);
+    for (node_id, delta) in node_deltas {
+        arena
+            .get(node_id)
+            .expect("backprop node lives until job drain")
+            .add_delta(delta);
     }
     result
 }
@@ -67,23 +65,24 @@ mod tests {
     use xiangqi_core::{GameState, Move, STARTPOS_FEN, Square};
 
     use super::complete_batch;
-    use crate::search::NodeRepository;
+    use crate::search::NodeArena;
     use crate::search::workerpool::{BackpropEvent, PlayoutEvent};
 
     #[test]
     fn backprop_completes_every_reservation_with_alternating_value() {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(xiangqi_core::PositionHistory::from_positions(state.positions()));
-        let repository = NodeRepository::default();
-        let root_key = PlayoutEvent::<crate::search::NoQueueStamp>::root(1, Arc::clone(&history)).node_key;
-        let root_node = repository.get_or_insert(root_key);
+        let arena = NodeArena::default();
+        let root_id = arena.allocate();
+        let root_node = arena.get(root_id).expect("root node");
         assert!(root_node.try_begin_evaluation());
         let mv = Move::new(Square::parse("b2").expect("b2"), Square::parse("b3").expect("b3"));
         root_node.publish_edges(vec![(mv, 1.0)]);
-        let child = PlayoutEvent::<crate::search::NoQueueStamp>::root(1, Arc::clone(&history))
-            .descend(root_key.child(mv), root_node.reserve_edge(0).expect("edge"));
+        let child_id = arena.child_or_create(&root_node.edges()[0]);
+        let child = PlayoutEvent::<crate::search::NoQueueStamp>::at_root(1, root_id, Arc::clone(&history))
+            .descend(child_id, root_node.reserve_edge(0).expect("edge"));
 
-        complete_batch([BackpropEvent::evaluation(child, 0.4, 0.2, 2.0)], &repository);
+        complete_batch([BackpropEvent::evaluation(child, 0.4, 0.2, 2.0)], &arena);
 
         let edge = &root_node.edges()[0];
         assert_eq!(edge.visits(), 1);
@@ -92,7 +91,7 @@ mod tests {
         assert_eq!(root_node.completed_visits(), 1);
         assert!((root_node.q() + 0.4).abs() < f32::EPSILON);
         assert!((root_node.m() - 3.0).abs() < f32::EPSILON);
-        let child_node = repository.get(root_key.child(mv)).expect("child node");
+        let child_node = arena.get(child_id).expect("child node");
         assert_eq!(child_node.completed_visits(), 1);
         assert!((child_node.q() - 0.4).abs() < f32::EPSILON);
         assert!((child_node.m() - 2.0).abs() < f32::EPSILON);

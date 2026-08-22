@@ -1,16 +1,16 @@
 //! 叶子终局分类（不是 `publish_edges`，也不是 `ExpansionState::Expanded`）。
 //!
 //! 只回答「要不要 NN」：死/子力不足/重复/rule60 → Terminal，否则 Evaluate。
-//! Eval 编码前调用；Gather 在已 Expanded 节点上复用 `path_terminal_value`。
+//! Eval 编码前调用；root 启动门禁复用 `path_terminal_value`。
 //!
 //! `mcts2`：`rep==1` 继续搜；`rep>=2` 才 RuleJudge。终局 `m` 用于排序。
 
-use xiangqi_core::{GameResult, Move, PositionHistory};
+use xiangqi_core::{GameResult, LegalMoveList, PositionHistory};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ExpandKind {
     /// NN 评估并发布 edge；合法着在分类时已生成，避免 Eval 再算一遍。
-    Evaluate { legal_moves: Vec<Move> },
+    Evaluate { legal_moves: LegalMoveList },
     /// 终局叶子：`(wl, draw, plies_left)` 按 incoming edge / 上一走子方视角。
     Terminal { wl: f32, draw: f32, plies_left: f32 },
 }
@@ -44,8 +44,8 @@ pub(crate) fn classify_expand(history: &PositionHistory, depth: usize) -> Expand
 
 /// 依赖完整 variation history 的终局：重复裁决与 rule60。
 ///
-/// 已 Expanded 的树 node 再次被命中时仍可能因本条路径 `rule60_ply >= 120`
-/// 或 `repetitions >= 2` 而终局，不能因 node 已存在而跳过。
+/// 当前路径树的 node key 已包含完整路径，故同一 node 的规则 history 不会变化；
+/// 重复与 rule60 只在首次 Eval 分类，root 则在启动门禁分类。
 pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Option<(f32, f32, f32)> {
     let is_root = depth == 0;
     if !is_root {

@@ -12,8 +12,8 @@ use crate::neural::backend::{Backend, CachingBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::{
     NoopObserver, Search, SearchConfig, SearchControl, SearchLimits, SearchParams, SearchTree, Stats, TimeBudget,
-    TimeManager, WorkerPool, best_mate_with_params, best_move_filtered_with_params,
-    principal_variation_with_history_and_params, root_stats, root_variations,
+    TimeManager, WorkerPool, best_mate_with_params, best_move_filtered_with_params, principal_variation_with_params,
+    root_stats, root_variations,
 };
 use crate::uci_loop::{
     BestMoveInfo, GoParams, ThinkingInfo, Wdl, write_stdout, write_stdout_best_move, write_stdout_thinking,
@@ -48,19 +48,20 @@ struct ActiveSearch {
     clock_budget: Option<TimeBudget>,
 }
 
-/// 后台回收旧 sibling 子树，或释放已被新 position 替换的整张 repository。
-///
-/// 前进换根后的 prune 可与下一手 `go` 重叠；下一次 `position` 入口会 `wait_idle`，
-/// 避免悔棋回到仍挂着待删 sibling 的祖先根时与 prune 竞态。
+/// 后台回收旧 sibling 子树，或释放已被新 position 替换的整张 arena。
+/// 前进换根后的 prune 只会在旧 job drain 后入队，可与下一手 `go` 重叠。
 struct GraphReaper {
     sender: Option<crossbeam_channel::Sender<GraphCleanup>>,
     thread: Option<JoinHandle<()>>,
 }
 
 enum GraphCleanup {
-    Prune(Arc<crate::search::NodeRepository>, Vec<crate::search::NodeKey>),
-    Retire(Arc<crate::search::NodeRepository>),
-    Flush(std::sync::mpsc::Sender<()>),
+    Prune(
+        Arc<crate::search::NodeArena>,
+        Vec<crate::search::NodeId>,
+        Vec<crate::search::NodeId>,
+    ),
+    Retire(Arc<crate::search::NodeArena>),
 }
 
 impl GraphReaper {
@@ -71,16 +72,14 @@ impl GraphReaper {
             .spawn(move || {
                 while let Ok(cleanup) = receiver.recv() {
                     match cleanup {
-                        GraphCleanup::Prune(repository, roots) => {
-                            let _ = repository.remove_subtrees(roots);
+                        GraphCleanup::Prune(arena, roots, nodes) => {
+                            let _ = arena.remove_subtrees(roots);
+                            arena.remove_nodes(nodes);
                         }
-                        GraphCleanup::Retire(repository) => match Arc::try_unwrap(repository) {
-                            Ok(repository) => repository.release_incrementally(),
-                            Err(repository) => drop(repository),
+                        GraphCleanup::Retire(arena) => match Arc::try_unwrap(arena) {
+                            Ok(arena) => arena.release_incrementally(),
+                            Err(arena) => drop(arena),
                         },
-                        GraphCleanup::Flush(done) => {
-                            let _ = done.send(());
-                        }
                     }
                 }
             })
@@ -91,34 +90,28 @@ impl GraphReaper {
         }
     }
 
-    fn retire(&self, repository: Arc<crate::search::NodeRepository>) {
+    fn retire(&self, arena: Arc<crate::search::NodeArena>) {
         self.sender
             .as_ref()
             .expect("graph reaper sender lives with engine")
-            .send(GraphCleanup::Retire(repository))
+            .send(GraphCleanup::Retire(arena))
             .expect("graph reaper thread is alive");
     }
 
-    fn prune(&self, repository: Arc<crate::search::NodeRepository>, roots: Vec<crate::search::NodeKey>) {
-        if roots.is_empty() {
+    fn prune(
+        &self,
+        arena: Arc<crate::search::NodeArena>,
+        roots: Vec<crate::search::NodeId>,
+        nodes: Vec<crate::search::NodeId>,
+    ) {
+        if roots.is_empty() && nodes.is_empty() {
             return;
         }
         self.sender
             .as_ref()
             .expect("graph reaper sender lives with engine")
-            .send(GraphCleanup::Prune(repository, roots))
+            .send(GraphCleanup::Prune(arena, roots, nodes))
             .expect("graph reaper thread is alive");
-    }
-
-    /// 等到此前已入队的 prune/retire 做完。
-    fn wait_idle(&self) {
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        self.sender
-            .as_ref()
-            .expect("graph reaper sender lives with engine")
-            .send(GraphCleanup::Flush(done_tx))
-            .expect("graph reaper thread is alive");
-        done_rx.recv().expect("graph reaper flush completes");
     }
 }
 
@@ -139,8 +132,8 @@ const OWNER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// search owner 持有的只读 root view，不参与 worker 的搜索状态。
 #[derive(Clone)]
 struct RootSnapshot {
-    repository: Arc<crate::search::NodeRepository>,
-    root_key: crate::search::NodeKey,
+    arena: Arc<crate::search::NodeArena>,
+    root_id: crate::search::NodeId,
     root_history: Arc<PositionHistory>,
     initial_visits: u64,
     root_is_black: bool,
@@ -273,14 +266,12 @@ impl Engine {
         let state = GameState::from_fen_moves(fen, moves)?;
         let history = Arc::new(state.position_history());
         self.abort()?;
-        // 先收完上一手异步 prune，再改 root；否则悔棋回到祖先根时可能与仍在删的 sibling 竞态。
-        self.graph_reaper.wait_idle();
         if let Some(graph) = self.graph.as_mut() {
             if let Some(retired) = graph.reset_to_history_after_drain(Arc::clone(&history))? {
                 self.graph_reaper.retire(retired);
             }
-            let pending = graph.take_pending_gc_roots();
-            self.graph_reaper.prune(Arc::clone(graph.repository()), pending);
+            let (roots, nodes) = graph.take_pending_gc();
+            self.graph_reaper.prune(Arc::clone(graph.arena()), roots, nodes);
         } else if self.backend.is_some() {
             self.graph = Some(SearchTree::new(history));
         }
@@ -413,11 +404,10 @@ impl Engine {
         };
         let graph = self.graph.as_ref().expect("position creates a graph with a backend");
         let root_is_black = graph.root_history().last().is_black_to_move();
-        let search =
-            Search::new_with_graph_in_pool(backend, self.next_generation, graph, config, NoopObserver, pool);
+        let search = Search::new_with_graph_in_pool(backend, self.next_generation, graph, config, NoopObserver, pool);
         let snapshot = RootSnapshot {
-            repository: Arc::clone(search.repository()),
-            root_key: search.root_key(),
+            arena: Arc::clone(search.arena()),
+            root_id: search.root_id(),
             root_history: Arc::clone(graph.root_history()),
             initial_visits: search.initial_visits(),
             root_is_black,
@@ -564,16 +554,15 @@ fn run_search(
         } else {
             (
                 best_move_filtered_with_params(
-                    search.repository(),
-                    search.root_key(),
+                    search.arena(),
+                    search.root_id(),
                     snapshot.root_is_black,
                     &snapshot.root_move_filter,
                     &snapshot.params,
                 ),
-                principal_variation_with_history_and_params(
-                    search.repository(),
-                    search.root_key(),
-                    snapshot.root_history.as_ref(),
+                principal_variation_with_params(
+                    search.arena(),
+                    search.root_id(),
                     snapshot.root_is_black,
                     &snapshot.root_move_filter,
                     &snapshot.params,
@@ -628,8 +617,8 @@ impl RootSnapshot {
     fn progress(&self, stats: &Stats) -> SearchProgress {
         SearchProgress {
             best_move: best_move_filtered_with_params(
-                &self.repository,
-                self.root_key,
+                &self.arena,
+                self.root_id,
                 self.root_is_black,
                 &self.root_move_filter,
                 &self.params,
@@ -662,15 +651,14 @@ impl RootSnapshot {
             eps,
             ..ThinkingInfo::default()
         };
-        let Some(root) = root_stats(&self.repository, self.root_key) else {
+        let Some(root) = root_stats(&self.arena, self.root_id) else {
             return vec![common];
         };
         let wl = (-root.q).clamp(-1.0, 1.0);
         let draw = root.draw.clamp(0.0, 1.0);
         let variations = root_variations(
-            &self.repository,
-            self.root_key,
-            Some(self.root_history.as_ref()),
+            &self.arena,
+            self.root_id,
             self.root_is_black,
             &self.root_move_filter,
             self.multi_pv,
@@ -679,7 +667,7 @@ impl RootSnapshot {
         if variations.is_empty() {
             let win = ((1.0_f32 - draw + wl) * 0.5).clamp(0.0, 1.0);
             let loss = ((1.0_f32 - draw - wl) * 0.5).clamp(0.0, 1.0);
-            let mate = best_mate_with_params(&self.repository, self.root_key, &self.root_move_filter, &self.params);
+            let mate = best_mate_with_params(&self.arena, self.root_id, &self.root_move_filter, &self.params);
             return vec![ThinkingInfo {
                 mate,
                 score: mate.is_none().then_some((wl * 1000.0).round() as i32),
@@ -688,10 +676,9 @@ impl RootSnapshot {
                     d: (draw * 1000.0).round() as i32,
                     l: (loss * 1000.0).round() as i32,
                 }),
-                pv: principal_variation_with_history_and_params(
-                    &self.repository,
-                    self.root_key,
-                    self.root_history.as_ref(),
+                pv: principal_variation_with_params(
+                    &self.arena,
+                    self.root_id,
                     self.root_is_black,
                     &self.root_move_filter,
                     &self.params,

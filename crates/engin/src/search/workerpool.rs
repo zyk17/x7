@@ -17,10 +17,10 @@ use super::backprop::complete_batch;
 use super::eval::{
     NnRequest, WaitingNn, drain_waiting, handle_eval_event, infer_nn_batch, poll_nn_completions, wait_one_nn_completion,
 };
-use super::observer::{NoopObserver, NoQueueStamp, QueueKind, QueueStamp, SearchObserver};
+use super::observer::{NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver};
 use super::param::{ResolvedSearchConfig, SearchConfig};
 use super::pipeline::{RECEIVE_POLL, Shared, process_gather_event};
-use super::{NodeKey, ValueDelta};
+use super::{NodeId, ValueDelta};
 
 // --- Event -------------------------------------------------------------------
 
@@ -28,7 +28,7 @@ use super::{NodeKey, ValueDelta};
 #[derive(Clone, Debug)]
 pub struct Variation {
     root_history: Arc<PositionHistory>,
-    moves: Vec<Move>,
+    moves: smallvec::SmallVec<[Move; 32]>,
     history: Option<PositionHistory>,
     position: Position,
 }
@@ -38,7 +38,7 @@ impl Variation {
         Self {
             position: root_history.last().clone(),
             root_history,
-            moves: Vec::new(),
+            moves: smallvec::SmallVec::new(),
             history: None,
         }
     }
@@ -75,33 +75,29 @@ impl Variation {
 #[derive(Debug)]
 pub struct PlayoutEvent<S: QueueStamp = NoQueueStamp> {
     pub generation: u64,
-    pub node_key: NodeKey,
-    pub(crate) node_path: Vec<NodeKey>,
+    pub node_id: NodeId,
+    pub(crate) node_path: Vec<NodeId>,
     pub variation: Variation,
     pub reservations: Vec<EdgeReservation>,
     queued_at: S,
 }
 
 impl<S: QueueStamp> PlayoutEvent<S> {
-    pub fn root(generation: u64, root_history: Arc<PositionHistory>) -> Self {
-        Self::at_root(generation, NodeKey::root(root_history.last().hash()), root_history)
-    }
-
-    pub fn at_root(generation: u64, root_key: NodeKey, root_history: Arc<PositionHistory>) -> Self {
+    pub fn at_root(generation: u64, root_id: NodeId, root_history: Arc<PositionHistory>) -> Self {
         Self {
             generation,
-            node_key: root_key,
-            node_path: vec![root_key],
+            node_id: root_id,
+            node_path: vec![root_id],
             variation: Variation::root(root_history),
             reservations: Vec::new(),
             queued_at: S::default(),
         }
     }
 
-    pub fn descend(mut self, child_key: NodeKey, reservation: EdgeReservation) -> Self {
+    pub fn descend(mut self, child_id: NodeId, reservation: EdgeReservation) -> Self {
         self.variation.push(reservation.mv());
-        self.node_key = child_key;
-        self.node_path.push(child_key);
+        self.node_id = child_id;
+        self.node_path.push(child_id);
         self.reservations.push(reservation);
         self
     }
@@ -112,7 +108,7 @@ impl<S: QueueStamp> PlayoutEvent<S> {
         }
     }
 
-    pub fn node_path(&self) -> &[NodeKey] {
+    pub fn node_path(&self) -> &[NodeId] {
         &self.node_path
     }
 
@@ -167,7 +163,11 @@ enum GatherCommand<O: SearchObserver> {
 }
 
 enum EvalCommand<O: SearchObserver> {
-    Run(Arc<Shared<O>>, Receiver<PlayoutEvent<O::Stamp>>, Sender<NnRequest<O::Stamp>>),
+    Run(
+        Arc<Shared<O>>,
+        Receiver<PlayoutEvent<O::Stamp>>,
+        Sender<NnRequest<O::Stamp>>,
+    ),
     Shutdown,
 }
 
@@ -458,11 +458,7 @@ fn nn_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver<NnReq
     }
 }
 
-fn persistent_nn_worker<O: SearchObserver>(
-    commands: Receiver<NnCommand<O>>,
-    job_done: Sender<()>,
-    batch_size: usize,
-) {
+fn persistent_nn_worker<O: SearchObserver>(commands: Receiver<NnCommand<O>>, job_done: Sender<()>, batch_size: usize) {
     while let Ok(command) = commands.recv() {
         match command {
             NnCommand::Run(shared, receiver) => {
@@ -499,10 +495,10 @@ fn backprop_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver
         for event in &mut events {
             event.observe_wait(&shared.observer, QueueKind::Backprop);
         }
-        let leaf_keys: Vec<NodeKey> = events.iter().map(|event| event.playout.node_key).collect();
-        let result = complete_batch(events, &shared.repository);
-        for key in leaf_keys {
-            shared.cancel_collisions(key);
+        let leaf_ids: Vec<NodeId> = events.iter().map(|event| event.playout.node_id).collect();
+        let result = complete_batch(events, &shared.arena);
+        for id in leaf_ids {
+            shared.cancel_collisions(id);
         }
         shared
             .completed_depth
