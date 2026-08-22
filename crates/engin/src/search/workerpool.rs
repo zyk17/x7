@@ -347,7 +347,9 @@ fn gather_worker<O: SearchObserver>(
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(mut event) => {
-                event.observe_wait(&shared.observer, QueueKind::Gather);
+                if O::ENABLED {
+                    event.observe_wait(&shared.observer, QueueKind::Gather);
+                }
                 if shared.stopping.load(Ordering::Acquire) {
                     event.cancel();
                     shared.finish(1, false);
@@ -399,7 +401,9 @@ fn eval_worker<O: SearchObserver>(
 
         match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(mut event) => {
-                event.observe_wait(&shared.observer, QueueKind::Eval);
+                if O::ENABLED {
+                    event.observe_wait(&shared.observer, QueueKind::Eval);
+                }
                 if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
                     shared.fail(error);
                 }
@@ -443,12 +447,16 @@ fn nn_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver<NnReq
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        first.observe_wait(&shared.observer, QueueKind::Nn);
+        if O::ENABLED {
+            first.observe_wait(&shared.observer, QueueKind::Nn);
+        }
         let mut requests = vec![first];
         while requests.len() < batch_size {
             match receiver.try_recv() {
                 Ok(mut request) => {
-                    request.observe_wait(&shared.observer, QueueKind::Nn);
+                    if O::ENABLED {
+                        request.observe_wait(&shared.observer, QueueKind::Nn);
+                    }
                     requests.push(request);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -492,8 +500,10 @@ fn backprop_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver
             shared.finish(n, false);
             continue;
         }
-        for event in &mut events {
-            event.observe_wait(&shared.observer, QueueKind::Backprop);
+        if O::ENABLED {
+            for event in &mut events {
+                event.observe_wait(&shared.observer, QueueKind::Backprop);
+            }
         }
         let leaf_ids: Vec<NodeId> = events.iter().map(|event| event.playout.node_id).collect();
         let result = complete_batch(events, &shared.arena);
