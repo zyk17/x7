@@ -82,7 +82,7 @@ mod tests {
         let child = PlayoutEvent::<crate::search::NoQueueStamp>::at_root(1, root_id, Arc::clone(&history))
             .descend(child_id, root_node.reserve_edge(0).expect("edge"));
 
-        complete_batch([BackpropEvent::evaluation(child, 0.4, 0.2, 2.0)], &arena);
+        complete_batch([BackpropEvent::from_gather(child, 0.4, 0.2, 2.0)], &arena);
 
         let edge = &root_node.edges()[0];
         assert_eq!(edge.visits(), 1);

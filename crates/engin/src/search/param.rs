@@ -79,7 +79,8 @@ pub struct SearchConfig {
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
-    /// 已交给 Eval 的叶子上限倍率：`limit = ceil(MiniBatchSize × nn_window)`，启动时算一次。
+    /// Eval claim 并发上限：`limit = ceil(MiniBatchSize × nn_window)`。
+    /// Claim 在 backprop 写完 N/Q 后释放；调大可能提高eps、调小让 Gather 更贴最新统计。
     pub nn_window: f32,
     pub params: SearchParams,
     pub gather_workers: usize,

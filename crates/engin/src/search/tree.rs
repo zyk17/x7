@@ -328,26 +328,6 @@ impl Node {
         stats.m_sum += delta.m_sum;
     }
 
-    /// 在同一把统计锁下读取 Q、WDL/M 与二阶矩。
-    pub(crate) fn value_moments_snapshot(&self) -> (f32, f32, f32, f32) {
-        let stats = self.stats.lock();
-        if stats.visits == 0 {
-            return (0.0, 0.0, 0.0, 0.0);
-        }
-        let visits = stats.visits as f32;
-        (
-            stats.wl_sum / visits,
-            stats.draw_sum / visits,
-            stats.m_sum / visits,
-            stats.wl_sq_sum / visits,
-        )
-    }
-
-    pub(crate) fn value_snapshot(&self) -> (f32, f32, f32) {
-        let (wl, draw, m, _) = self.value_moments_snapshot();
-        (wl, draw, m)
-    }
-
     pub fn expansion_state(&self) -> ExpansionState {
         ExpansionState::from_raw(self.expansion.load(Ordering::Acquire))
     }
