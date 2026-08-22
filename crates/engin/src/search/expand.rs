@@ -5,12 +5,12 @@
 //!
 //! `mcts2`：`rep==1` 继续搜；`rep>=2` 才 RuleJudge。终局 `m` 用于排序。
 
-use xiangqi_core::{GameResult, Move, PositionHistory};
+use xiangqi_core::{GameResult, LegalMoveList, PositionHistory};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ExpandKind {
     /// NN 评估并发布 edge；合法着在分类时已生成，避免 Eval 再算一遍。
-    Evaluate { legal_moves: Vec<Move> },
+    Evaluate { legal_moves: LegalMoveList },
     /// 终局叶子：`(wl, draw, plies_left)` 按 incoming edge / 上一走子方视角。
     Terminal { wl: f32, draw: f32, plies_left: f32 },
 }

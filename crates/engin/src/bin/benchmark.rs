@@ -487,7 +487,8 @@ fn print_tree_node(
         path.remove(&node_id);
         return;
     }
-    let mut edges: Vec<_> = node.edges().iter().cloned().collect();
+    let edge_table = node.edges();
+    let mut edges: Vec<_> = edge_table.iter().collect();
     edges.sort_unstable_by(|left, right| {
         right
             .completed_visits()

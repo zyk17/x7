@@ -183,15 +183,12 @@ impl Edge {
         stats.wl_sum / stats.visits as f32
     }
 
-    fn reserve(self: &Arc<Self>, virtual_mean: Option<f32>) -> EdgeReservation {
+    fn reserve(&self, virtual_mean: Option<f32>) -> f32 {
         let virtual_wl_sum = virtual_mean.unwrap_or(0.0);
         let mut stats = self.stats.lock();
         self.started.fetch_add(1, Ordering::AcqRel);
         stats.virtual_wl_sum += virtual_wl_sum;
-        EdgeReservation {
-            edge: Arc::clone(self),
-            virtual_wl_sum,
-        }
+        virtual_wl_sum
     }
 
     fn cancel(&self, virtual_wl_sum: f32) {
@@ -221,21 +218,22 @@ impl Edge {
 /// 一次待完成访问。它必须恰好被 `complete` 或 `cancel` 消费一次。
 #[derive(Debug)]
 pub struct EdgeReservation {
-    edge: Arc<Edge>,
+    edges: Arc<[Edge]>,
+    edge_index: usize,
     virtual_wl_sum: f32,
 }
 
 impl EdgeReservation {
     pub fn mv(&self) -> Move {
-        self.edge.mv()
+        self.edges[self.edge_index].mv()
     }
 
     pub fn complete(self, wl: f32) {
-        self.edge.complete(self.virtual_wl_sum, wl);
+        self.edges[self.edge_index].complete(self.virtual_wl_sum, wl);
     }
 
     pub fn cancel(self) {
-        self.edge.cancel(self.virtual_wl_sum);
+        self.edges[self.edge_index].cancel(self.virtual_wl_sum);
     }
 }
 
@@ -279,7 +277,7 @@ pub struct Node {
     /// 生命周期：Unexpanded → Evaluating → Expanded|Terminal（`ExpansionState` 以 u8
     /// 供 CAS 使用）。
     expansion: AtomicU8,
-    edges: OnceLock<Arc<[Arc<Edge>]>>,
+    edges: OnceLock<Arc<[Edge]>>,
     /// LC3 node 保留其 completed 聚合值。in-flight visit 保持在 edge-local，刻意不计入
     /// 此值。
     stats: Mutex<NodeStats>,
@@ -368,18 +366,15 @@ impl Node {
             .is_ok()
     }
 
-    pub fn publish_edges(&self, edges: Vec<(Move, f32)>) {
+    pub fn publish_edges(&self, edges: impl IntoIterator<Item = (Move, f32)>) {
         assert_eq!(
             self.expansion_state(),
             ExpansionState::Evaluating,
             "node must be evaluating"
         );
-        let mut edges = edges;
+        let mut edges: smallvec::SmallVec<[(Move, f32); 64]> = edges.into_iter().collect();
         edges.sort_unstable_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal));
-        let edges: Arc<[Arc<Edge>]> = edges
-            .into_iter()
-            .map(|(mv, prior)| Arc::new(Edge::new(mv, prior)))
-            .collect();
+        let edges: Arc<[Edge]> = edges.into_iter().map(|(mv, prior)| Edge::new(mv, prior)).collect();
         self.edges.set(edges).expect("stream node publishes edges once");
         self.expansion.store(ExpansionState::Expanded as u8, Ordering::Release);
     }
@@ -450,7 +445,7 @@ impl Node {
         (*self.terminal.lock()).map(|(_, _, plies)| plies)
     }
 
-    pub fn edges(&self) -> Arc<[Arc<Edge>]> {
+    pub fn edges(&self) -> Arc<[Edge]> {
         self.edges.get().cloned().unwrap_or_default()
     }
 
@@ -463,7 +458,14 @@ impl Node {
         edge_index: usize,
         virtual_mean: Option<f32>,
     ) -> Option<EdgeReservation> {
-        self.edges().get(edge_index).map(|edge| edge.reserve(virtual_mean))
+        let edges = self.edges();
+        let edge = edges.get(edge_index)?;
+        let virtual_wl_sum = edge.reserve(virtual_mean);
+        Some(EdgeReservation {
+            edges,
+            edge_index,
+            virtual_wl_sum,
+        })
     }
 }
 

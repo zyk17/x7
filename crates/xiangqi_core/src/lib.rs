@@ -17,7 +17,7 @@ pub use board::{ChessBoard, FenState, STARTPOS_FEN, board_to_fen, startpos_board
 pub use board_attacks::initialize_magic_bitboards;
 pub use gamestate::GameState;
 pub use position::{GameResult, Position, PositionHistory};
-pub use types::{File, Move, MoveList, PieceType, Rank, Square};
+pub use types::{File, LegalMoveList, Move, MoveList, PieceType, Rank, Square};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoreError {

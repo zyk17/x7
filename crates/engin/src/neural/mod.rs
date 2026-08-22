@@ -98,8 +98,8 @@ impl EncodedBatch {
 }
 
 /// 从完整 policy logits 中按合法着抽取子集。
-fn gather_legal_logits(logits: &[f32], legal_moves: &[Move]) -> Result<Vec<f32>, EnginError> {
-    let mut selected = Vec::with_capacity(legal_moves.len());
+fn gather_legal_logits(logits: &[f32], legal_moves: &[Move]) -> Result<smallvec::SmallVec<[f32; 64]>, EnginError> {
+    let mut selected = smallvec::SmallVec::new();
     for &mv in legal_moves {
         let index = move_to_nn_index(mv)
             .ok_or_else(|| EnginError::Onnx(format!("legal move absent from px0 policy table: {mv}")))?;
@@ -140,7 +140,7 @@ fn softmax_inplace(logits: &mut [f32]) -> Result<(), EnginError> {
 pub fn softmax_legal_policy(logits: &[f32], legal_moves: &[Move]) -> Result<Vec<f32>, EnginError> {
     let mut selected = gather_legal_logits(logits, legal_moves)?;
     softmax_inplace(&mut selected)?;
-    Ok(selected)
+    Ok(selected.into_vec())
 }
 
 /// TensorRT FP16 等 EP 数值噪声容差：允许轻微越界后再 clamp + 归一。

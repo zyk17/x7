@@ -371,7 +371,12 @@ impl fmt::Display for Move {
     }
 }
 
+/// 完整对局的走子历史，没有小容量上限。
 pub type MoveList = Vec<Move>;
+
+/// 生成和评估期间的临时合法着。绝大多数局面完全内联；极端局面自动溢出到堆，
+/// 不把容量假设变成规则限制。
+pub type LegalMoveList = smallvec::SmallVec<[Move; 64]>;
 
 #[cfg(test)]
 mod tests {

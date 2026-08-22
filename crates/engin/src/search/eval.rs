@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
-use xiangqi_core::Move;
+use xiangqi_core::LegalMoveList;
 
 use crate::EnginError;
 use crate::neural::backend::{EvalCacheKey, EvalResult};
@@ -44,7 +44,7 @@ impl<S: QueueStamp> NnRequest<S> {
 /// Eval 正在等待此 node 的 NN。
 pub(crate) struct WaitingNn<S: QueueStamp = super::observer::NoQueueStamp> {
     event: PlayoutEvent<S>,
-    legal_moves: Vec<Move>,
+    legal_moves: LegalMoveList,
     cache_key: EvalCacheKey,
     reply: Receiver<NnReply>,
 }
@@ -226,7 +226,7 @@ fn complete_nn_item<O: SearchObserver>(
 fn publish_eval<O: SearchObserver>(
     shared: &Shared<O>,
     event: PlayoutEvent<O::Stamp>,
-    legal_moves: Vec<Move>,
+    legal_moves: LegalMoveList,
     eval: Arc<EvalResult>,
 ) -> Result<(), EnginError> {
     let value_is_valid = eval.wl.is_finite()
@@ -248,7 +248,7 @@ fn publish_eval<O: SearchObserver>(
         .arena
         .get(event.node_id)
         .expect("eval node lives until job drain")
-        .publish_edges(legal_moves.iter().copied().zip(eval.policies.iter().copied()).collect());
+        .publish_edges(legal_moves.iter().copied().zip(eval.policies.iter().copied()));
     shared.send_backprop(BackpropEvent::evaluation(event, -eval.wl, eval.d, eval.plies_left));
     Ok(())
 }

@@ -28,7 +28,7 @@ use super::{NodeId, ValueDelta};
 #[derive(Clone, Debug)]
 pub struct Variation {
     root_history: Arc<PositionHistory>,
-    moves: Vec<Move>,
+    moves: smallvec::SmallVec<[Move; 32]>,
     history: Option<PositionHistory>,
     position: Position,
 }
@@ -38,7 +38,7 @@ impl Variation {
         Self {
             position: root_history.last().clone(),
             root_history,
-            moves: Vec::new(),
+            moves: smallvec::SmallVec::new(),
             history: None,
         }
     }

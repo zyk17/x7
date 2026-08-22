@@ -1,6 +1,4 @@
 //! PUCT / FPU / virtual mean。只算该选哪条边与挂多少 μ；不 `reserve`、不 `descend`。
-use std::sync::Arc;
-
 use xiangqi_core::Move;
 
 use super::Edge;
@@ -17,12 +15,12 @@ fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
 }
 
 /// reduction 越大，未知 edge 的 FPU 越低，越晚获得首次选择。
-fn get_fpu(params: &SearchParams, parent_q: f32, edges: &[Arc<Edge>]) -> f32 {
+fn get_fpu(params: &SearchParams, parent_q: f32, edges: &[Edge]) -> f32 {
     -parent_q - params.fpu_reduction * visited_policy(edges).sqrt()
 }
 
 /// 已访问边的 prior 之和，供 FPU 缩放使用。
-fn visited_policy(edges: &[Arc<Edge>]) -> f32 {
+fn visited_policy(edges: &[Edge]) -> f32 {
     edges
         .iter()
         .filter(|edge| edge.completed_visits() > 0 || edge.in_flight_visits() > 0)
@@ -59,7 +57,7 @@ fn virtual_mean_for_reservation(params: &SearchParams, fpu: f32) -> Option<f32> 
 ///
 /// completed N 决定 cPUCT 曲线；started N（含虚拟损失）进入实际 PUCT。
 pub(crate) fn select_edge(
-    edges: &[Arc<Edge>],
+    edges: &[Edge],
     parent_completed_visits: u32,
     parent_q: f32,
     depth: usize,
@@ -167,10 +165,11 @@ mod tests {
         let node = arena.get(arena.allocate()).expect("node");
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
-        let edge = node.edges()[0].clone();
+        let edges = node.edges();
+        let edge = &edges[0];
         node.reserve_edge(0).expect("res").complete(0.5);
-        assert!((edge_utility(&edge, 0.0, false) - 0.5).abs() < 1e-6);
-        assert!((visited_policy(&[edge]) - 1.0).abs() < f32::EPSILON);
+        assert!((edge_utility(edge, 0.0, false) - 0.5).abs() < 1e-6);
+        assert!((visited_policy(std::slice::from_ref(edge)) - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -179,17 +178,18 @@ mod tests {
         let node = arena.get(arena.allocate()).expect("node");
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
-        let edge = node.edges()[0].clone();
+        let edges = node.edges();
+        let edge = &edges[0];
         node.reserve_edge(0).expect("completed evidence").complete(0.8);
-        assert!((edge_utility(&edge, -0.3, true) - 0.8).abs() < 1e-6);
+        assert!((edge_utility(edge, -0.3, true) - 0.8).abs() < 1e-6);
 
         let reservation = node
             .reserve_edge_with_virtual_mean(0, Some(-0.3))
             .expect("virtual mean reservation");
-        assert!((edge_utility(&edge, -0.3, true) - 0.25).abs() < 1e-6);
+        assert!((edge_utility(edge, -0.3, true) - 0.25).abs() < 1e-6);
         reservation.cancel();
 
-        assert!((edge_utility(&edge, -0.3, true) - 0.8).abs() < 1e-6);
+        assert!((edge_utility(edge, -0.3, true) - 0.8).abs() < 1e-6);
         let stats = edge.stats();
         assert_eq!(stats.visits, 1);
         assert_eq!(stats.virtual_wl_sum, 0.0);

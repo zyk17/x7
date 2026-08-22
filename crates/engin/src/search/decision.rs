@@ -1,5 +1,7 @@
 //! 搜后根决策：bestmove、MultiPV、LCB、PV。不参与搜索过程。
 
+use std::ops::Deref;
+use std::sync::Arc;
 use xiangqi_core::Move;
 
 use super::param::SearchParams;
@@ -28,6 +30,28 @@ pub(crate) struct RootVariation {
     pub draw: f32,
     pub mate: Option<i32>,
     pub pv: Vec<Move>,
+}
+
+struct EdgeHandle {
+    table: Arc<[Edge]>,
+    index: usize,
+}
+
+impl Deref for EdgeHandle {
+    type Target = Edge;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table[self.index]
+    }
+}
+
+struct RankedEdge {
+    edge: EdgeHandle,
+    terminal: i8,
+    plies: f32,
+    visits: u32,
+    q: f32,
+    prior: f32,
 }
 
 pub fn root_stats(arena: &NodeArena, root: NodeId) -> Option<RootStats> {
@@ -77,35 +101,47 @@ fn edge_lcb(edge: &Edge, stdevs: f32) -> Option<f32> {
     Some(q - stdevs * (variance / n).sqrt())
 }
 
-fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &SearchParams) -> Vec<std::sync::Arc<Edge>> {
+fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &SearchParams) -> Vec<EdgeHandle> {
     let Some(node) = arena.get(root) else { return Vec::new() };
     let edges = node.edges();
     let mut ranked: Vec<_> = edges
         .iter()
-        .filter(|edge| filter.is_empty() || filter.contains(&edge.mv()))
-        .map(std::sync::Arc::clone)
-        .collect();
-    ranked.sort_unstable_by(|left, right| {
-        let terminal_key = |edge: &Edge| {
-            child(arena, edge)
+        .enumerate()
+        .filter(|(_, edge)| filter.is_empty() || filter.contains(&edge.mv()))
+        .map(|(index, _)| {
+            let edge = EdgeHandle {
+                table: Arc::clone(&edges),
+                index,
+            };
+            let (terminal, plies) = child(arena, &edge)
                 .filter(|_| edge.completed_visits() > 0)
                 .and_then(Node::terminal_value)
                 .map(|(wl, _, plies)| (wl.signum() as i8, plies))
-                .unwrap_or((0, 0.0))
-        };
-        let (left_terminal, left_plies) = terminal_key(left);
-        let (right_terminal, right_plies) = terminal_key(right);
-        right_terminal
-            .cmp(&left_terminal)
-            .then_with(|| match left_terminal {
-                1 => left_plies.total_cmp(&right_plies),
-                -1 => right_plies.total_cmp(&left_plies),
+                .unwrap_or((0, 0.0));
+            RankedEdge {
+                visits: edge.completed_visits(),
+                q: edge.q(),
+                prior: edge.prior(),
+                edge,
+                terminal,
+                plies,
+            }
+        })
+        .collect();
+    ranked.sort_unstable_by(|left, right| {
+        right
+            .terminal
+            .cmp(&left.terminal)
+            .then_with(|| match left.terminal {
+                1 => left.plies.total_cmp(&right.plies),
+                -1 => right.plies.total_cmp(&left.plies),
                 _ => std::cmp::Ordering::Equal,
             })
-            .then_with(|| right.completed_visits().cmp(&left.completed_visits()))
-            .then_with(|| right.q().total_cmp(&left.q()))
-            .then_with(|| right.prior().total_cmp(&left.prior()))
+            .then_with(|| right.visits.cmp(&left.visits))
+            .then_with(|| right.q.total_cmp(&left.q))
+            .then_with(|| right.prior.total_cmp(&left.prior))
     });
+    let mut ranked: Vec<_> = ranked.into_iter().map(|ranked| ranked.edge).collect();
     if params.lcb_stdevs > 0.0 && ranked.len() > 1 {
         let baseline = &ranked[0];
         let min_visits = baseline.completed_visits() as f32 * params.lcb_min_visit_fraction;
@@ -131,7 +167,7 @@ fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &Searc
     ranked
 }
 
-fn best_edge(arena: &NodeArena, root: NodeId, filter: &[Move], params: &SearchParams) -> Option<std::sync::Arc<Edge>> {
+fn best_edge(arena: &NodeArena, root: NodeId, filter: &[Move], params: &SearchParams) -> Option<EdgeHandle> {
     ranked_edges(arena, root, filter, params).into_iter().next()
 }
 

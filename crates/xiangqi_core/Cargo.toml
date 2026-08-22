@@ -8,3 +8,4 @@ description = "中国象棋规则、位棋盘与合法着生成。"
 path = "src/lib.rs"
 
 [dependencies]
+smallvec = "1.15"
