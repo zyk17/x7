@@ -3,7 +3,7 @@
 use std::cmp::{Ordering, Reverse};
 use std::sync::Arc;
 
-use xiangqi_core::{Move, PositionHistory};
+use xiangqi_core::Move;
 
 use super::param::SearchParams;
 use super::{Edge, ExpansionState, Node, NodeKey, NodeRepository};
@@ -18,7 +18,7 @@ pub struct RootEdgeStats {
     pub prior: f32,
 }
 
-/// root node 快照（不是全局原子 graph view）。
+/// root node 快照（不是全局原子 tree view）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct RootStats {
     pub completed_visits: u32,
@@ -288,7 +288,6 @@ fn principal_variation_from_root_edge(
     root_key: NodeKey,
     root_is_black: bool,
     first_move: Move,
-    _root_history: Option<&PositionHistory>,
 ) -> Vec<Move> {
     let mut pv = vec![orient_move(first_move, root_is_black)];
     let mut key = root_key.child(first_move);
@@ -313,7 +312,6 @@ fn principal_variation_from_root_edge(
 pub(crate) fn root_variations(
     repository: &NodeRepository,
     root_key: NodeKey,
-    root_history: Option<&PositionHistory>,
     root_is_black: bool,
     root_move_filter: &[Move],
     max_pv: usize,
@@ -339,7 +337,7 @@ pub(crate) fn root_variations(
                 wl,
                 draw,
                 mate,
-                pv: principal_variation_from_root_edge(repository, root_key, root_is_black, edge.mv(), root_history),
+                pv: principal_variation_from_root_edge(repository, root_key, root_is_black, edge.mv()),
             }
         })
         .collect()
@@ -506,10 +504,9 @@ pub(crate) fn principal_variation_filtered_with_params(
     pv
 }
 
-pub(crate) fn principal_variation_with_history_and_params(
+pub(crate) fn principal_variation_with_params(
     repository: &NodeRepository,
     root_key: NodeKey,
-    root_history: &PositionHistory,
     root_is_black: bool,
     root_move_filter: &[Move],
     params: &SearchParams,
@@ -517,7 +514,7 @@ pub(crate) fn principal_variation_with_history_and_params(
     let Some(first_move) = best_root_edge_absolute(repository, root_key, root_move_filter, params) else {
         return Vec::new();
     };
-    principal_variation_from_root_edge(repository, root_key, root_is_black, first_move, Some(root_history))
+    principal_variation_from_root_edge(repository, root_key, root_is_black, first_move)
 }
 
 #[cfg(test)]

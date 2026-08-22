@@ -1,5 +1,8 @@
 # Commands
 
+本文件只记录可复现的训练、验证、诊断与打包命令；目标和设计边界见 `README.MD` 与
+`ARCHITECTURE.md`，当前工作队列见 `NextStep.md`。
+
 默认先进入仓库根目录：
 
 ```powershell
@@ -180,7 +183,7 @@ cargo run --release -p engin --bin benchmark -- `
   --gathers 3 --evals 5
 ```
 
-`search_benchmark` 固定 `4/4` Search/Eval worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-graph 根部分流。使用完整历史诊断评分拐点：
+`search_benchmark` 固定 `4/4` Search/Eval worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-tree 根部分流。使用完整历史诊断评分拐点：
 
 ```powershell
 cargo run --release -p engin --bin search_benchmark -- `

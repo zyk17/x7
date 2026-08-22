@@ -2,7 +2,7 @@
 //!
 //! 只定义结构与原子操作，不调度流水线。`child = hash_cat(parent, move)`，不合并换位。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -594,11 +594,7 @@ impl NodeRepository {
     /// 检查 `root` 以下的 edge-local reservation 不变量。
     pub(crate) fn subtree_is_settled(&self, root: NodeKey) -> bool {
         let mut pending = vec![root];
-        let mut seen: HashSet<NodeKey, BuildHasherDefault<NoHashHasher<u64>>> = HashSet::default();
         while let Some(key) = pending.pop() {
-            if !seen.insert(key) {
-                continue;
-            }
             let Some(node) = self.get(key) else {
                 continue;
             };

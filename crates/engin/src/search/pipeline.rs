@@ -320,25 +320,6 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
             }
             ExpansionState::Expanded => {
                 let depth = event.variation.moves().len();
-                let terminal = if depth == 0 {
-                    path_terminal_value(event.variation.root_history().as_ref(), 0)
-                } else {
-                    path_terminal_value(event.variation.history(), depth)
-                };
-                if let Some((wl, draw, plies_left)) = terminal {
-                    if depth == 0 {
-                        // root 终局应在搜前门禁；落到这里只停 job，不标共享 node。
-                        shared.finish(1, false);
-                        shared.stopping.store(true, Ordering::Release);
-                        shared.idle.notify_all();
-                        return;
-                    }
-                    node.mark_terminal(wl, draw, plies_left);
-                    let root = event.node_path()[0];
-                    shared.repository.propagate_proven_terminals(event.node_path(), root);
-                    shared.send_backprop(BackpropEvent::evaluation(event, wl, draw, plies_left));
-                    return;
-                }
                 let Some((child, reservation)) = branch_at_expanded_node(shared, &event, node.as_ref(), depth) else {
                     if event.reservations.is_empty() {
                         // root 无着可探（空边 / searchmoves 滤空）：停搜，不伪造成路径终局。

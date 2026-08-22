@@ -1,4 +1,4 @@
-//! UCI 引擎入口：UCI 循环、ONNX backend 与 stream MCGS。
+//! UCI 引擎入口：UCI 循环、ONNX backend 与 stream 路径树搜索。
 
 pub mod engine;
 pub mod error;

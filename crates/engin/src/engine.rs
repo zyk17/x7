@@ -13,7 +13,7 @@ use crate::neural::onnx::OnnxBackend;
 use crate::search::{
     NoopObserver, Search, SearchConfig, SearchControl, SearchLimits, SearchParams, SearchTree, Stats, TimeBudget,
     TimeManager, WorkerPool, best_mate_with_params, best_move_filtered_with_params,
-    principal_variation_with_history_and_params, root_stats, root_variations,
+    principal_variation_with_params, root_stats, root_variations,
 };
 use crate::uci_loop::{
     BestMoveInfo, GoParams, ThinkingInfo, Wdl, write_stdout, write_stdout_best_move, write_stdout_thinking,
@@ -570,10 +570,9 @@ fn run_search(
                     &snapshot.root_move_filter,
                     &snapshot.params,
                 ),
-                principal_variation_with_history_and_params(
+                principal_variation_with_params(
                     search.repository(),
                     search.root_key(),
-                    snapshot.root_history.as_ref(),
                     snapshot.root_is_black,
                     &snapshot.root_move_filter,
                     &snapshot.params,
@@ -670,7 +669,6 @@ impl RootSnapshot {
         let variations = root_variations(
             &self.repository,
             self.root_key,
-            Some(self.root_history.as_ref()),
             self.root_is_black,
             &self.root_move_filter,
             self.multi_pv,
@@ -688,10 +686,9 @@ impl RootSnapshot {
                     d: (draw * 1000.0).round() as i32,
                     l: (loss * 1000.0).round() as i32,
                 }),
-                pv: principal_variation_with_history_and_params(
+                pv: principal_variation_with_params(
                     &self.repository,
                     self.root_key,
-                    self.root_history.as_ref(),
                     self.root_is_black,
                     &self.root_move_filter,
                     &self.params,
