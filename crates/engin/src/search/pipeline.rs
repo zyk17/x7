@@ -521,16 +521,12 @@ impl<O: SearchObserver> Search<O> {
         &self.shared.observer
     }
 
-    /// root 当前 history（含将死/rule60/重复等 `compute_game_result`）或共享 node
-    /// 已是终局。搜前可门禁；选着时不从旧边回退。UCI 仍可用 legal fallback。
-    /// 之后若要对 rule60/重复「允许继续搜」，再收窄此判定（现不做）。
+    /// 只以 root history 的规则终局作为搜前门禁。
+    ///
+    /// `ExpansionState::Terminal` 还表示子树已证明的胜负；该 node 跨回合成为
+    /// root 后仍可能有合法着可输出，不能把它误作棋局已经结束。
     pub(crate) fn root_is_terminal(&self) -> bool {
         path_terminal_value(self.root_history.as_ref(), 0).is_some()
-            || self
-                .shared
-                .arena
-                .get(self.root_id)
-                .is_some_and(|root| root.expansion_state() == ExpansionState::Terminal)
     }
 
     pub fn stats(&self) -> Stats {
@@ -727,7 +723,7 @@ impl<O: SearchObserver> Drop for Search<O> {
 mod tests {
     use std::sync::Arc;
 
-    use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
+    use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
     use super::Search;
     use crate::neural::backend::UniformBackend;
@@ -764,5 +760,43 @@ mod tests {
         assert_ne!(tree.root_id(), old_root);
         assert!(tree.arena().get(old_root).is_some());
         assert!(tree.arena().get(tree.root_id()).is_some());
+    }
+
+    #[test]
+    fn reused_proven_win_is_not_a_root_game_terminal() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(PositionHistory::from_positions(state.positions()));
+        let mut tree = super::SearchTree::new(history);
+        let played = tree
+            .root_history()
+            .last()
+            .board()
+            .parse_move("b2b3")
+            .expect("legal move");
+        let reply = Move::new(
+            xiangqi_core::Square::parse("a9").expect("square"),
+            xiangqi_core::Square::parse("a8").expect("square"),
+        );
+
+        let root = tree.arena().get(tree.root_id()).expect("root");
+        assert!(root.try_begin_evaluation());
+        root.publish_edges([(played, 1.0)]);
+        let child = tree.arena().child_or_create(&root.edges()[0]);
+        let child_node = tree.arena().get(child).expect("child");
+        assert!(child_node.try_begin_evaluation());
+        child_node.publish_edges([(reply, 1.0)]);
+        let terminal = tree.arena().child_or_create(&child_node.edges()[0]);
+        let terminal_node = tree.arena().get(terminal).expect("terminal child");
+        assert!(terminal_node.try_begin_evaluation());
+        terminal_node.mark_terminal(1.0, 0.0, 0.0);
+        tree.arena()
+            .propagate_proven_terminals(&[tree.root_id(), child, terminal], tree.root_id());
+        assert_eq!(child_node.expansion_state(), super::ExpansionState::Terminal);
+
+        tree.advance(played).expect("advance to proven child");
+        let mut reused = Search::new_with_graph(Arc::new(UniformBackend::default()), 2, &tree, SearchConfig::default());
+        assert!(!reused.root_is_terminal());
+        assert_eq!(best_move(reused.arena(), reused.root_id(), true), Some(reply.flip()));
+        reused.stop_and_finish();
     }
 }
