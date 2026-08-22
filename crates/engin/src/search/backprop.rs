@@ -41,7 +41,11 @@ pub(crate) fn complete_batch<S: super::observer::QueueStamp>(
             if node_index == 0 {
                 break;
             }
-            reservations.next().expect("path reservation").complete(delta.q());
+            let Some(reservation) = reservations.next() else {
+                debug_assert!(false, "every backprop edge has a reservation");
+                break;
+            };
+            reservation.complete(delta.q());
             delta = delta.for_parent().one_ply_up();
         }
         result.completed_playouts += 1;

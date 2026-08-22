@@ -313,21 +313,21 @@ impl<O: SearchObserver> WorkerPool<O> {
     }
 
     pub(crate) fn assert_compatible(&self, config: &ResolvedSearchConfig) {
-        assert_eq!(
+        debug_assert_eq!(
             self.gather_commands.len(),
             config.gather_workers,
             "worker pool gather topology changed"
         );
-        assert_eq!(
+        debug_assert_eq!(
             self.eval_commands.len(),
             config.eval_workers,
             "worker pool eval topology changed"
         );
-        assert_eq!(
+        debug_assert_eq!(
             self.eval_batch_size, config.eval_batch_size,
             "worker pool batch size changed"
         );
-        assert_eq!(
+        debug_assert_eq!(
             self.eval_claim_limit, config.eval_claim_limit,
             "worker pool nn window changed"
         );

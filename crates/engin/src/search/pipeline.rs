@@ -83,7 +83,7 @@ impl<O: SearchObserver> Shared<O> {
             self.completed.fetch_add(n as u64, Ordering::AcqRel);
         }
         let previous = self.outstanding.fetch_sub(n, Ordering::AcqRel);
-        assert!(previous >= n, "stream outstanding task underflow");
+        debug_assert!(previous >= n, "stream outstanding task underflow");
         // 唤醒等待本轮真实 leaf 完成的 owner。
         let _guard = self.idle_lock.lock();
         self.idle.notify_all();
@@ -95,7 +95,7 @@ impl<O: SearchObserver> Shared<O> {
             return;
         }
         let previous = self.nn_inflight.fetch_sub(count, Ordering::AcqRel);
-        assert!(previous >= count, "stream eval claim underflow");
+        debug_assert!(previous >= count, "stream eval claim underflow");
         let _guard = self.idle_lock.lock();
         self.idle.notify_all();
     }

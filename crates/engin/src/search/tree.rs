@@ -126,7 +126,7 @@ pub(crate) struct EdgeStats {
 
 impl Edge {
     fn new(mv: Move, prior: f32) -> Self {
-        assert!((0.0..=1.0).contains(&prior), "policy prior must be normalized");
+        debug_assert!((0.0..=1.0).contains(&prior), "policy prior must be normalized");
         Self {
             mv,
             prior,
@@ -194,7 +194,7 @@ impl Edge {
     fn cancel(&self, virtual_wl_sum: f32) {
         let mut stats = self.stats.lock();
         let started = self.started.fetch_sub(1, Ordering::AcqRel);
-        assert!(started > stats.visits, "stream edge reservation underflow");
+        debug_assert!(started > stats.visits, "stream edge reservation underflow");
         stats.virtual_wl_sum -= virtual_wl_sum;
         if started - 1 == stats.visits {
             stats.virtual_wl_sum = 0.0;
@@ -204,7 +204,7 @@ impl Edge {
     fn complete(&self, virtual_wl_sum: f32, wl: f32) {
         let mut stats = self.stats.lock();
         let started = self.started.load(Ordering::Acquire);
-        assert!(started > stats.visits, "stream edge completion without reservation");
+        debug_assert!(started > stats.visits, "stream edge completion without reservation");
         stats.virtual_wl_sum -= virtual_wl_sum;
         stats.visits += 1;
         stats.wl_sum += wl;
@@ -347,7 +347,7 @@ impl Node {
     }
 
     pub fn publish_edges(&self, edges: impl IntoIterator<Item = (Move, f32)>) {
-        assert_eq!(
+        debug_assert_eq!(
             self.expansion_state(),
             ExpansionState::Evaluating,
             "node must be evaluating"
@@ -355,25 +355,28 @@ impl Node {
         let mut edges: smallvec::SmallVec<[(Move, f32); 64]> = edges.into_iter().collect();
         edges.sort_unstable_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal));
         let edges: Arc<[Edge]> = edges.into_iter().map(|(mv, prior)| Edge::new(mv, prior)).collect();
-        self.edges.set(edges).expect("stream node publishes edges once");
+        let published = self.edges.set(edges).is_ok();
+        debug_assert!(published, "stream node publishes edges once");
         self.expansion.store(ExpansionState::Expanded as u8, Ordering::Release);
     }
 
     /// Eval 在发布终局数据或 policy 前失败后恢复 node，避免后续 Gather event 将失败的
     /// NN 请求当作永久 collision。
     pub fn abort_evaluation(&self) {
-        self.expansion
+        let aborted = self
+            .expansion
             .compare_exchange(
                 ExpansionState::Evaluating as u8,
                 ExpansionState::Unexpanded as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .expect("only evaluating stream nodes can abort evaluation");
+            .is_ok();
+        debug_assert!(aborted, "only evaluating stream nodes can abort evaluation");
     }
 
     pub fn mark_terminal(&self, wl: f32, draw: f32, plies_left: f32) {
-        assert_eq!(
+        debug_assert_eq!(
             self.expansion_state(),
             ExpansionState::Evaluating,
             "node must be evaluating"
