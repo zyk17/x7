@@ -311,11 +311,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.lcb_min_visit_fraction,
     );
     println!("note: fresh tree; workers=4 Search / 4 Eval; batch uses backend default; trace drains at each milestone");
-    let mut generation = 0;
     for &cpuct in &args.cpucts {
         for &cpuct_base in &args.cpuct_bases {
             for &cpuct_factor in &args.cpuct_factors {
-                generation += 1;
                 let params = SearchParams {
                     cpuct,
                     cpuct_base,
@@ -331,7 +329,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let mut search = Search::new(
                     Arc::new(OnnxBackend::from_file(&args.onnx)?) as Arc<dyn Backend>,
-                    generation,
                     Arc::clone(&history),
                     SearchConfig {
                         params,

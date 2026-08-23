@@ -619,7 +619,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
          --collision-dist / --tree-depth only for distribution shapes; \
          nps=completed/s, eps=nn_eval/s, submitted includes collisions"
     );
-    let mut generation = 0;
     for (name, fen) in positions {
         let state = GameState::from_fen_moves(&fen, &args.moves)?;
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
@@ -629,11 +628,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         for &gather_workers in &args.gathers {
             for &eval_workers in &args.evals {
                 for run_index in 1..=args.repeat {
-                    generation += 1;
                     backend.clear_cache();
                     let mut search = Search::new_with_observer(
                         Arc::clone(&backend),
-                        generation,
                         Arc::clone(&history),
                         SearchConfig {
                             eval_batch_size: target_batch,

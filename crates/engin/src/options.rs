@@ -1,6 +1,6 @@
 //! Engine 生命周期的 UCI option。
 //!
-//! `go` 时拍快照：算法 → `SearchParams`，拓扑 → `SearchConfig`，停止条件/`searchmoves` → `SearchLimits`。
+//! `go` 时拍快照：算法 → `SearchParams`，当前 worker 配置 → `SearchConfig`，停止条件/`searchmoves` → `SearchLimits`。
 
 use crate::neural::cache::{DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, MAX_NN_CACHE_SIZE_POWER_OF_TWO};
 use crate::search::SearchParams;

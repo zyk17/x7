@@ -16,12 +16,12 @@ use crate::EnginError;
 use crate::neural::MOVE_HISTORY;
 use crate::neural::backend::Backend;
 
-use super::eval::{NnRequest, cancel_evaluation};
+use super::eval::cancel_evaluation;
 use super::expand::path_terminal_value;
 use super::observer::{NoopObserver, SearchObserver};
 use super::param::{SearchConfig, SearchParams};
 use super::select::select_edge;
-use super::workerpool::{BackpropEvent, PlayoutEvent, WorkerPool};
+use super::workerpool::{BackpropEvent, Event, GatherEvent, NnRequest, WorkerPool};
 use super::{EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree};
 
 pub(crate) const RECEIVE_POLL: Duration = Duration::from_millis(10);
@@ -43,7 +43,6 @@ pub struct Stats {
 pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) backend: Arc<dyn Backend>,
     pub(crate) arena: Arc<NodeArena>,
-    pub(crate) generation: u64,
     pub(crate) params: SearchParams,
     pub(crate) root_move_filter: Mutex<Vec<Move>>,
     pub(crate) stopping: AtomicBool,
@@ -59,12 +58,12 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) error: Mutex<Option<EnginError>>,
     pub(crate) idle_lock: Mutex<()>,
     pub(crate) idle: Condvar,
-    pub(crate) gather_tx: crossbeam_channel::Sender<PlayoutEvent<O::Stamp>>,
-    pub(crate) eval_tx: crossbeam_channel::Sender<PlayoutEvent<O::Stamp>>,
+    pub(crate) gather_tx: crossbeam_channel::Sender<GatherEvent<O::Stamp>>,
+    pub(crate) eval_tx: crossbeam_channel::Sender<GatherEvent<O::Stamp>>,
     pub(crate) backprop_tx: crossbeam_channel::Sender<BackpropEvent<O::Stamp>>,
     /// 撞上 `Evaluating` 叶子的 playout。先留着 reservation / μ；该叶子自己的
     /// backprop `complete` 之后再按 `node_id` 摘出来 cancel。
-    pub(crate) collision_waiters: Mutex<Vec<PlayoutEvent<O::Stamp>>>,
+    pub(crate) collision_waiters: Mutex<Vec<Event>>,
 }
 
 impl<O: SearchObserver> Shared<O> {
@@ -126,10 +125,11 @@ impl<O: SearchObserver> Shared<O> {
     }
 
     /// 撞上正在评估的叶子：挂起整条 reservation，让 μ 继续分流。
-    pub(crate) fn park_collision(&self, event: PlayoutEvent<O::Stamp>) {
+    pub(crate) fn park_collision(&self, event: GatherEvent<O::Stamp>) {
         if O::ENABLED {
             self.observer.on_collision(event.variation.moves().len());
         }
+        let event = event.into_event();
         {
             let mut waiters = self.collision_waiters.lock();
             if !self.stopping.load(Ordering::Acquire)
@@ -185,7 +185,7 @@ impl<O: SearchObserver> Shared<O> {
 
     /// 先增加 `nn_inflight` 再入队：图复用后 cache hit 极快，若 `try_send` 成功后才 +1，
     /// Eval 可能已经 `release_eval_claims`，第二手 `go` 就会 underflow 闪退。
-    pub(crate) fn send_eval(&self, mut event: PlayoutEvent<O::Stamp>) {
+    pub(crate) fn send_eval(&self, mut event: GatherEvent<O::Stamp>) {
         event.mark_queued();
         let inflight = self.nn_inflight.fetch_add(1, Ordering::AcqRel) + 1;
         if O::ENABLED {
@@ -193,7 +193,7 @@ impl<O: SearchObserver> Shared<O> {
         }
         loop {
             if self.stopping.load(Ordering::Acquire) {
-                cancel_evaluation(self, event);
+                cancel_evaluation(self, event.into_event());
                 return;
             }
             match self.eval_tx.try_send(event) {
@@ -203,7 +203,7 @@ impl<O: SearchObserver> Shared<O> {
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    cancel_evaluation(self, returned);
+                    cancel_evaluation(self, returned.into_event());
                     return;
                 }
             }
@@ -215,7 +215,7 @@ impl<O: SearchObserver> Shared<O> {
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 self.release_eval_claims(usize::from(event.held_eval_claim));
-                let id = event.playout.node_id;
+                let id = event.event.node_id;
                 event.cancel();
                 self.finish(1, false);
                 self.cancel_collisions(id);
@@ -229,7 +229,7 @@ impl<O: SearchObserver> Shared<O> {
                 }
                 Err(TrySendError::Disconnected(returned)) => {
                     self.release_eval_claims(usize::from(returned.held_eval_claim));
-                    let id = returned.playout.node_id;
+                    let id = returned.event.node_id;
                     returned.cancel();
                     self.finish(1, false);
                     self.cancel_collisions(id);
@@ -254,7 +254,7 @@ impl<O: SearchObserver> Shared<O> {
 
 fn branch_at_expanded_node<O: SearchObserver>(
     shared: &Shared<O>,
-    _event: &PlayoutEvent<O::Stamp>,
+    _event: &GatherEvent<O::Stamp>,
     node: &Node,
     depth: usize,
 ) -> Option<(NodeId, EdgeReservation)> {
@@ -276,7 +276,7 @@ fn branch_at_expanded_node<O: SearchObserver>(
 
 pub(crate) fn process_gather_event<O: SearchObserver>(
     shared: &Shared<O>,
-    mut event: PlayoutEvent<O::Stamp>,
+    mut event: GatherEvent<O::Stamp>,
     eval_claim_limit: usize,
 ) {
     loop {
@@ -287,7 +287,7 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
         }
         let node = shared
             .arena
-            .get(event.node_id)
+            .get(event.event.node_id)
             .expect("event node lives until job drain");
         match node.expansion_state() {
             ExpansionState::Unexpanded => {
@@ -308,7 +308,7 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
             }
             ExpansionState::Terminal => {
                 let (wl, draw, plies_left) = node.terminal_value().unwrap_or((0.0, 1.0, 0.0));
-                shared.send_backprop(BackpropEvent::from_gather(event, wl, draw, plies_left));
+                shared.send_backprop(BackpropEvent::from_gather(event.into_event(), wl, draw, plies_left));
                 return;
             }
             ExpansionState::Expanded => {
@@ -383,53 +383,40 @@ pub struct Search<O: SearchObserver = NoopObserver> {
 }
 
 impl Search<NoopObserver> {
-    pub fn new(
-        backend: Arc<dyn Backend>,
-        generation: u64,
-        root_history: Arc<PositionHistory>,
-        config: SearchConfig,
-    ) -> Self {
+    pub fn new(backend: Arc<dyn Backend>, root_history: Arc<PositionHistory>, config: SearchConfig) -> Self {
         let tree = SearchTree::new(root_history);
-        Self::new_with_graph(backend, generation, &tree, config)
+        Self::new_with_graph(backend, &tree, config)
     }
 
     /// 从保留树创建独立搜索；该搜索自己创建、销毁 worker pool。
-    pub fn new_with_graph(
-        backend: Arc<dyn Backend>,
-        generation: u64,
-        graph: &SearchTree,
-        config: SearchConfig,
-    ) -> Self {
-        Self::new_with_graph_with_observer(backend, generation, graph, config, NoopObserver)
+    pub fn new_with_graph(backend: Arc<dyn Backend>, graph: &SearchTree, config: SearchConfig) -> Self {
+        Self::new_with_graph_with_observer(backend, graph, config, NoopObserver)
     }
 }
 
 impl<O: SearchObserver> Search<O> {
     pub fn new_with_observer(
         backend: Arc<dyn Backend>,
-        generation: u64,
         root_history: Arc<PositionHistory>,
         config: SearchConfig,
         observer: O,
     ) -> Self {
         let tree = SearchTree::new(root_history);
-        Self::new_with_graph_with_observer(backend, generation, &tree, config, observer)
+        Self::new_with_graph_with_observer(backend, &tree, config, observer)
     }
 
     pub fn new_with_graph_with_observer(
         backend: Arc<dyn Backend>,
-        generation: u64,
         graph: &SearchTree,
         config: SearchConfig,
         observer: O,
     ) -> Self {
         let worker_pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
-        Self::new_with_graph_in_pool(backend, generation, graph, config, observer, worker_pool)
+        Self::new_with_graph_in_pool(backend, graph, config, observer, worker_pool)
     }
 
     pub(crate) fn new_with_graph_in_pool(
         backend: Arc<dyn Backend>,
-        generation: u64,
         graph: &SearchTree,
         config: SearchConfig,
         observer: O,
@@ -452,7 +439,6 @@ impl<O: SearchObserver> Search<O> {
         let shared = Arc::new(Shared {
             backend,
             arena: Arc::clone(graph.arena()),
-            generation,
             params: resolved.params,
             root_move_filter: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
@@ -538,7 +524,7 @@ impl<O: SearchObserver> Search<O> {
             return Err(EnginError::PortIncomplete("stream worker pipeline is stopped"));
         }
         self.shared.start_playout();
-        let mut event = PlayoutEvent::at_root(self.shared.generation, self.root_id, Arc::clone(&self.root_history));
+        let mut event = GatherEvent::at_root(self.root_id, Arc::clone(&self.root_history));
         event.mark_queued();
         loop {
             if self.shared.stopping.load(Ordering::Acquire) {
@@ -714,7 +700,7 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
         let root_is_black = history.is_black_to_move();
-        let mut pipeline = Search::new(Arc::new(UniformBackend::default()), 1, history, SearchConfig::default());
+        let mut pipeline = Search::new(Arc::new(UniformBackend::default()), history, SearchConfig::default());
         let stats = pipeline.run_playouts(64).expect("search");
         assert_eq!(stats.completed_playouts, 64);
         assert!(stats.network_evaluations > 0);
@@ -730,7 +716,7 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
         let mut tree = super::SearchTree::new(history);
-        let mut first = Search::new_with_graph(Arc::new(UniformBackend::default()), 1, &tree, SearchConfig::default());
+        let mut first = Search::new_with_graph(Arc::new(UniformBackend::default()), &tree, SearchConfig::default());
         first.run_playouts(32).expect("first");
         let played = best_move(first.arena(), first.root_id(), false).expect("best");
         first.stop_and_finish();
@@ -773,7 +759,7 @@ mod tests {
         assert_eq!(child_node.expansion_state(), super::ExpansionState::Terminal);
 
         tree.advance(played).expect("advance to proven child");
-        let mut reused = Search::new_with_graph(Arc::new(UniformBackend::default()), 2, &tree, SearchConfig::default());
+        let mut reused = Search::new_with_graph(Arc::new(UniformBackend::default()), &tree, SearchConfig::default());
         assert!(!reused.root_is_terminal());
         assert_eq!(best_move(reused.arena(), reused.root_id(), true), Some(reply.flip()));
         reused.stop_and_finish();

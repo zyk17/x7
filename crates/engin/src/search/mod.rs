@@ -45,4 +45,4 @@ pub use pipeline::{Search, SearchControl, SearchLimits, Stats};
 pub(crate) use time::{TimeBudget, TimeManager};
 pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree, ValueDelta};
 pub(crate) use workerpool::WorkerPool;
-pub use workerpool::{BackpropEvent, PlayoutEvent, Variation};
+pub use workerpool::{BackpropEvent, Event, GatherEvent, Variation};
