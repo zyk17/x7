@@ -80,3 +80,30 @@ classic lc0 的 collision/terminal multivisit 是一次评估按 K 次 visit 加
 2. 实战 `μ=FPU` virtual mean 已比纯 virtual visit 更明显且更温和。一次打入 K 份 FPU 会破坏
    这份分流，让 select 更不可靠。后续若研究分流，改 virtual mean / virtual visit，不加 K。
 
+## 2026-08-24：时间型 verification credit（快速原型）
+
+### 已完成的方差方向
+
+本轮依次试过三类思路：
+
+- **父节点方差 cPUCT**：按节点整体的 value dispersion 改 cPUCT，语义是局面变宽/变窄，不能把预算定向给
+  产生冲突证据的具体 edge；与原始 cPUCT 曲线叠加后也难单独归因。
+- **raw sigma edge bonus**：1) 包括仍受 prior 约束的 `P * U * (1 + k*sigma)` 2)不受 prior 约束的 rescue
+  bonus。它们确实可让低 P 路线获得额外访问，但 sigma 在大量完成访问后仍可长期存在，因而会持续争抢预算；
+  rescue 还需要额外上限，行为更难控。
+- **时间型 credit**：不把 sigma 当作长期不确定性，而只把 Q/sigma 相对近期参考值的变化当作“新证据需要验证”。
+
+因此未保留前两类实现，也没有保留 LCB：三者都把已观察到的长期离散度误作需要永久补偿的搜索信号。
+
+### 原型与结果
+
+原始 `sigma = sqrt(E[wl²] - Q²)` 是已完成样本的离散度，不是均值不确定性，也不会必然随 N 消失；
+因此不再把它作为永久 PUCT/LCB bonus。当前原型在 edge 完成时比较 Q 与 sigma 的缓慢参考值：新证据
+冲击会累积有限 credit，之后同 edge 的完成回传会衰减它。选择只放大该 edge 原有的 `P * U`，默认
+scale 为 0。
+
+固定 `cPuct=e`、`cpuct_factor=0` 的 fresh-tree 扫描 `scale=0/0.5/1/2/4`：5 步杀例中，非零
+scale 都比 0 更早切入主杀线；`middle_01` 中低 prior 的 `f3f7 (P=0.051)` 在 0/0.5/1 下于 15k
+成为第一，但 2/4 被高 prior `e0e1` 压回。稳定路线即使保留较高 sigma，其 credit 也下降到约
+0.001–0.01。结果支持“credit 有时效”这一机制，不支持当前常数、衰减率或 scale 已可进入正式默认。
+
