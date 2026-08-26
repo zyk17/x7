@@ -67,6 +67,13 @@ pub trait SearchObserver: Send + Sync + 'static {
     fn on_batch(&self, _size: usize) {}
 }
 
+#[inline(always)]
+pub(crate) fn observe_queue_wait<O: SearchObserver>(stamp: &mut O::Stamp, observer: &O, kind: QueueKind) {
+    if let Some(wait) = stamp.take_wait() {
+        observer.on_queue_wait(kind, wait);
+    }
+}
+
 /// 正式 UCI / 默认搜索：无诊断开销。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopObserver;

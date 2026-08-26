@@ -1,7 +1,7 @@
 //! 搜索分层配置：
 //!
 //! - `SearchParams`：算法旋钮（PUCT / FPU / virtual mean / 根 LCB）。`Copy`，热路径只带这一包。
-//! - `SearchConfig`：一次 job 的流水线拓扑（线程、队列、batch、window）+ 嵌套的 `SearchParams`。
+//! - `SearchConfig`：当前固定 worker 实现的线程、队列、batch、window 配置 + 嵌套的 `SearchParams`。
 //! - `SearchLimits`（在 `pipeline`）：这一手 `go` 的停止条件与 `searchmoves`。
 //! - `Options`（`options.rs`）：UCI / 引擎生命周期；`go` 时拍快照写入上面几层。
 
@@ -25,14 +25,14 @@ pub struct SearchParams {
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            cpuct: 1.75,
+            cpuct: 1.25,
             cpuct_base: 40_000.0,
             cpuct_factor: 4.0,
             // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
-            fpu_reduction: 0.200,
+            fpu_reduction: 0.500,
             virtual_mean_fpu_scale: 1.0,
-            // KataGo 搜索参数的经验起点；只用于根最终 Decision，不参与 PUCT。
-            lcb_stdevs: 5.0,
+            // LCB 只用于根最终 Decision，不参与 PUCT；默认关闭，作为独立实验开关。
+            lcb_stdevs: 0.0,
             lcb_min_visit_fraction: 0.15,
         }
     }
@@ -71,7 +71,9 @@ impl SearchParams {
     }
 }
 
-/// 一次搜索 job 的流水线拓扑。算法旋钮在 `params`；`searchmoves` 在 `SearchLimits`。
+/// 当前固定 worker pool 的 job 配置。算法旋钮在 `params`；`searchmoves` 在 `SearchLimits`。
+/// Gather/Eval 的静态比例来自当前实验；后续动态调度可按队列压力在二者及 proof 间分配 CPU，
+/// 而不改变搜索语义。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchConfig {
     /// Search/Eval/NN 队列深度。`0` 表示 `max(4096, 64 * resolved_batch)`。
@@ -83,8 +85,9 @@ pub struct SearchConfig {
     /// Claim 在 backprop 写完 N/Q 后释放；调大可能提高eps、调小让 Gather 更贴最新统计。
     pub nn_window: f32,
     pub params: SearchParams,
+    /// 当前固定 pool 的 Gather worker 数。
     pub gather_workers: usize,
-    /// Eval worker 数。它负责准备、缓存、合法着；NN inference 是独立线程。
+    /// 当前固定 pool 的 Eval worker 数。它负责准备、缓存、合法着；NN inference 是单独的单 worker。
     pub eval_workers: usize,
 }
 

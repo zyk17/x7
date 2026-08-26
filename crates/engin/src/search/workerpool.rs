@@ -1,4 +1,4 @@
-//! 事件定义 + WorkerPool + Gather/Eval/NN/Backprop 线程循环壳。
+//! 事件定义 + WorkerPool + 当前固定拓扑的 Gather/Eval/NN/Backprop 线程循环壳。
 //!
 //! 循环只调度；算法在 `pipeline`（Gather 树走）/ `eval` / `backprop`。
 
@@ -8,17 +8,18 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
 use parking_lot::Mutex;
-use xiangqi_core::{Move, Position, PositionHistory};
+use xiangqi_core::{LegalMoveList, Move, PositionHistory};
 
-use crate::neural::backend::Backend;
+use crate::EnginError;
+use crate::neural::backend::{Backend, EvalCacheKey};
+use crate::neural::{EncodedBatch, InputPlanes};
 use crate::search::EdgeReservation;
 
 use super::backprop::complete_batch;
 use super::eval::{
-    NnRequest, WaitingNn, cancel_evaluation, drain_waiting, handle_eval_event, infer_nn_batch, poll_nn_completions,
-    wait_one_nn_completion,
+    cancel_evaluation, drain_waiting, handle_eval_event, infer_nn_batch, poll_nn_completions, wait_one_nn_completion,
 };
-use super::observer::{NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver};
+use super::observer::{NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver, observe_queue_wait};
 use super::param::{ResolvedSearchConfig, SearchConfig};
 use super::pipeline::{RECEIVE_POLL, Shared, process_gather_event};
 use super::{NodeId, ValueDelta};
@@ -28,81 +29,44 @@ use super::{NodeId, ValueDelta};
 /// root history 加上从 root 到 repository node 的走法。
 #[derive(Clone, Debug)]
 pub struct Variation {
-    root_history: Arc<PositionHistory>,
+    base_history: Arc<PositionHistory>,
     moves: smallvec::SmallVec<[Move; 32]>,
-    history: Option<PositionHistory>,
-    position: Position,
 }
 
 impl Variation {
     pub fn root(root_history: Arc<PositionHistory>) -> Self {
         Self {
-            position: root_history.last().clone(),
-            root_history,
+            base_history: root_history,
             moves: smallvec::SmallVec::new(),
-            history: None,
         }
-    }
-
-    pub fn root_history(&self) -> &Arc<PositionHistory> {
-        &self.root_history
     }
 
     pub fn moves(&self) -> &[Move] {
         &self.moves
     }
 
-    pub(crate) fn history(&mut self) -> &PositionHistory {
-        if self.history.is_none() {
-            let mut history = self.root_history.as_ref().clone();
-            for &mv in &self.moves {
-                history.append(mv);
-            }
-            self.history = Some(history);
+    pub(crate) fn history(&self) -> PositionHistory {
+        let mut history = self.base_history.as_ref().clone();
+        for &mv in &self.moves {
+            history.append(mv);
         }
-        self.history.as_ref().expect("variation history is initialized")
+        history
     }
 
     pub fn push(&mut self, mv: Move) {
-        self.position = Position::after(&self.position, mv);
         self.moves.push(mv);
-        if let Some(history) = self.history.as_mut() {
-            history.append(mv);
-        }
     }
 }
 
-/// 一次完整 playout：从 root 到 leaf 的路径、reservation 与 variation 上下文。
+/// Eval 后仍需的路径。它不携带 Gather 专用的规则上下文。
 #[derive(Debug)]
-pub struct PlayoutEvent<S: QueueStamp = NoQueueStamp> {
-    pub generation: u64,
-    pub node_id: NodeId,
+pub struct Event {
+    pub(crate) node_id: NodeId,
     pub(crate) node_path: Vec<NodeId>,
-    pub variation: Variation,
-    pub reservations: Vec<EdgeReservation>,
-    queued_at: S,
+    pub(crate) reservations: Vec<EdgeReservation>,
 }
 
-impl<S: QueueStamp> PlayoutEvent<S> {
-    pub fn at_root(generation: u64, root_id: NodeId, root_history: Arc<PositionHistory>) -> Self {
-        Self {
-            generation,
-            node_id: root_id,
-            node_path: vec![root_id],
-            variation: Variation::root(root_history),
-            reservations: Vec::new(),
-            queued_at: S::default(),
-        }
-    }
-
-    pub fn descend(mut self, child_id: NodeId, reservation: EdgeReservation) -> Self {
-        self.variation.push(reservation.mv());
-        self.node_id = child_id;
-        self.node_path.push(child_id);
-        self.reservations.push(reservation);
-        self
-    }
-
+impl Event {
     pub fn cancel(self) {
         for reservation in self.reservations.into_iter().rev() {
             reservation.cancel();
@@ -112,33 +76,100 @@ impl<S: QueueStamp> PlayoutEvent<S> {
     pub fn node_path(&self) -> &[NodeId] {
         &self.node_path
     }
+}
+
+/// Gather 到 Eval 前的完整 playout：路径、reservation 与规则上下文。
+#[derive(Debug)]
+pub struct GatherEvent<S: QueueStamp = NoQueueStamp> {
+    pub(crate) event: Event,
+    pub variation: Variation,
+    pub(crate) queued_at: S,
+}
+
+impl<S: QueueStamp> GatherEvent<S> {
+    pub fn at_root(root_id: NodeId, root_history: Arc<PositionHistory>) -> Self {
+        Self {
+            event: Event {
+                node_id: root_id,
+                node_path: vec![root_id],
+                reservations: Vec::new(),
+            },
+            variation: Variation::root(root_history),
+            queued_at: S::default(),
+        }
+    }
+
+    pub fn descend(mut self, child_id: NodeId, reservation: EdgeReservation) -> Self {
+        self.variation.push(reservation.mv());
+        self.event.node_id = child_id;
+        self.event.node_path.push(child_id);
+        self.event.reservations.push(reservation);
+        self
+    }
+
+    pub fn cancel(self) {
+        self.event.cancel();
+    }
+
+    pub fn node_path(&self) -> &[NodeId] {
+        self.event.node_path()
+    }
 
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at.mark();
     }
 
-    pub(crate) fn observe_wait<O: SearchObserver<Stamp = S>>(&mut self, obs: &O, kind: QueueKind) {
-        if let Some(wait) = self.queued_at.take_wait() {
-            obs.on_queue_wait(kind, wait);
+    pub(crate) fn into_event(self) -> Event {
+        self.event
+    }
+}
+
+pub(crate) type NnReply = Result<(Arc<EncodedBatch>, usize), EnginError>;
+
+/// 同一 NN 事务的发送半边：NN worker 输入与其排队时间。
+pub(crate) struct NnRequest<S: QueueStamp = NoQueueStamp> {
+    pub(crate) planes: InputPlanes,
+    pub(crate) reply: Sender<NnReply>,
+    pub(crate) queued_at: S,
+}
+
+impl<S: QueueStamp> NnRequest<S> {
+    pub(crate) fn new(planes: InputPlanes, reply: Sender<NnReply>) -> Self {
+        Self {
+            planes,
+            reply,
+            queued_at: S::default(),
         }
     }
+
+    pub(crate) fn mark_queued(&mut self) {
+        self.queued_at.mark();
+    }
+}
+
+/// 同一 NN 事务的等待半边：Eval 收到 reply 后据此发布 edge 或回传。
+pub(crate) struct NnPending {
+    pub(crate) event: Event,
+    pub(crate) legal_moves: LegalMoveList,
+    pub(crate) cache_key: EvalCacheKey,
+    pub(crate) reply: Receiver<NnReply>,
 }
 
 /// 由 Gather/Eval 路由给 Backprop 的结果（算法在 `backprop::complete_batch`）。
 #[derive(Debug)]
 pub struct BackpropEvent<S: QueueStamp = NoQueueStamp> {
-    pub(crate) playout: PlayoutEvent<S>,
+    pub(crate) event: Event,
     pub(crate) value: ValueDelta,
     /// 走过 `send_eval` 的叶子；backprop 完成后释放对应 claim slot。
     pub(crate) held_eval_claim: bool,
-    queued_at: S,
+    pub(crate) queued_at: S,
 }
 
 impl<S: QueueStamp> BackpropEvent<S> {
     /// Eval 路径：走过 `send_eval`，backprop 后释放 claim。
-    pub(crate) fn from_eval(playout: PlayoutEvent<S>, wl: f32, draw: f32, plies_left: f32) -> Self {
+    pub(crate) fn from_eval(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
-            playout,
+            event,
             value: ValueDelta::with_plies_left(wl, draw, plies_left),
             held_eval_claim: true,
             queued_at: S::default(),
@@ -146,9 +177,9 @@ impl<S: QueueStamp> BackpropEvent<S> {
     }
 
     /// Gather 直发：未占 eval claim。
-    pub(crate) fn from_gather(playout: PlayoutEvent<S>, wl: f32, draw: f32, plies_left: f32) -> Self {
+    pub(crate) fn from_gather(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
-            playout,
+            event,
             value: ValueDelta::with_plies_left(wl, draw, plies_left),
             held_eval_claim: false,
             queued_at: S::default(),
@@ -156,31 +187,25 @@ impl<S: QueueStamp> BackpropEvent<S> {
     }
 
     pub fn cancel(self) {
-        self.playout.cancel();
+        self.event.cancel();
     }
 
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at.mark();
-    }
-
-    pub(crate) fn observe_wait<O: SearchObserver<Stamp = S>>(&mut self, obs: &O, kind: QueueKind) {
-        if let Some(wait) = self.queued_at.take_wait() {
-            obs.on_queue_wait(kind, wait);
-        }
     }
 }
 
 // --- Pool --------------------------------------------------------------------
 
 enum GatherCommand<O: SearchObserver> {
-    Run(Arc<Shared<O>>, Receiver<PlayoutEvent<O::Stamp>>),
+    Run(Arc<Shared<O>>, Receiver<GatherEvent<O::Stamp>>),
     Shutdown,
 }
 
 enum EvalCommand<O: SearchObserver> {
     Run(
         Arc<Shared<O>>,
-        Receiver<PlayoutEvent<O::Stamp>>,
+        Receiver<GatherEvent<O::Stamp>>,
         Sender<NnRequest<O::Stamp>>,
     ),
     Shutdown,
@@ -196,9 +221,12 @@ enum BackpropCommand<O: SearchObserver> {
     Shutdown,
 }
 
-/// Engine 持有的固定 worker 拓扑。
+/// Engine 持有的当前固定 worker 拓扑。
 ///
-/// 每个 job 独占树视图、队列与 generation；线程池只跨 job 保留线程。
+/// 每个 job 独占树视图与队列；线程池只跨 job 保留线程。NN 与 Backprop
+/// 各固定一个 worker；Gather/Eval 的数量也在建池时固定。这只是当前实验配置：两者会彼此
+/// 受队列、claim 与回传速度制约，未来调度器可按实时压力在 Gather、Eval、proof 等工作间
+/// 分配 CPU worker，而不把静态线程数量当作 job 契约。
 pub(crate) struct WorkerPool<O: SearchObserver = NoopObserver> {
     gather_commands: Vec<Sender<GatherCommand<O>>>,
     eval_commands: Vec<Sender<EvalCommand<O>>>,
@@ -216,8 +244,8 @@ impl<O: SearchObserver> WorkerPool<O> {
         Self::from_resolved(&config.resolve(backend))
     }
 
-    /// 对齐 LC3 Overview 的固定 worker job：batch 或任一 worker 数改变时，必须
-    /// 使用相应拓扑的新 pool。
+    /// 当前固定拓扑实现中，batch 或 Gather/Eval worker 数改变时必须换新 pool。
+    /// 动态调度器落地后可将静态比例改为总 CPU 容量与调度策略，而非 pool 兼容性条件。
     pub(crate) fn matches_config(&self, backend: &dyn Backend, config: &SearchConfig) -> bool {
         let config = config.resolve(backend);
         self.eval_batch_size == config.eval_batch_size
@@ -272,8 +300,8 @@ impl<O: SearchObserver> WorkerPool<O> {
     pub(crate) fn start_job(
         &self,
         shared: &Arc<Shared<O>>,
-        gather_rx: &Receiver<PlayoutEvent<O::Stamp>>,
-        eval_rx: &Receiver<PlayoutEvent<O::Stamp>>,
+        gather_rx: &Receiver<GatherEvent<O::Stamp>>,
+        eval_rx: &Receiver<GatherEvent<O::Stamp>>,
         nn_tx: &Sender<NnRequest<O::Stamp>>,
         nn_rx: &Receiver<NnRequest<O::Stamp>>,
         backprop_rx: &Receiver<BackpropEvent<O::Stamp>>,
@@ -356,14 +384,14 @@ impl<O: SearchObserver> Drop for WorkerPool<O> {
 
 fn gather_worker<O: SearchObserver>(
     shared: Arc<Shared<O>>,
-    receiver: Receiver<PlayoutEvent<O::Stamp>>,
+    receiver: Receiver<GatherEvent<O::Stamp>>,
     eval_claim_limit: usize,
 ) {
     loop {
         match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(mut event) => {
                 if O::ENABLED {
-                    event.observe_wait(&shared.observer, QueueKind::Gather);
+                    observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Gather);
                 }
                 if shared.stopping.load(Ordering::Acquire) {
                     event.cancel();
@@ -397,15 +425,15 @@ fn persistent_gather_worker<O: SearchObserver>(
 
 fn eval_worker<O: SearchObserver>(
     shared: Arc<Shared<O>>,
-    receiver: Receiver<PlayoutEvent<O::Stamp>>,
+    receiver: Receiver<GatherEvent<O::Stamp>>,
     nn_tx: Sender<NnRequest<O::Stamp>>,
 ) {
-    let mut waiting: Vec<WaitingNn<O::Stamp>> = Vec::new();
+    let mut waiting = Vec::<NnPending>::new();
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             drain_waiting(&shared, &mut waiting);
             while let Ok(event) = receiver.try_recv() {
-                cancel_evaluation(&shared, event);
+                cancel_evaluation(&shared, event.into_event());
             }
             shared.cancel_all_collisions();
             break;
@@ -416,7 +444,7 @@ fn eval_worker<O: SearchObserver>(
         match receiver.recv_timeout(RECEIVE_POLL) {
             Ok(mut event) => {
                 if O::ENABLED {
-                    event.observe_wait(&shared.observer, QueueKind::Eval);
+                    observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Eval);
                 }
                 if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
                     shared.fail(error);
@@ -431,7 +459,7 @@ fn eval_worker<O: SearchObserver>(
             Err(RecvTimeoutError::Disconnected) => {
                 drain_waiting(&shared, &mut waiting);
                 while let Ok(event) = receiver.try_recv() {
-                    cancel_evaluation(&shared, event);
+                    cancel_evaluation(&shared, event.into_event());
                 }
                 shared.cancel_all_collisions();
                 break;
@@ -461,14 +489,14 @@ fn nn_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver<NnReq
             Err(RecvTimeoutError::Disconnected) => break,
         };
         if O::ENABLED {
-            first.observe_wait(&shared.observer, QueueKind::Nn);
+            observe_queue_wait(&mut first.queued_at, &shared.observer, QueueKind::Nn);
         }
         let mut requests = vec![first];
         while requests.len() < batch_size {
             match receiver.try_recv() {
                 Ok(mut request) => {
                     if O::ENABLED {
-                        request.observe_wait(&shared.observer, QueueKind::Nn);
+                        observe_queue_wait(&mut request.queued_at, &shared.observer, QueueKind::Nn);
                     }
                     requests.push(request);
                 }
@@ -517,12 +545,12 @@ fn backprop_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver
         }
         if O::ENABLED {
             for event in &mut events {
-                event.observe_wait(&shared.observer, QueueKind::Backprop);
+                observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Backprop);
             }
         }
         let claims: Vec<(bool, NodeId)> = events
             .iter()
-            .map(|event| (event.held_eval_claim, event.playout.node_id))
+            .map(|event| (event.held_eval_claim, event.event.node_id))
             .collect();
         let result = complete_batch(events, &shared.arena);
         for (_, id) in &claims {
@@ -560,12 +588,12 @@ mod tests {
     use parking_lot::{Condvar, Mutex};
     use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
-    use super::{BackpropEvent, PlayoutEvent, backprop_worker};
+    use super::{BackpropEvent, GatherEvent, backprop_worker};
     use crate::neural::backend::{Backend, UniformBackend};
-    use crate::search::NodeArena;
     use crate::search::observer::NoopObserver;
     use crate::search::param::SearchParams;
     use crate::search::pipeline::Shared;
+    use crate::search::{NoQueueStamp, NodeArena};
 
     #[test]
     fn backprop_completion_releases_the_eval_claim() {
@@ -579,7 +607,6 @@ mod tests {
         let shared = Arc::new(Shared {
             backend: Arc::new(UniformBackend::default()) as Arc<dyn Backend>,
             arena: Arc::clone(&arena),
-            generation: 1,
             params: SearchParams::default(),
             root_move_filter: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
@@ -600,7 +627,7 @@ mod tests {
         });
         backprop_tx
             .send(BackpropEvent::from_eval(
-                PlayoutEvent::at_root(1, root, history),
+                GatherEvent::<NoQueueStamp>::at_root(root, history).into_event(),
                 0.4,
                 0.2,
                 2.0,

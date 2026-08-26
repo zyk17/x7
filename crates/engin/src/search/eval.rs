@@ -6,111 +6,55 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
+use crossbeam_channel::{RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use xiangqi_core::LegalMoveList;
 
 use crate::EnginError;
 use crate::neural::backend::{EvalCacheKey, EvalResult};
-use crate::neural::{
-    EncodedBatch, FillEmptyHistory, InputPlanes, encode_position_input_planes, eval_result_from_encoded_row,
-};
+use crate::neural::{EncodedBatch, FillEmptyHistory, encode_position_input_planes, eval_result_from_encoded_row};
 
 use super::expand::{ExpandKind, classify_expand};
-use super::observer::{QueueKind, QueueStamp, SearchObserver};
+use super::observer::{QueueStamp, SearchObserver};
 use super::pipeline::{RECEIVE_POLL, Shared};
-use super::workerpool::{BackpropEvent, PlayoutEvent};
+use super::workerpool::{BackpropEvent, Event, GatherEvent, NnPending, NnRequest};
 
-type NnReply = Result<(Arc<EncodedBatch>, usize), EnginError>;
-
-/// 交给 NN 线程的一个已编码局面（稀疏 InputPlanes；ORT 前再 expand）。
-pub(crate) struct NnRequest<S: QueueStamp = super::observer::NoQueueStamp> {
-    planes: InputPlanes,
-    reply: Sender<NnReply>,
-    queued_at: S,
-}
-
-impl<S: QueueStamp> NnRequest<S> {
-    fn mark_queued(&mut self) {
-        self.queued_at.mark();
-    }
-
-    pub(crate) fn observe_wait<O: SearchObserver<Stamp = S>>(&mut self, obs: &O, kind: QueueKind) {
-        if let Some(wait) = self.queued_at.take_wait() {
-            obs.on_queue_wait(kind, wait);
-        }
-    }
-}
-
-/// Eval 正在等待此 node 的 NN。
-pub(crate) struct WaitingNn<S: QueueStamp = super::observer::NoQueueStamp> {
-    event: PlayoutEvent<S>,
-    legal_moves: LegalMoveList,
-    cache_key: EvalCacheKey,
-    reply: Receiver<NnReply>,
-}
-
-pub(crate) fn poll_nn_completions<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<WaitingNn<O::Stamp>>) {
+pub(crate) fn poll_nn_completions<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<NnPending>) {
     let mut i = 0;
     while i < waiting.len() {
-        match waiting[i].reply.try_recv() {
-            Ok(Ok((batch, row))) => {
-                let item = waiting.swap_remove(i);
-                if let Err(error) = complete_nn_item(shared, item, batch, row) {
-                    shared.fail(error);
-                    return;
-                }
+        let reply = match waiting[i].reply.try_recv() {
+            Ok(reply) => reply,
+            Err(TryRecvError::Empty) => {
+                i += 1;
+                continue;
             }
-            Ok(Err(error)) => {
-                let item = waiting.swap_remove(i);
-                cancel_evaluation(shared, item.event);
-                if !shared.stopping.load(Ordering::Acquire) {
-                    shared.fail(error);
-                }
-                return;
+            Err(TryRecvError::Disconnected) => Err(EnginError::PortIncomplete("stream nn reply disconnected")),
+        };
+        let item = waiting.swap_remove(i);
+        if let Err(error) = handle_nn_reply(shared, item, reply) {
+            if !shared.stopping.load(Ordering::Acquire) {
+                shared.fail(error);
             }
-            Err(TryRecvError::Empty) => i += 1,
-            Err(TryRecvError::Disconnected) => {
-                let item = waiting.swap_remove(i);
-                cancel_evaluation(shared, item.event);
-                if !shared.stopping.load(Ordering::Acquire) {
-                    shared.fail(EnginError::PortIncomplete("stream nn reply disconnected"));
-                }
-                return;
-            }
+            return;
         }
     }
 }
 
-pub(crate) fn wait_one_nn_completion<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<WaitingNn<O::Stamp>>) {
+pub(crate) fn wait_one_nn_completion<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<NnPending>) {
     if waiting.is_empty() || shared.stopping.load(Ordering::Acquire) {
         return;
     }
     match waiting[0].reply.recv_timeout(RECEIVE_POLL) {
-        Ok(Ok((batch, row))) => {
-            let item = waiting.remove(0);
-            if let Err(error) = complete_nn_item(shared, item, batch, row) {
-                shared.fail(error);
-            }
-        }
-        Ok(Err(error)) => {
-            let item = waiting.remove(0);
-            cancel_evaluation(shared, item.event);
-            if !shared.stopping.load(Ordering::Acquire) {
-                shared.fail(error);
-            }
-        }
+        Ok(reply) => finish_waiting_nn(shared, waiting.remove(0), reply),
         Err(RecvTimeoutError::Timeout) => {}
-        Err(RecvTimeoutError::Disconnected) => {
-            let item = waiting.remove(0);
-            cancel_evaluation(shared, item.event);
-            if !shared.stopping.load(Ordering::Acquire) {
-                shared.fail(EnginError::PortIncomplete("stream nn reply disconnected"));
-            }
-        }
+        Err(RecvTimeoutError::Disconnected) => finish_waiting_nn(
+            shared,
+            waiting.remove(0),
+            Err(EnginError::PortIncomplete("stream nn reply disconnected")),
+        ),
     }
 }
 
-pub(crate) fn drain_waiting<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<WaitingNn<O::Stamp>>) {
+pub(crate) fn drain_waiting<O: SearchObserver>(shared: &Shared<O>, waiting: &mut Vec<NnPending>) {
     for item in waiting.drain(..) {
         cancel_evaluation(shared, item.event);
     }
@@ -120,25 +64,25 @@ pub(crate) fn drain_waiting<O: SearchObserver>(shared: &Shared<O>, waiting: &mut
 pub(crate) fn handle_eval_event<O: SearchObserver>(
     shared: &Shared<O>,
     nn_tx: &Sender<NnRequest<O::Stamp>>,
-    waiting: &mut Vec<WaitingNn<O::Stamp>>,
-    mut event: PlayoutEvent<O::Stamp>,
+    waiting: &mut Vec<NnPending>,
+    event: GatherEvent<O::Stamp>,
 ) -> Result<(), EnginError> {
     if shared.stopping.load(Ordering::Acquire) {
-        cancel_evaluation(shared, event);
+        cancel_evaluation(shared, event.into_event());
         return Ok(());
     }
     let node = shared
         .arena
-        .get(event.node_id)
+        .get(event.event.node_id)
         .expect("eval node lives until job drain");
     let depth = event.variation.moves().len();
     let history = event.variation.history();
-    match classify_expand(history, depth) {
+    match classify_expand(&history, depth) {
         ExpandKind::Terminal { wl, draw, plies_left } => {
             node.mark_terminal(wl, draw, plies_left);
             let root = event.node_path()[0];
             shared.arena.propagate_proven_terminals(event.node_path(), root);
-            shared.send_backprop(BackpropEvent::from_eval(event, wl, draw, plies_left));
+            shared.send_backprop(BackpropEvent::from_eval(event.into_event(), wl, draw, plies_left));
             Ok(())
         }
         ExpandKind::Evaluate { legal_moves } => {
@@ -147,28 +91,20 @@ pub(crate) fn handle_eval_event<O: SearchObserver>(
                 if O::ENABLED {
                     shared.observer.on_cache_hit();
                 }
-                return publish_eval(shared, event, legal_moves, eval);
+                return publish_eval(shared, event.into_event(), legal_moves, eval);
             }
-            let planes = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
+            let planes = encode_position_input_planes(&history, FillEmptyHistory::FenOnly);
             let (reply_tx, reply_rx) = bounded(1);
-            if let Err(error) = send_nn_request(
-                shared,
-                nn_tx,
-                NnRequest {
-                    planes,
-                    reply: reply_tx,
-                    queued_at: Default::default(),
-                },
-            ) {
-                cancel_evaluation(shared, event);
+            if let Err(error) = send_nn_request(shared, nn_tx, NnRequest::new(planes, reply_tx)) {
+                cancel_evaluation(shared, event.into_event());
                 return if shared.stopping.load(Ordering::Acquire) {
                     Ok(())
                 } else {
                     Err(error)
                 };
             }
-            waiting.push(WaitingNn {
-                event,
+            waiting.push(NnPending {
+                event: event.into_event(),
                 legal_moves,
                 cache_key,
                 reply: reply_rx,
@@ -203,7 +139,7 @@ fn send_nn_request<O: SearchObserver>(
 
 fn complete_nn_item<O: SearchObserver>(
     shared: &Shared<O>,
-    item: WaitingNn<O::Stamp>,
+    item: NnPending,
     batch: Arc<EncodedBatch>,
     row: usize,
 ) -> Result<(), EnginError> {
@@ -218,9 +154,36 @@ fn complete_nn_item<O: SearchObserver>(
     publish_eval(shared, item.event, item.legal_moves, eval)
 }
 
+/// 统一 NN reply 的成功、推理错误与断连路径；轮询和阻塞等待只负责取 reply。
+fn handle_nn_reply<O: SearchObserver>(
+    shared: &Shared<O>,
+    item: NnPending,
+    reply: Result<(Arc<EncodedBatch>, usize), EnginError>,
+) -> Result<(), EnginError> {
+    match reply {
+        Ok((batch, row)) => complete_nn_item(shared, item, batch, row),
+        Err(error) => {
+            cancel_evaluation(shared, item.event);
+            Err(error)
+        }
+    }
+}
+
+fn finish_waiting_nn<O: SearchObserver>(
+    shared: &Shared<O>,
+    item: NnPending,
+    reply: Result<(Arc<EncodedBatch>, usize), EnginError>,
+) {
+    if let Err(error) = handle_nn_reply(shared, item, reply)
+        && !shared.stopping.load(Ordering::Acquire)
+    {
+        shared.fail(error);
+    }
+}
+
 fn publish_eval<O: SearchObserver>(
     shared: &Shared<O>,
-    event: PlayoutEvent<O::Stamp>,
+    event: Event,
     legal_moves: LegalMoveList,
     eval: Arc<EvalResult>,
 ) -> Result<(), EnginError> {
@@ -249,7 +212,7 @@ fn publish_eval<O: SearchObserver>(
 }
 
 /// 释放已 claim 但不会发布结果的 evaluation event。
-pub(crate) fn cancel_evaluation<O: SearchObserver>(shared: &Shared<O>, event: PlayoutEvent<O::Stamp>) {
+pub(crate) fn cancel_evaluation<O: SearchObserver>(shared: &Shared<O>, event: Event) {
     shared.release_eval_claims(1);
     let id = event.node_id;
     event.cancel();

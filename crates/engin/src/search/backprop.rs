@@ -25,12 +25,12 @@ pub(crate) fn complete_batch<S: super::observer::QueueStamp>(
     let mut result = BackpropResult::default();
 
     for event in events {
-        let BackpropEvent { playout, value, .. } = event;
-        debug_assert_eq!(playout.node_path.len(), playout.reservations.len() + 1);
-        let depth = playout.node_path.len() as u64;
+        let BackpropEvent { event, value, .. } = event;
+        debug_assert_eq!(event.node_path.len(), event.reservations.len() + 1);
+        let depth = event.node_path.len() as u64;
         let mut delta = value;
-        let mut reservations = playout.reservations.into_iter().rev();
-        for (node_index, node_id) in playout.node_path.into_iter().enumerate().rev() {
+        let mut reservations = event.reservations.into_iter().rev();
+        for (node_index, node_id) in event.node_path.into_iter().enumerate().rev() {
             if let Some((terminal_wl, terminal_draw, terminal_m)) = arena.get(node_id).and_then(Node::terminal_value) {
                 delta = ValueDelta::with_plies_left(terminal_wl, terminal_draw, terminal_m);
             }
@@ -70,7 +70,7 @@ mod tests {
 
     use super::complete_batch;
     use crate::search::NodeArena;
-    use crate::search::workerpool::{BackpropEvent, PlayoutEvent};
+    use crate::search::workerpool::{BackpropEvent, GatherEvent};
 
     #[test]
     fn backprop_completes_every_reservation_with_alternating_value() {
@@ -83,10 +83,18 @@ mod tests {
         let mv = Move::new(Square::parse("b2").expect("b2"), Square::parse("b3").expect("b3"));
         root_node.publish_edges(vec![(mv, 1.0)]);
         let child_id = arena.child_or_create(&root_node.edges()[0]);
-        let child = PlayoutEvent::<crate::search::NoQueueStamp>::at_root(1, root_id, Arc::clone(&history))
+        let child = GatherEvent::<crate::search::NoQueueStamp>::at_root(root_id, Arc::clone(&history))
             .descend(child_id, root_node.reserve_edge(0).expect("edge"));
 
-        complete_batch([BackpropEvent::from_gather(child, 0.4, 0.2, 2.0)], &arena);
+        complete_batch(
+            [BackpropEvent::<crate::search::NoQueueStamp>::from_gather(
+                child.into_event(),
+                0.4,
+                0.2,
+                2.0,
+            )],
+            &arena,
+        );
 
         let edge = &root_node.edges()[0];
         assert_eq!(edge.visits(), 1);

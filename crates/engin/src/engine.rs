@@ -27,7 +27,6 @@ pub struct Engine {
     graph: Option<SearchTree>,
     graph_reaper: GraphReaper,
     worker_pool: Option<Arc<WorkerPool>>,
-    next_generation: u64,
     applied_nn_cache_size: Option<u8>,
     time_manager: TimeManager,
     active: Option<ActiveSearch>,
@@ -36,7 +35,7 @@ pub struct Engine {
     manages_weights_file: bool,
     backend_error: Option<String>,
     loaded_weights_file: Option<String>,
-    /// 让 abort 与 owner 的整组输出线性化，避免新命令之后漏出旧 generation 的结果。
+    /// 让 abort 与 owner 的整组输出线性化，避免新命令之后漏出旧搜索的结果。
     stdout_gate: Arc<Mutex<()>>,
 }
 
@@ -173,7 +172,6 @@ impl Engine {
             graph: None,
             graph_reaper: GraphReaper::new(),
             worker_pool: None,
-            next_generation: 0,
             applied_nn_cache_size: None,
             time_manager: TimeManager::default(),
             active: None,
@@ -192,7 +190,6 @@ impl Engine {
         self.backend = Some(backend);
         self.graph = None;
         self.worker_pool = None;
-        self.next_generation = 0;
         self.applied_nn_cache_size = None;
     }
 
@@ -376,7 +373,6 @@ impl Engine {
             backend.set_cache_size_power_of_two(self.options.nn_cache_size_power_of_two);
             self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
         }
-        self.next_generation = self.next_generation.wrapping_add(1);
         let (gather_workers, eval_workers) = SearchConfig::gather_eval_from_threads(self.options.threads);
         let config = SearchConfig {
             eval_batch_size: self.options.mini_batch_size,
@@ -404,7 +400,7 @@ impl Engine {
         };
         let graph = self.graph.as_ref().expect("position creates a graph with a backend");
         let root_is_black = graph.root_history().last().is_black_to_move();
-        let search = Search::new_with_graph_in_pool(backend, self.next_generation, graph, config, NoopObserver, pool);
+        let search = Search::new_with_graph_in_pool(backend, graph, config, NoopObserver, pool);
         let snapshot = RootSnapshot {
             arena: Arc::clone(search.arena()),
             root_id: search.root_id(),
