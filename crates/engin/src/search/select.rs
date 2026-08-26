@@ -8,7 +8,7 @@ use crate::utils::fastmath::fast_log;
 /// cPUCT：常数项加上随访问数缓慢增长的对数项。
 ///
 /// 所有节点使用同一条曲线；根不再有独立初值或独立参数。
-/// 默认参数下 `C(0)=1.75`、`C(50k)≈5`。
+/// 默认参数下 `C(0)=1.25`、`C(50k)≈4.5`。
 /// `cpuct_base` 越小，增长越早开始；`cpuct_factor` 控制增长幅度。
 fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
     params.cpuct + params.cpuct_factor * fast_log((visits as f32 + params.cpuct_base) / params.cpuct_base)
@@ -101,15 +101,15 @@ mod tests {
     #[test]
     fn defaults_use_the_selected_constant_cpuct() {
         let params = SearchParams::default();
-        assert_eq!(params.cpuct, 1.75);
+        assert_eq!(params.cpuct, 1.25);
         assert_eq!(params.cpuct_base, 40_000.0);
         assert_eq!(params.cpuct_factor, 4.0);
-        assert_eq!(params.fpu_reduction, 0.200);
-        assert_eq!(params.lcb_stdevs, 5.0);
+        assert_eq!(params.fpu_reduction, 0.500);
+        assert_eq!(params.lcb_stdevs, 0.0);
         assert_eq!(params.lcb_min_visit_fraction, 0.15);
         assert_eq!(compute_cpuct(params, 0), params.cpuct);
-        // `fast_log` 是热路径近似；默认曲线在 50k 时接近设计目标 5。
-        assert!((compute_cpuct(params, 50_000) - 5.0).abs() < 0.05);
+        // `fast_log` 是热路径近似；默认曲线在 50k 时接近设计目标 4.5。
+        assert!((compute_cpuct(params, 50_000) - 4.5).abs() < 0.05);
     }
 
     #[test]
@@ -129,7 +129,10 @@ mod tests {
         assert!(node.try_begin_evaluation());
         node.publish_edges(vec![(mv("b2", "b3"), 0.6), (mv("c3", "c4"), 0.4)]);
         let edges = node.edges();
-        let params = SearchParams::default();
+        let params = SearchParams {
+            virtual_mean_fpu_scale: 0.0,
+            ..SearchParams::default()
+        };
         assert_eq!(
             select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index),
             Some(0)

@@ -135,7 +135,8 @@ cargo run --release -p engin
 当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`NNCacheSizePowerOfTwo`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
 `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`LcbStdevs`、`LcbMinVisitFraction`、`Threads`。
 `MiniBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
-搜索参数默认 `CPuct=1.75`、`CPuctBase=40000`、`CPuctFactor=4.0`、`FpuReduction=0.200`；
+搜索参数默认 `CPuct=1.25`、`CPuctBase=40000`、`CPuctFactor=4.0`、`FpuReduction=0.500`；
+`LcbStdevs=0`，即正式决策默认按 terminal、visit、Q、prior 排序；LCB 仅可通过 UCI option 单独实验。
 `Threads=8` 只在 Gather/Eval 间近似平分，NN 与 Backprop 固定各一条线程。option 名称和布尔值大小写不敏感。
 
 当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。

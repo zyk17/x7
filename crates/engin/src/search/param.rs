@@ -25,14 +25,14 @@ pub struct SearchParams {
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            cpuct: 1.75,
+            cpuct: 1.25,
             cpuct_base: 40_000.0,
             cpuct_factor: 4.0,
             // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
-            fpu_reduction: 0.200,
+            fpu_reduction: 0.500,
             virtual_mean_fpu_scale: 1.0,
-            // KataGo 搜索参数的经验起点；只用于根最终 Decision，不参与 PUCT。
-            lcb_stdevs: 5.0,
+            // LCB 只用于根最终 Decision，不参与 PUCT；默认关闭，作为独立实验开关。
+            lcb_stdevs: 0.0,
             lcb_min_visit_fraction: 0.15,
         }
     }
