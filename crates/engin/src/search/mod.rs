@@ -32,7 +32,9 @@ mod time;
 mod tree;
 mod workerpool;
 
-pub use decision::{RootEdgeStats, RootStats, best_move, principal_variation, root_stats};
+pub use decision::{
+    DecisionRule, RootEdgeStats, RootStats, best_move, best_move_with_params, principal_variation, root_stats,
+};
 pub(crate) use decision::{
     best_mate_with_params, best_move_filtered_with_params, principal_variation_with_params, root_variations,
 };
@@ -42,6 +44,7 @@ pub use observer::{
 };
 pub use param::{SearchConfig, SearchParams};
 pub use pipeline::{Search, SearchControl, SearchLimits, Stats};
+pub use select::{compute_cpuct, selection_q_from_means, variance_bonus_from_se};
 pub(crate) use time::{TimeBudget, TimeManager};
 pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree, ValueDelta};
 pub(crate) use workerpool::WorkerPool;

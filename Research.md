@@ -93,7 +93,7 @@ classic lc0 的 collision/terminal multivisit 是一次评估按 K 次 visit 加
   rescue 还需要额外上限，行为更难控。
 - **时间型 credit**：不把 sigma 当作长期不确定性，而只把 Q/sigma 相对近期参考值的变化当作“新证据需要验证”。
 
-因此未保留前两类实现，也没有保留 LCB：三者都把已观察到的长期离散度误作需要永久补偿的搜索信号。
+因此未保留前两类 Select 实现，也没有保留把 LCB 写入 Select 的方案：三者都把已观察到的长期离散度误作需要永久补偿的搜索信号。根最终 decision 的 LCB/UCB 是独立实验，不参与此处讨论的树内选择。
 
 ### 原型与结果
 
@@ -106,4 +106,42 @@ scale 为 0。
 scale 都比 0 更早切入主杀线；`middle_01` 中低 prior 的 `f3f7 (P=0.051)` 在 0/0.5/1 下于 15k
 成为第一，但 2/4 被高 prior `e0e1` 压回。稳定路线即使保留较高 sigma，其 credit 也下降到约
 0.001–0.01。结果支持“credit 有时效”这一机制，不支持当前常数、衰减率或 scale 已可进入正式默认。
+
+## 2026-09-01：recent-Q 与 SE verification bonus
+
+### 目标与公式
+
+小 completed-N 时，算术均值会让一条已被选中的高 Q 边对新证据反应过慢；但把近期样本长期替换
+算术均值会破坏大样本收敛。因此保留原始算术 `Q_mean`，另维护近期加权的 `Q_fast`，仅在 Select
+使用：
+
+`Q_select = Q_mean + g(N; T) * (Q_fast - Q_mean)`，其中 `g(N; T) = max(0, 1 - N/T)`。
+
+`ValueUpdateRate=a` 控制 `Q_fast` 的近期权重，`FreshQVisits=T` 控制它的有限生命周期；`N >= T`
+后严格回到 `Q_mean`。这不是改写回传的原始统计，`Q_mean` 仍是全部 completed evidence 的算术均值。
+每次完成样本 `w` 时，令旧 completed-N 为 `N`，则
+`eta = a/(N+a)`，`Q_fast <- (1-eta) Q_fast + eta w`；因此 `a=1` 恰为算术均值，较大的 `a` 更重视近期样本。
+
+方差方向的目标也不是救回低 prior 招法，而是暂时给已出现分歧证据的 edge 更多复核，以更快降低
+该 edge 的均值标准误。当前只保留独立项：
+
+`B_var = lambda * SE`（仅 `N >= 2`），
+`score = Q_select + U + B_var`。
+
+`SE` 是该 edge 的原始 completed `wl` 样本均值的经验标准误：
+`Q_mean = sum(w_i)/N`，`std = sqrt(max(0, sum(w_i^2)/N - Q_mean^2))`，
+`SE = std/sqrt(N)`。它不读 `Q_fast`、prior、父 N、reservation 或 depth。
+所以未访问/只有一个样本的 edge 仍只由通常的 FPU/PUCT 获得机会；停止回访时 `B_var` 不会像 U 一样
+随 sibling 访问增长。即使局面的原始 `std` 持续存在，`SE=std/sqrt(N)` 仍会随自身 evidence 自然趋近 0，
+不再人为 cap 高 SE 或设停止阈值。
+
+### 局部验证与边界
+
+用 `Gather=1`、`Eval=1`、batch=1、`nn_window=1` 的 fresh tree，检查根部 trace 和 tree funnel。
+在 `proof_draw_01`、`proof_mate_01`、`proof_variance` 与 `middle_37` 中，`lambda * SE` 可在早期给
+高 SE、已有 evidence 的边额外访问。同配置 repeat 的根部 trace 可复现。原始的 `U * (1 + k * SE)`
+路径因混淆“PUCT 探索”和“复核证据”已移除。
+
+这些只验证了公式的不变量与局部行为，**没有**证明固定时间候选质量或 Elo 改善，也没有选定
+`a`、`T`、`lambda`；正式默认保持 `FreshQVisits=0`、`VarianceBonusScale=0`。
 

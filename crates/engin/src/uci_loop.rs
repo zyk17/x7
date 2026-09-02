@@ -525,10 +525,10 @@ mod tests {
     fn minibatch_size_option_matches_px0_range() {
         let mut options = Options::default();
         options
-            .set_uci_option("MiniBatchSize", "128")
+            .set_uci_option("NnBatchSize", "128")
             .expect("minibatch-size option");
-        assert_eq!(options.mini_batch_size, 128);
-        assert!(options.set_uci_option("MiniBatchSize", "1025").is_err());
+        assert_eq!(options.nn_batch_size, 128);
+        assert!(options.set_uci_option("NnBatchSize", "1025").is_err());
     }
 
     #[test]
@@ -553,10 +553,23 @@ mod tests {
         options.set_uci_option("CPUctBase", "20000").expect("cpuct base");
         options.set_uci_option("cpuctfactor", "2.5").expect("cpuct factor");
         options.set_uci_option("fpureduction", "0.35").expect("fpu reduction");
-        options.set_uci_option("LCBSTDEVS", "4").expect("lcb stdevs");
         options
-            .set_uci_option("lcbminvisitfraction", "0.2")
-            .expect("lcb visit fraction");
+            .set_uci_option("ValueUpdateRate", "2")
+            .expect("value update rate");
+        options.set_uci_option("FreshQVisits", "20").expect("fresh Q visits");
+        options
+            .set_uci_option("VarianceBonusScale", "0.4")
+            .expect("variance bonus scale");
+        options.set_uci_option("DecisionLcbStdevs", "4").expect("lcb stdevs");
+        options.set_uci_option("DecisionUcbStdevs", "3").expect("ucb stdevs");
+        options.set_uci_option("NnWindow", "2.25").expect("nn window");
+        options
+            .set_uci_option("VirtualMeanFpuScale", "0.75")
+            .expect("virtual mean FPU scale");
+        options.set_uci_option("DecisionRule", "MixNQ").expect("decision rule");
+        options
+            .set_uci_option("DecisionMixNWeight", "0.3")
+            .expect("decision mix N weight");
         options.set_uci_option("threads", "7").expect("threads");
         options
             .set_uci_option("nncachesizepoweroftwo", "20")
@@ -565,16 +578,30 @@ mod tests {
         assert_eq!(options.cpuct_base, 20_000.0);
         assert_eq!(options.cpuct_factor, 2.5);
         assert_eq!(options.fpu_reduction, 0.35);
-        assert_eq!(options.lcb_stdevs, 4.0);
-        assert_eq!(options.lcb_min_visit_fraction, 0.2);
+        assert_eq!(options.value_update_rate, 2.0);
+        assert_eq!(options.fresh_q_visits, 20.0);
+        assert_eq!(options.variance_bonus_scale, 0.4);
+        assert_eq!(options.decision_lcb_stdevs, 4.0);
+        assert_eq!(options.decision_ucb_stdevs, 3.0);
+        assert_eq!(options.nn_window, 2.25);
+        assert_eq!(options.virtual_mean_fpu_scale, 0.75);
+        assert_eq!(options.decision_rule, crate::search::DecisionRule::MixNQ);
+        assert_eq!(options.decision_mix_n_weight, 0.3);
         assert_eq!(options.nn_cache_size_power_of_two, 20);
         assert_eq!(options.threads, 7);
         assert!(options.set_uci_option("CPuct", "NaN").is_err());
         assert!(options.set_uci_option("CPuctBase", "0").is_err());
         assert!(options.set_uci_option("CPuctFactor", "NaN").is_err());
         assert!(options.set_uci_option("FpuReduction", "-0.1").is_err());
-        assert!(options.set_uci_option("LcbStdevs", "NaN").is_err());
-        assert!(options.set_uci_option("LcbMinVisitFraction", "1.1").is_err());
+        assert!(options.set_uci_option("ValueUpdateRate", "0").is_err());
+        assert!(options.set_uci_option("FreshQVisits", "NaN").is_err());
+        assert!(options.set_uci_option("VarianceBonusScale", "NaN").is_err());
+        assert!(options.set_uci_option("DecisionLcbStdevs", "NaN").is_err());
+        assert!(options.set_uci_option("DecisionUcbStdevs", "NaN").is_err());
+        assert!(options.set_uci_option("NnWindow", "0").is_err());
+        assert!(options.set_uci_option("VirtualMeanFpuScale", "-0.1").is_err());
+        assert!(options.set_uci_option("DecisionRule", "bad-rule").is_err());
+        assert!(options.set_uci_option("DecisionMixNWeight", "-0.1").is_err());
         options
             .set_uci_option("Threads", "1")
             .expect("threads below minimum clamp");
@@ -582,7 +609,7 @@ mod tests {
         options.set_uci_option("Threads", "0").expect("zero threads clamp");
         assert_eq!(options.threads, 2);
         assert!(options.set_uci_option("Threads", "129").is_err());
-        assert!(options.set_uci_option("NNCacheSizePowerOfTwo", "49").is_err());
+        assert!(options.set_uci_option("NnCacheSizePowerOfTwo", "49").is_err());
     }
 
     #[test]

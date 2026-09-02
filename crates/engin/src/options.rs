@@ -3,7 +3,7 @@
 //! `go` 时拍快照：算法 → `SearchParams`，当前 worker 配置 → `SearchConfig`，停止条件/`searchmoves` → `SearchLimits`。
 
 use crate::neural::cache::{DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, MAX_NN_CACHE_SIZE_POWER_OF_TWO};
-use crate::search::SearchParams;
+use crate::search::{DecisionRule, SearchConfig, SearchParams};
 
 /// 正式 UCI 的最小 option 集。
 #[derive(Clone, Debug, PartialEq)]
@@ -13,9 +13,9 @@ pub struct Options {
     pub show_eps: bool,
     /// UCI `MultiPV`：每次 info 最多输出的根变化数。
     pub multi_pv: usize,
-    /// UCI `MiniBatchSize`：单次 NN 调用最多合并的局面数；0 使用 backend 建议值。
-    pub mini_batch_size: usize,
-    /// UCI `NNCacheSizePowerOfTwo`：NN cache 固定保存 `2^N` 个直映槽。
+    /// UCI `NnBatchSize`：单次 NN 调用最多合并的局面数；0 使用 backend 建议值。
+    pub nn_batch_size: usize,
+    /// UCI `NnCacheSizePowerOfTwo`：NN cache 固定保存 `2^N` 个直映槽。
     pub nn_cache_size_power_of_two: u8,
     /// UCI `CPuct`：所有节点共用的 PUCT 初始探索系数。
     pub cpuct: f32,
@@ -24,9 +24,17 @@ pub struct Options {
     pub cpuct_factor: f32,
     /// UCI `FpuReduction`：未访问边相对 parent Q 的 FPU 降幅。
     pub fpu_reduction: f32,
-    /// 根最终 Decision 的 LCB 参数；不参与 PUCT。
-    pub lcb_stdevs: f32,
-    pub lcb_min_visit_fraction: f32,
+    pub value_update_rate: f32,
+    pub fresh_q_visits: f32,
+    pub variance_bonus_scale: f32,
+    /// Eval claim 上限相对 batch 的倍率；控制 pending work 的新鲜度与 NN 供给。
+    pub nn_window: f32,
+    /// reservation 临时写入的 FPU 缩放；仅在 in-flight 时影响 action Q。
+    pub virtual_mean_fpu_scale: f32,
+    pub decision_lcb_stdevs: f32,
+    pub decision_ucb_stdevs: f32,
+    pub decision_rule: DecisionRule,
+    pub decision_mix_n_weight: f32,
     /// UCI `Threads` 只分配 Gather + Eval；Backprop 和 NN 各固定一条线程。
     pub threads: usize,
 }
@@ -39,14 +47,21 @@ impl Default for Options {
             show_wdl: false,
             show_eps: false,
             multi_pv: 1,
-            mini_batch_size: 0,
+            nn_batch_size: 0,
             nn_cache_size_power_of_two: DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO,
             cpuct: search.cpuct,
             cpuct_base: search.cpuct_base,
             cpuct_factor: search.cpuct_factor,
             fpu_reduction: search.fpu_reduction,
-            lcb_stdevs: search.lcb_stdevs,
-            lcb_min_visit_fraction: search.lcb_min_visit_fraction,
+            value_update_rate: search.value_update_rate,
+            fresh_q_visits: search.fresh_q_visits,
+            variance_bonus_scale: search.variance_bonus_scale,
+            nn_window: SearchConfig::default().nn_window,
+            virtual_mean_fpu_scale: search.virtual_mean_fpu_scale,
+            decision_lcb_stdevs: search.decision_lcb_stdevs,
+            decision_ucb_stdevs: search.decision_ucb_stdevs,
+            decision_rule: search.decision_rule,
+            decision_mix_n_weight: search.decision_mix_n_weight,
             threads: 8,
         }
     }
@@ -57,22 +72,47 @@ impl Options {
         vec![
             format!("option name Threads type spin default {} min 2 max 128", self.threads),
             format!(
-                "option name NNCacheSizePowerOfTwo type spin default {} min 0 max {}",
+                "option name NnCacheSizePowerOfTwo type spin default {} min 0 max {}",
                 self.nn_cache_size_power_of_two, MAX_NN_CACHE_SIZE_POWER_OF_TWO
             ),
             format!("option name MultiPV type spin default {} min 1 max 500", self.multi_pv),
             format!(
-                "option name MiniBatchSize type spin default {} min 0 max 1024",
-                self.mini_batch_size
+                "option name NnBatchSize type spin default {} min 0 max 1024",
+                self.nn_batch_size
             ),
             format!("option name CPuct type string default {}", self.cpuct),
             format!("option name CPuctBase type string default {}", self.cpuct_base),
             format!("option name CPuctFactor type string default {}", self.cpuct_factor),
             format!("option name FpuReduction type string default {}", self.fpu_reduction),
-            format!("option name LcbStdevs type string default {}", self.lcb_stdevs),
             format!(
-                "option name LcbMinVisitFraction type string default {}",
-                self.lcb_min_visit_fraction
+                "option name ValueUpdateRate type string default {}",
+                self.value_update_rate
+            ),
+            format!("option name FreshQVisits type string default {}", self.fresh_q_visits),
+            format!(
+                "option name VarianceBonusScale type string default {}",
+                self.variance_bonus_scale
+            ),
+            format!("option name NnWindow type string default {}", self.nn_window),
+            format!(
+                "option name VirtualMeanFpuScale type string default {}",
+                self.virtual_mean_fpu_scale
+            ),
+            format!(
+                "option name DecisionRule type combo default {} var Auto var MaxQ var MaxN var Lcb var Ucb var MixNQ",
+                self.decision_rule.uci_name()
+            ),
+            format!(
+                "option name DecisionLcbStdevs type string default {}",
+                self.decision_lcb_stdevs
+            ),
+            format!(
+                "option name DecisionUcbStdevs type string default {}",
+                self.decision_ucb_stdevs
+            ),
+            format!(
+                "option name DecisionMixNWeight type string default {}",
+                self.decision_mix_n_weight
             ),
             format!("option name UCI_ShowWDL type check default {}", self.show_wdl),
             format!("option name UCI_ShowEPS type check default {}", self.show_eps),
@@ -102,24 +142,24 @@ impl Options {
                 self.multi_pv = value;
             }
             "weightsfile" => self.weights_file = value.to_owned(),
-            "minibatchsize" => {
+            "nnbatchsize" => {
                 let value = value
                     .parse::<usize>()
-                    .map_err(|_| crate::EnginError::Uci("MiniBatchSize must be an integer within [0, 1024]".into()))?;
+                    .map_err(|_| crate::EnginError::Uci("NnBatchSize must be an integer within [0, 1024]".into()))?;
                 if value > 1024 {
-                    return Err(crate::EnginError::Uci("MiniBatchSize must be within [0, 1024]".into()));
+                    return Err(crate::EnginError::Uci("NnBatchSize must be within [0, 1024]".into()));
                 }
-                self.mini_batch_size = value;
+                self.nn_batch_size = value;
             }
             "nncachesizepoweroftwo" => {
                 let value = value.parse::<u8>().map_err(|_| {
                     crate::EnginError::Uci(format!(
-                        "NNCacheSizePowerOfTwo must be an integer within [0, {MAX_NN_CACHE_SIZE_POWER_OF_TWO}]"
+                        "NnCacheSizePowerOfTwo must be an integer within [0, {MAX_NN_CACHE_SIZE_POWER_OF_TWO}]"
                     ))
                 })?;
                 if value > MAX_NN_CACHE_SIZE_POWER_OF_TWO {
                     return Err(crate::EnginError::Uci(format!(
-                        "NNCacheSizePowerOfTwo must be within [0, {MAX_NN_CACHE_SIZE_POWER_OF_TWO}]"
+                        "NnCacheSizePowerOfTwo must be within [0, {MAX_NN_CACHE_SIZE_POWER_OF_TWO}]"
                     )));
                 }
                 self.nn_cache_size_power_of_two = value;
@@ -128,10 +168,21 @@ impl Options {
             "cpuctfactor" => self.cpuct_factor = parse_non_negative_float("CPuctFactor", value)?,
             "cpuct" => self.cpuct = parse_non_negative_float("CPuct", value)?,
             "fpureduction" => self.fpu_reduction = parse_non_negative_float("FpuReduction", value)?,
-            "lcbstdevs" => self.lcb_stdevs = parse_non_negative_float("LcbStdevs", value)?,
-            "lcbminvisitfraction" => {
-                self.lcb_min_visit_fraction = parse_unit_interval_float("LcbMinVisitFraction", value)?
+            "valueupdaterate" => self.value_update_rate = parse_positive_float("ValueUpdateRate", value)?,
+            "freshqvisits" => self.fresh_q_visits = parse_non_negative_float("FreshQVisits", value)?,
+            "variancebonusscale" => self.variance_bonus_scale = parse_non_negative_float("VarianceBonusScale", value)?,
+            "nnwindow" => self.nn_window = parse_positive_float("NnWindow", value)?,
+            "virtualmeanfpuscale" => {
+                self.virtual_mean_fpu_scale = parse_non_negative_float("VirtualMeanFpuScale", value)?
             }
+            "decisionlcbstdevs" => self.decision_lcb_stdevs = parse_non_negative_float("DecisionLcbStdevs", value)?,
+            "decisionucbstdevs" => self.decision_ucb_stdevs = parse_non_negative_float("DecisionUcbStdevs", value)?,
+            "decisionrule" => {
+                self.decision_rule = DecisionRule::parse_uci(value).ok_or_else(|| {
+                    crate::EnginError::Uci("DecisionRule must be one of Auto, MaxQ, MaxN, Lcb, Ucb, MixNQ".into())
+                })?
+            }
+            "decisionmixnweight" => self.decision_mix_n_weight = parse_non_negative_float("DecisionMixNWeight", value)?,
             "threads" => self.threads = parse_thread_count(value)?,
             _ => return Err(crate::EnginError::Uci(format!("Unknown option: {name}"))),
         }
@@ -147,14 +198,6 @@ fn parse_non_negative_float(name: &str, value: &str) -> Result<f32, crate::Engin
         return Err(crate::EnginError::Uci(format!(
             "{name} must be a finite non-negative number"
         )));
-    }
-    Ok(value)
-}
-
-fn parse_unit_interval_float(name: &str, value: &str) -> Result<f32, crate::EnginError> {
-    let value = parse_non_negative_float(name, value)?;
-    if value > 1.0 {
-        return Err(crate::EnginError::Uci(format!("{name} must be within [0, 1]")));
     }
     Ok(value)
 }

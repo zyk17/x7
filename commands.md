@@ -132,11 +132,22 @@ quit
 cargo run --release -p engin
 ```
 
-当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`NNCacheSizePowerOfTwo`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
-`CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`LcbStdevs`、`LcbMinVisitFraction`、`Threads`。
-`MiniBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
+当前 UCI options 是：`WeightsFile`、`NnBatchSize`、`NnCacheSizePowerOfTwo`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
+`CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`ValueUpdateRate`、`FreshQVisits`、`VarianceBonusScale`、`NnWindow`、`VirtualMeanFpuScale`、`DecisionRule`、`DecisionLcbStdevs`、`DecisionUcbStdevs`、`DecisionMixNWeight`、`Threads`。
+`NnBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
 搜索参数默认 `CPuct=1.25`、`CPuctBase=40000`、`CPuctFactor=4.0`、`FpuReduction=0.500`；
-`LcbStdevs=0`，即正式决策默认按 terminal、visit、Q、prior 排序；LCB 仅可通过 UCI option 单独实验。
+`DecisionLcbStdevs=1.0`、`DecisionUcbStdevs=1.0` 是一倍 SE 的温和置信修正，`DecisionMixNWeight=0.25` 表示最多 0.25 个 Q 单位的归一化 N 偏好；默认 `DecisionRule=Auto`（即 `MaxN`），因此三者只在切换到相应规则后生效。
+`DecisionRule=Auto` 与 `MaxN` 都直接取最大 completed N；`MaxQ` 直接取最大 Q；`Lcb/Ucb` 分别直接取最大
+`Q - DecisionLcbStdevs * SE` / `Q + DecisionUcbStdevs * SE`；`MixNQ` 直接取最大
+`Q + DecisionMixNWeight * N/max(root child N)`。所有规则使用同一套 N、Q、prior 作为并列时的稳定次序，
+不对 terminal、样本数或候选比例作额外覆盖或过滤；未满两个样本时 `SE=0`。
+`ValueUpdateRate=1` 是既有算术均值；大于 1 时维护一个更重视近期 completed evidence 的 fast Q。
+`FreshQVisits=0` 是严格算术 action-Q；大于 0 时 Select 在该 edge 前 `T` 次 completed visits 内线性混合 fast Q，并在 `N>=T` 后完全回到算术均值。
+`VarianceBonusScale=0` 关闭独立 SE 验证实验；非零时对至少两次 completed evidence 的 edge 加上不含 prior 的 `scale * SE`。它只为降低尚未收敛的 Q 的标准误提供平滑复核机会；`SE` 会随自身 evidence 增加自然衰减，常规 PUCT 的 Q 与 U 不变。
+
+相关公式为：`Q_select = Q_mean + max(0, 1-N/T) * (Q_fast-Q_mean)`；每次 completed 样本
+`w` 用 `eta=a/(N+a)` 更新 `Q_fast <- (1-eta)Q_fast+eta*w`。`SE=std/sqrt(N)`，其中
+`std=sqrt(max(0, mean(w²)-Q_mean²))`，全部来自同一 edge 的原始 completed `wl` 样本。
 `Threads=8` 只在 Gather/Eval 间近似平分，NN 与 Backprop 固定各一条线程。option 名称和布尔值大小写不敏感。
 
 当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
@@ -164,7 +175,7 @@ quit
 ```powershell
 @'
 uci
-setoption name MiniBatchSize value 64
+setoption name NnBatchSize value 64
 setoption name WeightsFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos
@@ -189,6 +200,26 @@ cargo run --release -p engin --bin benchmark -- `
 ```powershell
 cargo run --release -p engin --bin search_benchmark -- `
   --moves "c3c4 g6g5 ..." --playouts 2000 --root-top 12
+```
+
+扫描 recent-Q 与独立的目标 SE bonus（每组均为 fresh tree）：
+
+```powershell
+cargo run --release -p engin --bin search_benchmark -- `
+  --moves "c3c4 g6g5 ..." --playouts 20000 --root-top 12 `
+  --value-update-rate 1,2,4 --fresh-q-visits 10,15,20 `
+  --variance-bonus-scale 0,0.05,0.1,0.2
+```
+
+查看固定参数下的根访问集中度、collision 和主干树形；`--repeat` 必须大于 1，避免将异步调度的单次分流当作结论：
+
+```powershell
+cargo run --release -p engin --bin benchmark -- `
+  --fen "2bak4/3PaP1P1/9/4n4/2b6/6B2/3p5/4BA3/5C3/3K1A3 w - - 0 1" `
+  --playouts 20000 --repeat 3 --gathers 4 --evals 4 `
+  --value-update-rate 4 --fresh-q-visits 20 `
+  --variance-bonus-scale 0.1 `
+  --root-top 8 --tree-depth 3 --tree-top 3
 ```
 
 `benchmark` 输出正常 cache hit（`hit`）和流水线队列数据；`search_benchmark` 输出根候选的

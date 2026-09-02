@@ -115,12 +115,13 @@ pub struct Edge {
     stats: Mutex<EdgeStats>,
 }
 
-/// edge 聚合。`wl_sum` 是走子方视角；`wl_sq_sum` 仅供根 LCB。
+/// edge 聚合。原始矩是稳定 action-Q/SE 的真相；近期 Q 只需一个递推均值。
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EdgeStats {
     pub visits: u32,
     pub wl_sum: f32,
     pub wl_sq_sum: f32,
+    pub weighted_wl: f32,
     pub virtual_wl_sum: f32,
 }
 
@@ -183,6 +184,11 @@ impl Edge {
         stats.wl_sum / stats.visits as f32
     }
 
+    /// completed evidence 的近期 Q；只供搜索诊断，正式根决策仍使用 `q()`。
+    pub fn q_fast(&self) -> f32 {
+        self.stats.lock().weighted_wl
+    }
+
     fn reserve(&self, virtual_mean: Option<f32>) -> f32 {
         let virtual_wl_sum = virtual_mean.unwrap_or(0.0);
         let mut stats = self.stats.lock();
@@ -201,11 +207,15 @@ impl Edge {
         }
     }
 
-    fn complete(&self, virtual_wl_sum: f32, wl: f32) {
+    fn complete(&self, virtual_wl_sum: f32, wl: f32, value_update_rate: f32) {
         let mut stats = self.stats.lock();
         let started = self.started.load(Ordering::Acquire);
         debug_assert!(started > stats.visits, "stream edge completion without reservation");
         stats.virtual_wl_sum -= virtual_wl_sum;
+        let visits = stats.visits as f32;
+        let eta = value_update_rate / (visits + value_update_rate);
+        let beta = 1.0 - eta;
+        stats.weighted_wl = beta * stats.weighted_wl + eta * wl;
         stats.visits += 1;
         stats.wl_sum += wl;
         stats.wl_sq_sum += wl * wl;
@@ -228,8 +238,8 @@ impl EdgeReservation {
         self.edges[self.edge_index].mv()
     }
 
-    pub fn complete(self, wl: f32) {
-        self.edges[self.edge_index].complete(self.virtual_wl_sum, wl);
+    pub fn complete(self, wl: f32, value_update_rate: f32) {
+        self.edges[self.edge_index].complete(self.virtual_wl_sum, wl, value_update_rate);
     }
 
     pub fn cancel(self) {
@@ -1017,7 +1027,7 @@ mod repository_tests {
         node.publish_edges(vec![(b2_b3(), 1.0)]);
         let edge = node.reserve_edge(0).expect("edge");
         assert_eq!(node.edges()[0].visits(), 1);
-        edge.complete(0.5);
+        edge.complete(0.5, 1.0);
         assert_eq!(node.edges()[0].completed_visits(), 1);
         assert!((node.edges()[0].q() - 0.5).abs() < f32::EPSILON);
     }
@@ -1138,7 +1148,7 @@ mod repository_tests {
                 let complete_barrier = Arc::clone(&barrier);
                 scope.spawn(move || {
                     complete_barrier.wait();
-                    completed.complete(0.5);
+                    completed.complete(0.5, 1.0);
                 });
                 let cancel_barrier = Arc::clone(&barrier);
                 scope.spawn(move || {

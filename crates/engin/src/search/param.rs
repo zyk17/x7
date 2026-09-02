@@ -5,6 +5,7 @@
 //! - `SearchLimits`（在 `pipeline`）：这一手 `go` 的停止条件与 `searchmoves`。
 //! - `Options`（`options.rs`）：UCI / 引擎生命周期；`go` 时拍快照写入上面几层。
 
+use super::decision::DecisionRule;
 use crate::neural::backend::Backend;
 
 /// MCTS 算法旋钮。不包含线程、队列或 `searchmoves`。
@@ -14,12 +15,22 @@ pub struct SearchParams {
     pub cpuct_base: f32,   // 增长何时开始。更小 → 更早、更快变宽；更大 → 更久保持利用 Q。
     pub cpuct_factor: f32, // 增长幅度。更大 → 后期更强地向 PUCT/P 分流；更小 → 后期更容易让已验证的高 Q 分支继续积累 N。
     pub fpu_reduction: f32,
+    /// completed evidence 的近期更新率 `a`：1 为算术均值；更大时更重视较新的回传。
+    pub value_update_rate: f32,
+    /// recent Q 对 Select 的生命周期（completed visits）；0 为严格算术均值。
+    pub fresh_q_visits: f32,
+    /// 不受 prior/PUCT U 抑制的 completed-evidence 标准误 bonus；0 为关闭。
+    pub variance_bonus_scale: f32,
     /// reservation 暂时以 `scale * FPU` 进入 action Q；0 退化为纯 virtual visit。
     pub virtual_mean_fpu_scale: f32,
-    /// 根最终选边的 LCB 半径倍数；0 表示退回既有 N→Q→P 排名。
-    pub lcb_stdevs: f32,
-    /// LCB 候选至少须达到 N 第一候选的这一 completed-N 比例。
-    pub lcb_min_visit_fraction: f32,
+    /// `Lcb` 根决策的下置信半径倍数。
+    pub decision_lcb_stdevs: f32,
+    /// `Ucb` 根决策的上置信半径倍数。
+    pub decision_ucb_stdevs: f32,
+    /// 根最终选边规则；只读 completed evidence。
+    pub decision_rule: DecisionRule,
+    /// `MixNQ` 中归一化 N 的权重，单位与 Q 相同。
+    pub decision_mix_n_weight: f32,
 }
 
 impl Default for SearchParams {
@@ -30,10 +41,16 @@ impl Default for SearchParams {
             cpuct_factor: 4.0,
             // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
             fpu_reduction: 0.500,
+            value_update_rate: 1.0,
+            fresh_q_visits: 0.0,
+            variance_bonus_scale: 0.0,
             virtual_mean_fpu_scale: 1.0,
-            // LCB 只用于根最终 Decision，不参与 PUCT；默认关闭，作为独立实验开关。
-            lcb_stdevs: 0.0,
-            lcb_min_visit_fraction: 0.15,
+            // 根最终 Decision 的温和一倍 SE 置信修正；不参与 PUCT。
+            decision_lcb_stdevs: 1.0,
+            decision_ucb_stdevs: 1.0,
+            decision_rule: DecisionRule::Auto,
+            // N 已归一化；最多提供 0.25 个 Q 单位的访问量偏好。
+            decision_mix_n_weight: 0.25,
         }
     }
 }
@@ -57,16 +74,32 @@ impl SearchParams {
             "stream FPU reduction must be finite and non-negative"
         );
         assert!(
+            self.value_update_rate.is_finite() && self.value_update_rate > 0.0,
+            "stream value update rate must be finite and positive"
+        );
+        assert!(
+            self.fresh_q_visits.is_finite() && self.fresh_q_visits >= 0.0,
+            "stream fresh Q visits must be finite and non-negative"
+        );
+        assert!(
+            self.variance_bonus_scale.is_finite() && self.variance_bonus_scale >= 0.0,
+            "stream variance bonus scale must be finite and non-negative"
+        );
+        assert!(
             self.virtual_mean_fpu_scale.is_finite() && self.virtual_mean_fpu_scale >= 0.0,
             "stream virtual mean FPU scale must be finite and non-negative"
         );
         assert!(
-            self.lcb_stdevs.is_finite() && self.lcb_stdevs >= 0.0,
-            "stream LCB stdevs must be finite and non-negative"
+            self.decision_lcb_stdevs.is_finite() && self.decision_lcb_stdevs >= 0.0,
+            "stream decision LCB stdevs must be finite and non-negative"
         );
         assert!(
-            self.lcb_min_visit_fraction.is_finite() && (0.0..=1.0).contains(&self.lcb_min_visit_fraction),
-            "stream LCB minimum visit fraction must be within [0, 1]"
+            self.decision_ucb_stdevs.is_finite() && self.decision_ucb_stdevs >= 0.0,
+            "stream decision UCB stdevs must be finite and non-negative"
+        );
+        assert!(
+            self.decision_mix_n_weight.is_finite() && self.decision_mix_n_weight >= 0.0,
+            "stream decision MixNQ N weight must be finite and non-negative"
         );
     }
 }
@@ -81,7 +114,7 @@ pub struct SearchConfig {
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
-    /// Eval claim 并发上限：`limit = ceil(MiniBatchSize × nn_window)`。
+    /// Eval claim 并发上限：`limit = ceil(NnBatchSize × nn_window)`。
     /// Claim 在 backprop 写完 N/Q 后释放；调大可能提高eps、调小让 Gather 更贴最新统计。
     pub nn_window: f32,
     pub params: SearchParams,

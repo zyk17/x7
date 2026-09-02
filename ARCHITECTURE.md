@@ -29,6 +29,25 @@ GPU 主要生产 Prediction，CPU 主要生产 Evidence；二者的具体比例�
   首次分类；Gather 不重复裁决。
 - 只维护这一套 stream 搜索，不保留 classic 对照或多轨训练格式。
 
+## 搜索树形控制面
+
+Select 的长期分数由近期利用、常规探索与证据复核组成：
+`score = Q_select + U + B_var`。这些控制面都可能改变树宽，但职责不同：
+
+| 控制面 | 选择中的作用 | 典型树形影响 |
+| --- | --- | --- |
+| cPUCT | 放大所有节点的常规 `U(P, N)` | 全局、长期地更早从 Q 利用转向 policy/相对-N 探索。 |
+| FPU reduction | 定义未访问 child 的初始 action-Q | 每个节点局部降低首次门槛；常在主线经过的各层先扩出兄弟。 |
+| `nn_window` | 限制最多同时在途的 claim | 首要是 batch/吞吐上限；reservation 带来的分流只是受该上限约束的副作用。 |
+| virtual mean FPU scale | reservation 暂时写入 `scale * FPU`，并混入 in-flight edge 的 action-Q | 碰撞时可能暂时转向兄弟；只在 reservation 存在期间生效，具体方向取决于 FPU 符号。 |
+| `Q_select` | 近期样本修正利用 Q | 无固定宽/窄方向：近期好证据可聚焦，近期坏证据可更快分流。 |
+| `B_var` | `lambda * SE` 的已观察证据复核项 | 与 U 同级竞争，但只作用于 `N>=2` 的高 SE edge；不是未访问 child 的首次探索，也不保证单调扩树。 |
+
+调参的单位是固定并发语义下的树形组合：先固定 `nn_window` 与 virtual mean，再联合扫描
+cPUCT/FPU（普通探索）、`a,T`（近期利用）和 `lambda`（复核）。固定 visits 或固定时间比较根候选/PV、
+访问集中度、completed evidence 的整体 SE 与 `sum(B_var)/sum(U)`；NPS、EPS 和单条 edge 的最终 N 都不是
+充分结论。
+
 ## 工程约定
 
 外部语义参考应在代码注释中标明来源和“历史参考”性质。新的搜索设计可以自研，但必须说明其目标

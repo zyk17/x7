@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use super::workerpool::BackpropEvent;
-use super::{Node, NodeArena, NodeId, ValueDelta};
+use super::{Node, NodeArena, NodeId, SearchParams, ValueDelta};
 
 type NodeDeltaMap = HashMap<NodeId, ValueDelta>;
 
@@ -20,6 +20,7 @@ pub(crate) struct BackpropResult {
 pub(crate) fn complete_batch<S: super::observer::QueueStamp>(
     events: impl IntoIterator<Item = BackpropEvent<S>>,
     arena: &NodeArena,
+    params: &SearchParams,
 ) -> BackpropResult {
     let mut node_deltas = NodeDeltaMap::default();
     let mut result = BackpropResult::default();
@@ -45,7 +46,7 @@ pub(crate) fn complete_batch<S: super::observer::QueueStamp>(
                 debug_assert!(false, "every backprop edge has a reservation");
                 break;
             };
-            reservation.complete(delta.q());
+            reservation.complete(delta.q(), params.value_update_rate);
             delta = delta.for_parent().one_ply_up();
         }
         result.completed_playouts += 1;
@@ -69,8 +70,8 @@ mod tests {
     use xiangqi_core::{GameState, Move, STARTPOS_FEN, Square};
 
     use super::complete_batch;
-    use crate::search::NodeArena;
     use crate::search::workerpool::{BackpropEvent, GatherEvent};
+    use crate::search::{NodeArena, SearchParams};
 
     #[test]
     fn backprop_completes_every_reservation_with_alternating_value() {
@@ -94,6 +95,7 @@ mod tests {
                 2.0,
             )],
             &arena,
+            &SearchParams::default(),
         );
 
         let edge = &root_node.edges()[0];

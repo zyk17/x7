@@ -7,12 +7,58 @@ use xiangqi_core::Move;
 use super::param::SearchParams;
 use super::{Edge, ExpansionState, Node, NodeArena, NodeId};
 
+/// 根节点在既有 completed evidence 上的最终选边规则；不参与 PUCT。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DecisionRule {
+    /// 历史默认：按 completed N 最大。
+    #[default]
+    Auto,
+    MaxQ,
+    MaxN,
+    Lcb,
+    Ucb,
+    MixNQ,
+}
+
+impl DecisionRule {
+    pub const fn uci_name(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::MaxQ => "MaxQ",
+            Self::MaxN => "MaxN",
+            Self::Lcb => "Lcb",
+            Self::Ucb => "Ucb",
+            Self::MixNQ => "MixNQ",
+        }
+    }
+
+    pub fn parse_uci(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("auto") {
+            Some(Self::Auto)
+        } else if value.eq_ignore_ascii_case("maxq") {
+            Some(Self::MaxQ)
+        } else if value.eq_ignore_ascii_case("maxn") {
+            Some(Self::MaxN)
+        } else if value.eq_ignore_ascii_case("lcb") {
+            Some(Self::Lcb)
+        } else if value.eq_ignore_ascii_case("ucb") {
+            Some(Self::Ucb)
+        } else if value.eq_ignore_ascii_case("mixnq") {
+            Some(Self::MixNQ)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RootEdgeStats {
     pub mv: Move,
     pub completed_visits: u32,
     pub started_visits: u32,
     pub q: f32,
+    pub q_fast: f32,
+    pub variance: f32,
     pub prior: f32,
 }
 
@@ -47,8 +93,6 @@ impl Deref for EdgeHandle {
 
 struct RankedEdge {
     edge: EdgeHandle,
-    terminal: i8,
-    plies: f32,
     visits: u32,
     q: f32,
     prior: f32,
@@ -63,12 +107,21 @@ pub fn root_stats(arena: &NodeArena, root: NodeId) -> Option<RootStats> {
         edges: root
             .edges()
             .iter()
-            .map(|edge| RootEdgeStats {
-                mv: edge.mv(),
-                completed_visits: edge.completed_visits(),
-                started_visits: edge.visits(),
-                q: edge.q(),
-                prior: edge.prior(),
+            .map(|edge| {
+                let stats = edge.stats();
+                RootEdgeStats {
+                    mv: edge.mv(),
+                    completed_visits: stats.visits,
+                    started_visits: edge.visits(),
+                    q: edge.q(),
+                    q_fast: stats.weighted_wl,
+                    variance: if stats.visits < 2 {
+                        0.0
+                    } else {
+                        (stats.wl_sq_sum / stats.visits as f32 - edge.q() * edge.q()).max(0.0)
+                    },
+                    prior: edge.prior(),
+                }
             })
             .collect(),
     })
@@ -90,15 +143,35 @@ fn mate(child: Option<&Node>) -> Option<i32> {
     })
 }
 
-fn edge_lcb(edge: &Edge, stdevs: f32) -> Option<f32> {
+fn edge_standard_error(edge: &Edge) -> f32 {
     let stats = edge.stats();
-    if stats.visits == 0 {
-        return None;
+    if stats.visits < 2 {
+        return 0.0;
     }
     let n = stats.visits as f32;
     let q = stats.wl_sum / n;
     let variance = (stats.wl_sq_sum / n - q * q).max(0.0);
-    Some(q - stdevs * (variance / n).sqrt())
+    (variance / n).sqrt()
+}
+
+fn rank_by_score(ranked: &mut [RankedEdge], score: impl Fn(&RankedEdge) -> f32) {
+    ranked.sort_unstable_by(|left, right| {
+        score(right)
+            .total_cmp(&score(left))
+            .then_with(|| right.visits.cmp(&left.visits))
+            .then_with(|| right.q.total_cmp(&left.q))
+            .then_with(|| right.prior.total_cmp(&left.prior))
+    });
+}
+
+fn decision_score(rule: DecisionRule, edge: &RankedEdge, max_visits: u32, params: &SearchParams) -> f32 {
+    match rule {
+        DecisionRule::Auto | DecisionRule::MaxN => edge.visits as f32,
+        DecisionRule::MaxQ => edge.q,
+        DecisionRule::Lcb => edge.q - params.decision_lcb_stdevs * edge_standard_error(&edge.edge),
+        DecisionRule::Ucb => edge.q + params.decision_ucb_stdevs * edge_standard_error(&edge.edge),
+        DecisionRule::MixNQ => edge.q + params.decision_mix_n_weight * edge.visits as f32 / max_visits.max(1) as f32,
+    }
 }
 
 fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &SearchParams) -> Vec<EdgeHandle> {
@@ -113,62 +186,32 @@ fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &Searc
                 table: Arc::clone(&edges),
                 index,
             };
-            let (terminal, plies) = child(arena, &edge)
-                .filter(|_| edge.completed_visits() > 0)
-                .and_then(Node::terminal_value)
-                .map(|(wl, _, plies)| (wl.signum() as i8, plies))
-                .unwrap_or((0, 0.0));
             RankedEdge {
                 visits: edge.completed_visits(),
                 q: edge.q(),
                 prior: edge.prior(),
                 edge,
-                terminal,
-                plies,
             }
         })
         .collect();
-    ranked.sort_unstable_by(|left, right| {
-        right
-            .terminal
-            .cmp(&left.terminal)
-            .then_with(|| match left.terminal {
-                1 => left.plies.total_cmp(&right.plies),
-                -1 => right.plies.total_cmp(&left.plies),
-                _ => std::cmp::Ordering::Equal,
-            })
-            .then_with(|| right.visits.cmp(&left.visits))
-            .then_with(|| right.q.total_cmp(&left.q))
-            .then_with(|| right.prior.total_cmp(&left.prior))
+    let max_visits = ranked.iter().map(|edge| edge.visits).max().unwrap_or(0);
+    rank_by_score(&mut ranked, |edge| {
+        decision_score(params.decision_rule, edge, max_visits, params)
     });
-    let mut ranked: Vec<_> = ranked.into_iter().map(|ranked| ranked.edge).collect();
-    if params.lcb_stdevs > 0.0 && ranked.len() > 1 {
-        let baseline = &ranked[0];
-        let min_visits = baseline.completed_visits() as f32 * params.lcb_min_visit_fraction;
-        let decisive_terminal = child(arena, baseline)
-            .and_then(Node::terminal_value)
-            .is_some_and(|(wl, _, _)| wl != 0.0);
-        if !decisive_terminal
-            && let Some(base_lcb) = edge_lcb(baseline, params.lcb_stdevs)
-            && let Some((index, _)) = ranked
-                .iter()
-                .enumerate()
-                .skip(1)
-                .filter_map(|(index, edge)| {
-                    (edge.completed_visits() as f32 >= min_visits)
-                        .then(|| edge_lcb(edge, params.lcb_stdevs).map(|lcb| (index, lcb)))?
-                })
-                .max_by(|left, right| left.1.total_cmp(&right.1))
-                .filter(|(_, lcb)| *lcb >= base_lcb + 0.01)
-        {
-            ranked.swap(0, index);
-        }
-    }
-    ranked
+    ranked.into_iter().map(|edge| edge.edge).collect()
 }
 
 fn best_edge(arena: &NodeArena, root: NodeId, filter: &[Move], params: &SearchParams) -> Option<EdgeHandle> {
     ranked_edges(arena, root, filter, params).into_iter().next()
+}
+
+pub fn best_move_with_params(
+    arena: &NodeArena,
+    root: NodeId,
+    root_is_black: bool,
+    params: &SearchParams,
+) -> Option<Move> {
+    best_edge(arena, root, &[], params).map(|edge| orient_move(edge.mv(), root_is_black))
 }
 
 pub(crate) fn best_move_filtered_with_params(
@@ -182,7 +225,7 @@ pub(crate) fn best_move_filtered_with_params(
 }
 
 pub fn best_move(arena: &NodeArena, root: NodeId, root_is_black: bool) -> Option<Move> {
-    best_move_filtered_with_params(arena, root, root_is_black, &[], &SearchParams::default())
+    best_move_with_params(arena, root, root_is_black, &SearchParams::default())
 }
 
 pub(crate) fn best_mate_with_params(
@@ -258,4 +301,84 @@ pub(crate) fn root_variations(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use xiangqi_core::{Move, Square};
+
+    use super::{DecisionRule, NodeArena, SearchParams, best_move_with_params};
+
+    fn mv(from: &str, to: &str) -> Move {
+        Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
+    }
+
+    fn complete_samples(node: &super::Node, edge_index: usize, samples: &[f32]) {
+        for &sample in samples {
+            node.reserve_edge(edge_index)
+                .expect("reservation")
+                .complete(sample, 1.0);
+        }
+    }
+
+    #[test]
+    fn explicit_decision_rules_rank_completed_evidence_as_configured() {
+        let arena = NodeArena::default();
+        let root = arena.allocate();
+        let node = arena.get(root).expect("root");
+        assert!(node.try_begin_evaluation());
+        let first = mv("a0", "a1");
+        let second = mv("b0", "b1");
+        let third = mv("c0", "c1");
+        node.publish_edges(vec![(first, 0.4), (second, 0.3), (third, 0.3)]);
+        complete_samples(node, 0, &[0.2; 4]);
+        complete_samples(node, 1, &[0.6; 2]);
+        complete_samples(node, 2, &[-1.0, 1.0]);
+
+        let select = |rule, mix_weight| {
+            best_move_with_params(
+                &arena,
+                root,
+                false,
+                &SearchParams {
+                    decision_rule: rule,
+                    decision_mix_n_weight: mix_weight,
+                    decision_lcb_stdevs: 1.0,
+                    decision_ucb_stdevs: 1.0,
+                    ..SearchParams::default()
+                },
+            )
+        };
+        assert_eq!(select(DecisionRule::MaxN, 0.0), Some(first));
+        assert_eq!(select(DecisionRule::MaxQ, 0.0), Some(second));
+        assert_eq!(select(DecisionRule::Lcb, 0.0), Some(second));
+        assert_eq!(select(DecisionRule::Ucb, 0.0), Some(third));
+        assert_eq!(select(DecisionRule::MixNQ, 0.5), Some(second));
+        assert_eq!(select(DecisionRule::MixNQ, 1.0), Some(first));
+    }
+
+    #[test]
+    fn auto_is_the_max_n_baseline() {
+        let arena = NodeArena::default();
+        let root = arena.allocate();
+        let node = arena.get(root).expect("root");
+        assert!(node.try_begin_evaluation());
+        let first = mv("a0", "a1");
+        let second = mv("b0", "b1");
+        node.publish_edges(vec![(first, 0.5), (second, 0.5)]);
+        complete_samples(node, 0, &[0.2, 0.2]);
+        complete_samples(node, 1, &[1.0]);
+
+        assert_eq!(
+            best_move_with_params(
+                &arena,
+                root,
+                false,
+                &SearchParams {
+                    ..SearchParams::default()
+                },
+            ),
+            Some(first)
+        );
+    }
 }
