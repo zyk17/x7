@@ -136,12 +136,13 @@ cargo run --release -p engin
 `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`VarianceBonusScale`、`NnWindow`、`VirtualMeanFpuScale`、`DecisionRule`、`DecisionLcbStdevs`、`DecisionUcbStdevs`、`DecisionMixNWeight`、`Threads`。
 `NnBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
 搜索参数默认 `CPuct=1.25`、`CPuctBase=40000`、`CPuctFactor=4.0`、`FpuReduction=0.500`；
+`VarianceBonusScale=0.1` 是当前启用的实验性 SE verification bonus；
 `DecisionLcbStdevs=1.0`、`DecisionUcbStdevs=1.0` 是一倍 SE 的温和置信修正，`DecisionMixNWeight=0.25` 表示最多 0.25 个 Q 单位的归一化 N 偏好；默认 `DecisionRule=Auto`（即 `MaxN`），因此三者只在切换到相应规则后生效。
 `DecisionRule=Auto` 与 `MaxN` 都直接取最大 completed N；`MaxQ` 直接取最大 Q；`Lcb/Ucb` 分别直接取最大
 `Q - DecisionLcbStdevs * SE` / `Q + DecisionUcbStdevs * SE`；`MixNQ` 直接取最大
 `Q + DecisionMixNWeight * N/max(root child N)`。所有规则使用同一套 N、Q、prior 作为并列时的稳定次序，
 不对 terminal、样本数或候选比例作额外覆盖或过滤；未满两个样本时 `SE=0`。
-`VarianceBonusScale=0` 关闭独立 SE 验证 bonus；非零时对至少两次 completed evidence 的 edge 加上不含 prior 的 `scale * SE`。它只为降低尚未收敛的 Q 的标准误提供平滑复核机会；`SE` 会随自身 evidence 增加自然衰减，常规 PUCT 的 Q 与 U 不变。
+将 `VarianceBonusScale=0` 可关闭独立 SE verification bonus；非零时对至少两次 completed evidence 的 edge 加上不含 prior 的 `scale * SE`。它只为降低尚未收敛的 Q 的标准误提供平滑复核机会；`SE` 会随自身 evidence 增加自然衰减，常规 PUCT 的 Q 与 U 不变。
 
 相关公式为：`score = Q_mean + U + VarianceBonusScale * SE`，其中 `SE=std/sqrt(N)`，
 `std=sqrt(max(0, mean(w²)-Q_mean²))`，全部来自同一 edge 的原始 completed `wl` 样本。
@@ -191,6 +192,9 @@ cargo run --release -p engin --bin benchmark -- `
   --movetime 3000 --repeat 3 `
   --gathers 3 --evals 5
 ```
+
+它也可在同一 fresh-tree 批次内固定 `--cpuct`、`--cpuct-factor`、`--fpu-reduction`、`--nn-window` 与
+`--virtual-mean-fpu-scale`；这用于联合观察基础树形和流水线窗口，不替代 `search_benchmark` 的参数扫描。
 
 `search_benchmark` 固定 `4/4` Search/Eval worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-tree 根部分流。使用完整历史诊断评分拐点：
 

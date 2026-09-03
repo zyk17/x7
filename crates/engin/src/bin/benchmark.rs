@@ -28,6 +28,9 @@ struct Args {
     gathers: Vec<usize>,
     evals: Vec<usize>,
     eval_batch: Option<usize>,
+    cpuct: f32,
+    cpuct_factor: f32,
+    fpu_reduction: f32,
     nn_window: f32,
     virtual_mean_fpu_scale: f32,
     variance_bonus_scale: f32,
@@ -43,7 +46,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 0] [--decision-lcb-stdevs 0] \\
+     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--cpuct 1.25] [--cpuct-factor 4] [--fpu-reduction 0.5] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 0] [--decision-lcb-stdevs 0] \\
      [--root-top 8] [--trace 128,256,512] [--collision-dist] [--tree-depth 4] [--tree-top 4]"
 }
 
@@ -58,10 +61,14 @@ fn parse_args() -> Result<Args, String> {
     let mut gathers = vec![3];
     let mut evals = vec![5];
     let mut eval_batch = None;
+    let defaults = SearchParams::default();
+    let mut cpuct = defaults.cpuct;
+    let mut cpuct_factor = defaults.cpuct_factor;
+    let mut fpu_reduction = defaults.fpu_reduction;
     let mut nn_window = 2.25f32;
     let mut virtual_mean_fpu_scale = 1.0f32;
-    let mut variance_bonus_scale = SearchParams::default().variance_bonus_scale;
-    let mut decision_lcb_stdevs = SearchParams::default().decision_lcb_stdevs;
+    let mut variance_bonus_scale = defaults.variance_bonus_scale;
+    let mut decision_lcb_stdevs = defaults.decision_lcb_stdevs;
     let mut root_top = 8;
     let mut trace = Vec::new();
     let mut show_collision_dist = false;
@@ -115,6 +122,17 @@ fn parse_args() -> Result<Args, String> {
                         .parse()
                         .map_err(|_| "--eval-batch must be an unsigned integer")?,
                 )
+            }
+            "--cpuct" => {
+                cpuct = parse_non_negative_float("--cpuct", &args.next().ok_or("--cpuct needs a value")?)?;
+            }
+            "--cpuct-factor" => {
+                cpuct_factor =
+                    parse_non_negative_float("--cpuct-factor", &args.next().ok_or("--cpuct-factor needs a value")?)?;
+            }
+            "--fpu-reduction" => {
+                fpu_reduction =
+                    parse_non_negative_float("--fpu-reduction", &args.next().ok_or("--fpu-reduction needs a value")?)?;
             }
             "--nn-window" => {
                 nn_window = args
@@ -211,6 +229,9 @@ fn parse_args() -> Result<Args, String> {
         gathers,
         evals,
         eval_batch,
+        cpuct,
+        cpuct_factor,
+        fpu_reduction,
         nn_window,
         virtual_mean_fpu_scale,
         variance_bonus_scale,
@@ -709,9 +730,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} virtual_mean_fpu_scale={:.2} variance_bonus_scale={:.3} lcb={:.3} recommended_batch={} target_batch={} nn_window={} budget={} repeat={} worker_matrix={} positions={}",
+        "onnx={} provider={} cpuct={:.3} cpuct_factor={:.3} fpu_reduction={:.3} virtual_mean_fpu_scale={:.2} variance_bonus_scale={:.3} lcb={:.3} recommended_batch={} target_batch={} nn_window={} budget={} repeat={} worker_matrix={} positions={}",
         args.onnx.display(),
         provider,
+        args.cpuct,
+        args.cpuct_factor,
+        args.fpu_reduction,
         args.virtual_mean_fpu_scale,
         args.variance_bonus_scale,
         args.decision_lcb_stdevs,
@@ -742,6 +766,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for run_index in 1..=args.repeat {
                     backend.clear_cache();
                     let params = SearchParams {
+                        cpuct: args.cpuct,
+                        cpuct_factor: args.cpuct_factor,
+                        fpu_reduction: args.fpu_reduction,
                         virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
                         variance_bonus_scale: args.variance_bonus_scale,
                         decision_lcb_stdevs: args.decision_lcb_stdevs,

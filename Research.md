@@ -115,10 +115,10 @@ scale 都比 0 更早切入主杀线；`middle_01` 中低 prior 的 `f3f7 (P=0.0
 
 因此删除 `Q_fast`、`Q_select`、`ValueUpdateRate` 与 `FreshQVisits`。结论不是未来不能加权 Q，而是权重必须来自当时可解释的证据质量（例如 terminal/proof 覆盖），不能来自样本序号。未来若引入质量加权，`Q_mean` 仍保持原始 completed evidence 的算术均值真相；新估计必须有独立质量定义与不破坏渐近收敛的证明/实验。
 
-### 目标与公式
+### 已删除 recent-Q 的目标与公式
 
-小 completed-N 时，算术均值会让一条已被选中的高 Q 边对新证据反应过慢；但把近期样本长期替换
-算术均值会破坏大样本收敛。因此保留原始算术 `Q_mean`，另维护近期加权的 `Q_fast`，仅在 Select
+当时的设想是：小 completed-N 时，算术均值会让一条已被选中的高 Q 边对新证据反应过慢；但把近期样本长期替换
+算术均值会破坏大样本收敛。因此曾保留原始算术 `Q_mean`，另维护近期加权的 `Q_fast`，仅在 Select
 使用：
 
 `Q_select = Q_mean + g(N; T) * (Q_fast - Q_mean)`，其中 `g(N; T) = max(0, 1 - N/T)`。
@@ -128,8 +128,8 @@ scale 都比 0 更早切入主杀线；`middle_01` 中低 prior 的 `f3f7 (P=0.0
 每次完成样本 `w` 时，令旧 completed-N 为 `N`，则
 `eta = a/(N+a)`，`Q_fast <- (1-eta) Q_fast + eta w`；因此 `a=1` 恰为算术均值，较大的 `a` 更重视近期样本。
 
-方差方向的目标也不是救回低 prior 招法，而是暂时给已出现分歧证据的 edge 更多复核，以更快降低
-该 edge 的均值标准误。当前只保留独立项：
+方差方向的目标则不是救回低 prior 招法，而是暂时给已出现分歧证据的 edge 更多复核，以更快降低
+该 edge 的均值标准误。当前保留独立项：
 
 `B_var = lambda * SE`（仅 `N >= 2`）。
 历史公式为 `score = Q_select + U + B_var`；当前公式为 `score = Q_mean + U + B_var`。
@@ -149,4 +149,49 @@ scale 都比 0 更早切入主杀线；`middle_01` 中低 prior 的 `f3f7 (P=0.0
 路径因混淆“PUCT 探索”和“复核证据”已移除。
 
 2026-09-03 的正常并发 trace 中，强化 `lambda=1.0` 已能显著改变早期树形：`proof_mate_01` 的低 prior `i3e3` 在 12k 时成为访问第一，而基线仍为第二；但在 `e2e1` 中只是增加早期访问，尚未更早触发深收益。故 Bvar 保留为实验项，尚未声称固定时间候选质量或 Elo 改善。
+
+## 2026-09-03：基础树形参数候选（x7 / DirectML）
+
+为先隔离基础树形，固定 virtual mean FPU scale=1、关闭 Bvar，使用 fresh tree、`Gather=3`、`Eval=5`、
+batch=64。初始局面与低 prior `e2e1` 样本共同表明：
+
+- `nn_window=1.25`（claim 上限 80）平均 batch 约 34，初始局面约 6.2k–6.5k NPS；`nn_window=2`
+  可将 batch 填至约 61，却降到约 3.5k NPS、并把 collision 从约 45% 推至约 54%。本机候选取 1.25，
+  不能把“满 batch”单独当作收益。
+- 常数 `cPUCT=0.75` 在初始局面过窄（4k 时 top-1 约 66%、top-3 约 86%）；常数 1.25 虽约为
+  52%/77%，却让 `e2e1` 在 10k 停在约 140 visits。常数 `cPUCT=3.0` 在初始局面为约 40%/65%，
+  仍有清晰的两层主干；且 `e2e1` 在 4k 已反超、约 1,170 visits，10k 为约 6,820、Q 约 0.44。
+  因而下一阶段先用 `CPuct=3.0, CPuctFactor=0`，不让增长曲线掩盖初始探索强度。
+- `FpuReduction=.33` 仍能让 `e2e1` 在 4k 反超，但约 950 visits，低于 `.25` 的约 1,170；候选为 `.25`。
+- 在该基础树形中，`lambda=.1` 通常只有约 `.003` 的单 edge bonus，难以影响选择。`.5` 在
+  `proof_mate_01` 的两个 8k repeat 中均让 `i3e3` 获得更多访问（约 4.2k 对约 3.6k）且更高 Q
+  （约 .56 对约 .52）；但未改善 `proof_variance_01` 的 `h8g8`。因此 `.5` 是可继续复验的 Bvar
+  候选，而非已确定默认；需要固定时间候选质量与 Elo 验证。
+
+该候选组合为：`CPuct=3.0`、`CPuctFactor=0`、`FpuReduction=.25`、`NnWindow=1.25`、
+`VirtualMeanFpuScale=1`，Bvar 暂列 `.5` 候选。它专门解决早期低 prior 证据不足；不声称能解决
+AND/OR terminal proof 或残局知识缺失。
+
+## 2026-09-03：常数 cPUCT / 并发窗口与 additive Bvar 复验（x7 / DirectML）
+
+后续固定时间实战提出 `CPuct=2.25`（无增长曲线）、`FpuReduction=.225`、`NnWindow=2.25`、
+`VirtualMeanFpuScale=1` 的候选。以 batch=64、Gather=3、Eval=5，在固定 visits 与 2 秒固定时间
+各三次 fresh-tree repeat 复验后：
+
+- `NnWindow=2.25` 已能保持约 40--50 的平均 batch；`2.5` 略大但也稳定增加 claim/collision。collision
+  不是单独的优劣指标：它同时反映主线集中度、virtual mean 的排斥强度、窗口上限及 NN 延迟；必须与
+  固定时间的根部行为一起解释。
+- 低 prior `e2e1` 样本中，`FpuReduction=.15/.225` 在 10k 均可使 `e2e1` 反超（约 5k--7k visits），
+  `.30/.35` 则稳定只给约 0.3k--0.5k visits，仍由高 prior `f6f3` 主导。因此当前基础候选保留 `.225`，
+  不再把 `.30+` 作为同等候选。
+- 对 `B_var=lambda*SE` 扫描 `0/.5/1/1.5/2.25`：在上述基础参数下，2 秒低 prior `e2e1` 样本的
+  `lambda=0` 三次均反超（约 5.6k--6.5k visits）；从 `.5` 起三次均未反超，`.5/1/1.5/2.25` 的
+  `e2e1` 访问约为 0.4k--3.1k。强制杀 `proof_mate_01` 各档仍收敛 `i3e3`，但 lambda 增大没有使其
+  更快聚焦；高波动 `proof_variance_01` 的 total SE 有时下降，但主线 `d8c8` 的 Q 也从约 `.984`
+  降至 `.971--.980`。
+
+这组对照否定了“只要增大 lambda 就能整体更快可靠”的解释：不带 prior 的 additive SE bonus 会把预算
+转向其他波动 edge，从而阻碍低 prior、但需要连续证据才能翻转的分支。当前 `Bvar` 不应作为基础默认的
+确定参数；保留 `0` 作基线及 `2.25` 作实战 A/B 候选，若要继续该方向，先重新定义约束/目标，而不是继续
+把 lambda 向上扫。
 

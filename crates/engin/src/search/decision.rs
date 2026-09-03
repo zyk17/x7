@@ -94,6 +94,7 @@ struct RankedEdge {
     edge: EdgeHandle,
     visits: u32,
     q: f32,
+    standard_error: f32,
     prior: f32,
 }
 
@@ -112,12 +113,8 @@ pub fn root_stats(arena: &NodeArena, root: NodeId) -> Option<RootStats> {
                     mv: edge.mv(),
                     completed_visits: stats.visits,
                     started_visits: edge.visits(),
-                    q: edge.q(),
-                    variance: if stats.visits < 2 {
-                        0.0
-                    } else {
-                        (stats.wl_sq_sum / stats.visits as f32 - edge.q() * edge.q()).max(0.0)
-                    },
+                    q: stats.q(),
+                    variance: stats.variance(),
                     prior: edge.prior(),
                 }
             })
@@ -141,17 +138,6 @@ fn mate(child: Option<&Node>) -> Option<i32> {
     })
 }
 
-fn edge_standard_error(edge: &Edge) -> f32 {
-    let stats = edge.stats();
-    if stats.visits < 2 {
-        return 0.0;
-    }
-    let n = stats.visits as f32;
-    let q = stats.wl_sum / n;
-    let variance = (stats.wl_sq_sum / n - q * q).max(0.0);
-    (variance / n).sqrt()
-}
-
 fn rank_by_score(ranked: &mut [RankedEdge], score: impl Fn(&RankedEdge) -> f32) {
     ranked.sort_unstable_by(|left, right| {
         score(right)
@@ -166,8 +152,8 @@ fn decision_score(rule: DecisionRule, edge: &RankedEdge, max_visits: u32, params
     match rule {
         DecisionRule::Auto | DecisionRule::MaxN => edge.visits as f32,
         DecisionRule::MaxQ => edge.q,
-        DecisionRule::Lcb => edge.q - params.decision_lcb_stdevs * edge_standard_error(&edge.edge),
-        DecisionRule::Ucb => edge.q + params.decision_ucb_stdevs * edge_standard_error(&edge.edge),
+        DecisionRule::Lcb => edge.q - params.decision_lcb_stdevs * edge.standard_error,
+        DecisionRule::Ucb => edge.q + params.decision_ucb_stdevs * edge.standard_error,
         DecisionRule::MixNQ => edge.q + params.decision_mix_n_weight * edge.visits as f32 / max_visits.max(1) as f32,
     }
 }
@@ -184,9 +170,11 @@ fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &Searc
                 table: Arc::clone(&edges),
                 index,
             };
+            let stats = edge.stats();
             RankedEdge {
-                visits: edge.completed_visits(),
-                q: edge.q(),
+                visits: stats.visits,
+                q: stats.q(),
+                standard_error: stats.standard_error(),
                 prior: edge.prior(),
                 edge,
             }

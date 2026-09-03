@@ -24,11 +24,13 @@ pub struct Options {
     pub cpuct_factor: f32,
     /// UCI `FpuReduction`：未访问边相对 parent Q 的 FPU 降幅。
     pub fpu_reduction: f32,
+    /// UCI `VarianceBonusScale`：已观察 edge 的 `scale * SE` 复核 bonus。
     pub variance_bonus_scale: f32,
     /// Eval claim 上限相对 batch 的倍率；控制 pending work 的新鲜度与 NN 供给。
     pub nn_window: f32,
     /// reservation 临时写入的 FPU 缩放；仅在 in-flight 时影响 action Q。
     pub virtual_mean_fpu_scale: f32,
+    /// UCI 根决策 `Lcb` / `Ucb` 的 SE 半径倍数。
     pub decision_lcb_stdevs: f32,
     pub decision_ucb_stdevs: f32,
     pub decision_rule: DecisionRule,

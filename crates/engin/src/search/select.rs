@@ -3,7 +3,6 @@ use xiangqi_core::Move;
 
 use super::Edge;
 use super::param::SearchParams;
-use super::tree::EdgeStats;
 use crate::utils::fastmath::fast_log;
 
 /// cPUCT：常数项加上随访问数缓慢增长的对数项。
@@ -29,18 +28,8 @@ fn visited_policy(edges: &[Edge]) -> f32 {
         .sum()
 }
 
-/// 树搜索 action Q：读本 edge 的完成样本；可叠加 in-flight virtual mean。
-fn completed_selection_q(stats: EdgeStats) -> f32 {
-    stats.wl_sum / stats.visits as f32
-}
-
-fn edge_utility(edge: &Edge, fpu: f32, use_virtual_mean: bool) -> f32 {
-    let (stats, started_visits) = edge.selection_snapshot();
-    let completed_q = if stats.visits == 0 {
-        fpu
-    } else {
-        completed_selection_q(stats)
-    };
+fn action_q(stats: super::tree::EdgeStats, started_visits: u32, fpu: f32, use_virtual_mean: bool) -> f32 {
+    let completed_q = if stats.visits == 0 { fpu } else { stats.q() };
     let in_flight = started_visits.saturating_sub(stats.visits);
     if !use_virtual_mean || in_flight == 0 {
         completed_q
@@ -49,15 +38,10 @@ fn edge_utility(edge: &Edge, fpu: f32, use_virtual_mean: bool) -> f32 {
     }
 }
 
-/// 原始 completed evidence 的均值标准误代理，不把 reservation 当作信息。
-fn evidence_standard_error(edge: &Edge) -> f32 {
-    let stats = edge.stats();
-    if stats.visits < 2 {
-        return 0.0;
-    }
-    let mean = stats.wl_sum / stats.visits as f32;
-    let variance = (stats.wl_sq_sum / stats.visits as f32 - mean * mean).max(0.0);
-    (variance / stats.visits as f32).sqrt()
+#[cfg(test)]
+fn edge_utility(edge: &Edge, fpu: f32, use_virtual_mean: bool) -> f32 {
+    let (stats, started_visits) = edge.selection_snapshot();
+    action_q(stats, started_visits, fpu, use_virtual_mean)
 }
 
 /// 不带 prior 的均值不确定性 bonus。未访问或仅一个样本时没有方差信息；
@@ -104,10 +88,10 @@ pub(crate) fn select_edge(
         if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
             continue;
         }
-        let q = edge_utility(edge, fpu, params.virtual_mean_fpu_scale > 0.0);
-        let u = u_coeff * edge.prior() / (1 + edge.visits()) as f32;
-        let standard_error = evidence_standard_error(edge);
-        let score = q + u + variance_bonus_from_se(edge.completed_visits(), standard_error, params);
+        let (stats, started_visits) = edge.selection_snapshot();
+        let q = action_q(stats, started_visits, fpu, params.virtual_mean_fpu_scale > 0.0);
+        let u = u_coeff * edge.prior() / (1 + started_visits) as f32;
+        let score = q + u + variance_bonus_from_se(stats.visits, stats.standard_error(), params);
         if best.is_none_or(|(_, best_score)| score > best_score) {
             best = Some((index, score));
         }

@@ -22,8 +22,6 @@ use crate::EnginError;
 pub struct ValueDelta {
     pub visits: u32,
     pub wl_sum: f32,
-    /// `wl²` 聚合。仅用于根 LCB 的 value dispersion，不参与 Q / PUCT。
-    pub wl_sq_sum: f32,
     pub draw_sum: f32,
     pub m_sum: f32,
 }
@@ -36,7 +34,6 @@ impl ValueDelta {
         Self {
             visits: 1,
             wl_sum: wl,
-            wl_sq_sum: wl * wl,
             draw_sum: draw,
             m_sum: 0.0,
         }
@@ -68,7 +65,6 @@ impl ValueDelta {
         Self {
             visits: self.visits + other.visits,
             wl_sum: self.wl_sum + other.wl_sum,
-            wl_sq_sum: self.wl_sq_sum + other.wl_sq_sum,
             draw_sum: self.draw_sum + other.draw_sum,
             m_sum: self.m_sum + other.m_sum,
         }
@@ -115,13 +111,40 @@ pub struct Edge {
     stats: Mutex<EdgeStats>,
 }
 
-/// edge 聚合。原始矩是稳定 action-Q/SE 的真相。
+/// edge 聚合。completed 原始矩是 action-Q、方差与 SE 的唯一真相。
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EdgeStats {
     pub visits: u32,
     pub wl_sum: f32,
     pub wl_sq_sum: f32,
     pub virtual_wl_sum: f32,
+}
+
+impl EdgeStats {
+    pub(crate) fn q(self) -> f32 {
+        if self.visits == 0 {
+            0.0
+        } else {
+            self.wl_sum / self.visits as f32
+        }
+    }
+
+    pub(crate) fn variance(self) -> f32 {
+        if self.visits < 2 {
+            0.0
+        } else {
+            (self.wl_sq_sum / self.visits as f32 - self.q() * self.q()).max(0.0)
+        }
+    }
+
+    /// completed evidence 的样本均值标准误；reservation 不属于证据。
+    pub(crate) fn standard_error(self) -> f32 {
+        if self.visits < 2 {
+            0.0
+        } else {
+            (self.variance() / self.visits as f32).sqrt()
+        }
+    }
 }
 
 impl Edge {
@@ -176,11 +199,7 @@ impl Edge {
     }
 
     pub fn q(&self) -> f32 {
-        let stats = self.stats.lock();
-        if stats.visits == 0 {
-            return 0.0;
-        }
-        stats.wl_sum / stats.visits as f32
+        self.stats.lock().q()
     }
 
     fn reserve(&self, virtual_mean: Option<f32>) -> f32 {
@@ -265,7 +284,6 @@ impl ExpansionState {
 struct NodeStats {
     visits: u32,
     wl_sum: f32,
-    wl_sq_sum: f32,
     draw_sum: f32,
     m_sum: f32,
 }
@@ -323,7 +341,6 @@ impl Node {
         let mut stats = self.stats.lock();
         stats.visits += delta.visits;
         stats.wl_sum += delta.wl_sum;
-        stats.wl_sq_sum += delta.wl_sq_sum;
         stats.draw_sum += delta.draw_sum;
         stats.m_sum += delta.m_sum;
     }

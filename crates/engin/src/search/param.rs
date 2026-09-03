@@ -1,6 +1,6 @@
 //! 搜索分层配置：
 //!
-//! - `SearchParams`：算法旋钮（PUCT / FPU / virtual mean / 根 LCB）。`Copy`，热路径只带这一包。
+//! - `SearchParams`：算法旋钮（PUCT / FPU / virtual mean / Bvar / 根决策）。`Copy`，热路径只带这一包。
 //! - `SearchConfig`：当前固定 worker 实现的线程、队列、batch、window 配置 + 嵌套的 `SearchParams`。
 //! - `SearchLimits`（在 `pipeline`）：这一手 `go` 的停止条件与 `searchmoves`。
 //! - `Options`（`options.rs`）：UCI / 引擎生命周期；`go` 时拍快照写入上面几层。
