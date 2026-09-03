@@ -381,8 +381,6 @@ impl Engine {
                 cpuct_base: self.options.cpuct_base,
                 cpuct_factor: self.options.cpuct_factor,
                 fpu_reduction: self.options.fpu_reduction,
-                value_update_rate: self.options.value_update_rate,
-                fresh_q_visits: self.options.fresh_q_visits,
                 variance_bonus_scale: self.options.variance_bonus_scale,
                 virtual_mean_fpu_scale: self.options.virtual_mean_fpu_scale,
                 decision_lcb_stdevs: self.options.decision_lcb_stdevs,

@@ -554,10 +554,6 @@ mod tests {
         options.set_uci_option("cpuctfactor", "2.5").expect("cpuct factor");
         options.set_uci_option("fpureduction", "0.35").expect("fpu reduction");
         options
-            .set_uci_option("ValueUpdateRate", "2")
-            .expect("value update rate");
-        options.set_uci_option("FreshQVisits", "20").expect("fresh Q visits");
-        options
             .set_uci_option("VarianceBonusScale", "0.4")
             .expect("variance bonus scale");
         options.set_uci_option("DecisionLcbStdevs", "4").expect("lcb stdevs");
@@ -578,8 +574,6 @@ mod tests {
         assert_eq!(options.cpuct_base, 20_000.0);
         assert_eq!(options.cpuct_factor, 2.5);
         assert_eq!(options.fpu_reduction, 0.35);
-        assert_eq!(options.value_update_rate, 2.0);
-        assert_eq!(options.fresh_q_visits, 20.0);
         assert_eq!(options.variance_bonus_scale, 0.4);
         assert_eq!(options.decision_lcb_stdevs, 4.0);
         assert_eq!(options.decision_ucb_stdevs, 3.0);
@@ -593,8 +587,6 @@ mod tests {
         assert!(options.set_uci_option("CPuctBase", "0").is_err());
         assert!(options.set_uci_option("CPuctFactor", "NaN").is_err());
         assert!(options.set_uci_option("FpuReduction", "-0.1").is_err());
-        assert!(options.set_uci_option("ValueUpdateRate", "0").is_err());
-        assert!(options.set_uci_option("FreshQVisits", "NaN").is_err());
         assert!(options.set_uci_option("VarianceBonusScale", "NaN").is_err());
         assert!(options.set_uci_option("DecisionLcbStdevs", "NaN").is_err());
         assert!(options.set_uci_option("DecisionUcbStdevs", "NaN").is_err());

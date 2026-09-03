@@ -107,7 +107,13 @@ scale 都比 0 更早切入主杀线；`middle_01` 中低 prior 的 `f3f7 (P=0.0
 成为第一，但 2/4 被高 prior `e0e1` 压回。稳定路线即使保留较高 sigma，其 credit 也下降到约
 0.001–0.01。结果支持“credit 有时效”这一机制，不支持当前常数、衰减率或 scale 已可进入正式默认。
 
-## 2026-09-01：recent-Q 与 SE verification bonus
+## 2026-09-01～03：recent-Q 失败与 SE verification bonus
+
+### recent-Q 失败结论
+
+下述 `Q_fast/Q_select` 是已删除的历史实现，不是当前搜索公式。强化到 `a=8,T=80` 后，它确实能改变早期树形；但低 prior、深收益晚显现的分支会因早期暂时偏低的 Q 更快失去访问。它会同时加速近期好证据和近期坏证据，无法区分普通反证与尚未看深的正确分支。
+
+因此删除 `Q_fast`、`Q_select`、`ValueUpdateRate` 与 `FreshQVisits`。结论不是未来不能加权 Q，而是权重必须来自当时可解释的证据质量（例如 terminal/proof 覆盖），不能来自样本序号。未来若引入质量加权，`Q_mean` 仍保持原始 completed evidence 的算术均值真相；新估计必须有独立质量定义与不破坏渐近收敛的证明/实验。
 
 ### 目标与公式
 
@@ -125,12 +131,12 @@ scale 都比 0 更早切入主杀线；`middle_01` 中低 prior 的 `f3f7 (P=0.0
 方差方向的目标也不是救回低 prior 招法，而是暂时给已出现分歧证据的 edge 更多复核，以更快降低
 该 edge 的均值标准误。当前只保留独立项：
 
-`B_var = lambda * SE`（仅 `N >= 2`），
-`score = Q_select + U + B_var`。
+`B_var = lambda * SE`（仅 `N >= 2`）。
+历史公式为 `score = Q_select + U + B_var`；当前公式为 `score = Q_mean + U + B_var`。
 
 `SE` 是该 edge 的原始 completed `wl` 样本均值的经验标准误：
 `Q_mean = sum(w_i)/N`，`std = sqrt(max(0, sum(w_i^2)/N - Q_mean^2))`，
-`SE = std/sqrt(N)`。它不读 `Q_fast`、prior、父 N、reservation 或 depth。
+`SE = std/sqrt(N)`。它不读 prior、父 N、reservation 或 depth。
 所以未访问/只有一个样本的 edge 仍只由通常的 FPU/PUCT 获得机会；停止回访时 `B_var` 不会像 U 一样
 随 sibling 访问增长。即使局面的原始 `std` 持续存在，`SE=std/sqrt(N)` 仍会随自身 evidence 自然趋近 0，
 不再人为 cap 高 SE 或设停止阈值。
@@ -142,6 +148,5 @@ scale 都比 0 更早切入主杀线；`middle_01` 中低 prior 的 `f3f7 (P=0.0
 高 SE、已有 evidence 的边额外访问。同配置 repeat 的根部 trace 可复现。原始的 `U * (1 + k * SE)`
 路径因混淆“PUCT 探索”和“复核证据”已移除。
 
-这些只验证了公式的不变量与局部行为，**没有**证明固定时间候选质量或 Elo 改善，也没有选定
-`a`、`T`、`lambda`；正式默认保持 `FreshQVisits=0`、`VarianceBonusScale=0`。
+2026-09-03 的正常并发 trace 中，强化 `lambda=1.0` 已能显著改变早期树形：`proof_mate_01` 的低 prior `i3e3` 在 12k 时成为访问第一，而基线仍为第二；但在 `e2e1` 中只是增加早期访问，尚未更早触发深收益。故 Bvar 保留为实验项，尚未声称固定时间候选质量或 Elo 改善。
 

@@ -13,8 +13,7 @@ use engin::neural::onnx::OnnxBackend;
 use engin::neural::{EncodedBatch, FillEmptyHistory, encode_position_input_planes, eval_result_from_encoded_row};
 use engin::search::{
     BenchObserver, BenchStats, DecisionRule, NodeId, QueueStats, RootEdgeStats, Search, SearchConfig, SearchLimits,
-    SearchParams, Stats, best_move, best_move_with_params, compute_cpuct, root_stats, selection_q_from_means,
-    variance_bonus_from_se,
+    SearchParams, Stats, best_move, best_move_with_params, compute_cpuct, root_stats, variance_bonus_from_se,
 };
 use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
@@ -31,8 +30,6 @@ struct Args {
     eval_batch: Option<usize>,
     nn_window: f32,
     virtual_mean_fpu_scale: f32,
-    value_update_rate: f32,
-    fresh_q_visits: f32,
     variance_bonus_scale: f32,
     decision_lcb_stdevs: f32,
     root_top: usize,
@@ -46,7 +43,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--value-update-rate 1] [--fresh-q-visits 0] [--variance-bonus-scale 0] [--decision-lcb-stdevs 0] \\
+     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 0] [--decision-lcb-stdevs 0] \\
      [--root-top 8] [--trace 128,256,512] [--collision-dist] [--tree-depth 4] [--tree-top 4]"
 }
 
@@ -63,8 +60,6 @@ fn parse_args() -> Result<Args, String> {
     let mut eval_batch = None;
     let mut nn_window = 2.25f32;
     let mut virtual_mean_fpu_scale = 1.0f32;
-    let mut value_update_rate = SearchParams::default().value_update_rate;
-    let mut fresh_q_visits = SearchParams::default().fresh_q_visits;
     let mut variance_bonus_scale = SearchParams::default().variance_bonus_scale;
     let mut decision_lcb_stdevs = SearchParams::default().decision_lcb_stdevs;
     let mut root_top = 8;
@@ -138,18 +133,6 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--virtual-mean-fpu-scale must be finite and non-negative".into());
                 }
                 virtual_mean_fpu_scale = scale;
-            }
-            "--value-update-rate" => {
-                value_update_rate = parse_positive_float(
-                    "--value-update-rate",
-                    &args.next().ok_or("--value-update-rate needs a value")?,
-                )?;
-            }
-            "--fresh-q-visits" => {
-                fresh_q_visits = parse_non_negative_float(
-                    "--fresh-q-visits",
-                    &args.next().ok_or("--fresh-q-visits needs a value")?,
-                )?;
             }
             "--variance-bonus-scale" => {
                 variance_bonus_scale = parse_non_negative_float(
@@ -230,8 +213,6 @@ fn parse_args() -> Result<Args, String> {
         eval_batch,
         nn_window,
         virtual_mean_fpu_scale,
-        value_update_rate,
-        fresh_q_visits,
         variance_bonus_scale,
         decision_lcb_stdevs,
         root_top,
@@ -246,14 +227,6 @@ fn parse_non_negative_float(name: &str, text: &str) -> Result<f32, String> {
     let value = text.parse::<f32>().map_err(|_| format!("{name} must be a number"))?;
     if !value.is_finite() || value < 0.0 {
         return Err(format!("{name} must be finite and non-negative"));
-    }
-    Ok(value)
-}
-
-fn parse_positive_float(name: &str, text: &str) -> Result<f32, String> {
-    let value = parse_non_negative_float(name, text)?;
-    if value == 0.0 {
-        return Err(format!("{name} must be positive"));
     }
     Ok(value)
 }
@@ -538,30 +511,20 @@ fn print_root_block(
     let child_n = edges.iter().map(|edge| edge.started_visits).sum::<u32>().max(1);
     let u_coeff =
         compute_cpuct(*params, root.as_ref().map_or(0, |node| node.completed_visits)) * (child_n as f32).sqrt();
-    println!(
-        "  move       P    done flight    Qmean    Qfast     g   Qselect    Var     SE     LCB      U    UxSE   Bvar"
-    );
+    println!("  move       P    done flight    Qmean    Var     SE     LCB      U    UxSE   Bvar");
     for edge in edges.into_iter().take(top) {
         let mv = if root_is_black { edge.mv.flip() } else { edge.mv };
-        let (fresh_weight, q_select) = if edge.completed_visits == 0 {
-            (0.0, 0.0)
-        } else {
-            selection_q_from_means(edge.completed_visits, edge.q, edge.q_fast, params)
-        };
         let se = standard_error(edge.completed_visits, edge.variance).unwrap_or(0.0);
         let u = u_coeff * edge.prior / (1 + edge.started_visits) as f32;
         let variance_bonus = variance_bonus_from_se(edge.completed_visits, se, params);
         let lcb = edge.q - params.decision_lcb_stdevs * se;
         println!(
-            "  {:<6} {:>7.4} {:>7} {:>6} {:>8.4} {:>8.4} {:>5.2} {:>9.4} {:>6.3} {:>6.3} {:>7.3} {:>6.3} {:>7.4} {:>6.3}",
+            "  {:<6} {:>7.4} {:>7} {:>6} {:>8.4} {:>6.3} {:>6.3} {:>7.3} {:>6.3} {:>7.4} {:>6.3}",
             mv.to_uci(),
             edge.prior,
             edge.completed_visits,
             edge.started_visits.saturating_sub(edge.completed_visits),
             edge.q,
-            edge.q_fast,
-            fresh_weight,
-            q_select,
             edge.variance,
             se,
             lcb,
@@ -582,13 +545,7 @@ fn print_root_block(
     }
 }
 
-fn print_tree_funnel(
-    search: &Search<BenchObserver>,
-    root_is_black: bool,
-    max_depth: usize,
-    top: usize,
-    params: &SearchParams,
-) {
+fn print_tree_funnel(search: &Search<BenchObserver>, root_is_black: bool, max_depth: usize, top: usize) {
     println!("Tree funnel (depth<={max_depth}, top={top}/node; path-local cycle stop)");
     let mut path = HashSet::new();
     print_tree_node(
@@ -599,7 +556,6 @@ fn print_tree_funnel(
         max_depth,
         top,
         None,
-        params,
         &mut path,
     );
 }
@@ -612,8 +568,7 @@ fn print_tree_node(
     depth: usize,
     max_depth: usize,
     top: usize,
-    via: Option<(String, f32, u32, f32, f32)>,
-    params: &SearchParams,
+    via: Option<(String, f32, u32, f32)>,
     path: &mut HashSet<NodeId>,
 ) {
     if depth > max_depth || !path.insert(node_id) {
@@ -625,14 +580,11 @@ fn print_tree_node(
     };
     let indent = "  ".repeat(depth + 1);
     match via {
-        Some((mv, prior, n, mean, fast)) => {
-            let (fresh_weight, select) = selection_q_from_means(n, mean, fast, params);
-            println!(
-                "{indent}{mv:<6} P={prior:.4} N={n:<6} Qmean={mean:.4} Qfast={fast:.4} g={fresh_weight:.2} Qselect={select:.4}  node_N={} M={:.1}",
-                node.completed_visits(),
-                node.m()
-            )
-        }
+        Some((mv, prior, n, mean)) => println!(
+            "{indent}{mv:<6} P={prior:.4} N={n:<6} Q={mean:.4}  node_N={} M={:.1}",
+            node.completed_visits(),
+            node.m()
+        ),
         None => println!(
             "{indent}root     N={:<6} Q={:.4} M={:.1}",
             node.completed_visits(),
@@ -668,14 +620,7 @@ fn print_tree_node(
             depth + 1,
             max_depth,
             top,
-            Some((
-                mv.to_uci(),
-                edge.prior(),
-                edge.completed_visits(),
-                edge.q(),
-                edge.q_fast(),
-            )),
-            params,
+            Some((mv.to_uci(), edge.prior(), edge.completed_visits(), edge.q())),
             path,
         );
     }
@@ -751,7 +696,7 @@ fn print_run_report(
     print_root_block(search, root_is_black, args.root_top, "Root", Some(nn), params);
 
     if let Some(depth) = args.tree_depth {
-        print_tree_funnel(search, root_is_black, depth, args.tree_top, params);
+        print_tree_funnel(search, root_is_black, depth, args.tree_top);
     }
 }
 
@@ -764,12 +709,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} virtual_mean_fpu_scale={:.2} value_update_rate={:.3} fresh_q_visits={:.1} variance_bonus_scale={:.3} lcb={:.3} recommended_batch={} target_batch={} nn_window={} budget={} repeat={} worker_matrix={} positions={}",
+        "onnx={} provider={} virtual_mean_fpu_scale={:.2} variance_bonus_scale={:.3} lcb={:.3} recommended_batch={} target_batch={} nn_window={} budget={} repeat={} worker_matrix={} positions={}",
         args.onnx.display(),
         provider,
         args.virtual_mean_fpu_scale,
-        args.value_update_rate,
-        args.fresh_q_visits,
         args.variance_bonus_scale,
         args.decision_lcb_stdevs,
         recommended,
@@ -800,8 +743,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     backend.clear_cache();
                     let params = SearchParams {
                         virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
-                        value_update_rate: args.value_update_rate,
-                        fresh_q_visits: args.fresh_q_visits,
                         variance_bonus_scale: args.variance_bonus_scale,
                         decision_lcb_stdevs: args.decision_lcb_stdevs,
                         ..SearchParams::default()
@@ -841,7 +782,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 &params,
                             );
                             if let Some(depth) = args.tree_depth {
-                                print_tree_funnel(&search, root_is_black, depth, args.tree_top, &params);
+                                print_tree_funnel(&search, root_is_black, depth, args.tree_top);
                             }
                         }
                         if args.trace.last().copied().unwrap_or(0) < playouts {

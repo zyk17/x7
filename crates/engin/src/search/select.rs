@@ -29,28 +29,17 @@ fn visited_policy(edges: &[Edge]) -> f32 {
         .sum()
 }
 
-/// completed evidence 的 fast-Q 生命周期；benchmark 也用它观察实际 select-Q。
-pub fn selection_q_from_means(visits: u32, mean: f32, fast: f32, params: &SearchParams) -> (f32, f32) {
-    debug_assert!(visits > 0);
-    if params.fresh_q_visits == 0.0 {
-        return (0.0, mean);
-    }
-    let fresh_weight = (1.0_f32 - visits as f32 / params.fresh_q_visits).clamp(0.0, 1.0);
-    (fresh_weight, mean + fresh_weight * (fast - mean))
-}
-
 /// 树搜索 action Q：读本 edge 的完成样本；可叠加 in-flight virtual mean。
-fn completed_selection_q(stats: EdgeStats, params: &SearchParams) -> f32 {
-    let mean = stats.wl_sum / stats.visits as f32;
-    selection_q_from_means(stats.visits, mean, stats.weighted_wl, params).1
+fn completed_selection_q(stats: EdgeStats) -> f32 {
+    stats.wl_sum / stats.visits as f32
 }
 
-fn edge_utility(edge: &Edge, fpu: f32, use_virtual_mean: bool, params: &SearchParams) -> f32 {
+fn edge_utility(edge: &Edge, fpu: f32, use_virtual_mean: bool) -> f32 {
     let (stats, started_visits) = edge.selection_snapshot();
     let completed_q = if stats.visits == 0 {
         fpu
     } else {
-        completed_selection_q(stats, params)
+        completed_selection_q(stats)
     };
     let in_flight = started_visits.saturating_sub(stats.visits);
     if !use_virtual_mean || in_flight == 0 {
@@ -115,7 +104,7 @@ pub(crate) fn select_edge(
         if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
             continue;
         }
-        let q = edge_utility(edge, fpu, params.virtual_mean_fpu_scale > 0.0, params);
+        let q = edge_utility(edge, fpu, params.virtual_mean_fpu_scale > 0.0);
         let u = u_coeff * edge.prior() / (1 + edge.visits()) as f32;
         let standard_error = evidence_standard_error(edge);
         let score = q + u + variance_bonus_from_se(edge.completed_visits(), standard_error, params);
@@ -130,10 +119,7 @@ pub(crate) fn select_edge(
 mod tests {
     use xiangqi_core::{Move, Square};
 
-    use super::{
-        completed_selection_q, compute_cpuct, edge_utility, evidence_standard_error, select_edge,
-        selection_q_from_means, variance_bonus_from_se, visited_policy,
-    };
+    use super::{compute_cpuct, edge_utility, select_edge, variance_bonus_from_se, visited_policy};
     use crate::search::NodeArena;
     use crate::search::param::SearchParams;
 
@@ -150,6 +136,7 @@ mod tests {
         assert_eq!(params.decision_lcb_stdevs, 1.0);
         assert_eq!(params.decision_ucb_stdevs, 1.0);
         assert_eq!(params.decision_mix_n_weight, 0.25);
+        assert_eq!(params.variance_bonus_scale, 0.1);
         assert_eq!(compute_cpuct(params, 0), params.cpuct);
         // `fast_log` 是热路径近似；默认曲线在 50k 时接近设计目标 4.5。
         assert!((compute_cpuct(params, 50_000) - 4.5).abs() < 0.05);
@@ -225,8 +212,8 @@ mod tests {
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edges = node.edges();
         let edge = &edges[0];
-        node.reserve_edge(0).expect("res").complete(0.5, 1.0);
-        assert!((edge_utility(edge, 0.0, false, &SearchParams::default()) - 0.5).abs() < 1e-6);
+        node.reserve_edge(0).expect("res").complete(0.5);
+        assert!((edge_utility(edge, 0.0, false) - 0.5).abs() < 1e-6);
         assert!((visited_policy(std::slice::from_ref(edge)) - 1.0).abs() < f32::EPSILON);
     }
 
@@ -238,52 +225,18 @@ mod tests {
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edges = node.edges();
         let edge = &edges[0];
-        node.reserve_edge(0).expect("completed evidence").complete(0.8, 1.0);
-        assert!((edge_utility(edge, -0.3, true, &SearchParams::default()) - 0.8).abs() < 1e-6);
+        node.reserve_edge(0).expect("completed evidence").complete(0.8);
+        assert!((edge_utility(edge, -0.3, true) - 0.8).abs() < 1e-6);
 
         let reservation = node
             .reserve_edge_with_virtual_mean(0, Some(-0.3))
             .expect("virtual mean reservation");
-        assert!((edge_utility(edge, -0.3, true, &SearchParams::default()) - 0.25).abs() < 1e-6);
+        assert!((edge_utility(edge, -0.3, true) - 0.25).abs() < 1e-6);
         reservation.cancel();
 
-        assert!((edge_utility(edge, -0.3, true, &SearchParams::default()) - 0.8).abs() < 1e-6);
+        assert!((edge_utility(edge, -0.3, true) - 0.8).abs() < 1e-6);
         let stats = edge.stats();
         assert_eq!(stats.visits, 1);
         assert_eq!(stats.virtual_wl_sum, 0.0);
-    }
-
-    #[test]
-    fn recent_value_rate_preserves_mean_baseline_and_tracks_effective_evidence() {
-        let arena = NodeArena::default();
-        let node = arena.get(arena.allocate()).expect("node");
-        assert!(node.try_begin_evaluation());
-        node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
-        let edge = &node.edges()[0];
-        node.reserve_edge(0).expect("first").complete(-1.0, 1.0);
-        node.reserve_edge(0).expect("second").complete(1.0, 1.0);
-        assert!(edge.q().abs() < 1e-6, "a=1 is the arithmetic mean");
-        assert!((evidence_standard_error(edge) - 2.0_f32.sqrt() / 2.0).abs() < 1e-6);
-
-        let arena = NodeArena::default();
-        let node = arena.get(arena.allocate()).expect("node");
-        assert!(node.try_begin_evaluation());
-        node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
-        let edge = &node.edges()[0];
-        node.reserve_edge(0).expect("first").complete(-1.0, 2.0);
-        node.reserve_edge(0).expect("second").complete(1.0, 2.0);
-        assert!(edge.q().abs() < 1e-6, "stored edge Q remains the arithmetic mean");
-        assert!(
-            (edge.stats().weighted_wl - 1.0 / 3.0).abs() < 1e-6,
-            "larger a favors recent evidence"
-        );
-        let params = SearchParams {
-            fresh_q_visits: 4.0,
-            ..SearchParams::default()
-        };
-        assert!((completed_selection_q(edge.stats(), &params) - 1.0 / 6.0).abs() < 1e-6);
-        let (g, q_select) = selection_q_from_means(2, 0.0, 1.0 / 3.0, &params);
-        assert!((g - 0.5).abs() < 1e-6);
-        assert!((q_select - 1.0 / 6.0).abs() < 1e-6);
     }
 }

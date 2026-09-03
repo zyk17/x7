@@ -44,7 +44,7 @@ pub use observer::{
 };
 pub use param::{SearchConfig, SearchParams};
 pub use pipeline::{Search, SearchControl, SearchLimits, Stats};
-pub use select::{compute_cpuct, selection_q_from_means, variance_bonus_from_se};
+pub use select::{compute_cpuct, variance_bonus_from_se};
 pub(crate) use time::{TimeBudget, TimeManager};
 pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree, ValueDelta};
 pub(crate) use workerpool::WorkerPool;

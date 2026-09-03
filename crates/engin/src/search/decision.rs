@@ -57,7 +57,6 @@ pub struct RootEdgeStats {
     pub completed_visits: u32,
     pub started_visits: u32,
     pub q: f32,
-    pub q_fast: f32,
     pub variance: f32,
     pub prior: f32,
 }
@@ -114,7 +113,6 @@ pub fn root_stats(arena: &NodeArena, root: NodeId) -> Option<RootStats> {
                     completed_visits: stats.visits,
                     started_visits: edge.visits(),
                     q: edge.q(),
-                    q_fast: stats.weighted_wl,
                     variance: if stats.visits < 2 {
                         0.0
                     } else {
@@ -315,9 +313,7 @@ mod tests {
 
     fn complete_samples(node: &super::Node, edge_index: usize, samples: &[f32]) {
         for &sample in samples {
-            node.reserve_edge(edge_index)
-                .expect("reservation")
-                .complete(sample, 1.0);
+            node.reserve_edge(edge_index).expect("reservation").complete(sample);
         }
     }
 

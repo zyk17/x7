@@ -15,10 +15,6 @@ pub struct SearchParams {
     pub cpuct_base: f32,   // 增长何时开始。更小 → 更早、更快变宽；更大 → 更久保持利用 Q。
     pub cpuct_factor: f32, // 增长幅度。更大 → 后期更强地向 PUCT/P 分流；更小 → 后期更容易让已验证的高 Q 分支继续积累 N。
     pub fpu_reduction: f32,
-    /// completed evidence 的近期更新率 `a`：1 为算术均值；更大时更重视较新的回传。
-    pub value_update_rate: f32,
-    /// recent Q 对 Select 的生命周期（completed visits）；0 为严格算术均值。
-    pub fresh_q_visits: f32,
     /// 不受 prior/PUCT U 抑制的 completed-evidence 标准误 bonus；0 为关闭。
     pub variance_bonus_scale: f32,
     /// reservation 暂时以 `scale * FPU` 进入 action Q；0 退化为纯 virtual visit。
@@ -41,9 +37,7 @@ impl Default for SearchParams {
             cpuct_factor: 4.0,
             // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
             fpu_reduction: 0.500,
-            value_update_rate: 1.0,
-            fresh_q_visits: 0.0,
-            variance_bonus_scale: 0.0,
+            variance_bonus_scale: 0.1,
             virtual_mean_fpu_scale: 1.0,
             // 根最终 Decision 的温和一倍 SE 置信修正；不参与 PUCT。
             decision_lcb_stdevs: 1.0,
@@ -72,14 +66,6 @@ impl SearchParams {
         assert!(
             self.fpu_reduction.is_finite() && self.fpu_reduction >= 0.0,
             "stream FPU reduction must be finite and non-negative"
-        );
-        assert!(
-            self.value_update_rate.is_finite() && self.value_update_rate > 0.0,
-            "stream value update rate must be finite and positive"
-        );
-        assert!(
-            self.fresh_q_visits.is_finite() && self.fresh_q_visits >= 0.0,
-            "stream fresh Q visits must be finite and non-negative"
         );
         assert!(
             self.variance_bonus_scale.is_finite() && self.variance_bonus_scale >= 0.0,

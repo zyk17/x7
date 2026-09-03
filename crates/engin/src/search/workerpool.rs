@@ -552,7 +552,7 @@ fn backprop_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver
             .iter()
             .map(|event| (event.held_eval_claim, event.event.node_id))
             .collect();
-        let result = complete_batch(events, &shared.arena, &shared.params);
+        let result = complete_batch(events, &shared.arena);
         for (_, id) in &claims {
             shared.cancel_collisions(*id);
         }

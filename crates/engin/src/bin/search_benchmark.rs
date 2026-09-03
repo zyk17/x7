@@ -24,8 +24,6 @@ struct Args {
     cpuct_bases: Vec<f32>,
     cpuct_factors: Vec<f32>,
     fpu_reduction: f32,
-    value_update_rates: Vec<f32>,
-    fresh_q_visits: Vec<f32>,
     variance_bonus_scales: Vec<f32>,
     virtual_mean_fpu_scale: f32,
     decision_lcb_stdevs: f32,
@@ -35,7 +33,7 @@ struct Args {
 fn usage() -> &'static str {
     "usage: search_benchmark [--onnx data/x7.onnx] [--fen \"...\"] [--moves \"c3c4 h7h3 ...\"] [--playouts 2048] \\
      [--trace 128,256,512] [--track g6g9,i0g0] [--searchmoves \"g6g9 i0g0\"] [--cpuct 1.0,1.745] \\
-     [--cpuct-base 20000,38739] [--cpuct-factor 2.5,3.894] [--fpu-reduction 0.330] [--value-update-rate 1,2] [--fresh-q-visits 0,10,20] [--variance-bonus-scale 0,0.05,0.1,0.2] [--virtual-mean-fpu-scale 1.0] \\
+     [--cpuct-base 20000,38739] [--cpuct-factor 2.5,3.894] [--fpu-reduction 0.330] [--variance-bonus-scale 0,0.05,0.1,0.2] [--virtual-mean-fpu-scale 1.0] \\
      [--decision-lcb-stdevs 5] [--root-top 8]"
 }
 
@@ -52,8 +50,6 @@ fn parse_args() -> Result<Args, String> {
     let mut cpuct_bases = vec![defaults.cpuct_base];
     let mut cpuct_factors = vec![defaults.cpuct_factor];
     let mut fpu_reduction = defaults.fpu_reduction;
-    let mut value_update_rates = vec![defaults.value_update_rate];
-    let mut fresh_q_visits = vec![defaults.fresh_q_visits];
     let mut variance_bonus_scales = vec![defaults.variance_bonus_scale];
     let mut virtual_mean_fpu_scale = defaults.virtual_mean_fpu_scale;
     let mut decision_lcb_stdevs = defaults.decision_lcb_stdevs;
@@ -110,20 +106,6 @@ fn parse_args() -> Result<Args, String> {
                     false,
                 )?
             }
-            "--value-update-rate" => {
-                value_update_rates = parse_float_list(
-                    "--value-update-rate",
-                    &args.next().ok_or("--value-update-rate requires a number")?,
-                    true,
-                )?
-            }
-            "--fresh-q-visits" => {
-                fresh_q_visits = parse_float_list(
-                    "--fresh-q-visits",
-                    &args.next().ok_or("--fresh-q-visits requires a number")?,
-                    false,
-                )?
-            }
             "--variance-bonus-scale" => {
                 variance_bonus_scales = parse_float_list(
                     "--variance-bonus-scale",
@@ -174,8 +156,6 @@ fn parse_args() -> Result<Args, String> {
         cpuct_bases,
         cpuct_factors,
         fpu_reduction,
-        value_update_rates,
-        fresh_q_visits,
         variance_bonus_scales,
         virtual_mean_fpu_scale,
         decision_lcb_stdevs,
@@ -315,7 +295,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let filter = root_filter(&history, &args.searchmoves)?;
     let backend = OnnxBackend::from_file(&args.onnx)?;
     println!(
-        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3} value_update_rate={:?} fresh_q_visits={:?} variance_bonus_scale={:?} virtual_mean_fpu_scale={:.2} decision_lcb_stdevs={:.3}",
+        "onnx={} provider={} playouts={} cpuct={:?} cpuct_base={:?} cpuct_factor={:?} fpu_reduction={:.3} variance_bonus_scale={:?} virtual_mean_fpu_scale={:.2} decision_lcb_stdevs={:.3}",
         args.onnx.display(),
         backend.provider().name(),
         args.playouts,
@@ -323,8 +303,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.cpuct_bases,
         args.cpuct_factors,
         args.fpu_reduction,
-        args.value_update_rates,
-        args.fresh_q_visits,
         args.variance_bonus_scales,
         args.virtual_mean_fpu_scale,
         args.decision_lcb_stdevs,
@@ -333,56 +311,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for &cpuct in &args.cpucts {
         for &cpuct_base in &args.cpuct_bases {
             for &cpuct_factor in &args.cpuct_factors {
-                for &value_update_rate in &args.value_update_rates {
-                    for &fresh_q_visits in &args.fresh_q_visits {
-                        for &variance_bonus_scale in &args.variance_bonus_scales {
-                            let params = SearchParams {
-                                cpuct,
-                                cpuct_base,
-                                cpuct_factor,
-                                fpu_reduction: args.fpu_reduction,
-                                value_update_rate,
-                                fresh_q_visits,
-                                variance_bonus_scale,
-                                virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
-                                decision_lcb_stdevs: args.decision_lcb_stdevs,
-                                ..SearchParams::default()
-                            };
-                            println!(
-                                "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3} value_update_rate={value_update_rate:.3} fresh_q_visits={fresh_q_visits:.1} variance_bonus_scale={variance_bonus_scale:.3} virtual_mean_fpu_scale={:.2} lcb={:.3}",
-                                args.fpu_reduction, args.virtual_mean_fpu_scale, args.decision_lcb_stdevs
-                            );
-                            let mut search = Search::new(
-                                Arc::new(OnnxBackend::from_file(&args.onnx)?) as Arc<dyn Backend>,
-                                Arc::clone(&history),
-                                SearchConfig {
-                                    params,
-                                    ..SearchConfig::default()
-                                },
-                            );
-                            for &milestone in &args.trace {
-                                // `Search::run_playouts` 的参数是当前 Search 的累计目标；trace
-                                // milestone 不能再减去上一项，否则 100→1000 会错误停在 1000 而
-                                // 非“额外跑 900”后的 1000。
-                                search.run_with_limits(SearchLimits {
-                                    max_playouts: Some(milestone),
-                                    root_move_filter: filter.clone(),
-                                    ..Default::default()
-                                })?;
-                                println!("    trace completed={milestone}");
-                                print_roots(&search, root_is_black, args.root_top, &args.track);
-                            }
-                            if args.trace.last().copied().unwrap_or(0) < args.playouts {
-                                search.run_with_limits(SearchLimits {
-                                    max_playouts: Some(args.playouts),
-                                    root_move_filter: filter.clone(),
-                                    ..Default::default()
-                                })?;
-                            }
-                            print_roots(&search, root_is_black, args.root_top, &args.track);
-                            search.stop_and_finish();
-                        }
+                for &variance_bonus_scale in &args.variance_bonus_scales {
+                    let params = SearchParams {
+                        cpuct,
+                        cpuct_base,
+                        cpuct_factor,
+                        fpu_reduction: args.fpu_reduction,
+                        variance_bonus_scale,
+                        virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
+                        decision_lcb_stdevs: args.decision_lcb_stdevs,
+                        ..SearchParams::default()
+                    };
+                    println!(
+                        "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3} variance_bonus_scale={variance_bonus_scale:.3} virtual_mean_fpu_scale={:.2} lcb={:.3}",
+                        args.fpu_reduction, args.virtual_mean_fpu_scale, args.decision_lcb_stdevs
+                    );
+                    let mut search = Search::new(
+                        Arc::new(OnnxBackend::from_file(&args.onnx)?) as Arc<dyn Backend>,
+                        Arc::clone(&history),
+                        SearchConfig {
+                            params,
+                            ..SearchConfig::default()
+                        },
+                    );
+                    for &milestone in &args.trace {
+                        // `Search::run_playouts` 的参数是当前 Search 的累计目标；trace
+                        // milestone 不能再减去上一项，否则 100→1000 会错误停在 1000 而
+                        // 非“额外跑 900”后的 1000。
+                        search.run_with_limits(SearchLimits {
+                            max_playouts: Some(milestone),
+                            root_move_filter: filter.clone(),
+                            ..Default::default()
+                        })?;
+                        println!("    trace completed={milestone}");
+                        print_roots(&search, root_is_black, args.root_top, &args.track);
                     }
+                    if args.trace.last().copied().unwrap_or(0) < args.playouts {
+                        search.run_with_limits(SearchLimits {
+                            max_playouts: Some(args.playouts),
+                            root_move_filter: filter.clone(),
+                            ..Default::default()
+                        })?;
+                    }
+                    print_roots(&search, root_is_black, args.root_top, &args.track);
+                    search.stop_and_finish();
                 }
             }
         }

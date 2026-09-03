@@ -24,8 +24,6 @@ pub struct Options {
     pub cpuct_factor: f32,
     /// UCI `FpuReduction`：未访问边相对 parent Q 的 FPU 降幅。
     pub fpu_reduction: f32,
-    pub value_update_rate: f32,
-    pub fresh_q_visits: f32,
     pub variance_bonus_scale: f32,
     /// Eval claim 上限相对 batch 的倍率；控制 pending work 的新鲜度与 NN 供给。
     pub nn_window: f32,
@@ -53,8 +51,6 @@ impl Default for Options {
             cpuct_base: search.cpuct_base,
             cpuct_factor: search.cpuct_factor,
             fpu_reduction: search.fpu_reduction,
-            value_update_rate: search.value_update_rate,
-            fresh_q_visits: search.fresh_q_visits,
             variance_bonus_scale: search.variance_bonus_scale,
             nn_window: SearchConfig::default().nn_window,
             virtual_mean_fpu_scale: search.virtual_mean_fpu_scale,
@@ -84,11 +80,6 @@ impl Options {
             format!("option name CPuctBase type string default {}", self.cpuct_base),
             format!("option name CPuctFactor type string default {}", self.cpuct_factor),
             format!("option name FpuReduction type string default {}", self.fpu_reduction),
-            format!(
-                "option name ValueUpdateRate type string default {}",
-                self.value_update_rate
-            ),
-            format!("option name FreshQVisits type string default {}", self.fresh_q_visits),
             format!(
                 "option name VarianceBonusScale type string default {}",
                 self.variance_bonus_scale
@@ -168,8 +159,6 @@ impl Options {
             "cpuctfactor" => self.cpuct_factor = parse_non_negative_float("CPuctFactor", value)?,
             "cpuct" => self.cpuct = parse_non_negative_float("CPuct", value)?,
             "fpureduction" => self.fpu_reduction = parse_non_negative_float("FpuReduction", value)?,
-            "valueupdaterate" => self.value_update_rate = parse_positive_float("ValueUpdateRate", value)?,
-            "freshqvisits" => self.fresh_q_visits = parse_non_negative_float("FreshQVisits", value)?,
             "variancebonusscale" => self.variance_bonus_scale = parse_non_negative_float("VarianceBonusScale", value)?,
             "nnwindow" => self.nn_window = parse_positive_float("NnWindow", value)?,
             "virtualmeanfpuscale" => {
