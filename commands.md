@@ -135,8 +135,8 @@ cargo run --release -p engin
 当前 UCI options 是：`WeightsFile`、`NnBatchSize`、`NnCacheSizePowerOfTwo`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
 `CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`VarianceBonusScale`、`NnWindow`、`VirtualMeanFpuScale`、`DecisionRule`、`DecisionLcbStdevs`、`DecisionUcbStdevs`、`DecisionMixNWeight`、`Threads`。
 `NnBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
-搜索参数默认 `CPuct=1.25`、`CPuctBase=40000`、`CPuctFactor=4.0`、`FpuReduction=0.500`；
-`VarianceBonusScale=0.1` 是当前启用的实验性 SE verification bonus；
+搜索参数默认 `CPuct=2.4`、`CPuctBase=40000`、`CPuctFactor=0`、`FpuReduction=0.225`、
+`NnWindow=2.25`、`VarianceBonusScale=1.5`；
 `DecisionLcbStdevs=1.0`、`DecisionUcbStdevs=1.0` 是一倍 SE 的温和置信修正，`DecisionMixNWeight=0.25` 表示最多 0.25 个 Q 单位的归一化 N 偏好；默认 `DecisionRule=Auto`（即 `MaxN`），因此三者只在切换到相应规则后生效。
 `DecisionRule=Auto` 与 `MaxN` 都直接取最大 completed N；`MaxQ` 直接取最大 Q；`Lcb/Ucb` 分别直接取最大
 `Q - DecisionLcbStdevs * SE` / `Q + DecisionUcbStdevs * SE`；`MixNQ` 直接取最大

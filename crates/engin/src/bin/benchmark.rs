@@ -46,7 +46,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--cpuct 1.25] [--cpuct-factor 4] [--fpu-reduction 0.5] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 0] [--decision-lcb-stdevs 0] \\
+     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--cpuct 2.4] [--cpuct-factor 0] [--fpu-reduction 0.225] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 1.5] [--decision-lcb-stdevs 0] \\
      [--root-top 8] [--trace 128,256,512] [--collision-dist] [--tree-depth 4] [--tree-top 4]"
 }
 
@@ -65,7 +65,7 @@ fn parse_args() -> Result<Args, String> {
     let mut cpuct = defaults.cpuct;
     let mut cpuct_factor = defaults.cpuct_factor;
     let mut fpu_reduction = defaults.fpu_reduction;
-    let mut nn_window = 2.25f32;
+    let mut nn_window = SearchConfig::default().nn_window;
     let mut virtual_mean_fpu_scale = 1.0f32;
     let mut variance_bonus_scale = defaults.variance_bonus_scale;
     let mut decision_lcb_stdevs = defaults.decision_lcb_stdevs;

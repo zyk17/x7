@@ -32,12 +32,12 @@ pub struct SearchParams {
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            cpuct: 1.25,
+            cpuct: 2.4,
             cpuct_base: 40_000.0,
-            cpuct_factor: 4.0,
+            cpuct_factor: 0.0,
             // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
-            fpu_reduction: 0.500,
-            variance_bonus_scale: 0.1,
+            fpu_reduction: 0.225,
+            variance_bonus_scale: 1.5,
             virtual_mean_fpu_scale: 1.0,
             // 根最终 Decision 的温和一倍 SE 置信修正；不参与 PUCT。
             decision_lcb_stdevs: 1.0,
