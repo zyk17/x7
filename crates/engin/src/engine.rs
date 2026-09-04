@@ -375,16 +375,20 @@ impl Engine {
         }
         let (gather_workers, eval_workers) = SearchConfig::gather_eval_from_threads(self.options.threads);
         let config = SearchConfig {
-            eval_batch_size: self.options.mini_batch_size,
+            eval_batch_size: self.options.nn_batch_size,
             params: SearchParams {
                 cpuct: self.options.cpuct,
                 cpuct_base: self.options.cpuct_base,
                 cpuct_factor: self.options.cpuct_factor,
                 fpu_reduction: self.options.fpu_reduction,
-                virtual_mean_fpu_scale: 1.0,
-                lcb_stdevs: self.options.lcb_stdevs,
-                lcb_min_visit_fraction: self.options.lcb_min_visit_fraction,
+                variance_bonus_scale: self.options.variance_bonus_scale,
+                virtual_mean_fpu_scale: self.options.virtual_mean_fpu_scale,
+                decision_lcb_stdevs: self.options.decision_lcb_stdevs,
+                decision_ucb_stdevs: self.options.decision_ucb_stdevs,
+                decision_rule: self.options.decision_rule,
+                decision_mix_n_weight: self.options.decision_mix_n_weight,
             },
+            nn_window: self.options.nn_window,
             gather_workers,
             eval_workers,
             ..SearchConfig::default()

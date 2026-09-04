@@ -132,11 +132,21 @@ quit
 cargo run --release -p engin
 ```
 
-当前 UCI options 是：`WeightsFile`、`MiniBatchSize`、`NNCacheSizePowerOfTwo`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
-`CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`LcbStdevs`、`LcbMinVisitFraction`、`Threads`。
-`MiniBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
-搜索参数默认 `CPuct=1.25`、`CPuctBase=40000`、`CPuctFactor=4.0`、`FpuReduction=0.500`；
-`LcbStdevs=0`，即正式决策默认按 terminal、visit、Q、prior 排序；LCB 仅可通过 UCI option 单独实验。
+当前 UCI options 是：`WeightsFile`、`NnBatchSize`、`NnCacheSizePowerOfTwo`、`MultiPV`、`UCI_ShowWDL`、`UCI_ShowEPS`、
+`CPuct`、`CPuctBase`、`CPuctFactor`、`FpuReduction`、`VarianceBonusScale`、`NnWindow`、`VirtualMeanFpuScale`、`DecisionRule`、`DecisionLcbStdevs`、`DecisionUcbStdevs`、`DecisionMixNWeight`、`Threads`。
+`NnBatchSize` 使用 `0..=1024` 的整数，默认 `0`（backend 建议值）；一次 `setoption` 影响之后启动的每次 `go`，已运行搜索保留其 worker。
+搜索参数默认 `CPuct=2.4`、`CPuctBase=40000`、`CPuctFactor=0`、`FpuReduction=0.225`、
+`NnWindow=2.25`、`VarianceBonusScale=1.5`；
+`DecisionLcbStdevs=1.0`、`DecisionUcbStdevs=1.0` 是一倍 SE 的温和置信修正，`DecisionMixNWeight=0.25` 表示最多 0.25 个 Q 单位的归一化 N 偏好；默认 `DecisionRule=Auto`（即 `MaxN`），因此三者只在切换到相应规则后生效。
+`DecisionRule=Auto` 与 `MaxN` 都直接取最大 completed N；`MaxQ` 直接取最大 Q；`Lcb/Ucb` 分别直接取最大
+`Q - DecisionLcbStdevs * SE` / `Q + DecisionUcbStdevs * SE`；`MixNQ` 直接取最大
+`Q + DecisionMixNWeight * N/max(root child N)`。所有规则使用同一套 N、Q、prior 作为并列时的稳定次序，
+已证明必胜的 terminal root child 优先于普通候选，并在多个必胜着中选最短 mate；其余候选不对
+terminal、样本数或候选比例作额外覆盖或过滤。未满两个样本时 `SE=0`。
+将 `VarianceBonusScale=0` 可关闭独立 SE verification bonus；非零时对至少两次 completed evidence 的 edge 加上不含 prior 的 `scale * SE`。它只为降低尚未收敛的 Q 的标准误提供平滑复核机会；`SE` 会随自身 evidence 增加自然衰减，常规 PUCT 的 Q 与 U 不变。
+
+相关公式为：`score = Q_mean + U + VarianceBonusScale * SE`，其中 `SE=std/sqrt(N)`，
+`std=sqrt(max(0, mean(w²)-Q_mean²))`，全部来自同一 edge 的原始 completed `wl` 样本。
 `Threads=8` 只在 Gather/Eval 间近似平分，NN 与 Backprop 固定各一条线程。option 名称和布尔值大小写不敏感。
 
 当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
@@ -164,7 +174,7 @@ quit
 ```powershell
 @'
 uci
-setoption name MiniBatchSize value 64
+setoption name NnBatchSize value 64
 setoption name WeightsFile value C:/projects/77xiangqi_engine/data/x7.onnx
 isready
 position startpos
@@ -184,11 +194,32 @@ cargo run --release -p engin --bin benchmark -- `
   --gathers 3 --evals 5
 ```
 
+它也可在同一 fresh-tree 批次内固定 `--cpuct`、`--cpuct-factor`、`--fpu-reduction`、`--nn-window` 与
+`--virtual-mean-fpu-scale`；这用于联合观察基础树形和流水线窗口，不替代 `search_benchmark` 的参数扫描。
+
 `search_benchmark` 固定 `4/4` Search/Eval worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-tree 根部分流。使用完整历史诊断评分拐点：
 
 ```powershell
 cargo run --release -p engin --bin search_benchmark -- `
   --moves "c3c4 g6g5 ..." --playouts 2000 --root-top 12
+```
+
+扫描独立的目标 SE bonus（每组均为 fresh tree）：
+
+```powershell
+cargo run --release -p engin --bin search_benchmark -- `
+  --moves "c3c4 g6g5 ..." --playouts 20000 --root-top 12 `
+  --variance-bonus-scale 0,0.05,0.1,0.2
+```
+
+查看固定参数下的根访问集中度、collision 和主干树形；`--repeat` 必须大于 1，避免将异步调度的单次分流当作结论：
+
+```powershell
+cargo run --release -p engin --bin benchmark -- `
+  --fen "2bak4/3PaP1P1/9/4n4/2b6/6B2/3p5/4BA3/5C3/3K1A3 w - - 0 1" `
+  --playouts 20000 --repeat 3 --gathers 4 --evals 4 `
+  --variance-bonus-scale 0.1 `
+  --root-top 8 --tree-depth 3 --tree-top 3
 ```
 
 `benchmark` 输出正常 cache hit（`hit`）和流水线队列数据；`search_benchmark` 输出根候选的

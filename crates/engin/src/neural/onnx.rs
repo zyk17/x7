@@ -328,7 +328,7 @@ fn recommended_batch_size(provider: OnnxProvider) -> usize {
     }
 }
 
-/// UCI `MiniBatchSize` 硬顶与 option spin 对齐；单次 ORT run 仍按 provider 内部分块。
+/// UCI `NnBatchSize` 硬顶与 option spin 对齐；单次 ORT run 仍按 provider 内部分块。
 fn maximum_batch_size(_provider: OnnxProvider) -> usize {
     1024
 }

@@ -254,7 +254,6 @@ impl<O: SearchObserver> Shared<O> {
 
 fn branch_at_expanded_node<O: SearchObserver>(
     shared: &Shared<O>,
-    _event: &GatherEvent<O::Stamp>,
     node: &Node,
     depth: usize,
 ) -> Option<(NodeId, EdgeReservation)> {
@@ -265,6 +264,7 @@ fn branch_at_expanded_node<O: SearchObserver>(
         depth,
         &shared.params,
         &shared.root_move_filter.lock(),
+        shared.arena.as_ref(),
     )?;
     let edge = &node.edges()[edge_index];
     let child = shared.arena.child_or_create(edge);
@@ -313,8 +313,15 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
             }
             ExpansionState::Expanded => {
                 let depth = event.variation.moves().len();
-                let (child, reservation) = branch_at_expanded_node(shared, &event, node, depth)
-                    .expect("expanded node must have a selectable edge");
+                let Some((child, reservation)) = branch_at_expanded_node(shared, node, depth) else {
+                    // 当前搜索范围内的 child 都已 terminal；root 因而已精确解完。
+                    if event.node_path().len() == 1 {
+                        shared.stopping.store(true, Ordering::Release);
+                        shared.idle.notify_all();
+                    }
+                    thread::yield_now();
+                    continue;
+                };
                 event = event.descend(child, reservation);
             }
         }

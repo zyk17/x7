@@ -1,16 +1,16 @@
 //! PUCT / FPU / virtual mean。只算该选哪条边与挂多少 μ；不 `reserve`、不 `descend`。
 use xiangqi_core::Move;
 
-use super::Edge;
 use super::param::SearchParams;
+use super::{Edge, ExpansionState, NodeArena};
 use crate::utils::fastmath::fast_log;
 
 /// cPUCT：常数项加上随访问数缓慢增长的对数项。
 ///
 /// 所有节点使用同一条曲线；根不再有独立初值或独立参数。
-/// 默认参数下 `C(0)=1.25`、`C(50k)≈4.5`。
+/// 默认参数为常数 `C(N)=2.4`；`cpuct_factor` 非零时才随访问数增长。
 /// `cpuct_base` 越小，增长越早开始；`cpuct_factor` 控制增长幅度。
-fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
+pub fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
     params.cpuct + params.cpuct_factor * fast_log((visits as f32 + params.cpuct_base) / params.cpuct_base)
 }
 
@@ -28,19 +28,29 @@ fn visited_policy(edges: &[Edge]) -> f32 {
         .sum()
 }
 
-/// 树搜索 action Q：读本 edge 的完成样本；可叠加 in-flight virtual mean。
-fn edge_utility(edge: &Edge, fpu: f32, use_virtual_mean: bool) -> f32 {
-    let (stats, started_visits) = edge.selection_snapshot();
-    let completed_q = if stats.visits == 0 {
-        fpu
-    } else {
-        stats.wl_sum / stats.visits as f32
-    };
+fn action_q(stats: super::tree::EdgeStats, started_visits: u32, fpu: f32, use_virtual_mean: bool) -> f32 {
+    let completed_q = if stats.visits == 0 { fpu } else { stats.q() };
     let in_flight = started_visits.saturating_sub(stats.visits);
     if !use_virtual_mean || in_flight == 0 {
         completed_q
     } else {
         (completed_q * stats.visits as f32 + stats.virtual_wl_sum) / (stats.visits + in_flight) as f32
+    }
+}
+
+#[cfg(test)]
+fn edge_utility(edge: &Edge, fpu: f32, use_virtual_mean: bool) -> f32 {
+    let (stats, started_visits) = edge.selection_snapshot();
+    action_q(stats, started_visits, fpu, use_virtual_mean)
+}
+
+/// 不带 prior 的均值不确定性 bonus。未访问或仅一个样本时没有方差信息；
+/// `SE` 自身随 evidence 增加而衰减，不另设人为截断或停止阈值。
+pub fn variance_bonus_from_se(visits: u32, standard_error: f32, params: &SearchParams) -> f32 {
+    if visits < 2 {
+        0.0
+    } else {
+        params.variance_bonus_scale * standard_error
     }
 }
 
@@ -63,6 +73,7 @@ pub(crate) fn select_edge(
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
+    arena: &NodeArena,
 ) -> Option<(usize, Option<f32>)> {
     if edges.is_empty() {
         return None;
@@ -78,8 +89,17 @@ pub(crate) fn select_edge(
         if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
             continue;
         }
-        let q = edge_utility(edge, fpu, params.virtual_mean_fpu_scale > 0.0);
-        let score = q + u_coeff * edge.prior() / (1 + edge.visits()) as f32;
+        if edge
+            .child()
+            .and_then(|id| arena.get(id))
+            .is_some_and(|child| child.expansion_state() == ExpansionState::Terminal)
+        {
+            continue;
+        }
+        let (stats, started_visits) = edge.selection_snapshot();
+        let q = action_q(stats, started_visits, fpu, params.virtual_mean_fpu_scale > 0.0);
+        let u = u_coeff * edge.prior() / (1 + started_visits) as f32;
+        let score = q + u + variance_bonus_from_se(stats.visits, stats.standard_error(), params);
         if best.is_none_or(|(_, best_score)| score > best_score) {
             best = Some((index, score));
         }
@@ -91,7 +111,7 @@ pub(crate) fn select_edge(
 mod tests {
     use xiangqi_core::{Move, Square};
 
-    use super::{compute_cpuct, edge_utility, select_edge, visited_policy};
+    use super::{compute_cpuct, edge_utility, select_edge, variance_bonus_from_se, visited_policy};
     use crate::search::NodeArena;
     use crate::search::param::SearchParams;
 
@@ -101,15 +121,16 @@ mod tests {
     #[test]
     fn defaults_use_the_selected_constant_cpuct() {
         let params = SearchParams::default();
-        assert_eq!(params.cpuct, 1.25);
+        assert_eq!(params.cpuct, 2.4);
         assert_eq!(params.cpuct_base, 40_000.0);
-        assert_eq!(params.cpuct_factor, 4.0);
-        assert_eq!(params.fpu_reduction, 0.500);
-        assert_eq!(params.lcb_stdevs, 0.0);
-        assert_eq!(params.lcb_min_visit_fraction, 0.15);
+        assert_eq!(params.cpuct_factor, 0.0);
+        assert_eq!(params.fpu_reduction, 0.225);
+        assert_eq!(params.decision_lcb_stdevs, 1.0);
+        assert_eq!(params.decision_ucb_stdevs, 1.0);
+        assert_eq!(params.decision_mix_n_weight, 0.25);
+        assert_eq!(params.variance_bonus_scale, 1.5);
         assert_eq!(compute_cpuct(params, 0), params.cpuct);
-        // `fast_log` 是热路径近似；默认曲线在 50k 时接近设计目标 4.5。
-        assert!((compute_cpuct(params, 50_000) - 4.5).abs() < 0.05);
+        assert_eq!(compute_cpuct(params, 50_000), params.cpuct);
     }
 
     #[test]
@@ -120,6 +141,18 @@ mod tests {
             ..SearchParams::default()
         };
         assert_eq!(compute_cpuct(params, 10_000), 1.25);
+    }
+
+    #[test]
+    fn variance_bonus_requires_evidence_and_scales_with_standard_error() {
+        let params = SearchParams {
+            variance_bonus_scale: 0.8,
+            ..SearchParams::default()
+        };
+        assert_eq!(variance_bonus_from_se(0, 1.0, &params), 0.0);
+        assert_eq!(variance_bonus_from_se(1, 1.0, &params), 0.0);
+        assert!((variance_bonus_from_se(2, 1.0, &params) - 0.8).abs() < 1e-6);
+        assert!((variance_bonus_from_se(2, 0.1, &params) - 0.08).abs() < 1e-6);
     }
 
     #[test]
@@ -134,13 +167,13 @@ mod tests {
             ..SearchParams::default()
         };
         assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index),
+            select_edge(&edges, 0, 0.0, 0, &params, &[], &arena).map(|(index, _)| index),
             Some(0)
         );
 
         let reservation = node.reserve_edge(0).expect("first edge");
         assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index),
+            select_edge(&edges, 0, 0.0, 0, &params, &[], &arena).map(|(index, _)| index),
             Some(1)
         );
         reservation.cancel();
@@ -157,7 +190,25 @@ mod tests {
         let params = SearchParams::default();
         let filter = [mv("c3", "c4")];
         assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &params, &filter).map(|(index, _)| index),
+            select_edge(&edges, 0, 0.0, 0, &params, &filter, &arena).map(|(index, _)| index),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn terminal_child_is_not_selected_again() {
+        let arena = NodeArena::default();
+        let node = arena.get(arena.allocate()).expect("node");
+        assert!(node.try_begin_evaluation());
+        node.publish_edges(vec![(mv("b2", "b3"), 0.9), (mv("c3", "c4"), 0.1)]);
+        let edges = node.edges();
+        let terminal = arena.child_or_create(&edges[0]);
+        let terminal = arena.get(terminal).expect("terminal child");
+        assert!(terminal.try_begin_evaluation());
+        terminal.mark_terminal(-1.0, 0.0, 1.0);
+
+        assert_eq!(
+            select_edge(&edges, 0, 0.0, 0, &SearchParams::default(), &[], &arena).map(|(index, _)| index),
             Some(1)
         );
     }

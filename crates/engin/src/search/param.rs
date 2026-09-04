@@ -1,10 +1,11 @@
 //! 搜索分层配置：
 //!
-//! - `SearchParams`：算法旋钮（PUCT / FPU / virtual mean / 根 LCB）。`Copy`，热路径只带这一包。
+//! - `SearchParams`：算法旋钮（PUCT / FPU / virtual mean / Bvar / 根决策）。`Copy`，热路径只带这一包。
 //! - `SearchConfig`：当前固定 worker 实现的线程、队列、batch、window 配置 + 嵌套的 `SearchParams`。
 //! - `SearchLimits`（在 `pipeline`）：这一手 `go` 的停止条件与 `searchmoves`。
 //! - `Options`（`options.rs`）：UCI / 引擎生命周期；`go` 时拍快照写入上面几层。
 
+use super::decision::DecisionRule;
 use crate::neural::backend::Backend;
 
 /// MCTS 算法旋钮。不包含线程、队列或 `searchmoves`。
@@ -14,26 +15,36 @@ pub struct SearchParams {
     pub cpuct_base: f32,   // 增长何时开始。更小 → 更早、更快变宽；更大 → 更久保持利用 Q。
     pub cpuct_factor: f32, // 增长幅度。更大 → 后期更强地向 PUCT/P 分流；更小 → 后期更容易让已验证的高 Q 分支继续积累 N。
     pub fpu_reduction: f32,
+    /// 不受 prior/PUCT U 抑制的 completed-evidence 标准误 bonus；0 为关闭。
+    pub variance_bonus_scale: f32,
     /// reservation 暂时以 `scale * FPU` 进入 action Q；0 退化为纯 virtual visit。
     pub virtual_mean_fpu_scale: f32,
-    /// 根最终选边的 LCB 半径倍数；0 表示退回既有 N→Q→P 排名。
-    pub lcb_stdevs: f32,
-    /// LCB 候选至少须达到 N 第一候选的这一 completed-N 比例。
-    pub lcb_min_visit_fraction: f32,
+    /// `Lcb` 根决策的下置信半径倍数。
+    pub decision_lcb_stdevs: f32,
+    /// `Ucb` 根决策的上置信半径倍数。
+    pub decision_ucb_stdevs: f32,
+    /// 根最终选边规则；只读 completed evidence。
+    pub decision_rule: DecisionRule,
+    /// `MixNQ` 中归一化 N 的权重，单位与 Q 相同。
+    pub decision_mix_n_weight: f32,
 }
 
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            cpuct: 1.25,
+            cpuct: 2.4,
             cpuct_base: 40_000.0,
-            cpuct_factor: 4.0,
+            cpuct_factor: 0.0,
             // 小网络可能有系统性偏差；降低未知 edge 的首次进入门槛。
-            fpu_reduction: 0.500,
+            fpu_reduction: 0.225,
+            variance_bonus_scale: 1.5,
             virtual_mean_fpu_scale: 1.0,
-            // LCB 只用于根最终 Decision，不参与 PUCT；默认关闭，作为独立实验开关。
-            lcb_stdevs: 0.0,
-            lcb_min_visit_fraction: 0.15,
+            // 根最终 Decision 的温和一倍 SE 置信修正；不参与 PUCT。
+            decision_lcb_stdevs: 1.0,
+            decision_ucb_stdevs: 1.0,
+            decision_rule: DecisionRule::Auto,
+            // N 已归一化；最多提供 0.25 个 Q 单位的访问量偏好。
+            decision_mix_n_weight: 0.25,
         }
     }
 }
@@ -57,16 +68,24 @@ impl SearchParams {
             "stream FPU reduction must be finite and non-negative"
         );
         assert!(
+            self.variance_bonus_scale.is_finite() && self.variance_bonus_scale >= 0.0,
+            "stream variance bonus scale must be finite and non-negative"
+        );
+        assert!(
             self.virtual_mean_fpu_scale.is_finite() && self.virtual_mean_fpu_scale >= 0.0,
             "stream virtual mean FPU scale must be finite and non-negative"
         );
         assert!(
-            self.lcb_stdevs.is_finite() && self.lcb_stdevs >= 0.0,
-            "stream LCB stdevs must be finite and non-negative"
+            self.decision_lcb_stdevs.is_finite() && self.decision_lcb_stdevs >= 0.0,
+            "stream decision LCB stdevs must be finite and non-negative"
         );
         assert!(
-            self.lcb_min_visit_fraction.is_finite() && (0.0..=1.0).contains(&self.lcb_min_visit_fraction),
-            "stream LCB minimum visit fraction must be within [0, 1]"
+            self.decision_ucb_stdevs.is_finite() && self.decision_ucb_stdevs >= 0.0,
+            "stream decision UCB stdevs must be finite and non-negative"
+        );
+        assert!(
+            self.decision_mix_n_weight.is_finite() && self.decision_mix_n_weight >= 0.0,
+            "stream decision MixNQ N weight must be finite and non-negative"
         );
     }
 }
@@ -81,7 +100,7 @@ pub struct SearchConfig {
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
-    /// Eval claim 并发上限：`limit = ceil(MiniBatchSize × nn_window)`。
+    /// Eval claim 并发上限：`limit = ceil(NnBatchSize × nn_window)`。
     /// Claim 在 backprop 写完 N/Q 后释放；调大可能提高eps、调小让 Gather 更贴最新统计。
     pub nn_window: f32,
     pub params: SearchParams,
