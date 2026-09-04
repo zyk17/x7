@@ -613,7 +613,6 @@ impl NodeArena {
             if edges.is_empty() {
                 continue;
             }
-
             let mut all_terminal = true;
             let mut best_for_stm = f32::NEG_INFINITY;
             let mut min_win_plies: Option<f32> = None;

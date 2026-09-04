@@ -85,8 +85,7 @@ proof_mate_01 | 5aC2/1P2k4/9/7R1/9/3n5/8r/B3B4/9/4K4 b - - 0 1
 proof_mate_02 | 4kabC1/9/3ab4/p5P1N/9/8R/9/1n1ABC3/1c3K3/2Br5 w - - 0 1
 
 # AND/OR terminal-proof 回归：红方必胜，但实战约 1 分钟、1,055 万节点仍未给出 mate。
-# 目标不是只维持高 Q，而是尽快发现强制杀并完成守方应手（AND）覆盖，记录 first terminal、
-# terminal 传播与首次 bestmate 的时间/节点数。
+# 目标不是只维持高 Q，而是尽快发现强制杀并完成守方应手（AND）覆盖。
 proof_and_or_01 | 2b6/4k4/b4R3/9/9/9/9/B2A5/5K3/5AB2 w - - 0 1
 
 # 残局弃子攻杀：高 Q 方差 / 低先验样本。Pikafish：`h8g8` mate 9、`f8f9` mate 18

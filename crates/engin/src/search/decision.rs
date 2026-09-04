@@ -138,13 +138,23 @@ fn mate(child: Option<&Node>) -> Option<i32> {
     })
 }
 
-fn rank_by_score(ranked: &mut [RankedEdge], score: impl Fn(&RankedEdge) -> f32) {
+fn proven_win_plies(arena: &NodeArena, edge: &RankedEdge) -> Option<f32> {
+    let (wl, _, plies) = child(arena, &edge.edge)?.terminal_value()?;
+    (wl > 0.0).then_some(plies)
+}
+
+fn rank_by_score(arena: &NodeArena, ranked: &mut [RankedEdge], score: impl Fn(&RankedEdge) -> f32) {
     ranked.sort_unstable_by(|left, right| {
-        score(right)
-            .total_cmp(&score(left))
-            .then_with(|| right.visits.cmp(&left.visits))
-            .then_with(|| right.q.total_cmp(&left.q))
-            .then_with(|| right.prior.total_cmp(&left.prior))
+        match (proven_win_plies(arena, left), proven_win_plies(arena, right)) {
+            (Some(left_plies), Some(right_plies)) => left_plies.total_cmp(&right_plies),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| score(right).total_cmp(&score(left)))
+        .then_with(|| right.visits.cmp(&left.visits))
+        .then_with(|| right.q.total_cmp(&left.q))
+        .then_with(|| right.prior.total_cmp(&left.prior))
     });
 }
 
@@ -181,7 +191,7 @@ fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &Searc
         })
         .collect();
     let max_visits = ranked.iter().map(|edge| edge.visits).max().unwrap_or(0);
-    rank_by_score(&mut ranked, |edge| {
+    rank_by_score(arena, &mut ranked, |edge| {
         decision_score(params.decision_rule, edge, max_visits, params)
     });
     ranked.into_iter().map(|edge| edge.edge).collect()
@@ -363,6 +373,27 @@ mod tests {
                 },
             ),
             Some(first)
+        );
+    }
+
+    #[test]
+    fn proven_root_win_beats_a_more_visited_unproven_edge() {
+        let arena = NodeArena::default();
+        let root = arena.allocate();
+        let node = arena.get(root).expect("root");
+        assert!(node.try_begin_evaluation());
+        let ordinary = mv("a0", "a1");
+        let winning = mv("b0", "b1");
+        node.publish_edges(vec![(ordinary, 0.5), (winning, 0.5)]);
+        complete_samples(node, 0, &[0.9; 8]);
+        let child = arena.child_or_create(&node.edges()[1]);
+        let child_node = arena.get(child).expect("winning child");
+        assert!(child_node.try_begin_evaluation());
+        child_node.mark_terminal(1.0, 0.0, 3.0);
+
+        assert_eq!(
+            best_move_with_params(&arena, root, false, &SearchParams::default()),
+            Some(winning)
         );
     }
 }

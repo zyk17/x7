@@ -1,8 +1,8 @@
 //! PUCT / FPU / virtual mean。只算该选哪条边与挂多少 μ；不 `reserve`、不 `descend`。
 use xiangqi_core::Move;
 
-use super::Edge;
 use super::param::SearchParams;
+use super::{Edge, ExpansionState, NodeArena};
 use crate::utils::fastmath::fast_log;
 
 /// cPUCT：常数项加上随访问数缓慢增长的对数项。
@@ -73,6 +73,7 @@ pub(crate) fn select_edge(
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
+    arena: &NodeArena,
 ) -> Option<(usize, Option<f32>)> {
     if edges.is_empty() {
         return None;
@@ -86,6 +87,13 @@ pub(crate) fn select_edge(
     let filter_root_moves = is_root && !root_move_filter.is_empty();
     for (index, edge) in edges.iter().enumerate() {
         if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
+            continue;
+        }
+        if edge
+            .child()
+            .and_then(|id| arena.get(id))
+            .is_some_and(|child| child.expansion_state() == ExpansionState::Terminal)
+        {
             continue;
         }
         let (stats, started_visits) = edge.selection_snapshot();
@@ -160,13 +168,13 @@ mod tests {
             ..SearchParams::default()
         };
         assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index),
+            select_edge(&edges, 0, 0.0, 0, &params, &[], &arena).map(|(index, _)| index),
             Some(0)
         );
 
         let reservation = node.reserve_edge(0).expect("first edge");
         assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index),
+            select_edge(&edges, 0, 0.0, 0, &params, &[], &arena).map(|(index, _)| index),
             Some(1)
         );
         reservation.cancel();
@@ -183,7 +191,25 @@ mod tests {
         let params = SearchParams::default();
         let filter = [mv("c3", "c4")];
         assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &params, &filter).map(|(index, _)| index),
+            select_edge(&edges, 0, 0.0, 0, &params, &filter, &arena).map(|(index, _)| index),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn terminal_child_is_not_selected_again() {
+        let arena = NodeArena::default();
+        let node = arena.get(arena.allocate()).expect("node");
+        assert!(node.try_begin_evaluation());
+        node.publish_edges(vec![(mv("b2", "b3"), 0.9), (mv("c3", "c4"), 0.1)]);
+        let edges = node.edges();
+        let terminal = arena.child_or_create(&edges[0]);
+        let terminal = arena.get(terminal).expect("terminal child");
+        assert!(terminal.try_begin_evaluation());
+        terminal.mark_terminal(-1.0, 0.0, 1.0);
+
+        assert_eq!(
+            select_edge(&edges, 0, 0.0, 0, &SearchParams::default(), &[], &arena).map(|(index, _)| index),
             Some(1)
         );
     }

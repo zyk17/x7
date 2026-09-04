@@ -141,7 +141,8 @@ cargo run --release -p engin
 `DecisionRule=Auto` 与 `MaxN` 都直接取最大 completed N；`MaxQ` 直接取最大 Q；`Lcb/Ucb` 分别直接取最大
 `Q - DecisionLcbStdevs * SE` / `Q + DecisionUcbStdevs * SE`；`MixNQ` 直接取最大
 `Q + DecisionMixNWeight * N/max(root child N)`。所有规则使用同一套 N、Q、prior 作为并列时的稳定次序，
-不对 terminal、样本数或候选比例作额外覆盖或过滤；未满两个样本时 `SE=0`。
+已证明必胜的 terminal root child 优先于普通候选，并在多个必胜着中选最短 mate；其余候选不对
+terminal、样本数或候选比例作额外覆盖或过滤。未满两个样本时 `SE=0`。
 将 `VarianceBonusScale=0` 可关闭独立 SE verification bonus；非零时对至少两次 completed evidence 的 edge 加上不含 prior 的 `scale * SE`。它只为降低尚未收敛的 Q 的标准误提供平滑复核机会；`SE` 会随自身 evidence 增加自然衰减，常规 PUCT 的 Q 与 U 不变。
 
 相关公式为：`score = Q_mean + U + VarianceBonusScale * SE`，其中 `SE=std/sqrt(N)`，

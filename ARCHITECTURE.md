@@ -27,6 +27,8 @@ GPU 主要生产 Prediction，CPU 主要生产 Evidence；二者的具体比例�
   所有 event，再异步回收 sibling，slot 才可复用。
 - 重复、rule60 与亚洲规则是 variation/history 语义。根终局由 root gate 判断，非根叶子由 Eval
   首次分类；Gather 不重复裁决。
+- 已标记 `Terminal` 的 child 不再由 Gather 选择；其首次发现仍照常 Backprop。根自身不标记为
+  `Terminal`，当前搜索范围内的 root child 都已终局时停止；最终决策优先已证明必胜并选择最短 mate。
 - 只维护这一套 stream 搜索，不保留 classic 对照或多轨训练格式。
 
 ## 搜索树形控制面
