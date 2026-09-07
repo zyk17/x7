@@ -373,7 +373,6 @@ impl Engine {
             backend.set_cache_size_power_of_two(self.options.nn_cache_size_power_of_two);
             self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
         }
-        let (gather_workers, eval_workers) = SearchConfig::gather_eval_from_threads(self.options.threads);
         let config = SearchConfig {
             eval_batch_size: self.options.nn_batch_size,
             params: SearchParams {
@@ -389,8 +388,7 @@ impl Engine {
                 decision_mix_n_weight: self.options.decision_mix_n_weight,
             },
             nn_window: self.options.nn_window,
-            gather_workers,
-            eval_workers,
+            cpu_workers: self.options.threads,
             ..SearchConfig::default()
         };
         let decision_params = config.params;

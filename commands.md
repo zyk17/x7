@@ -147,7 +147,8 @@ terminal、样本数或候选比例作额外覆盖或过滤。未满两个样本
 
 相关公式为：`score = Q_mean + U + VarianceBonusScale * SE`，其中 `SE=std/sqrt(N)`，
 `std=sqrt(max(0, mean(w²)-Q_mean²))`，全部来自同一 edge 的原始 completed `wl` 样本。
-`Threads=8` 只在 Gather/Eval 间近似平分，NN 与 Backprop 固定各一条线程。option 名称和布尔值大小写不敏感。
+`Threads=8` 是八条通用 CPU worker；它们按队列就绪情况处理 Gather、Expand、Eval、NN 回包和 Backprop，NN
+另有一条设备线程。`NnWindow` 只限制真正已提交 NN 的请求，terminal 和 cache hit 不占该窗口。option 名称和布尔值大小写不敏感。
 
 当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
 `movetime` 不可与时钟字段混用；`infinite` 不可与其他预算混用。`depth`、`mate`、`ponder` 仍会明确报错。
@@ -191,13 +192,13 @@ quit
 ```powershell
 cargo run --release -p engin --bin benchmark -- `
   --movetime 3000 --repeat 3 `
-  --gathers 3 --evals 5
+  --threads 8
 ```
 
 它也可在同一 fresh-tree 批次内固定 `--cpuct`、`--cpuct-factor`、`--fpu-reduction`、`--nn-window` 与
 `--virtual-mean-fpu-scale`；这用于联合观察基础树形和流水线窗口，不替代 `search_benchmark` 的参数扫描。
 
-`search_benchmark` 固定 `4/4` Search/Eval worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-tree 根部分流。使用完整历史诊断评分拐点：
+`search_benchmark` 使用固定 CPU worker 数和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-tree 根部分流。使用完整历史诊断评分拐点：
 
 ```powershell
 cargo run --release -p engin --bin search_benchmark -- `
@@ -217,7 +218,7 @@ cargo run --release -p engin --bin search_benchmark -- `
 ```powershell
 cargo run --release -p engin --bin benchmark -- `
   --fen "2bak4/3PaP1P1/9/4n4/2b6/6B2/3p5/4BA3/5C3/3K1A3 w - - 0 1" `
-  --playouts 20000 --repeat 3 --gathers 4 --evals 4 `
+  --playouts 20000 --repeat 3 --threads 8 `
   --variance-bonus-scale 0.1 `
   --root-top 8 --tree-depth 3 --tree-top 3
 ```

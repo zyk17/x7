@@ -1,7 +1,7 @@
 //! 叶子终局分类（不是 `publish_edges`，也不是 `ExpansionState::Expanded`）。
 //!
 //! 只回答「要不要 NN」：死/子力不足/重复/rule60 → Terminal，否则 Evaluate。
-//! Eval 编码前调用；root 启动门禁复用 `path_terminal_value`。
+//! Expand task 调用；root 启动门禁复用 `path_terminal_value`。
 //!
 //! `mcts2`：`rep==1` 继续搜；`rep>=2` 才 RuleJudge。终局 `m` 用于排序。
 
@@ -15,7 +15,7 @@ pub(crate) enum ExpandKind {
     Terminal { wl: f32, draw: f32, plies_left: f32 },
 }
 
-/// 为 stream Gather/Eval 分类 `history` 的叶子。
+/// 为 stream Expand 分类 `history` 的叶子。
 ///
 /// `depth` 是自搜索 root 起的 variation 长度（0 即 root）。
 pub(crate) fn classify_expand(history: &PositionHistory, depth: usize) -> ExpandKind {

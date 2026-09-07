@@ -19,14 +19,16 @@ GPU 主要生产 Prediction，CPU 主要生产 Evidence；二者的具体比例�
 
 ## 搜索不变量
 
-- 流程固定为 `Gather -> Eval -> NN -> Eval -> Backprop`。Gather 一次只 claim 一个叶子；
-  Eval 首次到达叶子时处理终局、缓存与编码，NN 只做已编码 tensor 的合批推理。
+- 流程固定为 `Gather -> Expand -> Eval -> NN -> Reply -> Backprop`。Gather 一次只 claim 一个叶子；
+  Expand 处理终局和合法着，Eval 先查 cache、仅 miss 编码并发 NN，Reply 发布结果，NN 只合批 tensor。
+- `Threads` 是固定数目的通用 CPU worker，按就绪队列处理 Gather、Expand、Eval、NN 回包和 Backprop；NN
+  inference 独占一条设备线程。未来 Proof 复用同一 CPU 调度边界，不预留专用线程。
 - edge 的 reservation 是 pending visit；实战的 virtual mean 为 FPU。完成或取消必须精确归还，
   completed Evidence 不包含 pending 值。
 - 换根只支持向前复用已展开 child；悔棋或未展开路径直接换新 arena。stop/预算到期先取消并 drain
   所有 event，再异步回收 sibling，slot 才可复用。
-- 重复、rule60 与亚洲规则是 variation/history 语义。根终局由 root gate 判断，非根叶子由 Eval
-  首次分类；Gather 不重复裁决。
+- 重复、rule60 与亚洲规则是 variation/history 语义。根终局由 root gate 判断，非根叶子由 Expand
+  首次分类；后续 Eval 不重复裁决。
 - 已标记 `Terminal` 的 child 不再由 Gather 选择；其首次发现仍照常 Backprop。根自身不标记为
   `Terminal`，当前搜索范围内的 root child 都已终局时停止；最终决策优先已证明必胜并选择最短 mate。
 - 只维护这一套 stream 搜索，不保留 classic 对照或多轨训练格式。
@@ -40,7 +42,7 @@ Select 的长期分数由算术均值利用、常规探索与证据复核组成�
 | --- | --- | --- |
 | cPUCT | 放大所有节点的常规 `U(P, N)` | 全局、长期地更早从 Q 利用转向 policy/相对-N 探索。 |
 | FPU reduction | 定义未访问 child 的初始 action-Q | 每个节点局部降低首次门槛；常在主线经过的各层先扩出兄弟。 |
-| `nn_window` | 限制最多同时在途的 claim | 首要是 batch/吞吐上限；reservation 带来的分流只是受该上限约束的副作用。 |
+| `nn_window` | 限制最多同时已提交 NN 的请求 | terminal/cache 不占；首要是 batch/吞吐上限，reservation 带来的分流只是受该上限约束的副作用。 |
 | virtual mean FPU scale | reservation 暂时写入 `scale * FPU`，并混入 in-flight edge 的 action-Q | 碰撞时可能暂时转向兄弟；只在 reservation 存在期间生效，具体方向取决于 FPU 符号。 |
 | `B_var` | `lambda * SE` 的已观察证据复核项 | 与 U 同级竞争，但只作用于 `N>=2` 的高 SE edge；不是未访问 child 的首次探索，也不保证单调扩树。 |
 

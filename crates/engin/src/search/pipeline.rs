@@ -1,8 +1,9 @@
-//! Shared / Stats + Gather 流程组装 + `Search` API。
+//! Shared / Stats + Select/Expand 流程组装 + `Search` API。
 //!
 //! 树走组装（claim / collision / 选边下降）在本文件；选边公式在 `select`，
 //! worker 线程循环在 `workerpool`，发边 / 回传在 `eval` / `backprop`。
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -16,13 +17,13 @@ use crate::EnginError;
 use crate::neural::MOVE_HISTORY;
 use crate::neural::backend::Backend;
 
-use super::eval::cancel_evaluation;
-use super::expand::path_terminal_value;
+use super::expand::{ExpandKind, classify_expand, path_terminal_value};
 use super::observer::{NoopObserver, SearchObserver};
 use super::param::{SearchConfig, SearchParams};
 use super::select::select_edge;
-use super::workerpool::{BackpropEvent, Event, GatherEvent, NnRequest, WorkerPool};
+use super::workerpool::{BackpropEvent, EvalJob, Event, ExpandEvent, GatherEvent, NnRequest, WorkerPool};
 use super::{EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree};
+use crate::neural::backend::EvalCacheKey;
 
 pub(crate) const RECEIVE_POLL: Duration = Duration::from_millis(10);
 
@@ -48,8 +49,10 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) stopping: AtomicBool,
     /// 未 `finish` 的 owned event：drain / 节点预算。
     pub(crate) outstanding: AtomicUsize,
-    /// 已交给 Eval 的叶子（编码或 NN）。满窗口就不再 claim 新叶子。
+    /// 已承诺给 Eval/NN 流程的 cache miss；从取得 claim 到 Backprop 或 cancel 才释放。
+    /// cache、terminal 和等待 claim 的 EvalJob 不计入。
     pub(crate) nn_inflight: AtomicUsize,
+    pub(crate) eval_claim_limit: usize,
     pub(crate) completed: AtomicU64,
     pub(crate) completed_depth: AtomicU64,
     pub(crate) max_depth: AtomicU64,
@@ -59,11 +62,14 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) idle_lock: Mutex<()>,
     pub(crate) idle: Condvar,
     pub(crate) gather_tx: crossbeam_channel::Sender<GatherEvent<O::Stamp>>,
-    pub(crate) eval_tx: crossbeam_channel::Sender<GatherEvent<O::Stamp>>,
+    pub(crate) expand_tx: crossbeam_channel::Sender<ExpandEvent<O::Stamp>>,
+    pub(crate) eval_tx: crossbeam_channel::Sender<EvalJob<O::Stamp>>,
     pub(crate) backprop_tx: crossbeam_channel::Sender<BackpropEvent<O::Stamp>>,
     /// 撞上 `Evaluating` 叶子的 playout。先留着 reservation / μ；该叶子自己的
     /// backprop `complete` 之后再按 `node_id` 摘出来 cancel。
     pub(crate) collision_waiters: Mutex<Vec<Event>>,
+    /// FIFO：先因 NN window 等待的叶子先恢复，避免新 miss 持续压住旧 job。
+    pub(crate) deferred_evals: Mutex<VecDeque<EvalJob<O::Stamp>>>,
 }
 
 impl<O: SearchObserver> Shared<O> {
@@ -89,6 +95,17 @@ impl<O: SearchObserver> Shared<O> {
         let _ = previous;
     }
 
+    /// 取消尚未取得 Eval claim 的叶子，并归还其 reservation。
+    pub(crate) fn cancel_expansion(&self, event: Event) {
+        let id = event.node_id;
+        event.cancel();
+        if let Some(node) = self.arena.get(id) {
+            node.abort_evaluation();
+        }
+        self.cancel_collisions(id);
+        self.finish(1, false);
+    }
+
     pub(crate) fn release_eval_claims(&self, count: usize) {
         if count == 0 {
             return;
@@ -97,6 +114,49 @@ impl<O: SearchObserver> Shared<O> {
         debug_assert!(previous >= count, "stream eval claim underflow");
         let _guard = self.idle_lock.lock();
         self.idle.notify_all();
+    }
+
+    pub(crate) fn try_acquire_eval_claim(&self) -> bool {
+        let mut current = self.nn_inflight.load(Ordering::Acquire);
+        loop {
+            if current >= self.eval_claim_limit {
+                return false;
+            }
+            match self
+                .nn_inflight
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    if O::ENABLED {
+                        self.observer.on_peak_inflight(current + 1);
+                    }
+                    return true;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn defer_eval(&self, job: EvalJob<O::Stamp>) {
+        self.deferred_evals.lock().push_back(job);
+    }
+
+    /// Deferred job 已经完成 cache miss；取出时原子取得 NN slot，避免 CPU 空等。
+    pub(crate) fn take_deferred_eval(&self) -> Option<EvalJob<O::Stamp>> {
+        let job = self.deferred_evals.lock().pop_front()?;
+        if self.try_acquire_eval_claim() {
+            Some(job)
+        } else {
+            self.deferred_evals.lock().push_front(job);
+            None
+        }
+    }
+
+    pub(crate) fn cancel_deferred_evals(&self) {
+        let jobs = std::mem::take(&mut *self.deferred_evals.lock());
+        for job in jobs {
+            self.cancel_expansion(job.event);
+        }
     }
 
     pub(crate) fn wait_while(
@@ -165,15 +225,6 @@ impl<O: SearchObserver> Shared<O> {
         self.finish(n, false);
     }
 
-    pub(crate) fn cancel_all_collisions(&self) {
-        let parked = std::mem::take(&mut *self.collision_waiters.lock());
-        let n = parked.len();
-        for event in parked {
-            event.cancel();
-        }
-        self.finish(n, false);
-    }
-
     pub(crate) fn fail(&self, error: EnginError) {
         let mut current = self.error.lock();
         if current.is_none() {
@@ -183,27 +234,42 @@ impl<O: SearchObserver> Shared<O> {
         self.idle.notify_all();
     }
 
-    /// 先增加 `nn_inflight` 再入队：图复用后 cache hit 极快，若 `try_send` 成功后才 +1，
-    /// Eval 可能已经 `release_eval_claims`，第二手 `go` 就会 underflow 闪退。
-    pub(crate) fn send_eval(&self, mut event: GatherEvent<O::Stamp>) {
-        event.mark_queued();
-        let inflight = self.nn_inflight.fetch_add(1, Ordering::AcqRel) + 1;
-        if O::ENABLED {
-            self.observer.on_peak_inflight(inflight);
-        }
+    pub(crate) fn send_eval(&self, mut job: EvalJob<O::Stamp>) {
+        job.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
-                cancel_evaluation(self, event.into_event());
+                self.cancel_expansion(job.event);
                 return;
             }
-            match self.eval_tx.try_send(event) {
+            match self.eval_tx.try_send(job) {
+                Ok(()) => return,
+                Err(TrySendError::Full(returned)) => {
+                    job = returned;
+                    thread::yield_now();
+                }
+                Err(TrySendError::Disconnected(returned)) => {
+                    self.cancel_expansion(returned.event);
+                    return;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn send_expand(&self, mut event: ExpandEvent<O::Stamp>) {
+        event.mark_queued();
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                self.cancel_expansion(event.into_event());
+                return;
+            }
+            match self.expand_tx.try_send(event) {
                 Ok(()) => return,
                 Err(TrySendError::Full(returned)) => {
                     event = returned;
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    cancel_evaluation(self, returned.into_event());
+                    self.cancel_expansion(returned.into_event());
                     return;
                 }
             }
@@ -250,7 +316,7 @@ impl<O: SearchObserver> Shared<O> {
     }
 }
 
-// --- Gather 组装 -------------------------------------------------------------
+// --- Select / Expand ---------------------------------------------------------
 
 fn branch_at_expanded_node<O: SearchObserver>(
     shared: &Shared<O>,
@@ -274,11 +340,7 @@ fn branch_at_expanded_node<O: SearchObserver>(
     Some((child, reservation))
 }
 
-pub(crate) fn process_gather_event<O: SearchObserver>(
-    shared: &Shared<O>,
-    mut event: GatherEvent<O::Stamp>,
-    eval_claim_limit: usize,
-) {
+pub(crate) fn process_gather_event<O: SearchObserver>(shared: &Shared<O>, mut event: GatherEvent<O::Stamp>) {
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             event.cancel();
@@ -291,14 +353,8 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
             .expect("event node lives until job drain");
         match node.expansion_state() {
             ExpansionState::Unexpanded => {
-                if shared.nn_inflight.load(Ordering::Acquire) >= eval_claim_limit {
-                    shared.wait_while(None, true, |shared| {
-                        shared.nn_inflight.load(Ordering::Acquire) >= eval_claim_limit
-                    });
-                    continue;
-                }
                 if node.try_begin_evaluation() {
-                    shared.send_eval(event);
+                    shared.send_expand(event);
                     return;
                 }
             }
@@ -325,6 +381,42 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
                 };
                 event = event.descend(child, reservation);
             }
+        }
+    }
+}
+
+/// 只处理已 claim 叶子的规则、合法着与后续任务分流；forced `1/k` 将在这里扩展。
+pub(crate) fn process_expand_event<O: SearchObserver>(shared: &Shared<O>, event: ExpandEvent<O::Stamp>) {
+    if shared.stopping.load(Ordering::Acquire) {
+        shared.cancel_expansion(event.into_event());
+        return;
+    }
+    let node = shared
+        .arena
+        .get(event.event.node_id)
+        .expect("expand node lives until job drain");
+    let depth = event.variation.moves().len();
+    let history = event.variation.history();
+    match classify_expand(&history, depth) {
+        ExpandKind::Terminal { wl, draw, plies_left } => {
+            node.mark_terminal(wl, draw, plies_left);
+            let root = event.node_path()[0];
+            shared.arena.propagate_proven_terminals(event.node_path(), root);
+            shared.send_backprop(BackpropEvent::without_eval_claim(
+                event.into_event(),
+                wl,
+                draw,
+                plies_left,
+            ));
+        }
+        ExpandKind::Evaluate { legal_moves } => {
+            shared.send_eval(EvalJob {
+                event: event.into_event(),
+                cache_key: EvalCacheKey::new(history.last(), legal_moves.len()),
+                legal_moves,
+                history,
+                queued_at: O::Stamp::default(),
+            });
         }
     }
 }
@@ -377,9 +469,9 @@ impl<O: SearchObserver> SearchControl<O> {
     }
 }
 
-/// 连续流式搜索：Gather / Eval / NN / Backprop。
-/// Eval：terminal | cache → Backprop；否则稀疏编码 → NN queue；NN expand + 合批推理后
-/// 整批交回 → Eval 切行/softmax/edges → Backprop。
+/// 连续流式搜索：Gather / Expand / Eval / NN / Reply / Backprop。
+/// Expand 裁决规则终局和合法着；Eval 先查 cache，仅 miss 编码并送 NN；NN 合批结果交回
+/// Reply 发布 edge，再由 Backprop 完成 reservation。
 pub struct Search<O: SearchObserver = NoopObserver> {
     shared: Arc<Shared<O>>,
     root_history: Arc<PositionHistory>,
@@ -434,8 +526,10 @@ impl<O: SearchObserver> Search<O> {
         let resolved = config.resolve(backend.as_ref());
         worker_pool.assert_compatible(&resolved);
         let (gather_tx, gather_rx) = bounded(resolved.queue_capacity);
+        let (expand_tx, expand_rx) = bounded(resolved.queue_capacity);
         let (eval_tx, eval_rx) = bounded(resolved.queue_capacity);
         let (backprop_tx, backprop_rx) = bounded(resolved.queue_capacity);
+        let (nn_reply_tx, nn_reply_rx) = bounded(resolved.queue_capacity);
         // UCI/graph 持有完整 history 用于跨回合定位；每个 event 只需要重复规则自
         // 最近零化着以来的后缀，以及 NN 的最近 8 层。这里一次裁剪后由整次 job 共享。
         let root_history = Arc::new(graph.root_history().search_window(MOVE_HISTORY));
@@ -452,6 +546,7 @@ impl<O: SearchObserver> Search<O> {
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
             nn_inflight: AtomicUsize::new(0),
+            eval_claim_limit: resolved.eval_claim_limit,
             completed: AtomicU64::new(0),
             completed_depth: AtomicU64::new(0),
             max_depth: AtomicU64::new(0),
@@ -461,13 +556,26 @@ impl<O: SearchObserver> Search<O> {
             idle_lock: Mutex::new(()),
             idle: Condvar::new(),
             gather_tx,
+            expand_tx,
             eval_tx,
             backprop_tx,
             collision_waiters: Mutex::new(Vec::new()),
+            deferred_evals: Mutex::new(std::collections::VecDeque::new()),
         });
         let (nn_tx, nn_rx) = bounded::<NnRequest<O::Stamp>>(resolved.queue_capacity);
-        worker_pool.start_job(&shared, &gather_rx, &eval_rx, &nn_tx, &nn_rx, &backprop_rx);
+        worker_pool.start_job(
+            &shared,
+            &gather_rx,
+            &expand_rx,
+            &eval_rx,
+            &nn_reply_rx,
+            &nn_tx,
+            &nn_rx,
+            &nn_reply_tx,
+            &backprop_rx,
+        );
         drop(nn_tx);
+        drop(nn_reply_tx);
         Self {
             shared,
             root_history,
@@ -513,7 +621,7 @@ impl<O: SearchObserver> Search<O> {
     }
 
     /// Requests a normal stream-search stop without tearing down worker
-    /// threads. Gather/Eval/Backprop cancel every unfinished event and its
+    /// threads. Gather/Expand/Eval/Backprop cancel every unfinished event and its
     /// edge reservation before becoming idle. This is the boundary a later
     /// UCI controller uses this for `stop`; owner cleanup drains this job and
     /// returns its workers to the pool.
@@ -633,6 +741,14 @@ impl<O: SearchObserver> Search<O> {
                 self.worker_pool.eval_batch_size(),
                 now,
             );
+            // `nn_inflight` 只在 CPU 已经完成 Expand 并真的提交 NN 后增加。owner 若只看
+            // 它，会在 CPU 得到首个时间片前把 Gather 队列灌满，制造无意义 collision。这个
+            // 小的派发上限不是 NN window：它仅给每条 CPU worker 留一项前置工作。
+            let dispatch_limit = in_flight_limit.saturating_add(self.worker_pool.cpu_workers());
+            if outstanding >= dispatch_limit {
+                self.wait_until_outstanding_below(dispatch_limit, limits.deadline)?;
+                continue;
+            }
             if self.shared.nn_inflight.load(Ordering::Acquire) >= in_flight_limit {
                 self.shared.wait_while(limits.deadline, true, |shared| {
                     shared.nn_inflight.load(Ordering::Acquire) >= in_flight_limit
@@ -697,7 +813,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-    use crossbeam_channel::{TryRecvError, bounded};
+    use crossbeam_channel::{Receiver, TryRecvError, bounded};
     use parking_lot::{Condvar, Mutex};
     use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
@@ -706,7 +822,48 @@ mod tests {
     use crate::search::decision::{best_move, root_stats};
     use crate::search::observer::NoopObserver;
     use crate::search::param::{SearchConfig, SearchParams};
-    use crate::search::{NoQueueStamp, NodeArena};
+    use crate::search::workerpool::ExpandEvent;
+    use crate::search::{BackpropEvent, NoQueueStamp, NodeArena};
+
+    fn test_shared(
+        arena: Arc<NodeArena>,
+        outstanding: usize,
+        eval_claim_limit: usize,
+    ) -> (
+        Arc<Shared>,
+        Receiver<ExpandEvent<NoQueueStamp>>,
+        Receiver<BackpropEvent<NoQueueStamp>>,
+    ) {
+        let (gather_tx, _) = bounded(1);
+        let (expand_tx, expand_rx) = bounded(1);
+        let (eval_tx, _) = bounded(1);
+        let (backprop_tx, backprop_rx) = bounded(1);
+        let shared = Arc::new(Shared {
+            backend: Arc::new(UniformBackend::default()) as Arc<dyn Backend>,
+            arena,
+            params: SearchParams::default(),
+            root_move_filter: Mutex::new(Vec::new()),
+            stopping: AtomicBool::new(false),
+            outstanding: AtomicUsize::new(outstanding),
+            nn_inflight: AtomicUsize::new(0),
+            eval_claim_limit,
+            completed: AtomicU64::new(0),
+            completed_depth: AtomicU64::new(0),
+            max_depth: AtomicU64::new(0),
+            network_evaluations: AtomicU64::new(0),
+            observer: NoopObserver,
+            error: Mutex::new(None),
+            idle_lock: Mutex::new(()),
+            idle: Condvar::new(),
+            gather_tx,
+            expand_tx,
+            eval_tx,
+            backprop_tx,
+            collision_waiters: Mutex::new(Vec::new()),
+            deferred_evals: Mutex::new(std::collections::VecDeque::new()),
+        });
+        (shared, expand_rx, backprop_rx)
+    }
 
     #[test]
     fn stale_terminal_gather_cancels_its_reservation() {
@@ -726,40 +883,46 @@ mod tests {
         assert!(terminal.try_begin_evaluation());
         terminal.mark_terminal(1.0, 0.0, 1.0);
 
-        let (gather_tx, _) = bounded(1);
-        let (eval_tx, _) = bounded(1);
-        let (backprop_tx, backprop_rx) = bounded(1);
-        let shared = Arc::new(Shared {
-            backend: Arc::new(UniformBackend::default()) as Arc<dyn Backend>,
-            arena: Arc::clone(&arena),
-            params: SearchParams::default(),
-            root_move_filter: Mutex::new(Vec::new()),
-            stopping: AtomicBool::new(false),
-            outstanding: AtomicUsize::new(1),
-            nn_inflight: AtomicUsize::new(0),
-            completed: AtomicU64::new(0),
-            completed_depth: AtomicU64::new(0),
-            max_depth: AtomicU64::new(0),
-            network_evaluations: AtomicU64::new(0),
-            observer: NoopObserver,
-            error: Mutex::new(None),
-            idle_lock: Mutex::new(()),
-            idle: Condvar::new(),
-            gather_tx,
-            eval_tx,
-            backprop_tx,
-            collision_waiters: Mutex::new(Vec::new()),
-        });
+        let (shared, _, backprop_rx) = test_shared(Arc::clone(&arena), 1, 1);
         let event = super::GatherEvent::<NoQueueStamp>::at_root(root_id, history)
             .descend(terminal_id, root.reserve_edge(0).expect("reservation"));
 
-        process_gather_event(&shared, event, 1);
+        process_gather_event(&shared, event);
 
         assert_eq!(root.edges()[0].visits(), 0);
         assert_eq!(root.completed_visits(), 0);
         assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);
         assert_eq!(shared.completed.load(Ordering::Acquire), 0);
         assert!(matches!(backprop_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn eval_claim_window_is_strict_and_reopens_after_release() {
+        let (shared, _, _) = test_shared(Arc::new(NodeArena::default()), 0, 2);
+        assert!(shared.try_acquire_eval_claim());
+        assert!(shared.try_acquire_eval_claim());
+        assert!(!shared.try_acquire_eval_claim());
+        shared.release_eval_claims(1);
+        assert!(shared.try_acquire_eval_claim());
+        assert_eq!(shared.nn_inflight.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn gather_claims_then_queues_an_expand_event() {
+        let arena = Arc::new(NodeArena::default());
+        let root = arena.allocate();
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(PositionHistory::from_positions(state.positions()));
+        let (shared, expand_rx, _) = test_shared(Arc::clone(&arena), 1, 1);
+
+        process_gather_event(&shared, super::GatherEvent::at_root(root, history));
+
+        assert_eq!(
+            arena.get(root).expect("root").expansion_state(),
+            super::ExpansionState::Evaluating
+        );
+        assert_eq!(expand_rx.try_recv().expect("expand event").event.node_id, root);
+        assert_eq!(shared.outstanding.load(Ordering::Acquire), 1);
     }
 
     #[test]

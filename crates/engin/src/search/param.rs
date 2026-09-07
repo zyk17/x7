@@ -90,9 +90,7 @@ impl SearchParams {
     }
 }
 
-/// 当前固定 worker pool 的 job 配置。算法旋钮在 `params`；`searchmoves` 在 `SearchLimits`。
-/// Gather/Eval 的静态比例来自当前实验；后续动态调度可按队列压力在二者及 proof 间分配 CPU，
-/// 而不改变搜索语义。
+/// 当前 worker pool 的 job 配置。算法旋钮在 `params`；`searchmoves` 在 `SearchLimits`。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchConfig {
     /// Search/Eval/NN 队列深度。`0` 表示 `max(4096, 64 * resolved_batch)`。
@@ -100,14 +98,14 @@ pub struct SearchConfig {
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
-    /// Eval claim 并发上限：`limit = ceil(NnBatchSize × nn_window)`。
-    /// Claim 在 backprop 写完 N/Q 后释放；调大可能提高eps、调小让 Gather 更贴最新统计。
+    /// 真正已提交 NN 的请求并发上限：`limit = ceil(NnBatchSize × nn_window)`。
+    /// cache/terminal 不占 slot；NN 结果完成 backprop 后才释放。调大可能提高 eps，调小让
+    /// Gather 更贴最新统计。
     pub nn_window: f32,
     pub params: SearchParams,
-    /// 当前固定 pool 的 Gather worker 数。
-    pub gather_workers: usize,
-    /// 当前固定 pool 的 Eval worker 数。它负责准备、缓存、合法着；NN inference 是单独的单 worker。
-    pub eval_workers: usize,
+    /// 通用 CPU worker 数；每个 worker 按就绪队列处理 Gather、Expand、Eval、NN 回包、Backprop，
+    /// 后续也承接 Proof。
+    pub cpu_workers: usize,
 }
 
 impl Default for SearchConfig {
@@ -117,8 +115,7 @@ impl Default for SearchConfig {
             eval_batch_size: 0,
             nn_window: 2.25,
             params: SearchParams::default(),
-            gather_workers: 3,
-            eval_workers: 5,
+            cpu_workers: 8,
         }
     }
 }
@@ -126,19 +123,11 @@ impl Default for SearchConfig {
 impl SearchConfig {
     pub(crate) fn validate(&self) {
         self.params.validate();
-        assert!(self.gather_workers > 0, "stream requires at least one gather worker");
-        assert!(self.eval_workers > 0, "stream requires at least one eval worker");
+        assert!(self.cpu_workers > 0, "stream requires at least one CPU worker");
         assert!(
             self.nn_window.is_finite() && self.nn_window > 0.0,
             "stream nn window factor must be finite and positive"
         );
-    }
-
-    /// UCI `Threads` 尽量按 Gather:Eval = 1:2；除不尽时多给 Gather。
-    pub(crate) fn gather_eval_from_threads(threads: usize) -> (usize, usize) {
-        let eval = ((threads * 2) / 3).max(1);
-        let gather = threads.saturating_sub(eval).max(1);
-        (gather, eval)
     }
 
     /// 填充0配置, 推算具体队列/批量大小。
@@ -167,8 +156,7 @@ impl SearchConfig {
             eval_batch_size,
             eval_claim_limit,
             params: self.params,
-            gather_workers: self.gather_workers,
-            eval_workers: self.eval_workers,
+            cpu_workers: self.cpu_workers,
         }
     }
 }
@@ -179,6 +167,5 @@ pub(crate) struct ResolvedSearchConfig {
     pub(crate) eval_batch_size: usize,
     pub(crate) eval_claim_limit: usize,
     pub(crate) params: SearchParams,
-    pub(crate) gather_workers: usize,
-    pub(crate) eval_workers: usize,
+    pub(crate) cpu_workers: usize,
 }

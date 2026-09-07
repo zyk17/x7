@@ -25,8 +25,7 @@ struct Args {
     playouts: Option<u64>,
     movetime: Option<u64>,
     repeat: usize,
-    gathers: Vec<usize>,
-    evals: Vec<usize>,
+    threads: Vec<usize>,
     eval_batch: Option<usize>,
     cpuct: f32,
     cpuct_factor: f32,
@@ -46,7 +45,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--cpuct 2.4] [--cpuct-factor 0] [--fpu-reduction 0.225] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 1.5] [--decision-lcb-stdevs 0] \\
+     [--repeat 1] [--threads 4,8] [--eval-batch 64] [--cpuct 2.4] [--cpuct-factor 0] [--fpu-reduction 0.225] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 1.5] [--decision-lcb-stdevs 0] \\
      [--root-top 8] [--trace 128,256,512] [--collision-dist] [--tree-depth 4] [--tree-top 4]"
 }
 
@@ -58,8 +57,7 @@ fn parse_args() -> Result<Args, String> {
     let mut playouts = Some(20_000);
     let mut movetime = None;
     let mut repeat = 1;
-    let mut gathers = vec![3];
-    let mut evals = vec![5];
+    let mut threads = vec![8];
     let mut eval_batch = None;
     let defaults = SearchParams::default();
     let mut cpuct = defaults.cpuct;
@@ -113,8 +111,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--repeat must be an unsigned integer")?
             }
-            "--gathers" => gathers = parse_list(&args.next().ok_or("--gathers requires list like 4,8")?)?,
-            "--evals" => evals = parse_list(&args.next().ok_or("--evals requires list like 1,2")?)?,
+            "--threads" => threads = parse_list(&args.next().ok_or("--threads requires list like 4,8")?)?,
             "--eval-batch" => {
                 eval_batch = Some(
                     args.next()
@@ -213,10 +210,8 @@ fn parse_args() -> Result<Args, String> {
             return Err("--trace milestones must be strictly increasing and within --playouts".into());
         }
     }
-    for (name, values) in [("--gathers", &gathers), ("--evals", &evals)] {
-        if values.contains(&0) {
-            return Err(format!("{name} entries must be > 0"));
-        }
+    if threads.contains(&0) {
+        return Err("--threads entries must be > 0".into());
     }
     Ok(Args {
         onnx,
@@ -226,8 +221,7 @@ fn parse_args() -> Result<Args, String> {
         playouts,
         movetime,
         repeat,
-        gathers,
-        evals,
+        threads,
         eval_batch,
         cpuct,
         cpuct_factor,
@@ -650,8 +644,7 @@ fn print_tree_node(
 
 #[allow(clippy::too_many_arguments)]
 fn print_run_report(
-    gather_workers: usize,
-    eval_workers: usize,
+    threads: usize,
     run_index: usize,
     seconds: f64,
     stats: &Stats,
@@ -675,7 +668,7 @@ fn print_run_report(
         stats.network_evaluations as f64 / bench.network_batches as f64
     };
 
-    println!("=== G={gather_workers} E={eval_workers} run={run_index} ===");
+    println!("=== CPU={threads} NN=1 run={run_index} ===");
     println!("Throughput");
     println!(
         "  ms={ms:.1}  nps={nps:.0}  eps={eps:.0}  completed={}  submitted={}  peak_inflight={}",
@@ -707,8 +700,10 @@ fn print_run_report(
 
     println!("Queues (avg/max us)");
     print_queue("gather", bench.gather_queue);
+    print_queue("expand", bench.expand_queue);
     print_queue("eval", bench.eval_queue);
     print_queue("nn", bench.nn_queue);
+    print_queue("nn_reply", bench.nn_reply_queue);
     print_queue("backprop", bench.backprop_queue);
 
     println!("Search depth");
@@ -746,7 +741,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map(|n| format!("playouts={n}"))
             .unwrap_or_else(|| format!("movetime={}ms", args.movetime.unwrap_or(0))),
         args.repeat,
-        args.gathers.len() * args.evals.len(),
+        args.threads.len(),
         positions.len(),
     );
     println!(
@@ -761,80 +756,76 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let root_is_black = history.is_black_to_move();
         println!("position: {name}");
         let nn_probe = warmup_position(backend.as_ref(), history.as_ref(), target_batch)?;
-        for &gather_workers in &args.gathers {
-            for &eval_workers in &args.evals {
-                for run_index in 1..=args.repeat {
-                    backend.clear_cache();
-                    let params = SearchParams {
-                        cpuct: args.cpuct,
-                        cpuct_factor: args.cpuct_factor,
-                        fpu_reduction: args.fpu_reduction,
-                        virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
-                        variance_bonus_scale: args.variance_bonus_scale,
-                        decision_lcb_stdevs: args.decision_lcb_stdevs,
-                        ..SearchParams::default()
-                    };
-                    let mut search = Search::new_with_observer(
-                        Arc::clone(&backend),
-                        Arc::clone(&history),
-                        SearchConfig {
-                            eval_batch_size: target_batch,
-                            nn_window: args.nn_window,
-                            gather_workers,
-                            eval_workers,
-                            params,
-                            ..SearchConfig::default()
-                        },
-                        BenchObserver::new(),
-                    );
+        for &threads in &args.threads {
+            for run_index in 1..=args.repeat {
+                backend.clear_cache();
+                let params = SearchParams {
+                    cpuct: args.cpuct,
+                    cpuct_factor: args.cpuct_factor,
+                    fpu_reduction: args.fpu_reduction,
+                    virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
+                    variance_bonus_scale: args.variance_bonus_scale,
+                    decision_lcb_stdevs: args.decision_lcb_stdevs,
+                    ..SearchParams::default()
+                };
+                let mut search = Search::new_with_observer(
+                    Arc::clone(&backend),
+                    Arc::clone(&history),
+                    SearchConfig {
+                        eval_batch_size: target_batch,
+                        nn_window: args.nn_window,
+                        cpu_workers: threads,
+                        params,
+                        ..SearchConfig::default()
+                    },
+                    BenchObserver::new(),
+                );
 
-                    let started = Instant::now();
-                    let stats = if args.trace.is_empty() {
-                        search.run_with_limits(SearchLimits {
-                            max_playouts: args.playouts,
-                            deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
-                            ..Default::default()
-                        })?
+                let started = Instant::now();
+                let stats = if args.trace.is_empty() {
+                    search.run_with_limits(SearchLimits {
+                        max_playouts: args.playouts,
+                        deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
+                        ..Default::default()
+                    })?
+                } else {
+                    let playouts = args.playouts.expect("trace requires playouts");
+                    for &milestone in &args.trace {
+                        search.run_playouts(milestone)?;
+                        println!("--- trace completed={milestone} ---");
+                        print_root_block(
+                            &search,
+                            root_is_black,
+                            args.root_top,
+                            &format!("Root snapshot @ completed={milestone}"),
+                            Some(&nn_probe),
+                            &params,
+                        );
+                        if let Some(depth) = args.tree_depth {
+                            print_tree_funnel(&search, root_is_black, depth, args.tree_top);
+                        }
+                    }
+                    if args.trace.last().copied().unwrap_or(0) < playouts {
+                        search.run_playouts(playouts)?
                     } else {
-                        let playouts = args.playouts.expect("trace requires playouts");
-                        for &milestone in &args.trace {
-                            search.run_playouts(milestone)?;
-                            println!("--- trace completed={milestone} ---");
-                            print_root_block(
-                                &search,
-                                root_is_black,
-                                args.root_top,
-                                &format!("Root snapshot @ completed={milestone}"),
-                                Some(&nn_probe),
-                                &params,
-                            );
-                            if let Some(depth) = args.tree_depth {
-                                print_tree_funnel(&search, root_is_black, depth, args.tree_top);
-                            }
-                        }
-                        if args.trace.last().copied().unwrap_or(0) < playouts {
-                            search.run_playouts(playouts)?
-                        } else {
-                            search.stats()
-                        }
-                    };
-                    let seconds = started.elapsed().as_secs_f64().max(1e-9);
-                    let bench = search.observer().snapshot();
-                    print_run_report(
-                        gather_workers,
-                        eval_workers,
-                        run_index,
-                        seconds,
-                        &stats,
-                        &bench,
-                        &search,
-                        root_is_black,
-                        &args,
-                        &nn_probe,
-                        &params,
-                    );
-                    search.stop_and_finish();
-                }
+                        search.stats()
+                    }
+                };
+                let seconds = started.elapsed().as_secs_f64().max(1e-9);
+                let bench = search.observer().snapshot();
+                print_run_report(
+                    threads,
+                    run_index,
+                    seconds,
+                    &stats,
+                    &bench,
+                    &search,
+                    root_is_black,
+                    &args,
+                    &nn_probe,
+                    &params,
+                );
+                search.stop_and_finish();
             }
         }
     }

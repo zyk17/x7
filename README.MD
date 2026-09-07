@@ -16,8 +16,9 @@ Prediction、搜索产生 Evidence，并以固定时间 Elo 衡量二者协同�
 | `nn` | 训练、权重处理、ONNX 导出；不进入搜索热路径。 |
 
 当前搜索是单一 stream 路径树：edge 首次下探时一次性绑定 arena 中的 `NodeId`，不合并换位。流水线为
-`Gather -> Eval -> NN -> Eval -> Backprop`；每次 Gather 只提交一个叶子，规则终局在 Eval
-阶段按 event 的完整 variation/history 裁决。换回合只复用已展开的前进子树；旧 job 先 drain，再由后台
+`Gather -> Expand -> Eval -> NN -> Reply -> Backprop`；每次 Gather 只提交一个叶子，Expand 按完整
+variation/history 完成规则终局与合法着分类。固定 CPU worker 动态处理这些任务；NN 保持独立设备线程。
+换回合只复用已展开的前进子树；旧 job 先 drain，再由后台
 回收 sibling 或整张旧 arena。NN 只合并已经编码的 tensor，不等待逻辑搜索轮次。
 
 ## 文档

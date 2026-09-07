@@ -349,7 +349,7 @@ impl Node {
         ExpansionState::from_raw(self.expansion.load(Ordering::Acquire))
     }
 
-    /// `Unexpanded → Evaluating`：至多一个 Gather claim 成功，该叶子交给 Eval。
+    /// `Unexpanded → Evaluating`：至多一个 Gather claim 成功，该叶子交给 Expand。
     /// 其余撞上 `Evaluating` 的路径由 Gather `park_collision`（保留 reservation / μ），
     /// 等该叶子 backprop complete 后再 cancel，不立刻取消、也不重复 Eval。
     pub fn try_begin_evaluation(&self) -> bool {
@@ -377,8 +377,8 @@ impl Node {
         self.expansion.store(ExpansionState::Expanded as u8, Ordering::Release);
     }
 
-    /// Eval 在发布终局数据或 policy 前失败后恢复 node，避免后续 Gather event 将失败的
-    /// NN 请求当作永久 collision。
+    /// Expand 或 Eval 在发布终局数据或 policy 前失败后恢复 node，避免后续 Gather event 将失败的
+    /// 请求当作永久 collision。
     pub fn abort_evaluation(&self) {
         let aborted = self
             .expansion

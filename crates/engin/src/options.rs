@@ -26,7 +26,7 @@ pub struct Options {
     pub fpu_reduction: f32,
     /// UCI `VarianceBonusScale`：已观察 edge 的 `scale * SE` 复核 bonus。
     pub variance_bonus_scale: f32,
-    /// Eval claim 上限相对 batch 的倍率；控制 pending work 的新鲜度与 NN 供给。
+    /// 已提交 NN 请求上限相对 batch 的倍率；cache/terminal 不占，控制 NN 供给与树统计新鲜度。
     pub nn_window: f32,
     /// reservation 临时写入的 FPU 缩放；仅在 in-flight 时影响 action Q。
     pub virtual_mean_fpu_scale: f32,
@@ -35,7 +35,7 @@ pub struct Options {
     pub decision_ucb_stdevs: f32,
     pub decision_rule: DecisionRule,
     pub decision_mix_n_weight: f32,
-    /// UCI `Threads` 只分配 Gather + Eval；Backprop 和 NN 各固定一条线程。
+    /// UCI `Threads` 是通用 CPU worker 数；NN 另有一条设备线程。
     pub threads: usize,
 }
 
