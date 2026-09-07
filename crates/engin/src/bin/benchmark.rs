@@ -668,7 +668,7 @@ fn print_run_report(
         stats.network_evaluations as f64 / bench.network_batches as f64
     };
 
-    println!("=== CPU={threads} NN=1 run={run_index} ===");
+    println!("=== Threads={threads} NN=1 run={run_index} ===");
     println!("Throughput");
     println!(
         "  ms={ms:.1}  nps={nps:.0}  eps={eps:.0}  completed={}  submitted={}  peak_inflight={}",
@@ -699,7 +699,7 @@ fn print_run_report(
     );
 
     println!("Queues (avg/max us)");
-    print_queue("gather", bench.gather_queue);
+    print_queue("select", bench.select_queue);
     print_queue("expand", bench.expand_queue);
     print_queue("eval", bench.eval_queue);
     print_queue("nn", bench.nn_queue);
@@ -774,7 +774,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     SearchConfig {
                         eval_batch_size: target_batch,
                         nn_window: args.nn_window,
-                        cpu_workers: threads,
+                        threads,
                         params,
                         ..SearchConfig::default()
                     },

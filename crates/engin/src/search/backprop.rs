@@ -70,7 +70,7 @@ mod tests {
 
     use super::complete_batch;
     use crate::search::NodeArena;
-    use crate::search::workerpool::{BackpropEvent, GatherEvent};
+    use crate::search::workerpool::{BackpropEvent, SelectEvent};
 
     #[test]
     fn backprop_completes_every_reservation_with_alternating_value() {
@@ -83,7 +83,7 @@ mod tests {
         let mv = Move::new(Square::parse("b2").expect("b2"), Square::parse("b3").expect("b3"));
         root_node.publish_edges(vec![(mv, 1.0)]);
         let child_id = arena.child_or_create(&root_node.edges()[0]);
-        let child = GatherEvent::<crate::search::NoQueueStamp>::at_root(root_id, Arc::clone(&history))
+        let child = SelectEvent::<crate::search::NoQueueStamp>::at_root(root_id, Arc::clone(&history))
             .descend(child_id, root_node.reserve_edge(0).expect("edge"));
 
         complete_batch(

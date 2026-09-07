@@ -6,19 +6,19 @@
 //! |------|------|
 //! | `select` / `expand` / `eval` / `backprop` | 算法方法（MCTS 实验改这里） |
 //! | `workerpool` | 事件 + 通用 CPU 任务池 + 独立 NN worker 循环壳 |
-//! | `pipeline` | `Shared` / `Stats` + Gather 树走组装 + `Search` API |
+//! | `pipeline` | `Shared` / `Stats` + Select 树走组装 + `Search` API |
 //! | `tree` | 树 / 节点 / 边 / Repo 数据结构 |
 //! | `decision` | 搜后根选着 / PV / LCB |
 //! | `param` / `time` | 参数与时钟 |
 //!
 //! 硬规则：
-//! - 只有 **Gather**（`pipeline::process_gather_event`，由 `workerpool` 调度）可 `reserve_edge` / `descend`
-//! - 只有 **Gather** 可 claim Unexpanded；只有 **Expand** 裁决规则终局/合法着；只有 **Eval/Reply**
+//! - 只有 **Select**（`pipeline::process_select_event`，由 `workerpool` 调度）可 `reserve_edge` / `descend`
+//! - 只有 **Select** 可 claim Unexpanded；只有 **Expand** 裁决规则终局/合法着；只有 **Eval/Reply**
 //!   可将普通叶子发布为 Expanded（`publish_edges`）
 //! - 只有 **Backprop** 可 `complete` reservation 与 `add_delta`
 //!
 //! MCGS：edge 一次性绑定 `NodeId`；历史重复仍由 variation 的 RuleJudge 裁决。
-//! NN cache 按棋盘 + repetition + 合法着数。Gather 每次一个叶子；virtual mean 分流。
+//! NN cache 按棋盘 + repetition + 合法着数。Select 每次一个叶子；virtual mean 分流。
 //! 无 prefetch / multivisit。
 
 mod backprop;
@@ -49,4 +49,4 @@ pub use select::{compute_cpuct, variance_bonus_from_se};
 pub(crate) use time::{TimeBudget, TimeManager};
 pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree, ValueDelta};
 pub(crate) use workerpool::WorkerPool;
-pub use workerpool::{BackpropEvent, Event, GatherEvent, Variation};
+pub use workerpool::{BackpropEvent, Event, SelectEvent, Variation};

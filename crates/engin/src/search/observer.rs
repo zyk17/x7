@@ -9,11 +9,11 @@ use parking_lot::Mutex;
 /// 队列等待所属阶段。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueKind {
-    Gather,
+    Select,
     Expand,
     Eval,
     Nn,
-    /// NN 结果已回到 CPU，等待发布 edge / 送 Backprop。
+    /// NN 结果已回到 worker 队列，等待发布 edge / 送 Backprop。
     NnReply,
     Backprop,
 }
@@ -128,7 +128,7 @@ pub struct BenchObserver {
     network_batch_size_max: AtomicU64,
     collisions_by_depth: Mutex<Vec<u64>>,
     batches_by_size: Mutex<Vec<u64>>,
-    gather_queue: QueueMetrics,
+    select_queue: QueueMetrics,
     expand_queue: QueueMetrics,
     eval_queue: QueueMetrics,
     nn_queue: QueueMetrics,
@@ -151,7 +151,7 @@ impl BenchObserver {
             network_batch_size_max: self.network_batch_size_max.load(Ordering::Acquire),
             collisions_by_depth: self.collisions_by_depth.lock().clone(),
             batches_by_size: self.batches_by_size.lock().clone(),
-            gather_queue: self.gather_queue.snapshot(),
+            select_queue: self.select_queue.snapshot(),
             expand_queue: self.expand_queue.snapshot(),
             eval_queue: self.eval_queue.snapshot(),
             nn_queue: self.nn_queue.snapshot(),
@@ -184,7 +184,7 @@ impl SearchObserver for BenchObserver {
 
     fn on_queue_wait(&self, kind: QueueKind, wait: Duration) {
         match kind {
-            QueueKind::Gather => self.gather_queue.record(wait),
+            QueueKind::Select => self.select_queue.record(wait),
             QueueKind::Expand => self.expand_queue.record(wait),
             QueueKind::Eval => self.eval_queue.record(wait),
             QueueKind::Nn => self.nn_queue.record(wait),
@@ -223,7 +223,7 @@ pub struct BenchStats {
     pub collisions_by_depth: Vec<u64>,
     /// 下标 = batch size，值 = 该 size 出现次数；`[0]` 恒为 0。
     pub batches_by_size: Vec<u64>,
-    pub gather_queue: QueueStats,
+    pub select_queue: QueueStats,
     pub expand_queue: QueueStats,
     pub eval_queue: QueueStats,
     pub nn_queue: QueueStats,

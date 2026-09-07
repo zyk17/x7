@@ -388,7 +388,7 @@ impl Engine {
                 decision_mix_n_weight: self.options.decision_mix_n_weight,
             },
             nn_window: self.options.nn_window,
-            cpu_workers: self.options.threads,
+            threads: self.options.threads,
             ..SearchConfig::default()
         };
         let decision_params = config.params;

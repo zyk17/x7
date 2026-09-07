@@ -98,14 +98,14 @@ pub struct SearchConfig {
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
-    /// 真正已提交 NN 的请求并发上限：`limit = ceil(NnBatchSize × nn_window)`。
-    /// cache/terminal 不占 slot；NN 结果完成 backprop 后才释放。调大可能提高 eps，调小让
-    /// Gather 更贴最新统计。
+    /// Eval claim 并发上限：`limit = ceil(NnBatchSize × nn_window)`。
+    /// cache/terminal 与等待 claim 的 job 不占 slot；NN 结果完成 backprop 后才释放。调大可能提高 eps，调小让
+    /// Select 更贴最新统计。
     pub nn_window: f32,
     pub params: SearchParams,
-    /// 通用 CPU worker 数；每个 worker 按就绪队列处理 Gather、Expand、Eval、NN 回包、Backprop，
+    /// 通用 worker 数；每个 worker 按就绪队列处理 Select、Expand、Eval、NN 回包、Backprop，
     /// 后续也承接 Proof。
-    pub cpu_workers: usize,
+    pub threads: usize,
 }
 
 impl Default for SearchConfig {
@@ -115,7 +115,7 @@ impl Default for SearchConfig {
             eval_batch_size: 0,
             nn_window: 2.25,
             params: SearchParams::default(),
-            cpu_workers: 8,
+            threads: 8,
         }
     }
 }
@@ -123,7 +123,7 @@ impl Default for SearchConfig {
 impl SearchConfig {
     pub(crate) fn validate(&self) {
         self.params.validate();
-        assert!(self.cpu_workers > 0, "stream requires at least one CPU worker");
+        assert!(self.threads > 0, "stream requires at least one worker");
         assert!(
             self.nn_window.is_finite() && self.nn_window > 0.0,
             "stream nn window factor must be finite and positive"
@@ -156,7 +156,7 @@ impl SearchConfig {
             eval_batch_size,
             eval_claim_limit,
             params: self.params,
-            cpu_workers: self.cpu_workers,
+            threads: self.threads,
         }
     }
 }
@@ -167,5 +167,5 @@ pub(crate) struct ResolvedSearchConfig {
     pub(crate) eval_batch_size: usize,
     pub(crate) eval_claim_limit: usize,
     pub(crate) params: SearchParams,
-    pub(crate) cpu_workers: usize,
+    pub(crate) threads: usize,
 }

@@ -1,7 +1,7 @@
 //! Eval 算法：cache | 已编码 NN 请求 | NN 回包发布。
 //!
 //! 规则终局和合法着生成属于独立 Expand task；这里不持有 worker-local 等待列表，
-//! 因此任一 CPU worker 都可继续处理下一项任务。
+//! 因此任一 worker 都可继续处理下一项任务。
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,7 +17,7 @@ use super::observer::{QueueStamp, SearchObserver};
 use super::pipeline::Shared;
 use super::workerpool::{BackpropEvent, EvalJob, Event, NnReply, NnRequest};
 
-/// 处理一个 Gather 已分类的普通叶子。
+/// 处理一个 Expand 已分类的普通叶子。
 ///
 /// `claim_held` 只会来自 deferred job：它在上次 cache miss 时已经取得了 NN slot。
 pub(crate) fn handle_eval_job<O: SearchObserver>(
@@ -43,7 +43,7 @@ pub(crate) fn handle_eval_job<O: SearchObserver>(
         return publish_eval(shared, job.event, job.legal_moves, eval, claim_held);
     }
     if !claim_held && !shared.try_acquire_eval_claim() {
-        shared.defer_eval(job);
+        shared.defer_eval_job(job);
         return Ok(());
     }
     let planes = encode_position_input_planes(&job.history, FillEmptyHistory::FenOnly);
@@ -137,7 +137,7 @@ fn publish_eval<O: SearchObserver>(
         .expect("eval node lives until job drain")
         .publish_edges(legal_moves.iter().copied().zip(eval.policies.iter().copied()));
     let backprop = if held_claim {
-        BackpropEvent::from_eval(event, -eval.wl, eval.d, eval.plies_left)
+        BackpropEvent::with_eval_claim(event, -eval.wl, eval.d, eval.plies_left)
     } else {
         BackpropEvent::without_eval_claim(event, -eval.wl, eval.d, eval.plies_left)
     };
@@ -151,7 +151,7 @@ pub(crate) fn cancel_evaluation<O: SearchObserver>(shared: &Shared<O>, event: Ev
     shared.cancel_expansion(event);
 }
 
-/// 合批推理一批已编码请求；结果回交通用 CPU reply 队列，不阻塞提交它的 worker。
+/// 合批推理一批已编码请求；结果回交通用 reply 队列，不阻塞提交它的 worker。
 pub(crate) fn infer_nn_batch<O: SearchObserver>(
     shared: &Shared<O>,
     requests: Vec<NnRequest<O::Stamp>>,

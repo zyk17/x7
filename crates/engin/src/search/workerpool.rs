@@ -1,6 +1,6 @@
-//! 事件定义与固定 CPU 任务池。
+//! 事件定义与固定任务池。
 //!
-//! CPU worker 不再绑定 Gather/Expand/Eval/Backprop 角色：每次只取一个就绪任务，优先让
+//! worker 不再绑定 Select/Expand/Eval/Backprop 角色：每次只取一个就绪任务，优先让
 //! Backprop 和 NN 回包释放 reservation；NN inference 仍是独立设备 worker。Proof 的任务位
 //! 留在这个调度边界，暂不赋予搜索语义。
 
@@ -21,7 +21,7 @@ use super::backprop::complete_batch;
 use super::eval::{cancel_evaluation, handle_eval_job, handle_nn_reply, infer_nn_batch};
 use super::observer::{NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver, observe_queue_wait};
 use super::param::{ResolvedSearchConfig, SearchConfig};
-use super::pipeline::{RECEIVE_POLL, Shared, process_expand_event, process_gather_event};
+use super::pipeline::{RECEIVE_POLL, Shared, process_expand_event, process_select_event};
 use super::{NodeId, ValueDelta};
 
 #[derive(Clone, Debug)]
@@ -71,16 +71,16 @@ impl Event {
 }
 
 #[derive(Debug)]
-pub struct GatherEvent<S: QueueStamp = NoQueueStamp> {
+pub struct SelectEvent<S: QueueStamp = NoQueueStamp> {
     pub(crate) event: Event,
     pub variation: Variation,
     pub(crate) queued_at: S,
 }
 
 /// Select 已 claim 的未展开叶子；保留完整 variation，供规则裁决和后续 forced 展开使用。
-pub(crate) type ExpandEvent<S = NoQueueStamp> = GatherEvent<S>;
+pub(crate) type ExpandEvent<S = NoQueueStamp> = SelectEvent<S>;
 
-impl<S: QueueStamp> GatherEvent<S> {
+impl<S: QueueStamp> SelectEvent<S> {
     pub fn at_root(root_id: NodeId, root_history: Arc<PositionHistory>) -> Self {
         Self {
             event: Event {
@@ -147,7 +147,7 @@ impl<S: QueueStamp> NnRequest<S> {
     }
 }
 
-/// NN worker 回交给任一 CPU worker 的结果；其 event 保持一个 NN claim。
+/// NN worker 回交给任一 worker 的结果；其 event 保持一个 Eval claim。
 pub(crate) struct NnReply<S: QueueStamp = NoQueueStamp> {
     pub(crate) job: EvalJob<S>,
     pub(crate) result: Result<(Arc<EncodedBatch>, usize), EnginError>,
@@ -176,7 +176,7 @@ pub struct BackpropEvent<S: QueueStamp = NoQueueStamp> {
 }
 
 impl<S: QueueStamp> BackpropEvent<S> {
-    pub(crate) fn from_eval(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
+    pub(crate) fn with_eval_claim(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
             event,
             value: ValueDelta::with_plies_left(wl, draw, plies_left),
@@ -200,10 +200,10 @@ impl<S: QueueStamp> BackpropEvent<S> {
     }
 }
 
-enum CpuCommand<O: SearchObserver> {
+enum WorkerCommand<O: SearchObserver> {
     Run {
         shared: Arc<Shared<O>>,
-        gather_rx: Receiver<GatherEvent<O::Stamp>>,
+        select_rx: Receiver<SelectEvent<O::Stamp>>,
         expand_rx: Receiver<ExpandEvent<O::Stamp>>,
         eval_rx: Receiver<EvalJob<O::Stamp>>,
         nn_reply_rx: Receiver<NnReply<O::Stamp>>,
@@ -217,9 +217,9 @@ enum NnCommand<O: SearchObserver> {
     Shutdown,
 }
 
-/// 固定 CPU 容量的任务池；NN 另占一个设备 worker。
+/// 固定容量的任务池；NN 另占一个设备 worker。
 pub(crate) struct WorkerPool<O: SearchObserver = NoopObserver> {
-    cpu_commands: Vec<Sender<CpuCommand<O>>>,
+    worker_commands: Vec<Sender<WorkerCommand<O>>>,
     nn_commands: Sender<NnCommand<O>>,
     job_done: Receiver<()>,
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -236,18 +236,18 @@ impl<O: SearchObserver> WorkerPool<O> {
         let config = config.resolve(backend);
         self.eval_batch_size == config.eval_batch_size
             && self.eval_claim_limit == config.eval_claim_limit
-            && self.cpu_commands.len() == config.cpu_workers
+            && self.worker_commands.len() == config.threads
     }
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
         let (job_done_tx, job_done) = unbounded();
         let (nn_commands, nn_rx) = unbounded();
-        let mut cpu_commands = Vec::with_capacity(config.cpu_workers);
-        let mut threads = Vec::with_capacity(config.cpu_workers + 1);
-        for _ in 0..config.cpu_workers {
+        let mut worker_commands = Vec::with_capacity(config.threads);
+        let mut threads = Vec::with_capacity(config.threads + 1);
+        for _ in 0..config.threads {
             let (tx, rx) = unbounded();
             let done = job_done_tx.clone();
-            threads.push(thread::spawn(move || persistent_cpu_worker::<O>(rx, done)));
-            cpu_commands.push(tx);
+            threads.push(thread::spawn(move || persistent_worker::<O>(rx, done)));
+            worker_commands.push(tx);
         }
         let batch_size = config.eval_batch_size;
         threads.push(thread::spawn({
@@ -255,7 +255,7 @@ impl<O: SearchObserver> WorkerPool<O> {
             move || persistent_nn_worker::<O>(nn_rx, done, batch_size)
         }));
         Self {
-            cpu_commands,
+            worker_commands,
             nn_commands,
             job_done,
             threads: Mutex::new(threads),
@@ -267,7 +267,7 @@ impl<O: SearchObserver> WorkerPool<O> {
     pub(crate) fn start_job(
         &self,
         shared: &Arc<Shared<O>>,
-        gather_rx: &Receiver<GatherEvent<O::Stamp>>,
+        select_rx: &Receiver<SelectEvent<O::Stamp>>,
         expand_rx: &Receiver<ExpandEvent<O::Stamp>>,
         eval_rx: &Receiver<EvalJob<O::Stamp>>,
         nn_reply_rx: &Receiver<NnReply<O::Stamp>>,
@@ -279,22 +279,22 @@ impl<O: SearchObserver> WorkerPool<O> {
         self.nn_commands
             .send(NnCommand::Run(Arc::clone(shared), nn_rx.clone(), nn_reply_tx.clone()))
             .expect("persistent nn worker is alive");
-        for sender in &self.cpu_commands {
+        for sender in &self.worker_commands {
             sender
-                .send(CpuCommand::Run {
+                .send(WorkerCommand::Run {
                     shared: Arc::clone(shared),
-                    gather_rx: gather_rx.clone(),
+                    select_rx: select_rx.clone(),
                     expand_rx: expand_rx.clone(),
                     eval_rx: eval_rx.clone(),
                     nn_reply_rx: nn_reply_rx.clone(),
                     nn_tx: nn_tx.clone(),
                     backprop_rx: backprop_rx.clone(),
                 })
-                .expect("persistent CPU worker is alive");
+                .expect("persistent worker is alive");
         }
     }
     pub(crate) fn finish_job(&self) {
-        for _ in 0..self.cpu_commands.len() + 1 {
+        for _ in 0..self.worker_commands.len() + 1 {
             self.job_done.recv().expect("persistent worker completion");
         }
     }
@@ -305,14 +305,14 @@ impl<O: SearchObserver> WorkerPool<O> {
         self.eval_batch_size
     }
 
-    pub(crate) fn cpu_workers(&self) -> usize {
-        self.cpu_commands.len()
+    pub(crate) fn worker_count(&self) -> usize {
+        self.worker_commands.len()
     }
     pub(crate) fn assert_compatible(&self, config: &ResolvedSearchConfig) {
         debug_assert_eq!(
-            self.cpu_commands.len(),
-            config.cpu_workers,
-            "worker pool CPU capacity changed"
+            self.worker_commands.len(),
+            config.threads,
+            "worker pool capacity changed"
         );
         debug_assert_eq!(
             self.eval_batch_size, config.eval_batch_size,
@@ -326,8 +326,8 @@ impl<O: SearchObserver> WorkerPool<O> {
 }
 impl<O: SearchObserver> Drop for WorkerPool<O> {
     fn drop(&mut self) {
-        for sender in &self.cpu_commands {
-            let _ = sender.send(CpuCommand::Shutdown);
+        for sender in &self.worker_commands {
+            let _ = sender.send(WorkerCommand::Shutdown);
         }
         let _ = self.nn_commands.send(NnCommand::Shutdown);
         for worker in self.threads.get_mut().drain(..) {
@@ -375,16 +375,16 @@ fn process_backprop_batch<O: SearchObserver>(
     shared.finish(result.completed_playouts as usize, true);
 }
 
-fn cancel_cpu_queues<O: SearchObserver>(
+fn cancel_worker_queues<O: SearchObserver>(
     shared: &Shared<O>,
-    gather_rx: &Receiver<GatherEvent<O::Stamp>>,
+    select_rx: &Receiver<SelectEvent<O::Stamp>>,
     expand_rx: &Receiver<ExpandEvent<O::Stamp>>,
     eval_rx: &Receiver<EvalJob<O::Stamp>>,
     reply_rx: &Receiver<NnReply<O::Stamp>>,
     backprop_rx: &Receiver<BackpropEvent<O::Stamp>>,
 ) {
-    shared.cancel_deferred_evals();
-    while let Ok(event) = gather_rx.try_recv() {
+    shared.cancel_deferred_eval_jobs();
+    while let Ok(event) = select_rx.try_recv() {
         event.cancel();
         shared.finish(1, false);
     }
@@ -405,9 +405,9 @@ fn cancel_cpu_queues<O: SearchObserver>(
     }
 }
 
-fn cpu_worker<O: SearchObserver>(
+fn worker<O: SearchObserver>(
     shared: Arc<Shared<O>>,
-    gather_rx: Receiver<GatherEvent<O::Stamp>>,
+    select_rx: Receiver<SelectEvent<O::Stamp>>,
     expand_rx: Receiver<ExpandEvent<O::Stamp>>,
     eval_rx: Receiver<EvalJob<O::Stamp>>,
     reply_rx: Receiver<NnReply<O::Stamp>>,
@@ -416,14 +416,14 @@ fn cpu_worker<O: SearchObserver>(
 ) {
     loop {
         if shared.stopping.load(Ordering::Acquire) {
-            cancel_cpu_queues(&shared, &gather_rx, &expand_rx, &eval_rx, &reply_rx, &backprop_rx);
+            cancel_worker_queues(&shared, &select_rx, &expand_rx, &eval_rx, &reply_rx, &backprop_rx);
             if shared.outstanding.load(Ordering::Acquire) == 0 {
                 break;
             }
             thread::yield_now();
             continue;
         }
-        if let Some(job) = shared.take_deferred_eval() {
+        if let Some(job) = shared.take_deferred_eval_job() {
             if let Err(error) = handle_eval_job(&shared, &nn_tx, job, true) {
                 shared.fail(error);
             }
@@ -458,11 +458,11 @@ fn cpu_worker<O: SearchObserver>(
             process_expand_event(&shared, event);
             continue;
         }
-        if let Ok(mut event) = gather_rx.try_recv() {
+        if let Ok(mut event) = select_rx.try_recv() {
             if O::ENABLED {
-                observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Gather);
+                observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Select);
             }
-            process_gather_event(&shared, event);
+            process_select_event(&shared, event);
             continue;
         }
         crossbeam_channel::select! {
@@ -489,10 +489,10 @@ fn cpu_worker<O: SearchObserver>(
                     process_expand_event(&shared, event);
                 }
             },
-            recv(gather_rx) -> result => {
+            recv(select_rx) -> result => {
                 if let Ok(mut event) = result {
-                    if O::ENABLED { observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Gather); }
-                    process_gather_event(&shared, event);
+                    if O::ENABLED { observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Select); }
+                    process_select_event(&shared, event);
                 }
             },
             default(RECEIVE_POLL) => {},
@@ -500,22 +500,22 @@ fn cpu_worker<O: SearchObserver>(
     }
 }
 
-fn persistent_cpu_worker<O: SearchObserver>(commands: Receiver<CpuCommand<O>>, done: Sender<()>) {
+fn persistent_worker<O: SearchObserver>(commands: Receiver<WorkerCommand<O>>, done: Sender<()>) {
     while let Ok(command) = commands.recv() {
         match command {
-            CpuCommand::Run {
+            WorkerCommand::Run {
                 shared,
-                gather_rx,
+                select_rx,
                 expand_rx,
                 eval_rx,
                 nn_reply_rx,
                 nn_tx,
                 backprop_rx,
             } => {
-                cpu_worker(shared, gather_rx, expand_rx, eval_rx, nn_reply_rx, nn_tx, backprop_rx);
+                worker(shared, select_rx, expand_rx, eval_rx, nn_reply_rx, nn_tx, backprop_rx);
                 let _ = done.send(());
             }
-            CpuCommand::Shutdown => break,
+            WorkerCommand::Shutdown => break,
         }
     }
 }

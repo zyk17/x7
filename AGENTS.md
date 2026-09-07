@@ -20,7 +20,7 @@
 - `crates/xiangqi_core`：唯一规则真相。
 - `crates/engin`：UCI、网络外围、stream 搜索和时钟。
 - `crates/engin/src/search`：owned event 的
-  `Gather -> Expand -> Eval -> NN -> Reply -> Backprop` 流水线；Gather 每次一个叶子，Expand
+  `Select -> Expand -> Eval -> NN -> Reply -> Backprop` 流水线；Select 每次一个叶子，Expand
   处理规则终局与合法着，Eval 处理缓存并只为 miss 编码。
 - `nn/`：训练与 ONNX 导出，不进入规则或搜索热路径。
 
