@@ -17,11 +17,10 @@ use crate::neural::backend::{Backend, EvalCacheKey};
 use crate::neural::{EncodedBatch, InputPlanes};
 use crate::search::EdgeReservation;
 
-use super::backprop::complete_batch;
-use super::eval::{cancel_evaluation, handle_eval_job, handle_nn_reply, infer_nn_batch};
+use super::eval::{cancel_evaluation, handle_nn_reply, infer_nn_batch, process_eval_event, send_nn_reply};
 use super::observer::{NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver, observe_queue_wait};
 use super::param::{ResolvedSearchConfig, SearchConfig};
-use super::pipeline::{RECEIVE_POLL, Shared, process_expand_event, process_select_event};
+use super::pipeline::{RECEIVE_POLL, Shared, process_backprop_event, process_expand_event, process_select_event};
 use super::{NodeId, ValueDelta};
 
 #[derive(Clone, Debug)]
@@ -65,9 +64,6 @@ impl Event {
             reservation.cancel();
         }
     }
-    pub fn node_path(&self) -> &[NodeId] {
-        &self.node_path
-    }
 }
 
 #[derive(Debug)]
@@ -103,7 +99,7 @@ impl<S: QueueStamp> SelectEvent<S> {
         self.event.cancel();
     }
     pub fn node_path(&self) -> &[NodeId] {
-        self.event.node_path()
+        self.event.node_path.as_slice()
     }
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at.mark();
@@ -115,14 +111,14 @@ impl<S: QueueStamp> SelectEvent<S> {
 
 /// Expand 已完成规则分类的普通叶子。Eval 只处理 cache、编码、NN 和发布结果。
 #[derive(Debug)]
-pub(crate) struct EvalJob<S: QueueStamp = NoQueueStamp> {
+pub(crate) struct EvalEvent<S: QueueStamp = NoQueueStamp> {
     pub(crate) event: Event,
     pub(crate) legal_moves: LegalMoveList,
     pub(crate) cache_key: EvalCacheKey,
     pub(crate) history: PositionHistory,
     pub(crate) queued_at: S,
 }
-impl<S: QueueStamp> EvalJob<S> {
+impl<S: QueueStamp> EvalEvent<S> {
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at.mark();
     }
@@ -130,14 +126,14 @@ impl<S: QueueStamp> EvalJob<S> {
 
 /// 已取得 NN window slot 的设备请求。
 pub(crate) struct NnRequest<S: QueueStamp = NoQueueStamp> {
-    pub(crate) job: EvalJob<S>,
+    pub(crate) event: EvalEvent<S>,
     pub(crate) planes: InputPlanes,
     pub(crate) queued_at: S,
 }
 impl<S: QueueStamp> NnRequest<S> {
-    pub(crate) fn new(job: EvalJob<S>, planes: InputPlanes) -> Self {
+    pub(crate) fn new(event: EvalEvent<S>, planes: InputPlanes) -> Self {
         Self {
-            job,
+            event,
             planes,
             queued_at: S::default(),
         }
@@ -147,16 +143,16 @@ impl<S: QueueStamp> NnRequest<S> {
     }
 }
 
-/// NN worker 回交给任一 worker 的结果；其 event 保持一个 Eval claim。
+/// NN worker 回交给任一 worker 的结果；其 event 持有一个 NN permit。
 pub(crate) struct NnReply<S: QueueStamp = NoQueueStamp> {
-    pub(crate) job: EvalJob<S>,
+    pub(crate) event: EvalEvent<S>,
     pub(crate) result: Result<(Arc<EncodedBatch>, usize), EnginError>,
     pub(crate) queued_at: S,
 }
 impl<S: QueueStamp> NnReply<S> {
-    pub(crate) fn new(job: EvalJob<S>, result: Result<(Arc<EncodedBatch>, usize), EnginError>) -> Self {
+    pub(crate) fn new(event: EvalEvent<S>, result: Result<(Arc<EncodedBatch>, usize), EnginError>) -> Self {
         Self {
-            job,
+            event,
             result,
             queued_at: S::default(),
         }
@@ -170,25 +166,25 @@ impl<S: QueueStamp> NnReply<S> {
 pub struct BackpropEvent<S: QueueStamp = NoQueueStamp> {
     pub(crate) event: Event,
     pub(crate) value: ValueDelta,
-    /// 此 event 是否持有 Eval claim；Backprop 完成后释放对应 window slot。
-    pub(crate) held_eval_claim: bool,
+    /// 此 event 是否持有 NN permit；Backprop 完成后释放对应 window slot。
+    pub(crate) holds_nn_permit: bool,
     pub(crate) queued_at: S,
 }
 
 impl<S: QueueStamp> BackpropEvent<S> {
-    pub(crate) fn with_eval_claim(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
+    pub(crate) fn with_nn_permit(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
             event,
             value: ValueDelta::with_plies_left(wl, draw, plies_left),
-            held_eval_claim: true,
+            holds_nn_permit: true,
             queued_at: S::default(),
         }
     }
-    pub(crate) fn without_eval_claim(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
+    pub(crate) fn without_nn_permit(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
             event,
             value: ValueDelta::with_plies_left(wl, draw, plies_left),
-            held_eval_claim: false,
+            holds_nn_permit: false,
             queued_at: S::default(),
         }
     }
@@ -205,7 +201,7 @@ enum WorkerCommand<O: SearchObserver> {
         shared: Arc<Shared<O>>,
         select_rx: Receiver<SelectEvent<O::Stamp>>,
         expand_rx: Receiver<ExpandEvent<O::Stamp>>,
-        eval_rx: Receiver<EvalJob<O::Stamp>>,
+        eval_rx: Receiver<EvalEvent<O::Stamp>>,
         nn_reply_rx: Receiver<NnReply<O::Stamp>>,
         nn_tx: Sender<NnRequest<O::Stamp>>,
         backprop_rx: Receiver<BackpropEvent<O::Stamp>>,
@@ -224,7 +220,7 @@ pub(crate) struct WorkerPool<O: SearchObserver = NoopObserver> {
     job_done: Receiver<()>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     eval_batch_size: usize,
-    eval_claim_limit: usize,
+    nn_permit_limit: usize,
 }
 
 impl<O: SearchObserver> WorkerPool<O> {
@@ -235,7 +231,7 @@ impl<O: SearchObserver> WorkerPool<O> {
     pub(crate) fn matches_config(&self, backend: &dyn Backend, config: &SearchConfig) -> bool {
         let config = config.resolve(backend);
         self.eval_batch_size == config.eval_batch_size
-            && self.eval_claim_limit == config.eval_claim_limit
+            && self.nn_permit_limit == config.nn_permit_limit
             && self.worker_commands.len() == config.threads
     }
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
@@ -260,7 +256,7 @@ impl<O: SearchObserver> WorkerPool<O> {
             job_done,
             threads: Mutex::new(threads),
             eval_batch_size: config.eval_batch_size,
-            eval_claim_limit: config.eval_claim_limit,
+            nn_permit_limit: config.nn_permit_limit,
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -269,7 +265,7 @@ impl<O: SearchObserver> WorkerPool<O> {
         shared: &Arc<Shared<O>>,
         select_rx: &Receiver<SelectEvent<O::Stamp>>,
         expand_rx: &Receiver<ExpandEvent<O::Stamp>>,
-        eval_rx: &Receiver<EvalJob<O::Stamp>>,
+        eval_rx: &Receiver<EvalEvent<O::Stamp>>,
         nn_reply_rx: &Receiver<NnReply<O::Stamp>>,
         nn_tx: &Sender<NnRequest<O::Stamp>>,
         nn_rx: &Receiver<NnRequest<O::Stamp>>,
@@ -298,8 +294,8 @@ impl<O: SearchObserver> WorkerPool<O> {
             self.job_done.recv().expect("persistent worker completion");
         }
     }
-    pub(crate) fn eval_claim_limit(&self) -> usize {
-        self.eval_claim_limit
+    pub(crate) fn nn_permit_limit(&self) -> usize {
+        self.nn_permit_limit
     }
     pub(crate) fn eval_batch_size(&self) -> usize {
         self.eval_batch_size
@@ -319,7 +315,7 @@ impl<O: SearchObserver> WorkerPool<O> {
             "worker pool batch size changed"
         );
         debug_assert_eq!(
-            self.eval_claim_limit, config.eval_claim_limit,
+            self.nn_permit_limit, config.nn_permit_limit,
             "worker pool nn window changed"
         );
     }
@@ -336,54 +332,15 @@ impl<O: SearchObserver> Drop for WorkerPool<O> {
     }
 }
 
-fn process_backprop_batch<O: SearchObserver>(
-    shared: &Shared<O>,
-    first: BackpropEvent<O::Stamp>,
-    receiver: &Receiver<BackpropEvent<O::Stamp>>,
-) {
-    let mut events = Vec::with_capacity(1 + receiver.len());
-    events.push(first);
-    events.extend(receiver.try_iter());
-    if shared.stopping.load(Ordering::Acquire) {
-        let n = events.len();
-        let held = events.iter().filter(|event| event.held_eval_claim).count();
-        for event in events {
-            event.cancel();
-        }
-        shared.release_eval_claims(held);
-        shared.finish(n, false);
-        return;
-    }
-    if O::ENABLED {
-        for event in &mut events {
-            observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Backprop);
-        }
-    }
-    let claims: Vec<(bool, NodeId)> = events
-        .iter()
-        .map(|event| (event.held_eval_claim, event.event.node_id))
-        .collect();
-    let result = complete_batch(events, &shared.arena);
-    for (_, id) in &claims {
-        shared.cancel_collisions(*id);
-    }
-    shared.release_eval_claims(claims.iter().filter(|(held, _)| *held).count());
-    shared
-        .completed_depth
-        .fetch_add(result.completed_depth, Ordering::AcqRel);
-    shared.max_depth.fetch_max(result.max_depth, Ordering::AcqRel);
-    shared.finish(result.completed_playouts as usize, true);
-}
-
 fn cancel_worker_queues<O: SearchObserver>(
     shared: &Shared<O>,
     select_rx: &Receiver<SelectEvent<O::Stamp>>,
     expand_rx: &Receiver<ExpandEvent<O::Stamp>>,
-    eval_rx: &Receiver<EvalJob<O::Stamp>>,
+    eval_rx: &Receiver<EvalEvent<O::Stamp>>,
     reply_rx: &Receiver<NnReply<O::Stamp>>,
     backprop_rx: &Receiver<BackpropEvent<O::Stamp>>,
 ) {
-    shared.cancel_deferred_eval_jobs();
+    shared.cancel_deferred_eval_events();
     while let Ok(event) = select_rx.try_recv() {
         event.cancel();
         shared.finish(1, false);
@@ -395,12 +352,12 @@ fn cancel_worker_queues<O: SearchObserver>(
         shared.cancel_expansion(job.event);
     }
     while let Ok(reply) = reply_rx.try_recv() {
-        cancel_evaluation(shared, reply.job.event);
+        cancel_evaluation(shared, reply.event.event);
     }
     while let Ok(event) = backprop_rx.try_recv() {
-        let held = usize::from(event.held_eval_claim);
+        let held = usize::from(event.holds_nn_permit);
         event.cancel();
-        shared.release_eval_claims(held);
+        shared.release_nn_permits(held);
         shared.finish(1, false);
     }
 }
@@ -409,7 +366,7 @@ fn worker<O: SearchObserver>(
     shared: Arc<Shared<O>>,
     select_rx: Receiver<SelectEvent<O::Stamp>>,
     expand_rx: Receiver<ExpandEvent<O::Stamp>>,
-    eval_rx: Receiver<EvalJob<O::Stamp>>,
+    eval_rx: Receiver<EvalEvent<O::Stamp>>,
     reply_rx: Receiver<NnReply<O::Stamp>>,
     nn_tx: Sender<NnRequest<O::Stamp>>,
     backprop_rx: Receiver<BackpropEvent<O::Stamp>>,
@@ -423,14 +380,14 @@ fn worker<O: SearchObserver>(
             thread::yield_now();
             continue;
         }
-        if let Some(job) = shared.take_deferred_eval_job() {
-            if let Err(error) = handle_eval_job(&shared, &nn_tx, job, true) {
+        if let Some(event) = shared.take_deferred_eval_event() {
+            if let Err(error) = process_eval_event(&shared, &nn_tx, event, true) {
                 shared.fail(error);
             }
             continue;
         }
         if let Ok(event) = backprop_rx.try_recv() {
-            process_backprop_batch(&shared, event, &backprop_rx);
+            process_backprop_event(&shared, event, &backprop_rx);
             continue;
         }
         if let Ok(mut reply) = reply_rx.try_recv() {
@@ -446,7 +403,7 @@ fn worker<O: SearchObserver>(
             if O::ENABLED {
                 observe_queue_wait(&mut job.queued_at, &shared.observer, QueueKind::Eval);
             }
-            if let Err(error) = handle_eval_job(&shared, &nn_tx, job, false) {
+            if let Err(error) = process_eval_event(&shared, &nn_tx, job, false) {
                 shared.fail(error);
             }
             continue;
@@ -467,7 +424,7 @@ fn worker<O: SearchObserver>(
         }
         crossbeam_channel::select! {
             recv(backprop_rx) -> result => {
-                if let Ok(event) = result { process_backprop_batch(&shared, event, &backprop_rx); }
+                if let Ok(event) = result { process_backprop_event(&shared, event, &backprop_rx); }
             },
             recv(reply_rx) -> result => {
                 if let Ok(mut reply) = result {
@@ -479,7 +436,7 @@ fn worker<O: SearchObserver>(
             recv(eval_rx) -> result => {
                 if let Ok(mut job) = result {
                     if O::ENABLED { observe_queue_wait(&mut job.queued_at, &shared.observer, QueueKind::Eval); }
-                    let outcome = handle_eval_job(&shared, &nn_tx, job, false);
+                    let outcome = process_eval_event(&shared, &nn_tx, job, false);
                     if let Err(error) = outcome { shared.fail(error); }
                 }
             },
@@ -520,10 +477,6 @@ fn persistent_worker<O: SearchObserver>(commands: Receiver<WorkerCommand<O>>, do
     }
 }
 
-fn send_nn_reply<S: QueueStamp>(reply_tx: &Sender<NnReply<S>>, mut reply: NnReply<S>) {
-    reply.mark_queued();
-    let _ = reply_tx.send(reply);
-}
 fn nn_worker<O: SearchObserver>(
     shared: Arc<Shared<O>>,
     receiver: Receiver<NnRequest<O::Stamp>>,
@@ -537,7 +490,7 @@ fn nn_worker<O: SearchObserver>(
                 while let Ok(request) = receiver.try_recv() {
                     send_nn_reply(
                         &reply_tx,
-                        NnReply::new(request.job, Err(EnginError::PortIncomplete("stream nn stopping"))),
+                        NnReply::new(request.event, Err(EnginError::PortIncomplete("stream nn stopping"))),
                     );
                 }
                 break;

@@ -111,7 +111,6 @@ impl<'a> UciLoop<'a> {
                 write_stdout(&response);
             }
             "isready" => {
-                self.engine.ensure_ready()?;
                 write_stdout(&["readyok".into()]);
             }
             "setoption" => {

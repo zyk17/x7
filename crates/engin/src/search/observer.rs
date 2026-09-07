@@ -137,10 +137,6 @@ pub struct BenchObserver {
 }
 
 impl BenchObserver {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn snapshot(&self) -> BenchStats {
         BenchStats {
             submitted_playouts: self.submitted.load(Ordering::Acquire),

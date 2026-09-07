@@ -15,39 +15,39 @@ use crate::neural::{EncodedBatch, FillEmptyHistory, encode_position_input_planes
 
 use super::observer::{QueueStamp, SearchObserver};
 use super::pipeline::Shared;
-use super::workerpool::{BackpropEvent, EvalJob, Event, NnReply, NnRequest};
+use super::workerpool::{BackpropEvent, EvalEvent, Event, NnReply, NnRequest};
 
 /// 处理一个 Expand 已分类的普通叶子。
 ///
-/// `claim_held` 只会来自 deferred job：它在上次 cache miss 时已经取得了 NN slot。
-pub(crate) fn handle_eval_job<O: SearchObserver>(
+/// `holds_nn_permit` 只会来自 deferred event：它在上次 cache miss 时已经取得了 NN slot。
+pub(crate) fn process_eval_event<O: SearchObserver>(
     shared: &Shared<O>,
     nn_tx: &Sender<NnRequest<O::Stamp>>,
-    job: EvalJob<O::Stamp>,
-    claim_held: bool,
+    event: EvalEvent<O::Stamp>,
+    holds_nn_permit: bool,
 ) -> Result<(), EnginError> {
     if shared.stopping.load(Ordering::Acquire) {
-        if claim_held {
-            cancel_evaluation(shared, job.event);
+        if holds_nn_permit {
+            cancel_evaluation(shared, event.event);
         } else {
-            shared.cancel_expansion(job.event);
+            shared.cancel_expansion(event.event);
         }
         return Ok(());
     }
-    if let Some(eval) = shared.backend.cached_evaluation(job.cache_key) {
+    if let Some(eval) = shared.backend.cached_evaluation(event.cache_key) {
         if O::ENABLED {
             shared.observer.on_cache_hit();
         }
         // 延后期间，另一条非合并路径可能填入相同 cache key。slot 已取得，仍由
         // 一次 held-claim backprop 释放，不能在这里提前减计数。
-        return publish_eval(shared, job.event, job.legal_moves, eval, claim_held);
+        return publish_eval(shared, event.event, event.legal_moves, eval, holds_nn_permit);
     }
-    if !claim_held && !shared.try_acquire_eval_claim() {
-        shared.defer_eval_job(job);
+    if !holds_nn_permit && !shared.try_acquire_nn_permit() {
+        shared.defer_eval_event(event);
         return Ok(());
     }
-    let planes = encode_position_input_planes(&job.history, FillEmptyHistory::FenOnly);
-    send_nn_request(shared, nn_tx, NnRequest::new(job, planes))
+    let planes = encode_position_input_planes(&event.history, FillEmptyHistory::FenOnly);
+    send_nn_request(shared, nn_tx, NnRequest::new(event, planes))
 }
 
 fn send_nn_request<O: SearchObserver>(
@@ -58,7 +58,7 @@ fn send_nn_request<O: SearchObserver>(
     request.mark_queued();
     loop {
         if shared.stopping.load(Ordering::Acquire) {
-            cancel_evaluation(shared, request.job.event);
+            cancel_evaluation(shared, request.event.event);
             return Ok(());
         }
         match nn_tx.try_send(request) {
@@ -68,7 +68,7 @@ fn send_nn_request<O: SearchObserver>(
                 thread::yield_now();
             }
             Err(TrySendError::Disconnected(returned)) => {
-                cancel_evaluation(shared, returned.job.event);
+                cancel_evaluation(shared, returned.event.event);
                 return Err(EnginError::PortIncomplete("stream nn queue disconnected"));
             }
         }
@@ -80,9 +80,9 @@ pub(crate) fn handle_nn_reply<O: SearchObserver>(
     reply: NnReply<O::Stamp>,
 ) -> Result<(), EnginError> {
     match reply.result {
-        Ok((batch, row)) => complete_nn_item(shared, reply.job, batch, row),
+        Ok((batch, row)) => complete_nn_item(shared, reply.event, batch, row),
         Err(error) => {
-            cancel_evaluation(shared, reply.job.event);
+            cancel_evaluation(shared, reply.event.event);
             Err(error)
         }
     }
@@ -90,19 +90,19 @@ pub(crate) fn handle_nn_reply<O: SearchObserver>(
 
 fn complete_nn_item<O: SearchObserver>(
     shared: &Shared<O>,
-    job: EvalJob<O::Stamp>,
+    event: EvalEvent<O::Stamp>,
     batch: Arc<EncodedBatch>,
     row: usize,
 ) -> Result<(), EnginError> {
-    let eval = match eval_result_from_encoded_row(&batch, row, &job.legal_moves) {
+    let eval = match eval_result_from_encoded_row(&batch, row, &event.legal_moves) {
         Ok(eval) => eval,
         Err(error) => {
-            cancel_evaluation(shared, job.event);
+            cancel_evaluation(shared, event.event);
             return Err(error);
         }
     };
-    shared.backend.store_evaluation(job.cache_key, Arc::clone(&eval));
-    publish_eval(shared, job.event, job.legal_moves, eval, true)
+    shared.backend.store_evaluation(event.cache_key, Arc::clone(&eval));
+    publish_eval(shared, event.event, event.legal_moves, eval, true)
 }
 
 fn publish_eval<O: SearchObserver>(
@@ -110,7 +110,7 @@ fn publish_eval<O: SearchObserver>(
     event: Event,
     legal_moves: xiangqi_core::LegalMoveList,
     eval: Arc<EvalResult>,
-    held_claim: bool,
+    holds_nn_permit: bool,
 ) -> Result<(), EnginError> {
     let value_is_valid = eval.wl.is_finite()
         && eval.d.is_finite()
@@ -124,7 +124,7 @@ fn publish_eval<O: SearchObserver>(
         && policy_sum.is_finite()
         && (policy_sum - 1.0).abs() <= 1e-3;
     if !value_is_valid || !policy_is_valid {
-        if held_claim {
+        if holds_nn_permit {
             cancel_evaluation(shared, event);
         } else {
             shared.cancel_expansion(event);
@@ -136,10 +136,10 @@ fn publish_eval<O: SearchObserver>(
         .get(event.node_id)
         .expect("eval node lives until job drain")
         .publish_edges(legal_moves.iter().copied().zip(eval.policies.iter().copied()));
-    let backprop = if held_claim {
-        BackpropEvent::with_eval_claim(event, -eval.wl, eval.d, eval.plies_left)
+    let backprop = if holds_nn_permit {
+        BackpropEvent::with_nn_permit(event, -eval.wl, eval.d, eval.plies_left)
     } else {
-        BackpropEvent::without_eval_claim(event, -eval.wl, eval.d, eval.plies_left)
+        BackpropEvent::without_nn_permit(event, -eval.wl, eval.d, eval.plies_left)
     };
     shared.send_backprop(backprop);
     Ok(())
@@ -147,7 +147,7 @@ fn publish_eval<O: SearchObserver>(
 
 /// 取消一个已占 NN slot 的 evaluation。
 pub(crate) fn cancel_evaluation<O: SearchObserver>(shared: &Shared<O>, event: Event) {
-    shared.release_eval_claims(1);
+    shared.release_nn_permits(1);
     shared.cancel_expansion(event);
 }
 
@@ -185,9 +185,7 @@ pub(crate) fn infer_nn_batch<O: SearchObserver>(
             }
             let output = Arc::new(output);
             for (row, request) in requests.into_iter().enumerate() {
-                let mut reply = NnReply::new(request.job, Ok((Arc::clone(&output), row)));
-                reply.mark_queued();
-                let _ = reply_tx.send(reply);
+                send_nn_reply(reply_tx, NnReply::new(request.event, Ok((Arc::clone(&output), row))));
             }
         }
         Err(error) => reject_nn_requests(requests, error, reply_tx),
@@ -196,8 +194,12 @@ pub(crate) fn infer_nn_batch<O: SearchObserver>(
 
 fn reject_nn_requests<S: QueueStamp>(requests: Vec<NnRequest<S>>, error: EnginError, reply_tx: &Sender<NnReply<S>>) {
     for request in requests {
-        let mut reply = NnReply::new(request.job, Err(error.clone()));
-        reply.mark_queued();
-        let _ = reply_tx.send(reply);
+        send_nn_reply(reply_tx, NnReply::new(request.event, Err(error.clone())));
     }
+}
+
+/// NN 产生的所有结果都从这里进入 Reply 队列，以统一记录其排队时间。
+pub(crate) fn send_nn_reply<S: QueueStamp>(reply_tx: &Sender<NnReply<S>>, mut reply: NnReply<S>) {
+    reply.mark_queued();
+    let _ = reply_tx.send(reply);
 }

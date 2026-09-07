@@ -98,8 +98,8 @@ pub struct SearchConfig {
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
-    /// Eval claim 并发上限：`limit = ceil(NnBatchSize × nn_window)`。
-    /// cache/terminal 与等待 claim 的 job 不占 slot；NN 结果完成 backprop 后才释放。调大可能提高 eps，调小让
+    /// NN permit 并发上限：`limit = ceil(NnBatchSize × nn_window)`。
+    /// cache/terminal 与等待 permit 的 event 不占 slot；NN 结果完成 backprop 后才释放。调大可能提高 eps，调小让
     /// Select 更贴最新统计。
     pub nn_window: f32,
     pub params: SearchParams,
@@ -150,11 +150,11 @@ impl SearchConfig {
             eval_batch_size <= queue_capacity,
             "stream eval batch size must fit the queue capacity"
         );
-        let eval_claim_limit = ((eval_batch_size as f32) * self.nn_window).ceil().max(1.0) as usize;
+        let nn_permit_limit = ((eval_batch_size as f32) * self.nn_window).ceil().max(1.0) as usize;
         ResolvedSearchConfig {
             queue_capacity,
             eval_batch_size,
-            eval_claim_limit,
+            nn_permit_limit,
             params: self.params,
             threads: self.threads,
         }
@@ -165,7 +165,7 @@ impl SearchConfig {
 pub(crate) struct ResolvedSearchConfig {
     pub(crate) queue_capacity: usize,
     pub(crate) eval_batch_size: usize,
-    pub(crate) eval_claim_limit: usize,
+    pub(crate) nn_permit_limit: usize,
     pub(crate) params: SearchParams,
     pub(crate) threads: usize,
 }

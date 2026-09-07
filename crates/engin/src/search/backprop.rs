@@ -87,7 +87,7 @@ mod tests {
             .descend(child_id, root_node.reserve_edge(0).expect("edge"));
 
         complete_batch(
-            [BackpropEvent::<crate::search::NoQueueStamp>::without_eval_claim(
+            [BackpropEvent::<crate::search::NoQueueStamp>::without_nn_permit(
                 child.into_event(),
                 0.4,
                 0.2,

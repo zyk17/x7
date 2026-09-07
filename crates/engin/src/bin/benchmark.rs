@@ -778,7 +778,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         params,
                         ..SearchConfig::default()
                     },
-                    BenchObserver::new(),
+                    BenchObserver::default(),
                 );
 
                 let started = Instant::now();

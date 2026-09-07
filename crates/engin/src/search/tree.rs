@@ -704,11 +704,6 @@ impl NodeArena {
             .filter(|slot| slot.initialized.load(Ordering::Acquire))
             .count()
     }
-
-    /// 无关 position 换图后由后台线程释放整张旧 arena。
-    pub(crate) fn release_incrementally(self) {
-        drop(self);
-    }
 }
 
 impl Default for NodeArena {

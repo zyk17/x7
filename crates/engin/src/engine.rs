@@ -75,10 +75,7 @@ impl GraphReaper {
                             let _ = arena.remove_subtrees(roots);
                             arena.remove_nodes(nodes);
                         }
-                        GraphCleanup::Retire(arena) => match Arc::try_unwrap(arena) {
-                            Ok(arena) => arena.release_incrementally(),
-                            Err(arena) => drop(arena),
-                        },
+                        GraphCleanup::Retire(arena) => drop(arena),
                     }
                 }
             })
@@ -245,10 +242,6 @@ impl Engine {
     /// 更新 Engine 生命周期 option。已启动 job 使用自己创建时的 `SearchConfig` / `SearchParams` 快照。
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), EnginError> {
         self.options.set_uci_option(name, value)
-    }
-
-    pub(crate) fn ensure_ready(&mut self) -> Result<(), EnginError> {
-        Ok(())
     }
 
     pub(crate) fn new_game(&mut self) -> Result<(), EnginError> {
