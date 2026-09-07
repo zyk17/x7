@@ -177,6 +177,9 @@ impl<S: QueueStamp> BackpropEvent<S> {
     }
 
     /// Gather 直发：未占 eval claim。
+    ///
+    /// 当前所有正常 Gather leaf 都转 Eval；保留此构造器给不占 claim 的直发路径。
+    #[allow(dead_code)]
     pub(crate) fn from_gather(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
         Self {
             event,

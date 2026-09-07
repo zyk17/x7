@@ -307,8 +307,9 @@ pub(crate) fn process_gather_event<O: SearchObserver>(
                 return;
             }
             ExpansionState::Terminal => {
-                let (wl, draw, plies_left) = node.terminal_value().unwrap_or((0.0, 1.0, 0.0));
-                shared.send_backprop(BackpropEvent::from_gather(event.into_event(), wl, draw, plies_left));
+                // 仅可能是 select 后被另一 worker 钉死的竞态事件；不重复计入 evidence。
+                event.cancel();
+                shared.finish(1, false);
                 return;
             }
             ExpansionState::Expanded => {
@@ -694,13 +695,72 @@ impl<O: SearchObserver> Drop for Search<O> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+    use crossbeam_channel::{TryRecvError, bounded};
+    use parking_lot::{Condvar, Mutex};
     use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
-    use super::Search;
-    use crate::neural::backend::UniformBackend;
+    use super::{Search, Shared, process_gather_event};
+    use crate::neural::backend::{Backend, UniformBackend};
     use crate::search::decision::{best_move, root_stats};
-    use crate::search::param::SearchConfig;
+    use crate::search::observer::NoopObserver;
+    use crate::search::param::{SearchConfig, SearchParams};
+    use crate::search::{NoQueueStamp, NodeArena};
+
+    #[test]
+    fn stale_terminal_gather_cancels_its_reservation() {
+        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
+        let history = Arc::new(PositionHistory::from_positions(state.positions()));
+        let arena = Arc::new(NodeArena::default());
+        let root_id = arena.allocate();
+        let root = arena.get(root_id).expect("root");
+        assert!(root.try_begin_evaluation());
+        let mv = Move::new(
+            xiangqi_core::Square::parse("b2").expect("from"),
+            xiangqi_core::Square::parse("b3").expect("to"),
+        );
+        root.publish_edges([(mv, 1.0)]);
+        let terminal_id = arena.child_or_create(&root.edges()[0]);
+        let terminal = arena.get(terminal_id).expect("terminal");
+        assert!(terminal.try_begin_evaluation());
+        terminal.mark_terminal(1.0, 0.0, 1.0);
+
+        let (gather_tx, _) = bounded(1);
+        let (eval_tx, _) = bounded(1);
+        let (backprop_tx, backprop_rx) = bounded(1);
+        let shared = Arc::new(Shared {
+            backend: Arc::new(UniformBackend::default()) as Arc<dyn Backend>,
+            arena: Arc::clone(&arena),
+            params: SearchParams::default(),
+            root_move_filter: Mutex::new(Vec::new()),
+            stopping: AtomicBool::new(false),
+            outstanding: AtomicUsize::new(1),
+            nn_inflight: AtomicUsize::new(0),
+            completed: AtomicU64::new(0),
+            completed_depth: AtomicU64::new(0),
+            max_depth: AtomicU64::new(0),
+            network_evaluations: AtomicU64::new(0),
+            observer: NoopObserver,
+            error: Mutex::new(None),
+            idle_lock: Mutex::new(()),
+            idle: Condvar::new(),
+            gather_tx,
+            eval_tx,
+            backprop_tx,
+            collision_waiters: Mutex::new(Vec::new()),
+        });
+        let event = super::GatherEvent::<NoQueueStamp>::at_root(root_id, history)
+            .descend(terminal_id, root.reserve_edge(0).expect("reservation"));
+
+        process_gather_event(&shared, event, 1);
+
+        assert_eq!(root.edges()[0].visits(), 0);
+        assert_eq!(root.completed_visits(), 0);
+        assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);
+        assert_eq!(shared.completed.load(Ordering::Acquire), 0);
+        assert!(matches!(backprop_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
 
     #[test]
     fn search_completes_batched_playouts() {
