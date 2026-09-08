@@ -79,12 +79,12 @@ mod tests {
         let arena = NodeArena::default();
         let root_id = arena.allocate();
         let root_node = arena.get(root_id).expect("root node");
-        assert!(root_node.try_begin_evaluation());
+        assert!(root_node.try_claim());
         let mv = Move::new(Square::parse("b2").expect("b2"), Square::parse("b3").expect("b3"));
         root_node.publish_edges(vec![(mv, 1.0)]);
         let child_id = arena.child_or_create(&root_node.edges()[0]);
         let child = SelectEvent::<crate::search::NoQueueStamp>::at_root(root_id, Arc::clone(&history))
-            .descend(child_id, root_node.reserve_edge(0).expect("edge"));
+            .descend(child_id, root_node.reserve_edge(0, None).expect("edge"));
 
         complete_batch(
             [BackpropEvent::<crate::search::NoQueueStamp>::without_nn_permit(

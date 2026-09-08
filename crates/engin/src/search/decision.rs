@@ -311,7 +311,9 @@ mod tests {
 
     fn complete_samples(node: &super::Node, edge_index: usize, samples: &[f32]) {
         for &sample in samples {
-            node.reserve_edge(edge_index).expect("reservation").complete(sample);
+            node.reserve_edge(edge_index, None)
+                .expect("reservation")
+                .complete(sample);
         }
     }
 
@@ -320,7 +322,7 @@ mod tests {
         let arena = NodeArena::default();
         let root = arena.allocate();
         let node = arena.get(root).expect("root");
-        assert!(node.try_begin_evaluation());
+        assert!(node.try_claim());
         let first = mv("a0", "a1");
         let second = mv("b0", "b1");
         let third = mv("c0", "c1");
@@ -356,7 +358,7 @@ mod tests {
         let arena = NodeArena::default();
         let root = arena.allocate();
         let node = arena.get(root).expect("root");
-        assert!(node.try_begin_evaluation());
+        assert!(node.try_claim());
         let first = mv("a0", "a1");
         let second = mv("b0", "b1");
         node.publish_edges(vec![(first, 0.5), (second, 0.5)]);
@@ -381,14 +383,14 @@ mod tests {
         let arena = NodeArena::default();
         let root = arena.allocate();
         let node = arena.get(root).expect("root");
-        assert!(node.try_begin_evaluation());
+        assert!(node.try_claim());
         let ordinary = mv("a0", "a1");
         let winning = mv("b0", "b1");
         node.publish_edges(vec![(ordinary, 0.5), (winning, 0.5)]);
         complete_samples(node, 0, &[0.9; 8]);
         let child = arena.child_or_create(&node.edges()[1]);
         let child_node = arena.get(child).expect("winning child");
-        assert!(child_node.try_begin_evaluation());
+        assert!(child_node.try_claim());
         child_node.mark_terminal(1.0, 0.0, 3.0);
 
         assert_eq!(

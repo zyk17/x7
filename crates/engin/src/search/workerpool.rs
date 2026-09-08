@@ -346,10 +346,10 @@ fn cancel_worker_queues<O: SearchObserver>(
         shared.finish(1, false);
     }
     while let Ok(event) = expand_rx.try_recv() {
-        shared.cancel_expansion(event.into_event());
+        shared.cancel_claim(event.into_event());
     }
     while let Ok(job) = eval_rx.try_recv() {
-        shared.cancel_expansion(job.event);
+        shared.cancel_claim(job.event);
     }
     while let Ok(reply) = reply_rx.try_recv() {
         cancel_evaluation(shared, reply.event.event);

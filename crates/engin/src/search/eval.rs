@@ -30,7 +30,7 @@ pub(crate) fn process_eval_event<O: SearchObserver>(
         if holds_nn_permit {
             cancel_evaluation(shared, event.event);
         } else {
-            shared.cancel_expansion(event.event);
+            shared.cancel_claim(event.event);
         }
         return Ok(());
     }
@@ -127,7 +127,7 @@ fn publish_eval<O: SearchObserver>(
         if holds_nn_permit {
             cancel_evaluation(shared, event);
         } else {
-            shared.cancel_expansion(event);
+            shared.cancel_claim(event);
         }
         return Err(EnginError::Onnx("stream backend evaluation is invalid".into()));
     }
@@ -148,7 +148,7 @@ fn publish_eval<O: SearchObserver>(
 /// 取消一个已占 NN slot 的 evaluation。
 pub(crate) fn cancel_evaluation<O: SearchObserver>(shared: &Shared<O>, event: Event) {
     shared.release_nn_permits(1);
-    shared.cancel_expansion(event);
+    shared.cancel_claim(event);
 }
 
 /// 合批推理一批已编码请求；结果回交通用 reply 队列，不阻塞提交它的 worker。

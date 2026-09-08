@@ -67,7 +67,7 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) expand_tx: crossbeam_channel::Sender<ExpandEvent<O::Stamp>>,
     pub(crate) eval_tx: crossbeam_channel::Sender<EvalEvent<O::Stamp>>,
     pub(crate) backprop_tx: crossbeam_channel::Sender<BackpropEvent<O::Stamp>>,
-    /// 撞上 `Evaluating` 叶子的 playout。先留着 reservation / μ；该叶子自己的
+    /// 撞上 `Claimed` 叶子的 playout。先留着 reservation / μ；该叶子自己的
     /// backprop `complete` 之后再按 `node_id` 摘出来 cancel。
     pub(crate) collision_waiters: Mutex<Vec<Event>>,
     /// FIFO：先因 NN window 等待的叶子先恢复，避免新 miss 持续压住旧 job。
@@ -98,11 +98,11 @@ impl<O: SearchObserver> Shared<O> {
     }
 
     /// 取消尚未取得 NN permit 的叶子，并归还其 reservation。
-    pub(crate) fn cancel_expansion(&self, event: Event) {
+    pub(crate) fn cancel_claim(&self, event: Event) {
         let id = event.node_id;
         event.cancel();
         if let Some(node) = self.arena.get(id) {
-            node.abort_evaluation();
+            node.abort_claim();
         }
         self.cancel_collisions(id);
         self.finish(1, false);
@@ -157,7 +157,7 @@ impl<O: SearchObserver> Shared<O> {
     pub(crate) fn cancel_deferred_eval_events(&self) {
         let events = std::mem::take(&mut *self.deferred_eval_events.lock());
         for event in events {
-            self.cancel_expansion(event.event);
+            self.cancel_claim(event.event);
         }
     }
 
@@ -198,7 +198,7 @@ impl<O: SearchObserver> Shared<O> {
                 && self
                     .arena
                     .get(event.node_id)
-                    .is_some_and(|node| node.expansion_state() == ExpansionState::Evaluating)
+                    .is_some_and(|node| node.expansion_state() == ExpansionState::Claimed)
             {
                 waiters.push(event);
                 return;
@@ -240,7 +240,7 @@ impl<O: SearchObserver> Shared<O> {
         event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
-                self.cancel_expansion(event.event);
+                self.cancel_claim(event.event);
                 return;
             }
             match self.eval_tx.try_send(event) {
@@ -250,7 +250,7 @@ impl<O: SearchObserver> Shared<O> {
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    self.cancel_expansion(returned.event);
+                    self.cancel_claim(returned.event);
                     return;
                 }
             }
@@ -261,7 +261,7 @@ impl<O: SearchObserver> Shared<O> {
         event.mark_queued();
         loop {
             if self.stopping.load(Ordering::Acquire) {
-                self.cancel_expansion(event.into_event());
+                self.cancel_claim(event.into_event());
                 return;
             }
             match self.expand_tx.try_send(event) {
@@ -271,7 +271,7 @@ impl<O: SearchObserver> Shared<O> {
                     thread::yield_now();
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    self.cancel_expansion(returned.into_event());
+                    self.cancel_claim(returned.into_event());
                     return;
                 }
             }
@@ -337,7 +337,7 @@ fn branch_at_expanded_node<O: SearchObserver>(
     let edge = &node.edges()[edge_index];
     let child = shared.arena.child_or_create(edge);
     let reservation = node
-        .reserve_edge_with_virtual_mean(edge_index, virtual_mean)
+        .reserve_edge(edge_index, virtual_mean)
         .expect("selected stream edge");
     Some((child, reservation))
 }
@@ -355,12 +355,12 @@ pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut ev
             .expect("event node lives until job drain");
         match node.expansion_state() {
             ExpansionState::Unexpanded => {
-                if node.try_begin_evaluation() {
+                if node.try_claim() {
                     shared.send_expand(event);
                     return;
                 }
             }
-            ExpansionState::Evaluating => {
+            ExpansionState::Claimed => {
                 shared.park_collision(event);
                 return;
             }
@@ -390,7 +390,7 @@ pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut ev
 /// 只处理已 claim 叶子的规则、合法着与后续任务分流。
 pub(crate) fn process_expand_event<O: SearchObserver>(shared: &Shared<O>, event: ExpandEvent<O::Stamp>) {
     if shared.stopping.load(Ordering::Acquire) {
-        shared.cancel_expansion(event.into_event());
+        shared.cancel_claim(event.into_event());
         return;
     }
     let node = shared
@@ -750,7 +750,7 @@ impl<O: SearchObserver> Search<O> {
             if root_state == Some(ExpansionState::Terminal) {
                 break;
             }
-            if root_state == Some(ExpansionState::Evaluating) {
+            if root_state == Some(ExpansionState::Claimed) {
                 self.wait_until_outstanding_below(1, limits.deadline)?;
                 continue;
             }
@@ -916,7 +916,7 @@ mod tests {
         let arena = Arc::new(NodeArena::default());
         let root_id = arena.allocate();
         let root = arena.get(root_id).expect("root");
-        assert!(root.try_begin_evaluation());
+        assert!(root.try_claim());
         let mv = Move::new(
             xiangqi_core::Square::parse("b2").expect("from"),
             xiangqi_core::Square::parse("b3").expect("to"),
@@ -924,12 +924,12 @@ mod tests {
         root.publish_edges([(mv, 1.0)]);
         let terminal_id = arena.child_or_create(&root.edges()[0]);
         let terminal = arena.get(terminal_id).expect("terminal");
-        assert!(terminal.try_begin_evaluation());
+        assert!(terminal.try_claim());
         terminal.mark_terminal(1.0, 0.0, 1.0);
 
         let (shared, _, backprop_rx) = test_shared(Arc::clone(&arena), 1, 1);
         let event = super::SelectEvent::<NoQueueStamp>::at_root(root_id, history)
-            .descend(terminal_id, root.reserve_edge(0).expect("reservation"));
+            .descend(terminal_id, root.reserve_edge(0, None).expect("reservation"));
 
         process_select_event(&shared, event);
 
@@ -963,7 +963,7 @@ mod tests {
 
         assert_eq!(
             arena.get(root).expect("root").expansion_state(),
-            super::ExpansionState::Evaluating
+            super::ExpansionState::Claimed
         );
         assert_eq!(expand_rx.try_recv().expect("expand event").event.node_id, root);
         assert_eq!(shared.outstanding.load(Ordering::Acquire), 1);
@@ -1018,15 +1018,15 @@ mod tests {
         );
 
         let root = tree.arena().get(tree.root_id()).expect("root");
-        assert!(root.try_begin_evaluation());
+        assert!(root.try_claim());
         root.publish_edges([(played, 1.0)]);
         let child = tree.arena().child_or_create(&root.edges()[0]);
         let child_node = tree.arena().get(child).expect("child");
-        assert!(child_node.try_begin_evaluation());
+        assert!(child_node.try_claim());
         child_node.publish_edges([(reply, 1.0)]);
         let terminal = tree.arena().child_or_create(&child_node.edges()[0]);
         let terminal_node = tree.arena().get(terminal).expect("terminal child");
-        assert!(terminal_node.try_begin_evaluation());
+        assert!(terminal_node.try_claim());
         terminal_node.mark_terminal(1.0, 0.0, 0.0);
         tree.arena()
             .propagate_proven_terminals(&[tree.root_id(), child, terminal], tree.root_id());
