@@ -18,7 +18,7 @@ use crate::neural::MOVE_HISTORY;
 use crate::neural::backend::Backend;
 
 use super::backprop::{complete_batch, complete_one};
-use super::expand::{ExpandKind, classify_expand, path_terminal_value};
+use super::expand::{ExpandKind, classify_expand, game_terminal_value};
 use super::observer::{ExecutionKind, ExecutionTimer, NoopObserver, SearchObserver};
 use super::param::{SearchConfig, SearchParams};
 use super::select::select_edge;
@@ -294,9 +294,8 @@ pub(crate) fn process_expand_event<O: SearchObserver>(shared: &Shared<O>, event:
         return;
     }
     let node = shared.arena.get(event.event.node_id).expect("expand node lives until job drain");
-    let depth = event.variation.moves().len();
     let history = event.variation.history();
-    match classify_expand(&history, depth) {
+    match classify_expand(&history) {
         ExpandKind::Terminal { wl, draw, plies_left } => {
             node.mark_terminal(wl, draw, plies_left);
             let root = event.node_path()[0];
@@ -486,7 +485,7 @@ impl<O: SearchObserver> Search<O> {
     /// `ExpansionState::Terminal` 还表示子树已证明的胜负；该 node 跨回合成为
     /// root 后仍可能有合法着可输出，不能把它误作棋局已经结束。
     pub(crate) fn root_is_terminal(&self) -> bool {
-        path_terminal_value(self.search_history.as_ref(), 0).is_some()
+        game_terminal_value(self.search_history.as_ref()).is_some()
     }
 
     pub fn stats(&self) -> Stats {

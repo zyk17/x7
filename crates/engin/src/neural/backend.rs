@@ -52,9 +52,9 @@ pub struct EvalResult {
 
 /// NN cache 命中键：当前棋盘 + 合法着数 + `Position::repetitions`。
 ///
-/// `mcts2`（1A+2A）：树节点不按棋盘合并；NN cache 允许**历史路径不同**，但必须区分
-/// repetition 次数（编码平面的一部分）。`num_moves` 代价很低，保留作 hash 碰撞护栏
-///（policy 长度对不上则 miss）。不纳入完整 8-ply history；规则终局在 cache 之前裁决。
+/// 树节点不按棋盘合并；cache 允许历史路径不同，但须区分编码平面中的 repetition 次数。
+/// `num_moves` 用作 policy 长度的廉价护栏。为提高命中率，刻意不纳入完整 history 与
+/// rule60；规则终局在读取 cache 前裁决。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvalCacheKey {
     board: u64,
@@ -184,12 +184,12 @@ impl UniformBackend {
 }
 
 impl Backend for UniformBackend {
-    fn cached_evaluation(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
-        self.cache.get(key.slot_key(), key.num_moves)
-    }
-
     fn attributes(&self) -> BackendAttributes {
         BackendAttributes::default()
+    }
+
+    fn cached_evaluation(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
+        self.cache.get(key.slot_key(), key.num_moves)
     }
 
     fn infer_input_planes_into(

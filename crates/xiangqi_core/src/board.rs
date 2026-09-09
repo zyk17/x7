@@ -38,6 +38,7 @@ pub struct ChessBoard {
     our_king: Square,
     their_king: Square,
     flipped: bool,
+    /// 长捉裁决用的棋子身份；不参与局面相等或 hash。
     rule_id: [u8; 90],
 }
 

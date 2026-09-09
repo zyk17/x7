@@ -99,32 +99,40 @@ fn detects_repetitions_since_last_zeroing_move() {
 }
 
 #[test]
-fn rule_judge_covers_repetition_cases() {
+fn game_result_covers_repetition_cases() {
     ensure_init();
 
     let mut white_chase = history_from_fen("3k5/9/9/6c2/9/9/9/6R2/9/5K3 b - - 2 30", 2, 30);
-    for mv in ["g6h6", "g2h2", "h6g6", "h2g2"] {
-        append(&mut white_chase, mv);
+    for _ in 0..2 {
+        for mv in ["g6h6", "g2h2", "h6g6", "h2g2"] {
+            append(&mut white_chase, mv);
+        }
     }
-    assert_eq!(white_chase.rule_judge(), GameResult::BlackWon);
+    assert_eq!(white_chase.compute_game_result(), GameResult::BlackWon);
 
     let mut black_chase = history_from_fen("3k5/9/7r1/9/9/9/9/6C2/9/5K3 b - - 2 30", 2, 30);
-    for mv in ["h7g7", "g2h2", "g7h7", "h2g2"] {
-        append(&mut black_chase, mv);
+    for _ in 0..2 {
+        for mv in ["h7g7", "g2h2", "g7h7", "h2g2"] {
+            append(&mut black_chase, mv);
+        }
     }
-    assert_eq!(black_chase.rule_judge(), GameResult::WhiteWon);
+    assert_eq!(black_chase.compute_game_result(), GameResult::WhiteWon);
 
     let mut white_check = history_from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30", 2, 30);
-    for mv in ["d9e9", "d2e2", "e9d9", "e2d2"] {
-        append(&mut white_check, mv);
+    for _ in 0..2 {
+        for mv in ["d9e9", "d2e2", "e9d9", "e2d2"] {
+            append(&mut white_check, mv);
+        }
     }
-    assert_eq!(white_check.rule_judge(), GameResult::BlackWon);
+    assert_eq!(white_check.compute_game_result(), GameResult::BlackWon);
 
     let mut black_check = history_from_fen("3k5/9/4r4/9/9/9/9/9/9/5K3 b - - 2 30", 2, 30);
-    for mv in ["e7f7", "f0e0", "f7e7", "e0f0"] {
-        append(&mut black_check, mv);
+    for _ in 0..2 {
+        for mv in ["e7f7", "f0e0", "f7e7", "e0f0"] {
+            append(&mut black_check, mv);
+        }
     }
-    assert_eq!(black_check.rule_judge(), GameResult::WhiteWon);
+    assert_eq!(black_check.compute_game_result(), GameResult::WhiteWon);
 
     for (fen, moves) in [
         ("3k5/9/6r2/9/9/9/9/9/6R2/5K3 b - - 2 30", ["g7h7", "g1h1", "h7g7", "h1g1"]),
@@ -132,9 +140,11 @@ fn rule_judge_covers_repetition_cases() {
         ("3k5/9/9/9/9/9/9/9/1r2ARn2/4K4 b", ["b1b0", "e1d0", "b0b1", "d0e1"]),
     ] {
         let mut history = history_from_fen(fen, 2, 30);
-        for mv in moves {
-            append(&mut history, mv);
+        for _ in 0..2 {
+            for mv in moves {
+                append(&mut history, mv);
+            }
         }
-        assert_eq!(history.rule_judge(), GameResult::Draw, "fen={fen}");
+        assert_eq!(history.compute_game_result(), GameResult::Draw, "fen={fen}");
     }
 }
