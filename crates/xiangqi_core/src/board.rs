@@ -1,4 +1,4 @@
-//! 棋盘表示、FEN 与合法着。来源：px0 board。
+//! 棋盘表示、FEN 与合法着。
 
 use std::sync::OnceLock;
 

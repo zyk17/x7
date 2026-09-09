@@ -44,9 +44,8 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
   --config nn\configs\x7_v3_01.yaml
 ```
 
-配置分为 `dataset`、`model`、`training` 三段，格式参考
-`C:\Users\Administrator\projects\pxzero-training\tf\configs\example.yaml`，但只保留当前 PyTorch/PX0
-主线需要的字段。正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`；x7 v2 的纯 CNN trunk、
+配置分为 `dataset`、`model`、`training` 三段，只保留当前 PyTorch/PX0 主线需要的字段。正式契约固定为
+`124x10x9 -> 2062 + WDL + moves-left`；x7 v2 的纯 CNN trunk、
 正式 head 和 loss 语义不能通过配置切换。训练期 Auxiliary Soft Policy 与 root-WDL head 不进入 ONNX。
 优化器固定为 AdamW：Conv/Linear weights 使用 decoupled weight decay，BatchNorm 与 bias 不 decay；学习率为
 线性 warmup 后 cosine decay。

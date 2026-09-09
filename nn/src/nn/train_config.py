@@ -34,10 +34,8 @@ def _required(section: dict[str, Any], key: str, *, name: str) -> Any:
 def load_train_config(path: Path | str) -> argparse.Namespace:
     """Load the fixed PX0 training surface from one YAML file.
 
-    The section layout follows pxzero-training's `dataset/training/model`
-    configuration convention. Paths intentionally stay relative to the process
-    working directory, so the copied `nn/` directory remains self-contained.
-    Reference: pxzero-training `tf/train.py:110-126`, `tf/configs/example.yaml:4-31`.
+    Paths intentionally stay relative to the process working directory, so the
+    copied `nn/` directory remains self-contained.
     """
     config_path = Path(path)
     try:

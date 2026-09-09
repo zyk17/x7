@@ -1,7 +1,5 @@
-"""PX0/Lc0 AttentionBody for the fixed 124x10x9 Xiangqi contract.
+"""PX0 AttentionBody 的 Python 重写，使用固定 124x10x9 象棋契约。
 
-Reference: pxzero-training `tf/tfprocess.py:1259-1621` and PX0
-`src/neural/onnx/converter.cc:391-1059`.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ SMOLGEN_GENERATED = 128
 
 
 def _attention_position_encoding() -> torch.Tensor:
-    """Lc0 attention-policy-map positional encoding, [90, 90]."""
+    """Policy move-pair positional encoding, [90, 90]."""
     index = _build_move_pair_index()
     encoding = torch.zeros((BOARD_SQUARES, BOARD_SQUARES), dtype=torch.float32)
     encoding.diagonal().fill_(-1.0)
@@ -106,7 +104,7 @@ class TransformerValueHead(nn.Module):
 
 
 class KnowledgeTransformer(nn.Module):
-    """PX0/Lc0 AttentionBody; auxiliary heads remain training-only."""
+    """PX0 AttentionBody 的重写；辅助 head 只用于训练。"""
 
     def __init__(
         self,

@@ -1,7 +1,6 @@
 //! NN backend 边界：属性、cache 与批量评估结果。
 //!
-//! 接口形状历史上参考过 px0 `src/neural/backend.h`；正式推理走 ONNX，测试可用
-//! `UniformBackend`。这不是 task-worker 时代的 backend 翻译层。
+//! 正式推理走 ONNX，测试可用 `UniformBackend`。
 
 use std::sync::Arc;
 
@@ -54,7 +53,7 @@ pub struct EvalResult {
 /// NN cache 命中键：当前棋盘 + 合法着数 + `Position::repetitions`。
 ///
 /// `mcts2`（1A+2A）：树节点不按棋盘合并；NN cache 允许**历史路径不同**，但必须区分
-/// repetition 次数（对齐编码平面）。`num_moves` 代价很低，保留作 hash 碰撞护栏
+/// repetition 次数（编码平面的一部分）。`num_moves` 代价很低，保留作 hash 碰撞护栏
 ///（policy 长度对不上则 miss）。不纳入完整 8-ply history；规则终局在 cache 之前裁决。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvalCacheKey {

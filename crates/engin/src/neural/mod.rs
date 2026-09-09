@@ -1,6 +1,4 @@
-//! classical NN 编码：`124 x 10 x 9` 输入平面与 `2062` policy 映射。
-//!
-//! 平面布局与 policy 表历史上源于 px0 classical encoder；本模块由 X7 维护。
+//! X7 NN 编码：`124 x 10 x 9` 输入平面与 `2062` policy 映射。
 //! 热路径保持稀疏 `InputPlane`；DirectML 在 host expand，TensorRT 在 GPU expand。
 
 use std::sync::{Arc, OnceLock};
@@ -23,12 +21,10 @@ pub const PLANES_PER_BOARD: usize = 15;
 pub const AUX_PLANE_BASE: usize = MOVE_HISTORY * PLANES_PER_BOARD;
 /// 单样本编码后的 f32 个数。
 pub const ENCODED_PLANE_FLOATS: usize = INPUT_PLANES * BOARD_SQUARES;
-/// 棋盘 90 格 bitmask；对齐 px0 `kAllSquares`（`src/neural/network.h`）。
+/// 棋盘 90 格 bitmask。
 pub const ALL_SQUARES: u128 = (1_u128 << BOARD_SQUARES) - 1;
 
 /// 稀疏输入平面：mask 标出写入位置，value 为该平面统一取值。
-///
-/// 参考：px0 `InputPlane`（`src/neural/network.h`）。
 #[derive(Clone, Copy, Debug)]
 pub struct InputPlane {
     pub mask: u128,
@@ -97,7 +93,7 @@ fn gather_legal_logits(logits: &[f32], legal_moves: &[Move]) -> Result<smallvec:
     let mut selected = smallvec::SmallVec::new();
     for &mv in legal_moves {
         let index = move_to_nn_index(mv)
-            .ok_or_else(|| EnginError::Neural(format!("legal move absent from px0 policy table: {mv}")))?;
+            .ok_or_else(|| EnginError::Neural(format!("legal move absent from policy vocabulary: {mv}")))?;
         if index >= logits.len() {
             return Err(EnginError::Neural(format!("policy logit index {index} out of range {}", logits.len())));
         }
@@ -192,7 +188,7 @@ pub enum FillEmptyHistory {
 
 /// 将 PositionHistory 编码为稀疏 `InputPlanes`。
 ///
-/// 布局与填充语义对齐 px0 classical encoder（`src/neural/encoder.cc`）。
+/// 布局与填充语义遵守 PX0 classical 网络契约。
 /// 搜索只传真实 `PositionHistory`；孤立 FEN 由调用方构造长度为一的 history，再用 `FenOnly`。
 pub fn encode_position_input_planes(history: &PositionHistory, fill: FillEmptyHistory) -> InputPlanes {
     assert!(!history.is_empty(), "EncodePositionForNN requires a position");
@@ -231,7 +227,7 @@ pub fn encode_position_input_planes(history: &PositionHistory, fill: FillEmptyHi
 
 /// 稀疏平面 → dense NCHW `[124][10][9]`。
 ///
-/// 对齐 px0 ONNX 非 CUDA 分支的 CPU expand（`network_onnx.cc` `PrepareInputs`）。
+/// 展开为网络所需的 dense NCHW 输入。
 pub fn expand_input_planes(planes: &[InputPlane], dest: &mut [f32]) {
     assert_eq!(planes.len(), INPUT_PLANES, "expand expects {INPUT_PLANES} planes");
     assert_eq!(dest.len(), ENCODED_PLANE_FLOATS, "expand dest must be NCHW floats");
@@ -256,7 +252,7 @@ pub fn expand_input_planes_into_zeroed(planes: &[InputPlane], dest: &mut [f32]) 
     }
 }
 
-/// 将 PositionHistory 编码为 dense classical NCHW planes（测试 / 兼容路径）。
+/// 将 PositionHistory 编码为 dense classical NCHW planes（测试路径）。
 pub fn encode_position_for_nn(history: &PositionHistory, fill: FillEmptyHistory) -> Vec<f32> {
     let sparse = encode_position_input_planes(history, fill);
     let mut dense = vec![0.0; ENCODED_PLANE_FLOATS];
@@ -355,11 +351,10 @@ mod tests {
         );
     }
 
-    /// 直接移植 px0 `src/neural/encoder_test.cc:25-137` 的 classical 基线：
-    /// square layout、黑方 auxiliary plane、rule60 与历史交替 mirror 都不能靠
-    /// 当前实现自身生成期望值。
+    /// 固定网络契约的 classical 基线：square layout、黑方 auxiliary plane、rule60 与
+    /// 历史交替 mirror 都不能靠当前实现自身生成期望值。
     #[test]
-    fn px0_classical_startpos_and_two_ply_history() {
+    fn classical_startpos_and_two_ply_history() {
         fn mask(planes: &[f32], plane: usize) -> u128 {
             planes[plane * BOARD_ROWS * BOARD_COLS..(plane + 1) * BOARD_ROWS * BOARD_COLS]
                 .iter()
@@ -385,7 +380,7 @@ mod tests {
         assert_eq!(mask(&planes, 6), 1_u128 << 4);
         assert_eq!(mask(&planes, 13), 1_u128 << 85);
         assert_eq!(mask(&planes, AUX_PLANE_BASE), 0);
-        // px0 的 sparse plane 此时是“全 mask + value 0”；dense ONNX 输入中等价为全零。
+        // 稀疏 plane 的全 mask + value 0 在 dense ONNX 输入中等价为全零。
         assert!(is_filled_with(&planes, AUX_PLANE_BASE + 1, 0.0));
 
         let game = GameState::from_fen_moves(xiangqi_core::STARTPOS_FEN, &["h2e2"]).unwrap();
@@ -417,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn px0_policy_table_is_complete_and_stable() {
+    fn policy_table_is_complete_and_stable() {
         for (index, uci) in include_str!("px0_policy_moves.txt").lines().enumerate() {
             let mv = xiangqi_core::Move::new(
                 xiangqi_core::Square::parse(&uci[..2]).unwrap(),

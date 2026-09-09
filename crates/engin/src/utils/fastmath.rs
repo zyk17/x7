@@ -25,13 +25,13 @@ pub fn fast_exp2(value: f32) -> f32 {
 }
 
 /// 快速自然对数。
-#[allow(clippy::approx_constant)] // Keep px0's deliberately rounded f32 coefficient.
+#[allow(clippy::approx_constant)] // 保持现有的 f32 近似系数。
 pub fn fast_log(value: f32) -> f32 {
     0.693_147_2 * fast_log2(value)
 }
 
 /// 快速 e^x。
-#[allow(clippy::approx_constant)] // Keep px0's deliberately rounded f32 coefficient.
+#[allow(clippy::approx_constant)] // 保持现有的 f32 近似系数。
 pub fn fast_exp(value: f32) -> f32 {
     fast_exp2(1.442_695 * value)
 }
@@ -52,7 +52,7 @@ mod tests {
     use super::{fast_exp2, fast_log, fast_log2, fast_logistic};
 
     #[test]
-    fn px0_fastmath_preserves_power_of_two_anchors() {
+    fn fastmath_preserves_power_of_two_anchors() {
         assert!((fast_log2(1.0) - 0.0).abs() < f32::EPSILON);
         assert!((fast_log2(2.0) - 1.0).abs() < f32::EPSILON);
         assert!((fast_exp2(0.0) - 1.0).abs() < f32::EPSILON);
@@ -60,7 +60,7 @@ mod tests {
     }
 
     #[test]
-    fn px0_fastmath_keeps_logistic_guards() {
+    fn fastmath_keeps_logistic_guards() {
         assert_eq!(fast_logistic(21.0), 1.0);
         assert_eq!(fast_logistic(-21.0), 0.0);
         assert!(fast_log(2.0) > 0.69);

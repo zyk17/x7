@@ -1,7 +1,6 @@
 //! UCI 协议解析与输出。
 //!
-//! 命令形状与 info 字段历史上参考过 px0 `uciloop`；本模块由 X7 维护，未支持的
-//! 命令必须明确拒绝。
+//! X7 的 UCI 协议解析与输出；未支持的命令必须明确拒绝。
 
 use std::collections::HashMap;
 
@@ -124,8 +123,7 @@ impl<'a> UciLoop<'a> {
             }
             "go" => {
                 let mut go_params = GoParams::default();
-                // px0 只接受 `infinite`（`uciloop.cc:70,209-213`）。`infinity` 是本地别名，
-                // 设置相同的 `GoParams::infinite` flag。
+                // `infinity` 是本地别名，与 `infinite` 设置同一个 flag。
                 for flag in ["infinite", "infinity"] {
                     if !contains_key(params, flag) {
                         continue;
@@ -492,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn weights_file_option_matches_px0_name() {
+    fn weights_file_option_has_stable_name() {
         let mut options = Options::default();
         options.set_uci_option("WeightsFile", "data/x7.onnx").expect("weights option");
         assert_eq!(options.weights_file, "data/x7.onnx");
@@ -505,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn minibatch_size_option_matches_px0_range() {
+    fn minibatch_size_option_has_expected_range() {
         let mut options = Options::default();
         options.set_uci_option("NnBatchSize", "128").expect("minibatch-size option");
         assert_eq!(options.nn_batch_size, 128);
@@ -513,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn multipv_option_matches_px0_range() {
+    fn multipv_option_has_expected_range() {
         let mut options = Options::default();
         options.set_uci_option("MultiPV", "3").expect("multipv option");
         assert_eq!(options.multi_pv, 3);
@@ -576,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn format_thinking_info_matches_px0_fields() {
+    fn format_thinking_info_emits_requested_fields() {
         let options = Options { show_wdl: true, show_eps: true, ..Options::default() };
         let info = ThinkingInfo {
             depth: 0,

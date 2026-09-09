@@ -196,7 +196,7 @@ impl ExpansionState {
     }
 }
 
-/// 已完成 node WDL 聚合值（`wl_sum` / `draw_sum` 对应 px0 `wl_` / `d_`）。
+/// 已完成 node 的 WDL 聚合值。
 #[derive(Debug, Default)]
 struct NodeStats {
     visits: u32,

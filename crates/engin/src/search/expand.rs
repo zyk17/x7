@@ -42,7 +42,7 @@ pub(crate) fn path_terminal_value(history: &PositionHistory, depth: usize) -> Op
     let is_root = depth == 0;
     if !is_root {
         if history.last().repetitions() >= 2 {
-            // 语义参考自 px0 `MakeTerminal(history->RuleJudge())`，勿经绝对颜色转换。
+            // RuleJudge 已按 node / incoming-edge 视角给出结果，勿经绝对颜色转换。
             let (wl, draw) = rule_judge_wl_for_node(history.rule_judge());
             return Some((wl, draw, 0.0));
         }

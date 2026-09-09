@@ -1,4 +1,4 @@
-//! Hash 拼接。历史来源：px0 hashcat。
+//! Hash 拼接。
 
 pub const fn hash(val: u64) -> u64 {
     0xfad0d7f2fbb059f1u64

@@ -69,7 +69,7 @@ impl OnnxProvider {
 
 #[cfg(feature = "tensorrt")]
 const TRT_PROFILE_MIN_BATCH: usize = 1;
-/// recommended / opt / max 对齐 stream 稳态合批。
+/// TensorRT profile 的最小、最优与最大 batch。
 #[cfg(feature = "tensorrt")]
 const TRT_MAX_BATCH: usize = 256;
 #[cfg(feature = "directml")]
@@ -294,19 +294,19 @@ fn recommended_batch_size(provider: OnnxProvider) -> usize {
     if provider == OnnxProvider::DirectMl { DML_MAX_BATCH } else { 256 }
 }
 
-/// UCI `NnBatchSize` 硬顶与 option spin 对齐；单次 ORT run 仍按 provider 内部分块。
+/// UCI `NnBatchSize` 硬顶；单次 ORT run 仍按 provider 内部分块。
 fn maximum_batch_size(_provider: OnnxProvider) -> usize {
     1024
 }
 
-/// ORT TensorRT EP：选项语义对齐 px0 `network_onnx.cc` TRT 段，并适配 X7 mixed-fp16 图。
+/// ORT TensorRT EP：适配 X7 mixed-fp16 图。
 ///
-/// - `builder_optimization_level=5` ↔ px0 `optimize` 钳到 0..5 后的 builder 等级
+/// - `builder_optimization_level=5`：启用 TensorRT 的最高 builder 优化等级
 /// - 默认 **开** `trt_fp16_enable`：ORT 在关 fp16 时走 STRONGLY_TYPED，开时走弱类型
 ///   `BuilderFlag::kFP16`。X7 图已是 FP16 trunk + FP32 heads，但本栈关 EP-fp16 实测
-///   吞吐差约 3×；px0 能默认关是因为其 ONNX 是**整网统一 FP16**，形态不同。
+///   吞吐差约 3×。
 /// - `layer_norm_fp32_fallback`：弱类型下保护 LN（仅 `fp16_enable` 时生效）
-/// - 不设 `max_workspace_size`：与 px0 / KataGo 一样走 TRT 设备默认
+/// - 不设 `max_workspace_size`：使用 TRT 设备默认
 /// - 不启用 `cuda_graph`：动态 batch 下 ORT 要求 shape 固定，曾出现均匀 policy
 #[cfg(feature = "tensorrt")]
 fn create_tensorrt_sessions(path: &Path) -> Result<OnnxSessions, EnginError> {

@@ -4,8 +4,9 @@ X7 是独立的中国象棋研究引擎。目标是在有限计算资源和固�
 Prediction、搜索产生 Evidence，并以固定时间 Elo 衡量二者协同的效果。网络结构、搜索算法和
 硬件分工都是实现选择，不是目标本身。
 
-第一版规则、UCI 与训练外围曾参考 px0/Lc0；当前实现不是 px0 重写，也不承诺与 px0、LC3
-行为等价。正式模型契约固定为 `124 x 10 x 9 -> 2062 policy + WDL + moves-left`。
+`engin` 提供 X7 的 UCI、时钟和 stream 搜索。`xiangqi_core` 是 PX0 规则实现的 Rust 重写；`nn` 是
+PX0 网络与训练格式的 Python 重写。正式模型契约固定为
+`124 x 10 x 9 -> 2062 policy + WDL + moves-left`。
 
 ## 当前结构
 

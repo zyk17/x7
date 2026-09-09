@@ -19,17 +19,17 @@ dataset:
   force_download: false
 
 model:
-  # v3：逐结构复刻 PX0/Lc0 AttentionBody：attention-policy-map positional encoding、
-  # input MA gate、MHA + Smolgen + DeepNorm + LayerNorm + ReLU FFN，以及原版三正式 head。
-  # policy 由起点-终点 token pair score 收集回固定 2062 PX0 着法顺序；正式输出契约不变。
+  # v3：attention-policy-map positional encoding、input MA gate、MHA + Smolgen +
+  # DeepNorm + LayerNorm + ReLU FFN，以及三正式 head。
+  # policy 由起点-终点 token pair score 收集回固定 2062 着法顺序；正式输出契约不变。
   # 只接受本实现名：x7_v3_attentionbody 或 x7_v2_bottleneck_gbroadcast。
   # 两者 checkpoint 不兼容，不能互相 init_from 或续训。
   kind: x7_v3_attentionbody
   width: 512
   blocks: 12
-  # 32 channels/head 与 Lc0 默认 AttentionBody 保持同一量级。
+  # 默认每个 head 为 32 channels。
   heads: 16
-  # Lc0 的 dff=1.5*d_model；这里保持同一比例。
+  # 默认 ffn 宽度为 model 宽度的 1.5 倍。
   ffn_channels: 768
 
 training:
@@ -42,11 +42,11 @@ training:
   steps: 2000
   # 每个 optimizer step 的样本数。
   batch_size: 256
-  # 每隔多少 step 跑一次 PX0 test 验证并写 checkpoint。
+  # 每隔多少 step 跑一次验证并写 checkpoint。
   eval_every: 100
-  # PX0-style low-frequency sequential full validation; `.best.pt` only updates from this result.
+  # 低频顺序完整验证；`.best.pt` 只由这次结果更新。
   full_validation_every: 200000
-  # pxzero-style record shuffle buffer 的总大小；会按 DataLoader worker 均分，避免顺序读取
+  # record shuffle buffer 的总大小；会按 DataLoader worker 均分，避免顺序读取
   # 同一对局相邻局面。4096 个解码样本约占 200 MB 主存。
   shuffle_size: 4096
   # AdamW：线性 warmup 后平滑 cosine 衰减，不使用人工 lr boundaries。

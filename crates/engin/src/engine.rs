@@ -340,7 +340,6 @@ impl Engine {
     }
 
     /// 启动一个独占 job。worker pool 跨 job 常驻，图和配置均由 Engine 直接持有。
-    /// 参考 LC3 Overview 的 "Search" / "Workers"。
     fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError> {
         self.validate_go(params)?;
         self.abort_search();

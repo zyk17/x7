@@ -1,6 +1,6 @@
 //! X7 规则核心：棋盘、合法着、FEN、历史与裁判。
 //!
-//! 语义历史上源于 px0 `src/chess`；现由本仓维护。
+//! 本 crate 是 px0 `src/chess` 规则实现的 Rust 重写；现由本仓维护。
 
 pub mod bitboard;
 pub mod board;

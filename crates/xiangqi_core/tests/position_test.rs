@@ -9,14 +9,14 @@ fn ensure_init() {
 }
 
 fn history_from_fen(fen: &str, rule60_ply: u32, game_ply: u32) -> PositionHistory {
-    let (board, _) = ChessBoard::from_fen(fen).expect("valid px0 test FEN");
+    let (board, _) = ChessBoard::from_fen(fen).expect("valid test FEN");
     let mut history = PositionHistory::default();
     history.reset(board, rule60_ply, game_ply);
     history
 }
 
 fn append(history: &mut PositionHistory, text: &str) {
-    let mv = history.last().board().parse_move(text).expect("px0 test move");
+    let mv = history.last().board().parse_move(text).expect("test move");
     history.append(mv);
 }
 
@@ -34,8 +34,7 @@ fn set_fen_get_fen() {
         "4ka3/4a4/9/9/4N4/p8/9/4C3c/7n1/2BK5 w - - 0 1",
     ];
     for fen in source_fens {
-        // Mirrors px0 `PositionTest.SetFenGetFen`: `SetFromFen()` returns a
-        // fullmove count, while `PositionHistory::Reset()` receives game ply.
+        // FEN 提供 fullmove count，PositionHistory 保存 game ply。
         let (board, state) = ChessBoard::from_fen(fen).unwrap();
         let game_ply = 2 * state.game_ply - if board.flipped() { 1 } else { 2 };
         assert_eq!(Position::new(board, state.rule60_ply, game_ply).to_fen(), fen);
@@ -43,7 +42,7 @@ fn set_fen_get_fen() {
 }
 
 #[test]
-fn from_fen_keeps_px0_game_ply_field() {
+fn from_fen_converts_fullmove_to_game_ply() {
     ensure_init();
     let position = Position::from_fen("3k5/9/9/9/9/9/9/9/9/5K3 w - - 0 30").unwrap();
     assert_eq!(position.game_ply(), 30);
@@ -100,7 +99,7 @@ fn detects_repetitions_since_last_zeroing_move() {
 }
 
 #[test]
-fn rule_judge_matches_px0_cases() {
+fn rule_judge_covers_repetition_cases() {
     ensure_init();
 
     let mut white_chase = history_from_fen("3k5/9/9/6c2/9/9/9/6R2/9/5K3 b - - 2 30", 2, 30);

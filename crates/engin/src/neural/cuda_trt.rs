@@ -1,5 +1,5 @@
 //! TensorRT 用 CUDA：stream、device/pinned buffer、sparse→dense expand。
-//! Kernel 对齐 px0 `onnx_kernels.cu`（128-bit mask + 90 格）。
+//! 固定网络平面使用 128-bit mask 与 90 格棋盘。
 
 use std::ffi::c_void;
 use std::ptr;

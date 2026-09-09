@@ -1,4 +1,4 @@
-//! 攻击表与 magic bitboard 初始化。来源：px0 board.cc。
+//! 攻击表与 magic bitboard 初始化。
 
 use std::sync::OnceLock;
 

@@ -5,8 +5,9 @@
 X7 研究网络 Prediction 与搜索 Evidence 在固定时间下如何协同，并只以固定时间 Elo 评价成果。
 GPU 主要生产 Prediction，CPU 主要生产 Evidence；二者的具体比例、模型和 Proof 形式均可演进。
 
-规则、训练格式和 UCI 外围曾参考 px0/Lc0；LC3、KataGo 仅作按需的公开/历史参考。X7 是独立实现，
-不声称源码翻译或行为等价。
+X7 由 Rust 规则核心、Rust 引擎与 Python 网络训练组成。`xiangqi_core` 是 PX0 规则实现的 Rust 重写；
+`nn` 是 PX0 网络与训练格式的 Python 重写。正式模型契约固定为
+`124x10x9 -> 2062 + WDL + moves-left`。
 
 ## 模块边界
 
@@ -15,7 +16,7 @@ GPU 主要生产 Prediction，CPU 主要生产 Evidence；二者的具体比例�
   `UniformBackend` 仅限测试。
 - `engin/src/search` 是单一的 stream 路径树。edge 首次下探时绑定 arena `NodeId`，换位不合并；
   event 自带 variation 和根历史，规则不依赖树拓扑。
-- `nn` 是独立 Python 训练子项目；其输出遵守正式 ONNX 契约，但不进入规则或搜索热路径。
+- `nn` 是 Python 训练子项目；其输出遵守正式 ONNX 契约，但不进入规则或搜索热路径。
 
 ## 搜索不变量
 
@@ -67,6 +68,5 @@ cPUCT/FPU（普通探索）和 `lambda`（复核）。固定 visits 或固定时
 
 ## 工程约定
 
-外部语义参考应在代码注释中标明来源和“历史参考”性质。新的搜索设计可以自研，但必须说明其目标
-和不变量，不能伪装为外部引擎等价实现。运行、实验和打包操作见 [commands.md](commands.md)；已否决
-的方案见 [Research.md](Research.md)。
+搜索设计必须说明其目标和不变量。运行、实验和打包操作见 [commands.md](commands.md)；已否决的方案见
+[Research.md](Research.md)。

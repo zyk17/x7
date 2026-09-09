@@ -1,4 +1,4 @@
-//! Bitboard 与位迭代。来源：px0 bitboard / bititer。
+//! Bitboard 与位迭代。
 
 use crate::types::{File, Rank, Square};
 

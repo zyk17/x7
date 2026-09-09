@@ -116,8 +116,8 @@ def forward_training(
     """Use FP16 for the spatial trunk and explicit FP32 heads/losses.
 
     This follows PyTorch AMP's mixed-precision pattern while preserving stable
-    policy/value reductions in FP32. KataGoMethods.md motivates the two
-    training-only heads; their tensors never enter the exporter.
+    policy/value reductions in FP32. The two training-only heads never enter
+    the exporter.
     """
     if amp_enabled:
         with torch.amp.autocast("cuda", dtype=torch.float16):

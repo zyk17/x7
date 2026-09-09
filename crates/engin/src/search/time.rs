@@ -1,7 +1,7 @@
 //! UCI 时钟预算。
 //!
-//! 分配形状历史上参考过 px0 legacy stopper；stream 只在搜索启动时取得 deadline、
-//! 在 drain 后归还未用时间，不保留通用停止链或可调进攻/保守倍率。
+//! stream 只在搜索启动时取得 deadline、在 drain 后归还未用时间，
+//! 不保留通用停止链或可调进攻/保守倍率。
 
 use std::time::{Duration, Instant};
 
@@ -60,7 +60,7 @@ impl TimeManager {
         Some(TimeBudget { limit_ms: (this_move_time as i64).min(time - MOVE_OVERHEAD_MS) })
     }
 
-    /// 新对局清除 legacy 预算中保留的首手与剩余时间状态。
+    /// 新对局清除首手与剩余时间状态。
     pub(crate) fn reset(&mut self) {
         *self = Self { first_move_of_game: true, time_spared_ms: 0 };
     }
@@ -101,7 +101,7 @@ mod tests {
     use crate::uci::GoParams;
 
     #[test]
-    fn estimated_moves_matches_px0_curve() {
+    fn estimated_moves_stays_positive_after_midpoint() {
         assert!((estimated_moves_to_go(0) - 51.5).abs() < 0.001);
         assert!(estimated_moves_to_go(100) > 0.0);
     }

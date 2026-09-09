@@ -1,4 +1,4 @@
-//! 棋子、坐标、着法类型。来源：px0 types。
+//! 棋子、坐标、着法类型。
 
 use std::fmt;
 
@@ -132,7 +132,7 @@ impl File {
 }
 
 impl Default for File {
-    /// px0 `File()` initializes to an off-board value (`types.h:65`).
+    /// 默认值是棋盘外坐标。
     fn default() -> Self {
         Self::INVALID
     }
@@ -191,7 +191,7 @@ impl Rank {
     }
 }
 
-/// px0 square order：`a0 = 0`，每 rank 连续 9 格。
+/// Square 顺序：`a0 = 0`，每 rank 连续 9 格。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Square(u8);
 
@@ -299,7 +299,7 @@ impl fmt::Display for Square {
     }
 }
 
-/// px0 `Move`：to 在低 7 位，from 在 bit 7-13。
+/// Move 编码：to 在低 7 位，from 在 bit 7-13。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Move(u16);
 
@@ -367,7 +367,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn square_and_move_match_px0_layout() {
+    fn square_and_move_use_stable_layout() {
         let a0 = Square::new(File::A, Rank::from_idx(0).unwrap());
         let i9 = Square::new(File::I, Rank::from_idx(9).unwrap());
         assert_eq!(a0.index(), 0);
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_types_match_px0_helpers() {
+    fn scalar_types_have_expected_defaults() {
         assert!(!File::default().is_valid());
         assert_eq!(File::H.to_string(false), "h");
         assert_eq!(File::H.to_string(true), "H");

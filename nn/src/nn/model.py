@@ -1,4 +1,4 @@
-"""Public NN factory and compatibility imports.
+"""Public NN factory exports.
 
 Architecture implementations live in `model_v2` and `model_v3`; shared model
 contract and losses live in `model_common`.

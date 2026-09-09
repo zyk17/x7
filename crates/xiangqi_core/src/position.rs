@@ -1,4 +1,4 @@
-//! Position / PositionHistory / GameResult。来源：px0 position。
+//! Position / PositionHistory / GameResult。
 
 use crate::board::board_to_fen;
 use crate::hashcat::{hash_cat, hash_cat_u128s};
@@ -171,9 +171,7 @@ impl PositionHistory {
         Self::from_positions(self.positions[start..].to_vec())
     }
 
-    /// Copies a root history without discarding this instance's reserved DFS
-    /// capacity. px0 gives every search workspace a persistent
-    /// `PositionHistory` and reuses it through `Trim`/`Append`
+    /// Copies a root history without discarding this instance's reserved DFS capacity.
     pub fn copy_from_history(&mut self, source: &Self) {
         self.positions.clear();
         self.positions.extend_from_slice(source.positions());
@@ -223,7 +221,7 @@ impl PositionHistory {
         GameResult::Undecided
     }
 
-    /// 返回值按 px0 `MakeTerminal` 约定解释：`WhiteWon`→node `wl=+1`，
+    /// 返回值按 node `wl` 约定解释：`WhiteWon`→`wl=+1`，
     /// `BlackWon`→`wl=-1`（incoming-edge 视角），**不是**绝对红黑胜负。
     /// 绝对结果见 [`Self::compute_game_result`]（白走时会取反）。
     pub fn rule_judge(&self) -> GameResult {
@@ -292,7 +290,7 @@ impl PositionHistory {
             index -= 2;
         }
 
-        panic!("px0 RuleJudge called without a repeat");
+        panic!("RuleJudge called without a repeat");
     }
 
     pub fn did_repeat_since_last_zeroing_move(&self) -> bool {

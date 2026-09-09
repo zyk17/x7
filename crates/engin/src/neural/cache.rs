@@ -2,9 +2,7 @@
 //!
 //! key 由 `EvalCacheKey::slot_key()` 提供：棋盘 hash 混入 `repetitions`；
 //! 命中时再校验 `num_moves`（廉价碰撞护栏）。**不**纳入完整 history。
-//! 容量与替换：固定 `2^N` 直映表，槽内新结果替换旧结果（KataGo 风格）。
-//!
-//! 历史参考：px0 `neural/memcache.cc`；KataGo `neuralnet/nneval.cpp`。
+//! 容量与替换：固定 `2^N` 直映表，槽内新结果替换旧结果。
 
 use std::sync::Arc;
 
@@ -12,9 +10,9 @@ use parking_lot::{Mutex, RwLock};
 
 use super::backend::EvalResult;
 
-/// KataGo GTP 默认值（`cpp/program/setup.cpp:248-255`）：`2^20 = 1,048,576` 槽。
+/// 默认 `2^20 = 1,048,576` 槽。
 pub const DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO: u8 = 20;
-/// KataGo `setup.cpp` 对该配置接受 `0..=48`。超大值仍受实际可分配内存约束。
+/// 可设范围为 `0..=48`；超大值仍受实际可分配内存约束。
 pub const MAX_NN_CACHE_SIZE_POWER_OF_TWO: u8 = 48;
 
 /// cache 中保存的评估结果。
@@ -33,7 +31,7 @@ struct CacheEntry {
 #[derive(Debug, Default)]
 struct CacheSlot(Mutex<Option<CacheEntry>>);
 
-/// KataGo 风格的直映 NN cache。每个槽只保留一个完整 key；不同 key 映射到同一槽时，
+/// 直映 NN cache。每个槽只保留一个完整 key；不同 key 映射到同一槽时，
 /// 后写结果替换先前结果。表大小只在 UCI option 改动时重建，查找只锁定目标槽。
 #[derive(Debug)]
 pub(crate) struct EvalCache {
@@ -58,8 +56,7 @@ impl EvalCache {
     }
 
     /// 查找 cache；key 冲突时校验完整 key / 合法着数。
-    /// （`memcache.cc:130-150`）。空合法着列表可接受缓存结果；否则只有相同 policy
-    /// 长度才安全。
+    /// 空合法着列表可接受缓存结果；否则只有相同 policy 长度才安全。
     pub(crate) fn get(&self, key: u64, requested_moves: usize) -> Option<Arc<EvalResult>> {
         let slots = self.slots();
         let slot = slots[key as usize & (slots.len() - 1)].0.lock();
@@ -68,7 +65,7 @@ impl EvalCache {
             .then(|| Arc::clone(&entry.value.result))
     }
 
-    /// KataGo `NNCacheTable::set`：同一槽内的新结果替换旧结果。旧 `Arc` 在离开锁后
+    /// 同一槽内的新结果替换旧结果。旧 `Arc` 在离开锁后
     /// 才释放，避免析构占用槽锁。
     pub(crate) fn insert(&self, key: u64, value: CachedEval) {
         let slots = self.slots();

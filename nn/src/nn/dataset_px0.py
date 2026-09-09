@@ -58,9 +58,8 @@ T = TypeVar("T")
 def shuffle_stream(items: Iterator[T], *, size: int) -> Iterator[T]:
     """Bounded replacement shuffle for sequential chunk records.
 
-    Reference: pxzero-training `tf/chunkparser.py:480-500` and
-    `tf/shufflebuffer.py:56-74`. The buffer is deliberately bounded because
-    decoded PyTorch samples are much larger than pxzero's packed records.
+    The buffer is deliberately bounded because decoded PyTorch samples are
+    large.
     """
     if size <= 1:
         yield from items
