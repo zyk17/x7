@@ -15,7 +15,7 @@ use crate::neural::{
 };
 
 use super::observer::{ExecutionKind, ExecutionTimer, SearchObserver};
-use super::pipeline::{Shared, process_backprop_batch};
+use super::pipeline::{Shared, process_backprop_batch, process_backprop_one};
 use super::workerpool::{BackpropEvent, EvalEvent, Event, NnReplyBatch, NnRequest};
 
 /// 处理一个 Expand 已分类的普通叶子。
@@ -25,7 +25,7 @@ pub(crate) fn process_eval_event<O: SearchObserver>(
     nn_tx: &Sender<NnRequest<O::Stamp>>,
     event: EvalEvent<O::Stamp>,
 ) -> Result<(), EnginError> {
-    let _timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Eval);
+    let timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Eval);
     if shared.stopping.load(Ordering::Acquire) {
         shared.cancel_claim(event.event);
         return Ok(());
@@ -34,7 +34,8 @@ pub(crate) fn process_eval_event<O: SearchObserver>(
         if O::ENABLED {
             shared.observer.on_cache_hit();
         }
-        shared.send_backprop(publish_eval(shared, event.event, event.legal_moves, eval, false));
+        drop(timer);
+        process_backprop_one(shared, publish_eval(shared, event.event, event.legal_moves, eval, false));
         return Ok(());
     }
     let planes = encode_position_input_planes(&event.history, FillEmptyHistory::No);
@@ -114,7 +115,7 @@ fn publish_eval<O: SearchObserver>(
     legal_moves: xiangqi_core::LegalMoveList,
     eval: Arc<EvalResult>,
     holds_nn_credit: bool,
-) -> BackpropEvent<O::Stamp> {
+) -> BackpropEvent {
     shared
         .arena
         .get(event.node_id)

@@ -53,10 +53,7 @@ pub(crate) struct BackpropResult {
 }
 
 /// 一条 path 不会重复 node，因此直接完成 edge 与写回 node，不需要聚合表。
-pub(crate) fn complete_one<S: super::observer::QueueStamp>(
-    event: BackpropEvent<S>,
-    arena: &NodeArena,
-) -> BackpropResult {
+pub(crate) fn complete_one(event: BackpropEvent, arena: &NodeArena) -> BackpropResult {
     let BackpropEvent { event, value, .. } = event;
     debug_assert_eq!(event.node_path.len(), event.reservations.len() + 1);
     let depth = event.node_path.len() as u64;
@@ -79,10 +76,7 @@ pub(crate) fn complete_one<S: super::observer::QueueStamp>(
 }
 
 /// 多条 path 的 node 增量合并后一次写入；edge 仍逐层 complete。
-pub(crate) fn complete_batch<S: super::observer::QueueStamp>(
-    events: impl IntoIterator<Item = BackpropEvent<S>>,
-    arena: &NodeArena,
-) -> BackpropResult {
+pub(crate) fn complete_batch(events: impl IntoIterator<Item = BackpropEvent>, arena: &NodeArena) -> BackpropResult {
     let mut node_deltas = NodeDeltaMap::default();
     let mut result = BackpropResult::default();
 
@@ -138,12 +132,9 @@ mod tests {
         root_node.publish_edges(vec![(mv, 1.0)]);
         let child_id = arena.child_or_create(&root_node.edges()[0]);
         let child = SelectEvent::<crate::search::NoQueueStamp>::at_root(root_id, Arc::clone(&history))
-            .descend(child_id, root_node.reserve_edge(0, None).expect("edge"));
+            .descend(child_id, root_node.reserve_edge(0, 0.0).expect("edge"));
 
-        complete_one(
-            BackpropEvent::<crate::search::NoQueueStamp>::without_nn_credit(child.into_event(), 0.4, 0.2, 2.0),
-            &arena,
-        );
+        complete_one(BackpropEvent::without_nn_credit(child.into_event(), 0.4, 0.2, 2.0), &arena);
 
         let edge = &root_node.edges()[0];
         assert_eq!(edge.visits(), 1);

@@ -40,7 +40,8 @@ pub use observer::{
     QueueStamp, QueueStats, SearchObserver,
 };
 pub use param::{SearchConfig, SearchParams};
-pub use pipeline::{Search, SearchControl, SearchLimits, Stats};
+pub(crate) use pipeline::StopHandle;
+pub use pipeline::{Search, SearchLimits, Stats};
 pub use select::{compute_cpuct, variance_bonus_from_se};
 pub(crate) use time::{TimeBudget, TimeManager};
 pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree};

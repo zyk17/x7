@@ -1,7 +1,7 @@
 //! 事件定义与固定任务池。
 //!
-//! worker 不再绑定 Select/Expand/Eval/Backprop 角色：每次只取一个就绪任务，优先让
-//! Backprop 和 NN 回包释放 reservation；NN inference 仍是独立设备 worker。Proof 的任务位
+//! worker 不再绑定 Select/Expand/Eval 角色：每次只取一个就绪任务，优先让 NN 回包
+//! 释放 reservation；NN inference 仍是独立设备 worker。Proof 的任务位
 //! 留在这个调度边界，暂不赋予搜索语义。
 
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use super::observer::{
     observe_queue_wait,
 };
 use super::param::{ResolvedSearchConfig, SearchConfig};
-use super::pipeline::{RECEIVE_POLL, Shared, process_backprop_event, process_expand_event, process_select_event};
+use super::pipeline::{RECEIVE_POLL, Shared, process_expand_event, process_select_event};
 
 /// 第一份 NN request 到达后，给并发 Eval 极短的汇聚时间；避免退化成连续 batch=1。
 const NN_BATCH_GATHER: Duration = Duration::from_micros(50);
@@ -153,7 +153,7 @@ impl<S: QueueStamp> NnReplyBatch<S> {
 }
 
 #[derive(Debug)]
-pub struct BackpropEvent<S: QueueStamp = NoQueueStamp> {
+pub struct BackpropEvent {
     pub(crate) event: Event,
     pub(crate) value: ValueDelta,
     /// 该 event 是否持有 NN scheduler credit。
@@ -161,21 +161,17 @@ pub struct BackpropEvent<S: QueueStamp = NoQueueStamp> {
     /// cache miss 从 NN scheduler admission 起一直持有到 Backprop 或取消；不在 NN Reply
     /// 时提前释放，确保新的 NN 工作只在当前评估已写入树的 Evidence 后再占 slot。
     pub(crate) holds_nn_credit: bool,
-    pub(crate) queued_at: S,
 }
 
-impl<S: QueueStamp> BackpropEvent<S> {
+impl BackpropEvent {
     pub(crate) fn with_nn_credit(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
-        Self { event, value: ValueDelta::one(wl, draw, plies_left), holds_nn_credit: true, queued_at: S::default() }
+        Self { event, value: ValueDelta::one(wl, draw, plies_left), holds_nn_credit: true }
     }
     pub(crate) fn without_nn_credit(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
-        Self { event, value: ValueDelta::one(wl, draw, plies_left), holds_nn_credit: false, queued_at: S::default() }
+        Self { event, value: ValueDelta::one(wl, draw, plies_left), holds_nn_credit: false }
     }
     pub fn cancel(self) {
         self.event.cancel();
-    }
-    pub(crate) fn mark_queued(&mut self) {
-        self.queued_at.mark();
     }
 }
 
@@ -187,7 +183,6 @@ enum WorkerCommand<O: SearchObserver> {
         eval_rx: Receiver<EvalEvent<O::Stamp>>,
         nn_reply_rx: Receiver<NnReplyBatch<O::Stamp>>,
         nn_tx: Sender<NnRequest<O::Stamp>>,
-        backprop_rx: Receiver<BackpropEvent<O::Stamp>>,
     },
     Shutdown,
 }
@@ -255,7 +250,6 @@ impl<O: SearchObserver> WorkerPool<O> {
         nn_rx: &Receiver<NnRequest<O::Stamp>>,
         nn_credit_rx: &Receiver<usize>,
         nn_reply_tx: &Sender<NnReplyBatch<O::Stamp>>,
-        backprop_rx: &Receiver<BackpropEvent<O::Stamp>>,
     ) {
         self.nn_commands
             .send(NnCommand::Run(Arc::clone(shared), nn_rx.clone(), nn_credit_rx.clone(), nn_reply_tx.clone()))
@@ -269,7 +263,6 @@ impl<O: SearchObserver> WorkerPool<O> {
                     eval_rx: eval_rx.clone(),
                     nn_reply_rx: nn_reply_rx.clone(),
                     nn_tx: nn_tx.clone(),
-                    backprop_rx: backprop_rx.clone(),
                 })
                 .expect("persistent worker is alive");
         }
@@ -298,7 +291,7 @@ impl<O: SearchObserver> Drop for WorkerPool<O> {
     }
 }
 
-/// stop 后不再启动上游工作；已经得到结果的 Reply / Backprop 继续完成。
+/// stop 后不再启动上游工作；已经得到结果的 NN reply 仍完成并写入缓存。
 fn cancel_pending_worker_queues<O: SearchObserver>(
     shared: &Shared<O>,
     select_rx: &Receiver<SelectEvent<O::Stamp>>,
@@ -316,6 +309,15 @@ fn cancel_pending_worker_queues<O: SearchObserver>(
     }
 }
 
+fn process_nn_reply<O: SearchObserver>(shared: &Shared<O>, mut reply: NnReplyBatch<O::Stamp>) {
+    if O::ENABLED {
+        observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply);
+    }
+    if let Err(error) = handle_nn_reply_batch(shared, reply) {
+        shared.fail(error);
+    }
+}
+
 fn worker<O: SearchObserver>(
     shared: Arc<Shared<O>>,
     select_rx: Receiver<SelectEvent<O::Stamp>>,
@@ -323,52 +325,24 @@ fn worker<O: SearchObserver>(
     eval_rx: Receiver<EvalEvent<O::Stamp>>,
     reply_rx: Receiver<NnReplyBatch<O::Stamp>>,
     nn_tx: Sender<NnRequest<O::Stamp>>,
-    backprop_rx: Receiver<BackpropEvent<O::Stamp>>,
 ) {
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             cancel_pending_worker_queues(&shared, &select_rx, &expand_rx, &eval_rx);
-            if let Ok(event) = backprop_rx.try_recv() {
-                process_backprop_event(&shared, event, &backprop_rx);
-                continue;
-            }
-            if let Ok(mut reply) = reply_rx.try_recv() {
-                if O::ENABLED {
-                    observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply);
-                }
-                if let Err(error) = handle_nn_reply_batch(&shared, reply) {
-                    shared.fail(error);
-                }
+            if let Ok(reply) = reply_rx.try_recv() {
+                process_nn_reply(&shared, reply);
                 continue;
             }
             if shared.outstanding.load(Ordering::Acquire) == 0 {
                 break;
             }
-            crossbeam_channel::select! {
-                recv(backprop_rx) -> result => {
-                    if let Ok(event) = result { process_backprop_event(&shared, event, &backprop_rx); }
-                },
-                recv(reply_rx) -> result => {
-                    if let Ok(mut reply) = result {
-                        if O::ENABLED { observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply); }
-                        if let Err(error) = handle_nn_reply_batch(&shared, reply) { shared.fail(error); }
-                    }
-                },
-                default(RECEIVE_POLL) => {},
+            if let Ok(reply) = reply_rx.recv_timeout(RECEIVE_POLL) {
+                process_nn_reply(&shared, reply);
             }
             continue;
         }
-        if let Ok(event) = backprop_rx.try_recv() {
-            process_backprop_event(&shared, event, &backprop_rx);
-            continue;
-        }
-        if let Ok(mut reply) = reply_rx.try_recv() {
-            if O::ENABLED {
-                observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply);
-            }
-            if let Err(error) = handle_nn_reply_batch(&shared, reply) {
-                shared.fail(error);
-            }
+        if let Ok(reply) = reply_rx.try_recv() {
+            process_nn_reply(&shared, reply);
             continue;
         }
         if let Ok(mut job) = eval_rx.try_recv() {
@@ -395,15 +369,8 @@ fn worker<O: SearchObserver>(
             continue;
         }
         crossbeam_channel::select! {
-            recv(backprop_rx) -> result => {
-                if let Ok(event) = result { process_backprop_event(&shared, event, &backprop_rx); }
-            },
             recv(reply_rx) -> result => {
-                if let Ok(mut reply) = result {
-                    if O::ENABLED { observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply); }
-                    let outcome = handle_nn_reply_batch(&shared, reply);
-                    if let Err(error) = outcome { shared.fail(error); }
-                }
+                if let Ok(reply) = result { process_nn_reply(&shared, reply); }
             },
             recv(eval_rx) -> result => {
                 if let Ok(mut job) = result {
@@ -432,8 +399,8 @@ fn worker<O: SearchObserver>(
 fn persistent_worker<O: SearchObserver>(commands: Receiver<WorkerCommand<O>>, done: Sender<()>) {
     while let Ok(command) = commands.recv() {
         match command {
-            WorkerCommand::Run { shared, select_rx, expand_rx, eval_rx, nn_reply_rx, nn_tx, backprop_rx } => {
-                worker(shared, select_rx, expand_rx, eval_rx, nn_reply_rx, nn_tx, backprop_rx);
+            WorkerCommand::Run { shared, select_rx, expand_rx, eval_rx, nn_reply_rx, nn_tx } => {
+                worker(shared, select_rx, expand_rx, eval_rx, nn_reply_rx, nn_tx);
                 let _ = done.send(());
             }
             WorkerCommand::Shutdown => break,

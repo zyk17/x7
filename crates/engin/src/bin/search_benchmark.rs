@@ -309,7 +309,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         })?;
                     }
                     print_roots(&search, root_is_black, args.root_top, &args.track);
-                    search.stop_and_finish();
+                    search.finish();
                 }
             }
         }

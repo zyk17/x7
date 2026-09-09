@@ -87,8 +87,6 @@ impl SearchParams {
 /// 当前 worker pool 的 job 配置。算法旋钮在 `params`；`searchmoves` 在 `SearchLimits`。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchConfig {
-    /// Search/Eval/NN 队列深度。`0` 表示 `max(4096, 64 * resolved_batch)`。
-    pub queue_capacity: usize,
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
@@ -104,7 +102,7 @@ pub struct SearchConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { queue_capacity: 0, eval_batch_size: 0, nn_window: 2.25, params: SearchParams::default(), threads: 8 }
+        Self { eval_batch_size: 0, nn_window: 2.25, params: SearchParams::default(), threads: 8 }
     }
 }
 
@@ -118,30 +116,19 @@ impl SearchConfig {
         );
     }
 
-    /// 填充0配置, 推算具体队列/批量大小。
+    /// 填充 0 配置，推算具体批量大小。
     pub(crate) fn resolve(&self, backend: &dyn Backend) -> ResolvedSearchConfig {
         let recommended = backend.attributes().recommended_batch_size.max(1);
         let maximum = backend.attributes().maximum_batch_size.max(1);
         let eval_batch_size = if self.eval_batch_size == 0 { recommended } else { self.eval_batch_size.min(maximum) };
-        let queue_capacity =
-            if self.queue_capacity == 0 { (eval_batch_size.saturating_mul(64)).max(4096) } else { self.queue_capacity };
-        assert!(queue_capacity > 0, "stream queue capacity must be non-zero");
         assert!(eval_batch_size > 0, "stream eval batch size must be non-zero");
-        assert!(eval_batch_size <= queue_capacity, "stream eval batch size must fit the queue capacity");
         let nn_permit_limit = ((eval_batch_size as f32) * self.nn_window).ceil().max(1.0) as usize;
-        ResolvedSearchConfig {
-            queue_capacity,
-            eval_batch_size,
-            nn_permit_limit,
-            params: self.params,
-            threads: self.threads,
-        }
+        ResolvedSearchConfig { eval_batch_size, nn_permit_limit, params: self.params, threads: self.threads }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResolvedSearchConfig {
-    pub(crate) queue_capacity: usize,
     pub(crate) eval_batch_size: usize,
     pub(crate) nn_permit_limit: usize,
     pub(crate) params: SearchParams,

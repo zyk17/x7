@@ -306,7 +306,7 @@ mod tests {
 
     fn complete_samples(node: &super::Node, edge_index: usize, samples: &[f32]) {
         for &sample in samples {
-            node.reserve_edge(edge_index, None).expect("reservation").complete(sample);
+            node.reserve_edge(edge_index, 0.0).expect("reservation").complete(sample);
         }
     }
 

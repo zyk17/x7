@@ -119,8 +119,8 @@ impl Edge {
         self.stats.lock().q()
     }
 
-    fn reserve(&self, virtual_mean: Option<f32>) -> f32 {
-        let virtual_wl_sum = virtual_mean.unwrap_or(0.0);
+    fn reserve(&self, virtual_mean: f32) -> f32 {
+        let virtual_wl_sum = virtual_mean;
         let mut stats = self.stats.lock();
         self.started.fetch_add(1, Ordering::AcqRel);
         stats.virtual_wl_sum += virtual_wl_sum;
@@ -346,7 +346,7 @@ impl Node {
         self.edges.get().cloned().unwrap_or_default()
     }
 
-    pub(crate) fn reserve_edge(&self, edge_index: usize, virtual_mean: Option<f32>) -> Option<EdgeReservation> {
+    pub(crate) fn reserve_edge(&self, edge_index: usize, virtual_mean: f32) -> Option<EdgeReservation> {
         let edges = self.edges();
         let edge = edges.get(edge_index)?;
         let virtual_wl_sum = edge.reserve(virtual_mean);

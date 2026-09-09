@@ -11,7 +11,7 @@ use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 use crate::neural::backend::{Backend, CachingBackend};
 use crate::neural::onnx::OnnxBackend;
 use crate::search::{
-    NoopObserver, Search, SearchConfig, SearchControl, SearchLimits, SearchParams, SearchTree, Stats, TimeBudget,
+    NoopObserver, Search, SearchConfig, SearchLimits, SearchParams, SearchTree, Stats, StopHandle, TimeBudget,
     TimeManager, WorkerPool, best_mate_with_params, best_move_filtered_with_params, principal_variation_with_params,
     root_stats, root_variations,
 };
@@ -29,7 +29,7 @@ pub struct Engine {
     worker_pool: Option<Arc<WorkerPool>>,
     applied_nn_cache_size: Option<u8>,
     time_manager: TimeManager,
-    active: Option<ActiveSearch>,
+    running: Option<RunningSearch>,
     options: Options,
     position: Option<GameState>,
     manages_weights_file: bool,
@@ -39,8 +39,8 @@ pub struct Engine {
     stdout_gate: Arc<Mutex<()>>,
 }
 
-struct ActiveSearch {
-    control: SearchControl,
+struct RunningSearch {
+    stop: StopHandle,
     publish_output: Arc<AtomicBool>,
     owner_thread: JoinHandle<Result<(), EnginError>>,
     started: Instant,
@@ -164,7 +164,7 @@ impl Engine {
             worker_pool: None,
             applied_nn_cache_size: None,
             time_manager: TimeManager::default(),
-            active: None,
+            running: None,
             options: Options::default(),
             position: None,
             manages_weights_file: true,
@@ -322,18 +322,8 @@ impl Engine {
         Ok(moves)
     }
 
-    /// 启动一个独占 job。worker pool 跨 job 常驻，图和配置均由 Engine 直接持有。
-    /// 参考 LC3 Overview 的 "Search" / "Workers"。
-    fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError> {
-        self.validate_go(params)?;
-        self.abort()?;
-        let root_move_filter = self.root_move_filter(&params.searchmoves)?;
-        let backend = Arc::clone(self.backend.as_ref().ok_or(EnginError::Uci("position is not configured".into()))?);
-        if self.applied_nn_cache_size != Some(self.options.nn_cache_size_power_of_two) {
-            backend.set_cache_size_power_of_two(self.options.nn_cache_size_power_of_two);
-            self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
-        }
-        let config = SearchConfig {
+    fn search_config(&self) -> SearchConfig {
+        SearchConfig {
             eval_batch_size: self.options.nn_batch_size,
             params: SearchParams {
                 cpuct: self.options.cpuct,
@@ -349,20 +339,37 @@ impl Engine {
             },
             nn_window: self.options.nn_window,
             threads: self.options.threads,
-            ..SearchConfig::default()
-        };
-        let decision_params = config.params;
-        let pool = match self.worker_pool.as_ref() {
-            Some(pool) if pool.matches_config(backend.as_ref(), &config) => Arc::clone(pool),
+        }
+    }
+
+    fn ensure_worker_pool(&mut self, backend: &Arc<dyn Backend>, config: &SearchConfig) -> Arc<WorkerPool> {
+        match self.worker_pool.as_ref() {
+            Some(pool) if pool.matches_config(backend.as_ref(), config) => Arc::clone(pool),
             _ => {
-                let pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
+                let pool = Arc::new(WorkerPool::new(backend.as_ref(), config));
                 self.worker_pool = Some(Arc::clone(&pool));
                 pool
             }
-        };
+        }
+    }
+
+    /// 启动一个独占 job。worker pool 跨 job 常驻，图和配置均由 Engine 直接持有。
+    /// 参考 LC3 Overview 的 "Search" / "Workers"。
+    fn start_search(&mut self, params: &GoParams) -> Result<(), EnginError> {
+        self.validate_go(params)?;
+        self.abort()?;
+        let root_move_filter = self.root_move_filter(&params.searchmoves)?;
+        let backend = Arc::clone(self.backend.as_ref().ok_or(EnginError::Uci("position is not configured".into()))?);
+        if self.applied_nn_cache_size != Some(self.options.nn_cache_size_power_of_two) {
+            backend.set_cache_size_power_of_two(self.options.nn_cache_size_power_of_two);
+            self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
+        }
+        let config = self.search_config();
+        let decision_params = config.params;
+        let pool = self.ensure_worker_pool(&backend, &config);
         let graph = self.graph.as_ref().expect("position creates a graph with a backend");
         let root_is_black = graph.root_history().last().is_black_to_move();
-        let search = Search::new_in_pool(backend, graph, config, NoopObserver, pool);
+        let search = Search::new_with_pool(backend, graph, config, NoopObserver, pool);
         let snapshot = RootSnapshot {
             arena: Arc::clone(search.arena()),
             root_id: search.root_id(),
@@ -387,7 +394,7 @@ impl Engine {
                 .or_else(|| clock_budget.map(|budget| budget.deadline_after(started))),
             root_move_filter,
         };
-        let control = search.control();
+        let stop = search.stop_handle();
         let publish_output = Arc::new(AtomicBool::new(true));
         let owner_publish_output = Arc::clone(&publish_output);
         let output_options = self.options.clone();
@@ -395,7 +402,7 @@ impl Engine {
         let owner_thread = thread::spawn(move || {
             run_search(search, snapshot, output_options, output_gate, owner_publish_output, limits)
         });
-        self.active = Some(ActiveSearch { control, publish_output, owner_thread, started, clock_budget });
+        self.running = Some(RunningSearch { stop, publish_output, owner_thread, started, clock_budget });
         Ok(())
     }
 
@@ -425,10 +432,10 @@ impl Engine {
     }
 
     pub(crate) fn wait(&mut self) -> Result<(), EnginError> {
-        let Some(active) = self.active.take() else {
+        let Some(running) = self.running.take() else {
             return Ok(());
         };
-        let ActiveSearch { owner_thread, started, clock_budget, .. } = active;
+        let RunningSearch { owner_thread, started, clock_budget, .. } = running;
         let result = owner_thread.join().map_err(|_| EnginError::Uci("search owner thread panicked".into()))?;
         if let Some(clock_budget) = clock_budget {
             self.time_manager.finish(clock_budget, started.elapsed());
@@ -437,18 +444,18 @@ impl Engine {
     }
 
     pub(crate) fn stop(&mut self) -> Result<(), EnginError> {
-        if let Some(active) = &self.active {
-            active.control.request_stop();
+        if let Some(running) = &self.running {
+            running.stop.request_stop();
         }
         self.wait()
     }
 
     /// 替换 position / backend / 新 `go` 时停止 info，但必须留下 `bestmove` 结束上一次 `go`。
     fn abort(&mut self) -> Result<(), EnginError> {
-        if let Some(active) = &self.active {
+        if let Some(running) = &self.running {
             let _output = self.stdout_gate.lock();
-            active.publish_output.store(false, Ordering::Release);
-            active.control.request_stop();
+            running.publish_output.store(false, Ordering::Release);
+            running.stop.request_stop();
         }
         if let Err(error) = self.wait() {
             eprintln!("info string abort drain ignored previous search error: {error}");
@@ -469,7 +476,7 @@ fn run_search(
 ) -> Result<(), EnginError> {
     let started = Instant::now();
     let mut published = PublishedInfo::default();
-    let result = search.run_reporting(limits, Some(OWNER_PROGRESS_INTERVAL), |stats| {
+    let result = search.run_with_report(limits, Some(OWNER_PROGRESS_INTERVAL), |stats| {
         if !publish_output.load(Ordering::Acquire) {
             return;
         }
@@ -526,7 +533,7 @@ fn run_search(
         }
         write_stdout_best_move(&BestMoveInfo::new(best_move));
     }
-    search.stop_and_finish();
+    search.finish();
     result.map(|_| ())
 }
 

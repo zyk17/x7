@@ -683,7 +683,6 @@ fn print_run_report(
     print_queue("eval", bench.eval_queue);
     print_queue("nn", bench.nn_queue);
     print_queue("nn_reply", bench.nn_reply_queue);
-    print_queue("backprop", bench.backprop_queue);
 
     println!("Search depth");
     println!("  avg={}  max={}", stats.average_depth, stats.max_depth);
@@ -751,13 +750,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut search = Search::new(
                     Arc::clone(&backend),
                     &tree,
-                    SearchConfig {
-                        eval_batch_size: target_batch,
-                        nn_window: args.nn_window,
-                        threads,
-                        params,
-                        ..SearchConfig::default()
-                    },
+                    SearchConfig { eval_batch_size: target_batch, nn_window: args.nn_window, threads, params },
                     BenchObserver::default(),
                 );
 
@@ -805,7 +798,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &nn_probe,
                     &params,
                 );
-                search.stop_and_finish();
+                search.finish();
             }
         }
     }

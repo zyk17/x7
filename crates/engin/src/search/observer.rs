@@ -15,7 +15,6 @@ pub enum QueueKind {
     Nn,
     /// NN 结果已回到 worker 队列，等待发布 edge / 送 Backprop。
     NnReply,
-    Backprop,
 }
 
 /// 实际执行所属阶段；只由 benchmark 记录。
@@ -193,7 +192,6 @@ pub struct BenchObserver {
     eval_queue: QueueMetrics,
     nn_queue: QueueMetrics,
     nn_reply_queue: QueueMetrics,
-    backprop_queue: QueueMetrics,
     select_execution: ExecutionMetrics,
     expand_execution: ExecutionMetrics,
     eval_execution: ExecutionMetrics,
@@ -219,7 +217,6 @@ impl BenchObserver {
             eval_queue: self.eval_queue.snapshot(),
             nn_queue: self.nn_queue.snapshot(),
             nn_reply_queue: self.nn_reply_queue.snapshot(),
-            backprop_queue: self.backprop_queue.snapshot(),
             select_execution: self.select_execution.snapshot(),
             expand_execution: self.expand_execution.snapshot(),
             eval_execution: self.eval_execution.snapshot(),
@@ -258,7 +255,6 @@ impl SearchObserver for BenchObserver {
             QueueKind::Eval => self.eval_queue.record(wait),
             QueueKind::Nn => self.nn_queue.record(wait),
             QueueKind::NnReply => self.nn_reply_queue.record(wait),
-            QueueKind::Backprop => self.backprop_queue.record(wait),
         }
     }
 
@@ -318,7 +314,6 @@ pub struct BenchStats {
     pub eval_queue: QueueStats,
     pub nn_queue: QueueStats,
     pub nn_reply_queue: QueueStats,
-    pub backprop_queue: QueueStats,
     pub select_execution: ExecutionStats,
     pub expand_execution: ExecutionStats,
     pub eval_execution: ExecutionStats,

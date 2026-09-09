@@ -28,10 +28,10 @@ fn visited_policy(edges: &[Edge]) -> f32 {
         .sum()
 }
 
-fn action_q(stats: EdgeStats, started_visits: u32, fpu: f32, use_virtual_mean: bool) -> f32 {
+fn action_q(stats: EdgeStats, started_visits: u32, fpu: f32) -> f32 {
     let completed_q = if stats.visits == 0 { fpu } else { stats.q() };
     let in_flight = started_visits.saturating_sub(stats.visits);
-    if !use_virtual_mean || in_flight == 0 {
+    if in_flight == 0 {
         completed_q
     } else {
         (completed_q * stats.visits as f32 + stats.virtual_wl_sum) / (stats.visits + in_flight) as f32
@@ -44,9 +44,9 @@ pub fn variance_bonus_from_se(visits: u32, standard_error: f32, params: &SearchP
     if visits < 2 { 0.0 } else { params.variance_bonus_scale * standard_error }
 }
 
-/// reservation 应写入的 virtual mean；`scale==0` 退化为纯 virtual visit。
-fn virtual_mean_for_reservation(params: &SearchParams, fpu: f32) -> Option<f32> {
-    if params.virtual_mean_fpu_scale > 0.0 { Some(params.virtual_mean_fpu_scale * fpu) } else { None }
+/// reservation 应写入的 virtual mean；`scale==0` 写入零，退化为纯 virtual visit。
+fn virtual_mean_for_reservation(params: &SearchParams, fpu: f32) -> f32 {
+    params.virtual_mean_fpu_scale * fpu
 }
 
 /// 选择 PUCT 最高的 edge，并给出该边应挂的 virtual mean。
@@ -59,23 +59,28 @@ pub(crate) fn select_edge(
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
-) -> Option<(usize, Option<f32>)> {
+) -> Option<(usize, f32)> {
     if edges.is_empty() {
         return None;
     }
     let is_root = depth == 0;
+    // todo: 1a
     let children_visits = edges.iter().map(|edge| edge.visits()).sum::<u32>();
     let cpuct = compute_cpuct(*params, parent_completed_visits);
     let u_coeff = cpuct * (children_visits.max(1) as f32).sqrt();
+    // todo: 1b
     let fpu = get_fpu(params, parent_q, edges);
     let mut best: Option<(usize, f32)> = None;
     let filter_root_moves = is_root && !root_move_filter.is_empty();
+    // todo: 1c
+    // 一次select太重了   select   events=10736   total_ms=   638.8 avg_us=   59.5 max_us=  945.5
+    // 假如平均深度d 30, 平均branchs = 40, 则一次扩展大约需要30*40*3 次遍历. 这个代价显然不免费, 最大us接近1ms
     for (index, edge) in edges.iter().enumerate() {
         if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
             continue;
         }
         let (stats, started_visits) = edge.selection_snapshot();
-        let q = action_q(stats, started_visits, fpu, params.virtual_mean_fpu_scale > 0.0);
+        let q = action_q(stats, started_visits, fpu);
         let u = u_coeff * edge.prior() / (1 + started_visits) as f32;
         let score = q + u + variance_bonus_from_se(stats.visits, stats.standard_error(), params);
         if best.is_none_or(|(_, best_score)| score > best_score) {
@@ -97,9 +102,9 @@ mod tests {
         Move::new(Square::parse(from).expect("from"), Square::parse(to).expect("to"))
     }
 
-    fn edge_utility(edge: &Edge, fpu: f32, use_virtual_mean: bool) -> f32 {
+    fn edge_utility(edge: &Edge, fpu: f32) -> f32 {
         let (stats, started_visits) = edge.selection_snapshot();
-        action_q(stats, started_visits, fpu, use_virtual_mean)
+        action_q(stats, started_visits, fpu)
     }
 
     #[test]
@@ -121,7 +126,7 @@ mod tests {
         let params = SearchParams { virtual_mean_fpu_scale: 0.0, ..SearchParams::default() };
         assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index), Some(0));
 
-        let reservation = node.reserve_edge(0, None).expect("first edge");
+        let reservation = node.reserve_edge(0, 0.0).expect("first edge");
         assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index), Some(1));
         reservation.cancel();
         assert_eq!(edges[0].completed_visits(), 0);
@@ -162,8 +167,8 @@ mod tests {
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edges = node.edges();
         let edge = &edges[0];
-        node.reserve_edge(0, None).expect("res").complete(0.5);
-        assert!((edge_utility(edge, 0.0, false) - 0.5).abs() < 1e-6);
+        node.reserve_edge(0, 0.0).expect("res").complete(0.5);
+        assert!((edge_utility(edge, 0.0) - 0.5).abs() < 1e-6);
         assert!((visited_policy(std::slice::from_ref(edge)) - 1.0).abs() < f32::EPSILON);
     }
 
@@ -175,14 +180,14 @@ mod tests {
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edges = node.edges();
         let edge = &edges[0];
-        node.reserve_edge(0, None).expect("completed evidence").complete(0.8);
-        assert!((edge_utility(edge, -0.3, true) - 0.8).abs() < 1e-6);
+        node.reserve_edge(0, 0.0).expect("completed evidence").complete(0.8);
+        assert!((edge_utility(edge, -0.3) - 0.8).abs() < 1e-6);
 
-        let reservation = node.reserve_edge(0, Some(-0.3)).expect("virtual mean reservation");
-        assert!((edge_utility(edge, -0.3, true) - 0.25).abs() < 1e-6);
+        let reservation = node.reserve_edge(0, -0.3).expect("virtual mean reservation");
+        assert!((edge_utility(edge, -0.3) - 0.25).abs() < 1e-6);
         reservation.cancel();
 
-        assert!((edge_utility(edge, -0.3, true) - 0.8).abs() < 1e-6);
+        assert!((edge_utility(edge, -0.3) - 0.8).abs() < 1e-6);
         let stats = edge.stats();
         assert_eq!(stats.visits, 1);
         assert_eq!(stats.virtual_wl_sum, 0.0);
