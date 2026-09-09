@@ -26,7 +26,7 @@ pub(crate) fn process_eval_event<O: SearchObserver>(
     event: EvalEvent<O::Stamp>,
 ) -> Result<(), EnginError> {
     let timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Eval);
-    if shared.stopping.load(Ordering::Acquire) {
+    if shared.is_stopping() {
         shared.cancel_claim(event.event);
         return Ok(());
     }
@@ -97,7 +97,7 @@ pub(crate) fn handle_nn_reply_batch<O: SearchObserver>(
             }
         };
         shared.backend.store_evaluation(event.cache_key, Arc::clone(&eval));
-        if shared.stopping.load(Ordering::Acquire) {
+        if shared.is_stopping() {
             shared.cancel_evaluation(event.event);
         } else {
             backprops.push(publish_eval(shared, event.event, event.legal_moves, eval, true));

@@ -29,9 +29,23 @@ GPU 主要生产 Prediction，CPU 主要生产 Evidence；二者的具体比例�
   所有 event，再异步回收 sibling，slot 才可复用。
 - 重复、rule60 与亚洲规则是 variation/history 语义。根终局由 root gate 判断，非根叶子由 Expand
   首次分类；后续 Eval 不重复裁决。
-- 已标记 `Terminal` 的 child 不再由 Select 选择；其首次发现仍照常 Backprop。根自身不标记为
-  `Terminal`，当前搜索范围内的 root child 都已终局时停止；最终决策优先已证明必胜并选择最短 mate。
+- 已标记 `Terminal` 的 child 仍可由 Select 重选，并继续 exact Backprop；这使其结果持续影响祖先
+  的 PUCT。根自身不标记为 `Terminal`，当前搜索范围内的 root child 都已终局时停止；最终决策优先
+  已证明必胜并选择最短 mate。
 - 只维护这一套 stream 搜索，不保留 classic 对照或多轨训练格式。
+
+## 生命周期
+
+- UCI 的 `Engine` 长期拥有 backend、`SearchTree`、固定 `WorkerPool`、时钟和 `GraphReaper`；
+  `SearchTree` 的 root history 是当前 position 的唯一真相。它只在旧 job 停止并 drain 后换 position、
+  backend 或树根。
+- `Search` 是一次 job：`start -> run* -> finish`。`run` 可分阶段调用；`finish` 才请求停止并归还
+  本 job 的常驻 worker。`Drop` 只是遗漏 `finish` 时的兜底。
+- `WorkerPool` 不持有 job 状态。UCI 路径由 Engine 复用固定 pool；独立 `Search::start` 可自持一个
+  pool，供 benchmark 与测试直接使用。每个 job 将全部队列端点交给 pool，固定 CPU worker 和独立 NN
+  worker 处理至 job 完成。
+- 树推进产生的 sibling 回收与整张旧 arena 释放由 Engine 在 drain 后交给 `GraphReaper` 后台执行；GC
+  不参与正在运行的搜索。
 
 ## 搜索树形控制面
 

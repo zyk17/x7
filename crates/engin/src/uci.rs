@@ -169,8 +169,8 @@ impl<'a> UciLoop<'a> {
                 ucigooption!(movetime);
                 self.engine.go(&go_params)?;
             }
-            "wait" => self.engine.wait()?,
-            "stop" => self.engine.stop()?,
+            "wait" => self.engine.wait_search()?,
+            "stop" => self.engine.stop_search()?,
             "ponderhit" => self.engine.ponder_hit()?,
             "quit" => return Ok(false),
             _ => return Err(EnginError::Uci(format!("Unknown command: {command}"))),
@@ -191,7 +191,7 @@ impl<'a> UciLoop<'a> {
 impl Drop for UciLoop<'_> {
     /// 退出前确保搜索已停止。
     fn drop(&mut self) {
-        let _ = self.engine.stop();
+        let _ = self.engine.stop_search();
     }
 }
 

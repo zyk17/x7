@@ -26,7 +26,7 @@ struct Args {
     playouts: Option<u64>,
     movetime: Option<u64>,
     repeat: usize,
-    threads: Vec<usize>,
+    threads: usize,
     eval_batch: Option<usize>,
     cpuct: f32,
     cpuct_factor: f32,
@@ -46,7 +46,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--threads 4,8] [--eval-batch 64] [--cpuct 2.4] [--cpuct-factor 0] [--fpu-reduction 0.225] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 1.5] [--decision-lcb-stdevs 0] \\
+     [--repeat 1] [--threads 8] [--eval-batch 64] [--cpuct 2.4] [--cpuct-factor 0] [--fpu-reduction 0.225] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 1.5] [--decision-lcb-stdevs 0] \\
      [--root-top 8] [--trace 128,256,512] [--collision-dist] [--tree-depth 4] [--tree-top 4]"
 }
 
@@ -58,7 +58,7 @@ fn parse_args() -> Result<Args, String> {
     let mut playouts = Some(20_000);
     let mut movetime = None;
     let mut repeat = 1;
-    let mut threads = vec![8];
+    let mut threads = 8;
     let mut eval_batch = None;
     let defaults = SearchParams::default();
     let mut cpuct = defaults.cpuct;
@@ -112,7 +112,13 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--repeat must be an unsigned integer")?
             }
-            "--threads" => threads = parse_list(&args.next().ok_or("--threads requires list like 4,8")?)?,
+            "--threads" => {
+                threads = args
+                    .next()
+                    .ok_or("--threads requires a positive integer")?
+                    .parse()
+                    .map_err(|_| "--threads must be a positive integer")?
+            }
             "--eval-batch" => {
                 eval_batch = Some(
                     args.next()
@@ -211,8 +217,8 @@ fn parse_args() -> Result<Args, String> {
             return Err("--trace milestones must be strictly increasing and within --playouts".into());
         }
     }
-    if threads.contains(&0) {
-        return Err("--threads entries must be > 0".into());
+    if threads == 0 {
+        return Err("--threads must be > 0".into());
     }
     Ok(Args {
         onnx,
@@ -245,10 +251,6 @@ fn parse_non_negative_float(name: &str, text: &str) -> Result<f32, String> {
         return Err(format!("{name} must be finite and non-negative"));
     }
     Ok(value)
-}
-
-fn parse_list(text: &str) -> Result<Vec<usize>, String> {
-    text.split(',').map(|part| part.trim().parse().map_err(|_| format!("invalid list entry: {part}"))).collect()
 }
 
 fn parse_u64_list(text: &str) -> Result<Vec<u64>, String> {
@@ -703,7 +705,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} cpuct={:.3} cpuct_factor={:.3} fpu_reduction={:.3} virtual_mean_fpu_scale={:.2} variance_bonus_scale={:.3} lcb={:.3} recommended_batch={} target_batch={} nn_window={} budget={} repeat={} worker_matrix={} positions={}",
+        "onnx={} provider={} cpuct={:.3} cpuct_factor={:.3} fpu_reduction={:.3} virtual_mean_fpu_scale={:.2} variance_bonus_scale={:.3} lcb={:.3} recommended_batch={} target_batch={} nn_window={} budget={} repeat={} threads={} positions={}",
         args.onnx.display(),
         provider,
         args.cpuct,
@@ -719,7 +721,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map(|n| format!("playouts={n}"))
             .unwrap_or_else(|| format!("movetime={}ms", args.movetime.unwrap_or(0))),
         args.repeat,
-        args.threads.len(),
+        args.threads,
         positions.len(),
     );
     println!(
@@ -734,72 +736,75 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let root_is_black = history.is_black_to_move();
         println!("position: {name}");
         let nn_probe = warmup_position(backend.as_ref(), history.as_ref(), target_batch)?;
-        for &threads in &args.threads {
-            for run_index in 1..=args.repeat {
-                backend.clear_cache();
-                let params = SearchParams {
-                    cpuct: args.cpuct,
-                    cpuct_factor: args.cpuct_factor,
-                    fpu_reduction: args.fpu_reduction,
-                    virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
-                    variance_bonus_scale: args.variance_bonus_scale,
-                    decision_lcb_stdevs: args.decision_lcb_stdevs,
-                    ..SearchParams::default()
-                };
-                let tree = SearchTree::new(Arc::clone(&history));
-                let mut search = Search::new(
-                    Arc::clone(&backend),
-                    &tree,
-                    SearchConfig { eval_batch_size: target_batch, nn_window: args.nn_window, threads, params },
-                    BenchObserver::default(),
-                );
+        for run_index in 1..=args.repeat {
+            backend.clear_cache();
+            let params = SearchParams {
+                cpuct: args.cpuct,
+                cpuct_factor: args.cpuct_factor,
+                fpu_reduction: args.fpu_reduction,
+                virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
+                variance_bonus_scale: args.variance_bonus_scale,
+                decision_lcb_stdevs: args.decision_lcb_stdevs,
+                ..SearchParams::default()
+            };
+            let tree = SearchTree::new(Arc::clone(&history));
+            let mut search = Search::start(
+                Arc::clone(&backend),
+                &tree,
+                SearchConfig {
+                    eval_batch_size: target_batch,
+                    nn_window: args.nn_window,
+                    threads: args.threads,
+                    params,
+                },
+                BenchObserver::default(),
+            );
 
-                let started = Instant::now();
-                let stats = if args.trace.is_empty() {
-                    search.run(SearchLimits {
-                        max_playouts: args.playouts,
-                        deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
-                        ..Default::default()
-                    })?
+            let started = Instant::now();
+            let stats = if args.trace.is_empty() {
+                search.run(SearchLimits {
+                    max_playouts: args.playouts,
+                    deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
+                    ..Default::default()
+                })?
+            } else {
+                let playouts = args.playouts.expect("trace requires playouts");
+                for &milestone in &args.trace {
+                    search.run(SearchLimits { max_playouts: Some(milestone), ..Default::default() })?;
+                    println!("--- trace completed={milestone} ---");
+                    print_root_block(
+                        &search,
+                        root_is_black,
+                        args.root_top,
+                        &format!("Root snapshot @ completed={milestone}"),
+                        Some(&nn_probe),
+                        &params,
+                    );
+                    if let Some(depth) = args.tree_depth {
+                        print_tree_funnel(&search, root_is_black, depth, args.tree_top);
+                    }
+                }
+                if args.trace.last().copied().unwrap_or(0) < playouts {
+                    search.run(SearchLimits { max_playouts: Some(playouts), ..Default::default() })?
                 } else {
-                    let playouts = args.playouts.expect("trace requires playouts");
-                    for &milestone in &args.trace {
-                        search.run(SearchLimits { max_playouts: Some(milestone), ..Default::default() })?;
-                        println!("--- trace completed={milestone} ---");
-                        print_root_block(
-                            &search,
-                            root_is_black,
-                            args.root_top,
-                            &format!("Root snapshot @ completed={milestone}"),
-                            Some(&nn_probe),
-                            &params,
-                        );
-                        if let Some(depth) = args.tree_depth {
-                            print_tree_funnel(&search, root_is_black, depth, args.tree_top);
-                        }
-                    }
-                    if args.trace.last().copied().unwrap_or(0) < playouts {
-                        search.run(SearchLimits { max_playouts: Some(playouts), ..Default::default() })?
-                    } else {
-                        search.stats()
-                    }
-                };
-                let seconds = started.elapsed().as_secs_f64().max(1e-9);
-                let bench = search.observer().snapshot();
-                print_run_report(
-                    threads,
-                    run_index,
-                    seconds,
-                    &stats,
-                    &bench,
-                    &search,
-                    root_is_black,
-                    &args,
-                    &nn_probe,
-                    &params,
-                );
-                search.finish();
-            }
+                    search.stats()
+                }
+            };
+            let seconds = started.elapsed().as_secs_f64().max(1e-9);
+            let bench = search.observer().snapshot();
+            print_run_report(
+                args.threads,
+                run_index,
+                seconds,
+                &stats,
+                &bench,
+                &search,
+                root_is_black,
+                &args,
+                &nn_probe,
+                &params,
+            );
+            search.finish();
         }
     }
     Ok(())

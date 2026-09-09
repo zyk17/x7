@@ -640,10 +640,6 @@ impl SearchTree {
     /// 旧 root 留在已走主线；sibling 子树只挂到 `pending_gc_roots`，不在此同步删除。
     pub(crate) fn advance(&mut self, mv: Move) -> Result<(), EnginError> {
         debug_assert!(self.arena.subtree_is_settled(self.root_id()));
-        self.advance_settled(mv)
-    }
-
-    fn advance_settled(&mut self, mv: Move) -> Result<(), EnginError> {
         let old_root = self.root_id();
         if !self.root_history().last().board().is_legal_move(mv) {
             return Err(EnginError::Internal("stream tree advance requires a legal move"));

@@ -22,7 +22,7 @@ use super::expand::{ExpandKind, classify_expand, path_terminal_value};
 use super::observer::{ExecutionKind, ExecutionTimer, NoopObserver, SearchObserver};
 use super::param::{SearchConfig, SearchParams};
 use super::select::select_edge;
-use super::workerpool::{BackpropEvent, EvalEvent, Event, ExpandEvent, NnRequest, SelectEvent, WorkerPool};
+use super::workerpool::{BackpropEvent, EvalEvent, Event, ExpandEvent, NnRequest, SelectEvent, WorkerJob, WorkerPool};
 use super::{EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree};
 use crate::neural::backend::EvalCacheKey;
 
@@ -44,7 +44,7 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) arena: Arc<NodeArena>,
     pub(crate) params: SearchParams,
     pub(crate) root_move_filter: Mutex<Vec<Move>>,
-    pub(crate) stopping: AtomicBool,
+    stopping: AtomicBool,
     /// 未 `finish` 的 owned event：drain 与派发上限。
     pub(crate) outstanding: AtomicUsize,
     /// Backprop 或取消归还给 NN scheduler 的 credit。
@@ -158,7 +158,7 @@ impl<O: SearchObserver> Shared<O> {
             let mut waiters = self.collision_waiters.lock();
             // owner 可在本次 Select 看到 Claimed 后、waiter 入队前完成或取消；此处复查
             // 避免把永远不会再由 owner 唤醒的 reservation 留在 waiter 表。
-            if !self.stopping.load(Ordering::Acquire)
+            if !self.is_stopping()
                 && self.arena.get(event.node_id).expect("collision event node lives until drain").expansion_state()
                     == ExpansionState::Claimed
             {
@@ -198,18 +198,14 @@ impl<O: SearchObserver> Shared<O> {
 
     pub(crate) fn send_eval(&self, mut event: EvalEvent<O::Stamp>) {
         event.mark_queued();
-        if self.stopping.load(Ordering::Acquire) {
-            self.cancel_claim(event.event);
-        } else if let Err(error) = self.eval_tx.send(event) {
+        if let Err(error) = self.eval_tx.send(event) {
             self.cancel_claim(error.0.event);
         }
     }
 
     pub(crate) fn send_expand(&self, mut event: ExpandEvent<O::Stamp>) {
         event.mark_queued();
-        if self.stopping.load(Ordering::Acquire) {
-            self.cancel_claim(event.into_event());
-        } else if let Err(error) = self.expand_tx.send(event) {
+        if let Err(error) = self.expand_tx.send(event) {
             self.cancel_claim(error.0.into_event());
         }
     }
@@ -249,7 +245,7 @@ fn branch_at_expanded_node<O: SearchObserver>(
 pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut event: SelectEvent<O::Stamp>) {
     let _timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Select);
     loop {
-        if shared.stopping.load(Ordering::Acquire) {
+        if shared.is_stopping() {
             shared.cancel_event(event.into_event());
             return;
         }
@@ -293,7 +289,7 @@ pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut ev
 /// 只处理已 claim 叶子的规则、合法着与后续任务分流。
 pub(crate) fn process_expand_event<O: SearchObserver>(shared: &Shared<O>, event: ExpandEvent<O::Stamp>) {
     let timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Expand);
-    if shared.stopping.load(Ordering::Acquire) {
+    if shared.is_stopping() {
         shared.cancel_claim(event.into_event());
         return;
     }
@@ -398,8 +394,8 @@ impl<O: SearchObserver> StopHandle<O> {
 /// Reply 发布 edge，再由 Backprop 完成 reservation。
 pub struct Search<O: SearchObserver = NoopObserver> {
     shared: Arc<Shared<O>>,
-    root_history: Arc<PositionHistory>,
     root_id: NodeId,
+    search_history: Arc<PositionHistory>,
     /// 启动本次 job 前 root 已有的 completed N。它计入 UCI `go nodes`，但不计入本次 NPS。
     initial_visits: u64,
     worker_pool: Arc<WorkerPool<O>>,
@@ -407,13 +403,14 @@ pub struct Search<O: SearchObserver = NoopObserver> {
 }
 
 impl<O: SearchObserver> Search<O> {
-    /// 从保留树创建独立搜索；该搜索自己创建、销毁 worker pool。
-    pub fn new(backend: Arc<dyn Backend>, graph: &SearchTree, config: SearchConfig, observer: O) -> Self {
+    /// 启动一次独立 Search job；该 job 自己创建并持有 worker pool。
+    pub fn start(backend: Arc<dyn Backend>, graph: &SearchTree, config: SearchConfig, observer: O) -> Self {
         let worker_pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
-        Self::new_with_pool(backend, graph, config, observer, worker_pool)
+        Self::start_with_pool(backend, graph, config, observer, worker_pool)
     }
 
-    pub(crate) fn new_with_pool(
+    /// 启动一次 job，复用 Engine 持有的固定 worker pool。
+    pub(crate) fn start_with_pool(
         backend: Arc<dyn Backend>,
         graph: &SearchTree,
         config: SearchConfig,
@@ -429,8 +426,8 @@ impl<O: SearchObserver> Search<O> {
         let (nn_credit_tx, nn_credit_rx) = unbounded();
         // UCI/graph 持有完整 history 用于跨回合定位；每个 event 只需要重复规则自
         // 最近零化着以来的后缀，以及 NN 的最近 8 层。这里一次裁剪后由整次 job 共享。
-        let root_history = Arc::new(graph.root_history().search_window(MOVE_HISTORY));
         let root_id = graph.root_id();
+        let search_history = Arc::new(graph.root_history().search_window(MOVE_HISTORY));
         let initial_visits = graph.arena().get(root_id).map_or(0, |root| root.completed_visits() as u64);
         let shared = Arc::new(Shared {
             backend,
@@ -454,20 +451,18 @@ impl<O: SearchObserver> Search<O> {
             collision_waiters: Mutex::new(Vec::new()),
         });
         let (nn_tx, nn_rx) = crossbeam_channel::unbounded::<NnRequest<O::Stamp>>();
-        worker_pool.start_job(
-            &shared,
-            &select_rx,
-            &expand_rx,
-            &eval_rx,
-            &nn_reply_rx,
-            &nn_tx,
-            &nn_rx,
-            &nn_credit_rx,
-            &nn_reply_tx,
-        );
-        drop(nn_tx);
-        drop(nn_reply_tx);
-        Self { shared, root_history, root_id, initial_visits, worker_pool, finished: false }
+        worker_pool.start(WorkerJob {
+            shared: Arc::clone(&shared),
+            select_rx,
+            expand_rx,
+            eval_rx,
+            nn_reply_rx,
+            nn_tx,
+            nn_rx,
+            nn_credit_rx,
+            nn_reply_tx,
+        });
+        Self { shared, root_id, search_history, initial_visits, worker_pool, finished: false }
     }
 
     pub fn arena(&self) -> &Arc<NodeArena> {
@@ -491,7 +486,7 @@ impl<O: SearchObserver> Search<O> {
     /// `ExpansionState::Terminal` 还表示子树已证明的胜负；该 node 跨回合成为
     /// root 后仍可能有合法着可输出，不能把它误作棋局已经结束。
     pub(crate) fn root_is_terminal(&self) -> bool {
-        path_terminal_value(self.root_history.as_ref(), 0).is_some()
+        path_terminal_value(self.search_history.as_ref(), 0).is_some()
     }
 
     pub fn stats(&self) -> Stats {
@@ -503,11 +498,8 @@ impl<O: SearchObserver> Search<O> {
     }
 
     fn submit_select(&self) -> Result<(), EnginError> {
-        if self.shared.stopping.load(Ordering::Acquire) {
-            return Err(EnginError::Internal("stream worker pipeline is stopped"));
-        }
         self.shared.start_playout();
-        let mut event = SelectEvent::at_root(self.root_id, Arc::clone(&self.root_history));
+        let mut event = SelectEvent::at_root(self.root_id, Arc::clone(&self.search_history));
         event.mark_queued();
         if let Err(error) = self.shared.select_tx.send(event) {
             self.shared.cancel_event(error.0.into_event());
@@ -557,12 +549,7 @@ impl<O: SearchObserver> Search<O> {
             }
             if root_state != Some(ExpansionState::Expanded) {
                 // root 展开前只需要一个真实 leaf。
-                if let Err(error) = self.submit_select() {
-                    if self.shared.is_stopping() {
-                        break;
-                    }
-                    return Err(error);
-                }
+                self.submit_select()?;
                 self.wait_until_outstanding_below(1, limits.deadline)?;
                 continue;
             }
@@ -572,12 +559,7 @@ impl<O: SearchObserver> Search<O> {
                 self.wait_until_outstanding_below(dispatch_limit, limits.deadline)?;
                 continue;
             }
-            if let Err(error) = self.submit_select() {
-                if self.shared.is_stopping() {
-                    break;
-                }
-                return Err(error);
-            }
+            self.submit_select()?;
         }
         // 时钟到期后必须 request_stop：否则 Eval 会等当前 GPU 整批跑完，200ms
         // 的 go 就会变成一次推荐 batch 的推理时间。节点预算仍等在途完成。
@@ -609,7 +591,7 @@ impl<O: SearchObserver> Search<O> {
         }
         self.shared.request_stop();
         let _ = self.wait_for_idle();
-        self.worker_pool.finish_job();
+        self.worker_pool.finish();
         self.finished = true;
     }
 }
@@ -716,7 +698,7 @@ mod tests {
         let root_is_black = history.is_black_to_move();
         let tree = SearchTree::new(history);
         let mut pipeline =
-            Search::new(Arc::new(UniformBackend::default()), &tree, SearchConfig::default(), NoopObserver);
+            Search::start(Arc::new(UniformBackend::default()), &tree, SearchConfig::default(), NoopObserver);
         let stats = pipeline.run(SearchLimits { max_playouts: Some(64), ..Default::default() }).expect("search");
         assert!(stats.completed_playouts >= 64);
         assert!(stats.network_evaluations > 0);
@@ -732,7 +714,8 @@ mod tests {
         let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
         let mut tree = SearchTree::new(history);
-        let mut first = Search::new(Arc::new(UniformBackend::default()), &tree, SearchConfig::default(), NoopObserver);
+        let mut first =
+            Search::start(Arc::new(UniformBackend::default()), &tree, SearchConfig::default(), NoopObserver);
         first.run(SearchLimits { max_playouts: Some(32), ..Default::default() }).expect("first");
         let played = best_move(first.arena(), first.root_id(), false).expect("best");
         first.finish();
@@ -769,7 +752,8 @@ mod tests {
         assert_eq!(child_node.expansion_state(), super::ExpansionState::Terminal);
 
         tree.advance(played).expect("advance to proven child");
-        let mut reused = Search::new(Arc::new(UniformBackend::default()), &tree, SearchConfig::default(), NoopObserver);
+        let mut reused =
+            Search::start(Arc::new(UniformBackend::default()), &tree, SearchConfig::default(), NoopObserver);
         assert!(!reused.root_is_terminal());
         assert_eq!(best_move(reused.arena(), reused.root_id(), true), Some(reply.flip()));
         reused.finish();

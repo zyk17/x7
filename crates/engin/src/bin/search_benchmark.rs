@@ -283,7 +283,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         args.fpu_reduction, args.virtual_mean_fpu_scale, args.decision_lcb_stdevs
                     );
                     let tree = SearchTree::new(Arc::clone(&history));
-                    let mut search = Search::new(
+                    let mut search = Search::start(
                         Arc::new(OnnxBackend::from_file(&args.onnx)?) as Arc<dyn Backend>,
                         &tree,
                         SearchConfig { params, ..SearchConfig::default() },

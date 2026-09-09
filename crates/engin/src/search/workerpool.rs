@@ -191,6 +191,21 @@ enum NnCommand<O: SearchObserver> {
     Shutdown,
 }
 
+/// 一次 Search 启动时交给固定 worker 的全部队列端点。
+///
+/// 这些端点只属于一个 job；pool 只负责让常驻线程运行它，不保存 job 状态。
+pub(crate) struct WorkerJob<O: SearchObserver> {
+    pub(crate) shared: Arc<Shared<O>>,
+    pub(crate) select_rx: Receiver<SelectEvent<O::Stamp>>,
+    pub(crate) expand_rx: Receiver<ExpandEvent<O::Stamp>>,
+    pub(crate) eval_rx: Receiver<EvalEvent<O::Stamp>>,
+    pub(crate) nn_reply_rx: Receiver<NnReplyBatch<O::Stamp>>,
+    pub(crate) nn_tx: Sender<NnRequest<O::Stamp>>,
+    pub(crate) nn_rx: Receiver<NnRequest<O::Stamp>>,
+    pub(crate) nn_credit_rx: Receiver<usize>,
+    pub(crate) nn_reply_tx: Sender<NnReplyBatch<O::Stamp>>,
+}
+
 /// 固定容量的任务池；NN 另占一个设备 worker。
 pub(crate) struct WorkerPool<O: SearchObserver = NoopObserver> {
     worker_commands: Vec<Sender<WorkerCommand<O>>>,
@@ -238,26 +253,17 @@ impl<O: SearchObserver> WorkerPool<O> {
             nn_credit_limit: config.nn_permit_limit,
         }
     }
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn start_job(
-        &self,
-        shared: &Arc<Shared<O>>,
-        select_rx: &Receiver<SelectEvent<O::Stamp>>,
-        expand_rx: &Receiver<ExpandEvent<O::Stamp>>,
-        eval_rx: &Receiver<EvalEvent<O::Stamp>>,
-        nn_reply_rx: &Receiver<NnReplyBatch<O::Stamp>>,
-        nn_tx: &Sender<NnRequest<O::Stamp>>,
-        nn_rx: &Receiver<NnRequest<O::Stamp>>,
-        nn_credit_rx: &Receiver<usize>,
-        nn_reply_tx: &Sender<NnReplyBatch<O::Stamp>>,
-    ) {
+    /// 让所有常驻 worker 开始处理一个完整的 Search job。
+    pub(crate) fn start(&self, job: WorkerJob<O>) {
+        let WorkerJob { shared, select_rx, expand_rx, eval_rx, nn_reply_rx, nn_tx, nn_rx, nn_credit_rx, nn_reply_tx } =
+            job;
         self.nn_commands
-            .send(NnCommand::Run(Arc::clone(shared), nn_rx.clone(), nn_credit_rx.clone(), nn_reply_tx.clone()))
+            .send(NnCommand::Run(Arc::clone(&shared), nn_rx, nn_credit_rx, nn_reply_tx))
             .expect("persistent nn worker is alive");
         for sender in &self.worker_commands {
             sender
                 .send(WorkerCommand::Run {
-                    shared: Arc::clone(shared),
+                    shared: Arc::clone(&shared),
                     select_rx: select_rx.clone(),
                     expand_rx: expand_rx.clone(),
                     eval_rx: eval_rx.clone(),
@@ -267,7 +273,8 @@ impl<O: SearchObserver> WorkerPool<O> {
                 .expect("persistent worker is alive");
         }
     }
-    pub(crate) fn finish_job(&self) {
+    /// 等待本 job 的全部 CPU worker 与 NN worker 退出。
+    pub(crate) fn finish(&self) {
         for _ in 0..self.worker_commands.len() + 1 {
             self.job_done.recv().expect("persistent worker completion");
         }
@@ -327,7 +334,7 @@ fn worker<O: SearchObserver>(
     nn_tx: Sender<NnRequest<O::Stamp>>,
 ) {
     loop {
-        if shared.stopping.load(Ordering::Acquire) {
+        if shared.is_stopping() {
             cancel_pending_worker_queues(&shared, &select_rx, &expand_rx, &eval_rx);
             if let Ok(reply) = reply_rx.try_recv() {
                 process_nn_reply(&shared, reply);
@@ -420,7 +427,7 @@ fn nn_worker<O: SearchObserver>(
     let mut samples = Vec::with_capacity(batch_size);
     let mut in_flight = 0;
     loop {
-        if shared.stopping.load(Ordering::Acquire) {
+        if shared.is_stopping() {
             while let Ok(request) = request_rx.try_recv() {
                 shared.cancel_claim(request.event.event);
             }
@@ -472,7 +479,7 @@ fn nn_worker<O: SearchObserver>(
             }
         }
         in_flight += requests.len();
-        if shared.stopping.load(Ordering::Acquire) {
+        if shared.is_stopping() {
             for request in requests.drain(..) {
                 shared.cancel_evaluation(request.event.event);
             }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use xiangqi_core::Position;
 
-use crate::uci_loop::GoParams;
+use crate::uci::GoParams;
 
 const MOVE_OVERHEAD_MS: i64 = 200;
 const DEFAULT_MIDPOINT: f32 = 51.5;
@@ -98,7 +98,7 @@ mod tests {
     use xiangqi_core::{Position, STARTPOS_FEN};
 
     use super::{TimeManager, estimated_moves_to_go};
-    use crate::uci_loop::GoParams;
+    use crate::uci::GoParams;
 
     #[test]
     fn estimated_moves_matches_px0_curve() {
