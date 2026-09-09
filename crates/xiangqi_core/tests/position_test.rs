@@ -128,14 +128,8 @@ fn rule_judge_matches_px0_cases() {
     assert_eq!(black_check.rule_judge(), GameResult::WhiteWon);
 
     for (fen, moves) in [
-        (
-            "3k5/9/6r2/9/9/9/9/9/6R2/5K3 b - - 2 30",
-            ["g7h7", "g1h1", "h7g7", "h1g1"],
-        ),
-        (
-            "4c4/3k5/4b3b/9/9/2B4N1/4p4/3A5/2p1A4/5K3 w - - 2 30",
-            ["h4g2", "e3f3", "g2h4", "f3e3"],
-        ),
+        ("3k5/9/6r2/9/9/9/9/9/6R2/5K3 b - - 2 30", ["g7h7", "g1h1", "h7g7", "h1g1"]),
+        ("4c4/3k5/4b3b/9/9/2B4N1/4p4/3A5/2p1A4/5K3 w - - 2 30", ["h4g2", "e3f3", "g2h4", "f3e3"]),
         ("3k5/9/9/9/9/9/9/9/1r2ARn2/4K4 b", ["b1b0", "e1d0", "b0b1", "d0e1"]),
     ] {
         let mut history = history_from_fen(fen, 2, 30);

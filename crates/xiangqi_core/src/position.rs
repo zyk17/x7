@@ -2,7 +2,7 @@
 
 use crate::board::board_to_fen;
 use crate::hashcat::{hash_cat, hash_cat_u128s};
-use crate::{ChessBoard, CoreError, Move};
+use crate::{ChessBoard, Move};
 
 /// 对局结果。枚举顺序使 `max()` 优先选更好的结果。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
@@ -39,18 +39,10 @@ pub struct Position {
 
 impl Position {
     pub fn new(board: ChessBoard, rule60_ply: u32, game_ply: u32) -> Self {
-        Self {
-            board,
-            rule60_ply,
-            us_check: 0,
-            them_check: 0,
-            repetitions: 0,
-            cycle_length: 0,
-            game_ply,
-        }
+        Self { board, rule60_ply, us_check: 0, them_check: 0, repetitions: 0, cycle_length: 0, game_ply }
     }
 
-    pub fn from_fen(fen: &str) -> Result<Self, CoreError> {
+    pub fn from_fen(fen: &str) -> Result<Self, String> {
         let (board, state) = ChessBoard::from_fen(fen)?;
         Ok(Self::new(board, state.rule60_ply, state.game_ply))
     }
@@ -173,11 +165,7 @@ impl PositionHistory {
     /// 原完整 history 仍由 UCI/Engine 持有，用于跨回合定位和 root 裁决。
     pub fn search_window(&self, recent_positions: usize) -> Self {
         assert!(!self.positions.is_empty(), "PositionHistory is empty");
-        let rule_start = self
-            .positions
-            .iter()
-            .rposition(|position| position.rule60_ply == 0)
-            .unwrap_or(0);
+        let rule_start = self.positions.iter().rposition(|position| position.rule60_ply == 0).unwrap_or(0);
         let nn_start = self.positions.len().saturating_sub(recent_positions.max(1));
         let start = rule_start.min(nn_start);
         Self::from_positions(self.positions[start..].to_vec())
@@ -209,10 +197,7 @@ impl PositionHistory {
         let next = Position::after(self.last(), mv);
         self.positions.push(next);
         let (repetitions, cycle_length) = self.compute_last_move_repetitions();
-        self.positions
-            .last_mut()
-            .expect("position appended")
-            .set_repetitions(repetitions, cycle_length);
+        self.positions.last_mut().expect("position appended").set_repetitions(repetitions, cycle_length);
     }
 
     pub fn pop(&mut self) {
@@ -226,19 +211,11 @@ impl PositionHistory {
     pub fn compute_game_result(&self) -> GameResult {
         let last = self.last();
         if last.board.generate_legal_moves().is_empty() {
-            return if self.is_black_to_move() {
-                GameResult::WhiteWon
-            } else {
-                GameResult::BlackWon
-            };
+            return if self.is_black_to_move() { GameResult::WhiteWon } else { GameResult::BlackWon };
         }
         if last.repetitions >= 2 {
             let result = self.rule_judge();
-            return if self.is_black_to_move() {
-                result
-            } else {
-                result.negate()
-            };
+            return if self.is_black_to_move() { result } else { result.negate() };
         }
         if !last.board.has_mating_material() || last.rule60_ply >= 120 {
             return GameResult::Draw;
@@ -379,11 +356,7 @@ mod tests {
         let (board, _) = ChessBoard::from_fen("4k4/9/9/9/9/9/9/9/9/4K4 w - - 0 1").expect("board");
         let positions = (0..12)
             .map(|index| {
-                Position::new(
-                    board.clone(),
-                    if index < 5 { index as u32 + 1 } else { index as u32 - 5 },
-                    index as u32,
-                )
+                Position::new(board.clone(), if index < 5 { index as u32 + 1 } else { index as u32 - 5 }, index as u32)
             })
             .collect();
         let history = PositionHistory::from_positions(positions);
@@ -392,10 +365,6 @@ mod tests {
         assert_eq!(window.len(), 8, "NN keeps the latest eight positions");
         assert_eq!(window.starting().game_ply(), 4);
         assert_eq!(window.last().game_ply(), 11);
-        assert_eq!(
-            window.get(1).rule60_ply(),
-            0,
-            "the latest zeroing position stays in the window"
-        );
+        assert_eq!(window.get(1).rule60_ply(), 0, "the latest zeroing position stays in the window");
     }
 }

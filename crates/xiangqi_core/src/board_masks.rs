@@ -58,18 +58,12 @@ pub fn bishop_bb() -> BitBoard {
 
 pub const PAWN_FILE_BB: u128 = FILE_A_BB | FILE_C_BB | FILE_E_BB | FILE_G_BB | FILE_I_BB;
 
-pub const HALF_BB: [u128; 2] = [
-    RANK0_BB | RANK1_BB | RANK2_BB | RANK3_BB | RANK4_BB,
-    RANK5_BB | RANK6_BB | RANK7_BB | RANK8_BB | RANK9_BB,
-];
+pub const HALF_BB: [u128; 2] =
+    [RANK0_BB | RANK1_BB | RANK2_BB | RANK3_BB | RANK4_BB, RANK5_BB | RANK6_BB | RANK7_BB | RANK8_BB | RANK9_BB];
 
 pub fn pawn_bb(for_theirs: bool) -> BitBoard {
     let half = if for_theirs { HALF_BB[0] } else { HALF_BB[1] };
-    let extra = if for_theirs {
-        (RANK6_BB | RANK5_BB) & PAWN_FILE_BB
-    } else {
-        (RANK3_BB | RANK4_BB) & PAWN_FILE_BB
-    };
+    let extra = if for_theirs { (RANK6_BB | RANK5_BB) & PAWN_FILE_BB } else { (RANK3_BB | RANK4_BB) & PAWN_FILE_BB };
     BitBoard::from_bits(half | extra)
 }
 
@@ -90,11 +84,7 @@ pub fn distance(a: Square, b: Square) -> i32 {
 
 pub fn safe_destination(s: Square, step: Direction) -> BitBoard {
     let to = s.offset_by(step);
-    if to.is_valid() && distance(s, to) <= 2 {
-        BitBoard::from_square(to)
-    } else {
-        BitBoard::EMPTY
-    }
+    if to.is_valid() && distance(s, to) <= 2 { BitBoard::from_square(to) } else { BitBoard::EMPTY }
 }
 
 pub fn shift(direction: Direction, board: BitBoard) -> BitBoard {

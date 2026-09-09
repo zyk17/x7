@@ -26,16 +26,8 @@ fn current_position_replays_moves() {
     let moves = ["h2h4", "h9h7", "h4h5", "h7h6"];
     let state = GameState::from_fen_moves(STARTPOS_FEN, &moves).expect("game state");
     let expected = history_from_moves(STARTPOS_FEN, &moves).last().clone();
-    assert_eq!(
-        state.current_position().board(),
-        expected.board(),
-        "current board mismatch"
-    );
-    assert_eq!(
-        state.current_position().rule60_ply(),
-        expected.rule60_ply(),
-        "rule60 mismatch"
-    );
+    assert_eq!(state.current_position().board(), expected.board(), "current board mismatch");
+    assert_eq!(state.current_position().rule60_ply(), expected.rule60_ply(), "rule60 mismatch");
 }
 
 #[test]

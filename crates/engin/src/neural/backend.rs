@@ -65,11 +65,7 @@ pub struct EvalCacheKey {
 
 impl EvalCacheKey {
     pub fn new(position: &Position, num_moves: usize) -> Self {
-        Self {
-            board: position.board().hash(),
-            num_moves,
-            repetitions: position.repetitions(),
-        }
+        Self { board: position.board().hash(), num_moves, repetitions: position.repetitions() }
     }
 
     /// 直映表 u64：把 repetition 次数混进 board。
@@ -121,10 +117,7 @@ impl CachingBackend {
     }
 
     pub fn with_cache_size_power_of_two(wrapped: Box<dyn Backend>, size_power_of_two: u8) -> Self {
-        Self {
-            wrapped: Arc::from(wrapped),
-            cache: Arc::new(EvalCache::new(size_power_of_two)),
-        }
+        Self { wrapped: Arc::from(wrapped), cache: Arc::new(EvalCache::new(size_power_of_two)) }
     }
 
     fn cached(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
@@ -156,13 +149,7 @@ impl Backend for CachingBackend {
     }
 
     fn store_evaluation(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
-        self.cache.insert(
-            key.slot_key(),
-            CachedEval {
-                result,
-                num_moves: key.num_moves,
-            },
-        );
+        self.cache.insert(key.slot_key(), CachedEval { result, num_moves: key.num_moves });
     }
 
     fn clear_cache(&self) {
@@ -187,23 +174,13 @@ pub struct UniformBackend {
 
 impl Default for UniformBackend {
     fn default() -> Self {
-        Self {
-            wl: 0.0,
-            d: 0.0,
-            plies_left: 0.0,
-            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)),
-        }
+        Self { wl: 0.0, d: 0.0, plies_left: 0.0, cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)) }
     }
 }
 
 impl UniformBackend {
     pub fn with_wdl(wl: f32, d: f32, plies_left: f32) -> Self {
-        Self {
-            wl,
-            d,
-            plies_left,
-            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)),
-        }
+        Self { wl, d, plies_left, cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)) }
     }
 }
 
@@ -252,13 +229,7 @@ impl Backend for UniformBackend {
 
 impl UniformBackend {
     pub fn store_cache(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
-        self.cache.insert(
-            key.slot_key(),
-            CachedEval {
-                result,
-                num_moves: key.num_moves,
-            },
-        );
+        self.cache.insert(key.slot_key(), CachedEval { result, num_moves: key.num_moves });
     }
 }
 
@@ -281,9 +252,7 @@ mod tests {
         let mut logits = Vec::new();
         let mut wdl = Vec::new();
         let mut moves_left = Vec::new();
-        backend
-            .infer_input_planes_into(&samples, &mut logits, &mut wdl, &mut moves_left)
-            .expect("infer");
+        backend.infer_input_planes_into(&samples, &mut logits, &mut wdl, &mut moves_left).expect("infer");
         assert_eq!(moves_left, vec![17.0, 17.0]);
     }
 

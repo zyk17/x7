@@ -12,72 +12,7 @@ use parking_lot::{Mutex, RwLock};
 use xiangqi_core::{Move, PositionHistory};
 
 use crate::EnginError;
-
-/// stream backpropagation 使用的紧凑 WDL 更新。
-///
-/// - `visits`：多份 `one()` 样本的合计，不是一次 reservation 携带的 K
-/// - `wl_sum`：走子方 / incoming-edge 视角（非 NN 原始 STM）
-/// - `draw_sum`：和棋分量
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ValueDelta {
-    pub visits: u32,
-    pub wl_sum: f32,
-    pub draw_sum: f32,
-    pub m_sum: f32,
-}
-
-impl ValueDelta {
-    pub fn one(wl: f32, draw: f32) -> Self {
-        // 归一化由 Eval/终局入口保证；此处只在 debug 抓回归，避免 backprop 热路径开销。
-        debug_assert!((-1.0..=1.0).contains(&wl), "WDL wl must be normalized");
-        debug_assert!((0.0..=1.0).contains(&draw), "WDL draw must be normalized");
-        Self {
-            visits: 1,
-            wl_sum: wl,
-            draw_sum: draw,
-            m_sum: 0.0,
-        }
-    }
-
-    pub fn with_plies_left(wl: f32, draw: f32, plies_left: f32) -> Self {
-        debug_assert!(plies_left >= 0.0, "plies-left must be non-negative");
-        Self {
-            m_sum: plies_left,
-            ..Self::one(wl, draw)
-        }
-    }
-
-    pub fn for_parent(self) -> Self {
-        Self {
-            wl_sum: -self.wl_sum,
-            ..self
-        }
-    }
-
-    pub fn one_ply_up(self) -> Self {
-        Self {
-            m_sum: self.m_sum + self.visits as f32,
-            ..self
-        }
-    }
-
-    pub fn merge(self, other: Self) -> Self {
-        Self {
-            visits: self.visits + other.visits,
-            wl_sum: self.wl_sum + other.wl_sum,
-            draw_sum: self.draw_sum + other.draw_sum,
-            m_sum: self.m_sum + other.m_sum,
-        }
-    }
-
-    pub fn q(self) -> f32 {
-        if self.visits == 0 {
-            0.0
-        } else {
-            self.wl_sum / self.visits as f32
-        }
-    }
-}
+use crate::search::backprop::ValueDelta;
 
 /// 路径树 node 的稳定地址。它只用于 arena 寻址，不携带棋盘或路径 hash。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -122,41 +57,23 @@ pub(crate) struct EdgeStats {
 
 impl EdgeStats {
     pub(crate) fn q(self) -> f32 {
-        if self.visits == 0 {
-            0.0
-        } else {
-            self.wl_sum / self.visits as f32
-        }
+        if self.visits == 0 { 0.0 } else { self.wl_sum / self.visits as f32 }
     }
 
     pub(crate) fn variance(self) -> f32 {
-        if self.visits < 2 {
-            0.0
-        } else {
-            (self.wl_sq_sum / self.visits as f32 - self.q() * self.q()).max(0.0)
-        }
+        if self.visits < 2 { 0.0 } else { (self.wl_sq_sum / self.visits as f32 - self.q() * self.q()).max(0.0) }
     }
 
     /// completed evidence 的样本均值标准误；reservation 不属于证据。
     pub(crate) fn standard_error(self) -> f32 {
-        if self.visits < 2 {
-            0.0
-        } else {
-            (self.variance() / self.visits as f32).sqrt()
-        }
+        if self.visits < 2 { 0.0 } else { (self.variance() / self.visits as f32).sqrt() }
     }
 }
 
 impl Edge {
     fn new(mv: Move, prior: f32) -> Self {
         debug_assert!((0.0..=1.0).contains(&prior), "policy prior must be normalized");
-        Self {
-            mv,
-            prior,
-            started: AtomicU32::new(0),
-            child: OnceLock::new(),
-            stats: Mutex::new(EdgeStats::default()),
-        }
+        Self { mv, prior, started: AtomicU32::new(0), child: OnceLock::new(), stats: Mutex::new(EdgeStats::default()) }
     }
 
     pub fn mv(&self) -> Move {
@@ -310,29 +227,17 @@ impl Node {
 
     pub fn q(&self) -> f32 {
         let stats = self.stats.lock();
-        if stats.visits == 0 {
-            0.0
-        } else {
-            stats.wl_sum / stats.visits as f32
-        }
+        if stats.visits == 0 { 0.0 } else { stats.wl_sum / stats.visits as f32 }
     }
 
     pub fn draw(&self) -> f32 {
         let stats = self.stats.lock();
-        if stats.visits == 0 {
-            0.0
-        } else {
-            stats.draw_sum / stats.visits as f32
-        }
+        if stats.visits == 0 { 0.0 } else { stats.draw_sum / stats.visits as f32 }
     }
 
     pub fn m(&self) -> f32 {
         let stats = self.stats.lock();
-        if stats.visits == 0 {
-            0.0
-        } else {
-            stats.m_sum / stats.visits as f32
-        }
+        if stats.visits == 0 { 0.0 } else { stats.m_sum / stats.visits as f32 }
     }
 
     pub(crate) fn add_delta(&self, delta: ValueDelta) {
@@ -445,11 +350,7 @@ impl Node {
         let edges = self.edges();
         let edge = edges.get(edge_index)?;
         let virtual_wl_sum = edge.reserve(virtual_mean);
-        Some(EdgeReservation {
-            edges,
-            edge_index,
-            virtual_wl_sum,
-        })
+        Some(EdgeReservation { edges, edge_index, virtual_wl_sum })
     }
 }
 
@@ -466,10 +367,7 @@ unsafe impl Sync for NodeSlot {}
 
 impl NodeSlot {
     fn empty() -> Self {
-        Self {
-            initialized: AtomicBool::new(false),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        }
+        Self { initialized: AtomicBool::new(false), value: UnsafeCell::new(MaybeUninit::uninit()) }
     }
 }
 
@@ -479,9 +377,7 @@ struct NodePage {
 
 impl NodePage {
     fn new() -> Self {
-        Self {
-            slots: std::iter::repeat_with(NodeSlot::empty).take(NODES_PER_PAGE).collect(),
-        }
+        Self { slots: std::iter::repeat_with(NodeSlot::empty).take(NODES_PER_PAGE).collect() }
     }
 }
 
@@ -501,10 +397,7 @@ pub struct NodeArena {
 
 impl NodeArena {
     pub fn new() -> Self {
-        Self {
-            pages: RwLock::new(Vec::new()),
-            allocator: Mutex::new(ArenaAllocator::default()),
-        }
+        Self { pages: RwLock::new(Vec::new()), allocator: Mutex::new(ArenaAllocator::default()) }
     }
 
     fn page(&self, id: NodeId) -> Option<Arc<NodePage>> {
@@ -590,14 +483,12 @@ impl NodeArena {
                     all_terminal = false;
                     continue;
                 };
-                let Some((wl, _, plies)) = self
-                    .get(child_id)
-                    .filter(|child| child.expansion_state() == ExpansionState::Terminal)
-                    .and_then(Node::terminal_value)
-                else {
+                let child = self.get(child_id).expect("terminal propagation child lives");
+                if child.expansion_state() != ExpansionState::Terminal {
                     all_terminal = false;
                     continue;
-                };
+                }
+                let (wl, _, plies) = child.terminal_value().expect("terminal child has exact value");
                 best_for_stm = best_for_stm.max(wl);
                 max_plies = max_plies.max(plies);
                 if wl > 0.0 {
@@ -627,13 +518,9 @@ impl NodeArena {
     }
 
     fn free(&self, id: NodeId) {
-        let Some(page) = self.page(id) else {
-            return;
-        };
+        let page = self.page(id).expect("reusable node page exists");
         let slot = &page.slots[id.slot()];
-        if !slot.initialized.swap(false, Ordering::AcqRel) {
-            return;
-        }
+        assert!(slot.initialized.swap(false, Ordering::AcqRel), "reusable node lives");
         // SAFETY: GC reaches only settled, unreachable nodes and removes each slot once.
         unsafe { std::ptr::drop_in_place((*slot.value.get()).as_mut_ptr()) };
         self.allocator.lock().free.push(id);
@@ -679,9 +566,7 @@ impl NodeArena {
     pub(crate) fn subtree_is_settled(&self, root: NodeId) -> bool {
         let mut pending = vec![root];
         while let Some(id) = pending.pop() {
-            let Some(node) = self.get(id) else {
-                continue;
-            };
+            let node = self.get(id).expect("tree node lives while checking reservations");
             let edges = node.edges();
             if edges.iter().any(|edge| edge.visits() != edge.completed_visits()) {
                 return false;
@@ -736,13 +621,7 @@ pub struct SearchTree {
 impl SearchTree {
     pub fn new(root_history: Arc<PositionHistory>) -> Self {
         let arena = Arc::new(NodeArena::default());
-        Self {
-            root: arena.allocate(),
-            arena,
-            root_history,
-            pending_gc_roots: Vec::new(),
-            pending_gc_nodes: Vec::new(),
-        }
+        Self { root: arena.allocate(), arena, root_history, pending_gc_roots: Vec::new(), pending_gc_nodes: Vec::new() }
     }
 
     pub fn arena(&self) -> &Arc<NodeArena> {
@@ -767,27 +646,17 @@ impl SearchTree {
     fn advance_settled(&mut self, mv: Move) -> Result<(), EnginError> {
         let old_root = self.root_id();
         if !self.root_history().last().board().is_legal_move(mv) {
-            return Err(EnginError::PortIncomplete("stream tree advance requires a legal move"));
+            return Err(EnginError::Internal("stream tree advance requires a legal move"));
         }
 
-        let root = self
-            .arena
-            .get(old_root)
-            .ok_or(EnginError::PortIncomplete("stream tree root is unavailable"))?;
+        let root = self.arena.get(old_root).ok_or(EnginError::Internal("stream tree root is unavailable"))?;
         let edges = root.edges();
         let chosen = edges
             .iter()
             .find(|edge| edge.mv() == mv)
             .and_then(|edge| edge.child())
-            .ok_or(EnginError::PortIncomplete(
-                "stream tree cannot reuse an unexpanded child",
-            ))?;
-        self.pending_gc_roots.extend(
-            edges
-                .iter()
-                .filter(|edge| edge.mv() != mv)
-                .filter_map(|edge| edge.child()),
-        );
+            .ok_or(EnginError::Internal("stream tree cannot reuse an unexpanded child"))?;
+        self.pending_gc_roots.extend(edges.iter().filter(|edge| edge.mv() != mv).filter_map(|edge| edge.child()));
         self.pending_gc_nodes.push(old_root);
         let mut history = self.root_history().as_ref().clone();
         history.append(mv);
@@ -798,10 +667,7 @@ impl SearchTree {
 
     /// 取出 `advance` 挂起的 sibling 子树根，交给 Engine reaper 异步 `remove_subtrees`。
     pub(crate) fn take_pending_gc(&mut self) -> (Vec<NodeId>, Vec<NodeId>) {
-        (
-            std::mem::take(&mut self.pending_gc_roots),
-            std::mem::take(&mut self.pending_gc_nodes),
-        )
+        (std::mem::take(&mut self.pending_gc_roots), std::mem::take(&mut self.pending_gc_nodes))
     }
 
     /// Engine 的 `position` 路径在调用前已经 abort 并 drain 当前 job。
@@ -826,9 +692,7 @@ impl SearchTree {
                         candidate.append(*mv);
                         candidate.last().board() == next.board()
                     })
-                    .ok_or(EnginError::PortIncomplete(
-                        "stream tree reset could not derive legal move",
-                    ))?;
+                    .ok_or(EnginError::Internal("stream tree reset could not derive legal move"))?;
                 if self.advance(mv).is_err() {
                     return Ok(Some(self.replace_with_fresh(target)));
                 }
@@ -923,10 +787,7 @@ mod arena_tests {
         tree.arena().child_or_create(&root.edges()[0]);
         tree.advance(mv).expect("advance");
 
-        let retired = tree
-            .reset_to_history_after_drain(initial)
-            .expect("reset")
-            .expect("fresh arena");
+        let retired = tree.reset_to_history_after_drain(initial).expect("reset").expect("fresh arena");
         assert!(retired.get(tree.root_id()).is_some());
         assert!(tree.arena().get(tree.root_id()).is_some());
         assert_eq!(tree.take_pending_gc(), (Vec::new(), Vec::new()));
@@ -942,10 +803,7 @@ mod arena_tests {
         let parent = arena.get(parent).expect("parent");
         assert_eq!(parent.expansion_state(), ExpansionState::Terminal);
         assert_eq!(parent.terminal_value(), Some((-1.0, 0.0, 7.0)));
-        assert_eq!(
-            arena.get(root).expect("root").expansion_state(),
-            ExpansionState::Expanded
-        );
+        assert_eq!(arena.get(root).expect("root").expansion_state(), ExpansionState::Expanded);
     }
 
     #[test]
@@ -953,27 +811,18 @@ mod arena_tests {
         let (arena, root, parent) = parent_with_two_children();
         let loss = mark_child(&arena, parent, 0, -1.0, 2.0);
         arena.propagate_proven_terminals(&[root, parent, loss], root);
-        assert_eq!(
-            arena.get(parent).expect("parent").expansion_state(),
-            ExpansionState::Expanded
-        );
+        assert_eq!(arena.get(parent).expect("parent").expansion_state(), ExpansionState::Expanded);
 
         let draw = mark_child(&arena, parent, 1, 0.0, 8.0);
         arena.propagate_proven_terminals(&[root, parent, draw], root);
-        assert_eq!(
-            arena.get(parent).expect("parent").terminal_value(),
-            Some((0.0, 1.0, 9.0))
-        );
+        assert_eq!(arena.get(parent).expect("parent").terminal_value(), Some((0.0, 1.0, 9.0)));
 
         let (arena, root, parent) = parent_with_two_children();
         let short_loss = mark_child(&arena, parent, 0, -1.0, 2.0);
         arena.propagate_proven_terminals(&[root, parent, short_loss], root);
         let long_loss = mark_child(&arena, parent, 1, -1.0, 6.0);
         arena.propagate_proven_terminals(&[root, parent, long_loss], root);
-        assert_eq!(
-            arena.get(parent).expect("parent").terminal_value(),
-            Some((1.0, 0.0, 7.0))
-        );
+        assert_eq!(arena.get(parent).expect("parent").terminal_value(), Some((1.0, 0.0, 7.0)));
     }
 
     #[test]
@@ -984,9 +833,6 @@ mod arena_tests {
         let short_win = mark_child(&arena, parent, 1, 1.0, 2.0);
         arena.propagate_proven_terminals(&[root, parent, short_win], root);
 
-        assert_eq!(
-            arena.get(parent).expect("parent").terminal_value(),
-            Some((-1.0, 0.0, 3.0))
-        );
+        assert_eq!(arena.get(parent).expect("parent").terminal_value(), Some((-1.0, 0.0, 3.0)));
     }
 }

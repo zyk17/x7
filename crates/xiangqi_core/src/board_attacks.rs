@@ -103,11 +103,7 @@ fn lame_leaper_path_one(pt: PieceType, d: Direction, mut s: Square) -> BitBoard 
 }
 
 fn lame_leaper_path(pt: PieceType, s: Square) -> BitBoard {
-    let directions = if pt == PieceType::Bishop {
-        &BISHOP_DIRECTIONS[..]
-    } else {
-        &KNIGHT_DIRECTIONS[..]
-    };
+    let directions = if pt == PieceType::Bishop { &BISHOP_DIRECTIONS[..] } else { &KNIGHT_DIRECTIONS[..] };
     let mut b = BitBoard::EMPTY;
     for d in directions {
         b = b.union(lame_leaper_path_one(pt, *d, s));
@@ -120,11 +116,7 @@ fn lame_leaper_path(pt: PieceType, s: Square) -> BitBoard {
 }
 
 fn lame_leaper_attack(pt: PieceType, s: Square, occupied: BitBoard) -> BitBoard {
-    let directions = if pt == PieceType::Bishop {
-        &BISHOP_DIRECTIONS[..]
-    } else {
-        &KNIGHT_DIRECTIONS[..]
-    };
+    let directions = if pt == PieceType::Bishop { &BISHOP_DIRECTIONS[..] } else { &KNIGHT_DIRECTIONS[..] };
     let mut b = BitBoard::EMPTY;
     for d in directions {
         let to = s.offset_by(*d);
@@ -180,11 +172,7 @@ fn build_attacks_table(
             PieceType::Bishop | PieceType::Knight | PieceType::KnightTo => lame_leaper_path(pt, b_sq),
             _ => BitBoard::EMPTY,
         };
-        let mask = if pt != PieceType::KnightTo {
-            mask.difference(edges)
-        } else {
-            mask
-        };
+        let mask = if pt != PieceType::KnightTo { mask.difference(edges) } else { mask };
 
         let mask_bits = mask.bits();
         let mask_count = mask.count();
@@ -229,12 +217,7 @@ fn build_attacks_table(
 
 impl AttackTables {
     fn new() -> Self {
-        let empty_magic = MagicParams {
-            mask: 0,
-            attacks_table_offset: 0,
-            magic_number: 0,
-            shift_bits: 0,
-        };
+        let empty_magic = MagicParams { mask: 0, attacks_table_offset: 0, magic_number: 0, shift_bits: 0 };
 
         let mut rook_magic_params = [empty_magic; 90];
         let mut cannon_magic_params = [empty_magic; 90];
@@ -255,24 +238,9 @@ impl AttackTables {
             &mut cannon_attacks_table,
             Some(&rook_magic_params),
         );
-        build_attacks_table(
-            PieceType::Bishop,
-            &mut bishop_magic_params,
-            &mut bishop_attacks_table,
-            None,
-        );
-        build_attacks_table(
-            PieceType::Knight,
-            &mut knight_magic_params,
-            &mut knight_attacks_table,
-            None,
-        );
-        build_attacks_table(
-            PieceType::KnightTo,
-            &mut knight_to_magic_params,
-            &mut knight_to_attacks_table,
-            None,
-        );
+        build_attacks_table(PieceType::Bishop, &mut bishop_magic_params, &mut bishop_attacks_table, None);
+        build_attacks_table(PieceType::Knight, &mut knight_magic_params, &mut knight_attacks_table, None);
+        build_attacks_table(PieceType::KnightTo, &mut knight_to_magic_params, &mut knight_to_attacks_table, None);
 
         let mut pseudo_attacks = [[BitBoard::EMPTY; 90]; PSEUDO_ATTACK_TYPES];
         let mut between_sq = [[Square::INVALID; 90]; 90];
@@ -336,9 +304,7 @@ impl AttackTables {
 }
 
 fn tables() -> &'static AttackTables {
-    ATTACK_TABLES
-        .get()
-        .expect("initialize_magic_bitboards must be called before using attacks")
+    ATTACK_TABLES.get().expect("initialize_magic_bitboards must be called before using attacks")
 }
 
 pub fn initialize_magic_bitboards() {

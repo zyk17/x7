@@ -23,11 +23,7 @@ impl BitBoard {
     pub const EMPTY: Self = Self(0);
 
     pub const fn from_square(square: Square) -> Self {
-        if square.is_valid() {
-            Self(1u128 << square.index())
-        } else {
-            Self::EMPTY
-        }
+        if square.is_valid() { Self(1u128 << square.index()) } else { Self::EMPTY }
     }
 
     pub const fn from_bits(bits: u128) -> Self {
@@ -93,11 +89,7 @@ impl BitBoard {
     }
 
     pub fn subtract_square(self, square: Square) -> Self {
-        if square.is_valid() {
-            Self(self.0 & !(1u128 << square.index()))
-        } else {
-            self
-        }
+        if square.is_valid() { Self(self.0 & !(1u128 << square.index())) } else { self }
     }
 
     pub fn debug_string(self) -> String {
@@ -181,10 +173,7 @@ mod tests {
     fn iter_visits_set_bits() {
         let a0 = Square::new(File::A, Rank::from_idx(0).unwrap());
         let i9 = Square::new(File::I, Rank::from_idx(9).unwrap());
-        let squares: Vec<_> = BitBoard::from_square(a0)
-            .union(BitBoard::from_square(i9))
-            .into_iter()
-            .collect();
+        let squares: Vec<_> = BitBoard::from_square(a0).union(BitBoard::from_square(i9)).into_iter().collect();
         assert_eq!(squares, vec![a0, i9]);
     }
 }

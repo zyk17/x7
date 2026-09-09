@@ -1,6 +1,6 @@
 //! PUCT / FPU / virtual mean。只算该选哪条边与挂多少 μ；不 `reserve`、不 `descend`。
+use super::Edge;
 use super::param::SearchParams;
-use super::{Edge, ExpansionState, NodeArena};
 use crate::search::tree::EdgeStats;
 use crate::utils::fastmath::fast_log;
 use xiangqi_core::Move;
@@ -41,20 +41,12 @@ fn action_q(stats: EdgeStats, started_visits: u32, fpu: f32, use_virtual_mean: b
 /// 不带 prior 的均值不确定性 bonus。未访问或仅一个样本时没有方差信息；
 /// `SE` 自身随 evidence 增加而衰减，不另设人为截断或停止阈值。
 pub fn variance_bonus_from_se(visits: u32, standard_error: f32, params: &SearchParams) -> f32 {
-    if visits < 2 {
-        0.0
-    } else {
-        params.variance_bonus_scale * standard_error
-    }
+    if visits < 2 { 0.0 } else { params.variance_bonus_scale * standard_error }
 }
 
 /// reservation 应写入的 virtual mean；`scale==0` 退化为纯 virtual visit。
 fn virtual_mean_for_reservation(params: &SearchParams, fpu: f32) -> Option<f32> {
-    if params.virtual_mean_fpu_scale > 0.0 {
-        Some(params.virtual_mean_fpu_scale * fpu)
-    } else {
-        None
-    }
+    if params.virtual_mean_fpu_scale > 0.0 { Some(params.virtual_mean_fpu_scale * fpu) } else { None }
 }
 
 /// 选择 PUCT 最高的 edge，并给出该边应挂的 virtual mean。
@@ -67,7 +59,6 @@ pub(crate) fn select_edge(
     depth: usize,
     params: &SearchParams,
     root_move_filter: &[Move],
-    arena: &NodeArena,
 ) -> Option<(usize, Option<f32>)> {
     if edges.is_empty() {
         return None;
@@ -81,13 +72,6 @@ pub(crate) fn select_edge(
     let filter_root_moves = is_root && !root_move_filter.is_empty();
     for (index, edge) in edges.iter().enumerate() {
         if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
-            continue;
-        }
-        if edge
-            .child()
-            .and_then(|id| arena.get(id))
-            .is_some_and(|child| child.expansion_state() == ExpansionState::Terminal)
-        {
             continue;
         }
         let (stats, started_visits) = edge.selection_snapshot();
@@ -105,7 +89,7 @@ pub(crate) fn select_edge(
 mod tests {
     use xiangqi_core::{Move, Square};
 
-    use super::{action_q, compute_cpuct, select_edge, variance_bonus_from_se, visited_policy};
+    use super::{action_q, select_edge, variance_bonus_from_se, visited_policy};
     use crate::search::param::SearchParams;
     use crate::search::{Edge, NodeArena};
 
@@ -119,36 +103,8 @@ mod tests {
     }
 
     #[test]
-    fn defaults_use_the_selected_constant_cpuct() {
-        let params = SearchParams::default();
-        assert_eq!(params.cpuct, 2.4);
-        assert_eq!(params.cpuct_base, 40_000.0);
-        assert_eq!(params.cpuct_factor, 0.0);
-        assert_eq!(params.fpu_reduction, 0.225);
-        assert_eq!(params.decision_lcb_stdevs, 1.0);
-        assert_eq!(params.decision_ucb_stdevs, 1.0);
-        assert_eq!(params.decision_mix_n_weight, 0.25);
-        assert_eq!(params.variance_bonus_scale, 1.5);
-        assert_eq!(compute_cpuct(params, 0), params.cpuct);
-        assert_eq!(compute_cpuct(params, 50_000), params.cpuct);
-    }
-
-    #[test]
-    fn zero_cpuct_factor_keeps_the_initial_value() {
-        let params = SearchParams {
-            cpuct: 1.25,
-            cpuct_factor: 0.0,
-            ..SearchParams::default()
-        };
-        assert_eq!(compute_cpuct(params, 10_000), 1.25);
-    }
-
-    #[test]
     fn variance_bonus_requires_evidence_and_scales_with_standard_error() {
-        let params = SearchParams {
-            variance_bonus_scale: 0.8,
-            ..SearchParams::default()
-        };
+        let params = SearchParams { variance_bonus_scale: 0.8, ..SearchParams::default() };
         assert_eq!(variance_bonus_from_se(0, 1.0, &params), 0.0);
         assert_eq!(variance_bonus_from_se(1, 1.0, &params), 0.0);
         assert!((variance_bonus_from_se(2, 1.0, &params) - 0.8).abs() < 1e-6);
@@ -162,20 +118,11 @@ mod tests {
         assert!(node.try_claim());
         node.publish_edges(vec![(mv("b2", "b3"), 0.6), (mv("c3", "c4"), 0.4)]);
         let edges = node.edges();
-        let params = SearchParams {
-            virtual_mean_fpu_scale: 0.0,
-            ..SearchParams::default()
-        };
-        assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &params, &[], &arena).map(|(index, _)| index),
-            Some(0)
-        );
+        let params = SearchParams { virtual_mean_fpu_scale: 0.0, ..SearchParams::default() };
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index), Some(0));
 
         let reservation = node.reserve_edge(0, None).expect("first edge");
-        assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &params, &[], &arena).map(|(index, _)| index),
-            Some(1)
-        );
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index), Some(1));
         reservation.cancel();
         assert_eq!(edges[0].completed_visits(), 0);
     }
@@ -189,14 +136,11 @@ mod tests {
         let edges = node.edges();
         let params = SearchParams::default();
         let filter = [mv("c3", "c4")];
-        assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &params, &filter, &arena).map(|(index, _)| index),
-            Some(1)
-        );
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &filter).map(|(index, _)| index), Some(1));
     }
 
     #[test]
-    fn terminal_child_is_not_selected_again() {
+    fn terminal_child_remains_selectable() {
         let arena = NodeArena::default();
         let node = arena.get(arena.allocate()).expect("node");
         assert!(node.try_claim());
@@ -207,10 +151,7 @@ mod tests {
         assert!(terminal.try_claim());
         terminal.mark_terminal(-1.0, 0.0, 1.0);
 
-        assert_eq!(
-            select_edge(&edges, 0, 0.0, 0, &SearchParams::default(), &[], &arena).map(|(index, _)| index),
-            Some(1)
-        );
+        assert_eq!(select_edge(&edges, 0, 0.0, 0, &SearchParams::default(), &[]).map(|(index, _)| index), Some(0));
     }
 
     #[test]

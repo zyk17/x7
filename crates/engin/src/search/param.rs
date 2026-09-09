@@ -51,14 +51,8 @@ impl Default for SearchParams {
 
 impl SearchParams {
     pub(crate) fn validate(self) {
-        assert!(
-            self.cpuct.is_finite() && self.cpuct >= 0.0,
-            "stream cpuct must be finite and non-negative"
-        );
-        assert!(
-            self.cpuct_base.is_finite() && self.cpuct_base > 0.0,
-            "stream cpuct base must be finite and positive"
-        );
+        assert!(self.cpuct.is_finite() && self.cpuct >= 0.0, "stream cpuct must be finite and non-negative");
+        assert!(self.cpuct_base.is_finite() && self.cpuct_base > 0.0, "stream cpuct base must be finite and positive");
         assert!(
             self.cpuct_factor.is_finite() && self.cpuct_factor >= 0.0,
             "stream cpuct factor must be finite and non-negative"
@@ -110,13 +104,7 @@ pub struct SearchConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self {
-            queue_capacity: 0,
-            eval_batch_size: 0,
-            nn_window: 2.25,
-            params: SearchParams::default(),
-            threads: 8,
-        }
+        Self { queue_capacity: 0, eval_batch_size: 0, nn_window: 2.25, params: SearchParams::default(), threads: 8 }
     }
 }
 
@@ -134,22 +122,12 @@ impl SearchConfig {
     pub(crate) fn resolve(&self, backend: &dyn Backend) -> ResolvedSearchConfig {
         let recommended = backend.attributes().recommended_batch_size.max(1);
         let maximum = backend.attributes().maximum_batch_size.max(1);
-        let eval_batch_size = if self.eval_batch_size == 0 {
-            recommended
-        } else {
-            self.eval_batch_size.min(maximum)
-        };
-        let queue_capacity = if self.queue_capacity == 0 {
-            (eval_batch_size.saturating_mul(64)).max(4096)
-        } else {
-            self.queue_capacity
-        };
+        let eval_batch_size = if self.eval_batch_size == 0 { recommended } else { self.eval_batch_size.min(maximum) };
+        let queue_capacity =
+            if self.queue_capacity == 0 { (eval_batch_size.saturating_mul(64)).max(4096) } else { self.queue_capacity };
         assert!(queue_capacity > 0, "stream queue capacity must be non-zero");
         assert!(eval_batch_size > 0, "stream eval batch size must be non-zero");
-        assert!(
-            eval_batch_size <= queue_capacity,
-            "stream eval batch size must fit the queue capacity"
-        );
+        assert!(eval_batch_size <= queue_capacity, "stream eval batch size must fit the queue capacity");
         let nn_permit_limit = ((eval_batch_size as f32) * self.nn_window).ceil().max(1.0) as usize;
         ResolvedSearchConfig {
             queue_capacity,

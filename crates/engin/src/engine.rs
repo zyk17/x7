@@ -55,11 +55,7 @@ struct GraphReaper {
 }
 
 enum GraphCleanup {
-    Prune(
-        Arc<crate::search::NodeArena>,
-        Vec<crate::search::NodeId>,
-        Vec<crate::search::NodeId>,
-    ),
+    Prune(Arc<crate::search::NodeArena>, Vec<crate::search::NodeId>, Vec<crate::search::NodeId>),
     Retire(Arc<crate::search::NodeArena>),
 }
 
@@ -80,10 +76,7 @@ impl GraphReaper {
                 }
             })
             .expect("graph reaper thread starts");
-        Self {
-            sender: Some(sender),
-            thread: Some(thread),
-        }
+        Self { sender: Some(sender), thread: Some(thread) }
     }
 
     fn retire(&self, arena: Arc<crate::search::NodeArena>) {
@@ -272,10 +265,10 @@ impl Engine {
     /// 检查 stream 已实现的 UCI `go` 子集；未支持项明确拒绝。
     fn validate_go(&self, params: &GoParams) -> Result<(), EnginError> {
         if params.depth.is_some() {
-            return Err(EnginError::PortIncomplete("go depth is not supported"));
+            return Err(EnginError::Uci("go depth is not supported".into()));
         }
         if params.mate.is_some() {
-            return Err(EnginError::PortIncomplete("go mate is not supported"));
+            return Err(EnginError::Uci("go mate is not supported".into()));
         }
         if params.nodes.is_some_and(|nodes| nodes <= 0) {
             return Err(EnginError::Uci("go nodes must be positive".into()));
@@ -288,56 +281,34 @@ impl Engine {
             || params.winc.is_some()
             || params.binc.is_some()
             || params.movestogo.is_some();
-        if [params.wtime, params.btime, params.winc, params.binc]
-            .into_iter()
-            .flatten()
-            .any(|value| value < 0)
+        if [params.wtime, params.btime, params.winc, params.binc].into_iter().flatten().any(|value| value < 0)
             || params.movestogo.is_some_and(|value| value <= 0)
         {
-            return Err(EnginError::Uci(
-                "go clock values must be non-negative and movestogo positive".into(),
-            ));
+            return Err(EnginError::Uci("go clock values must be non-negative and movestogo positive".into()));
         }
         if has_clock {
-            let root = self
-                .graph
-                .as_ref()
-                .ok_or(EnginError::Uci("position is not configured".into()))?
-                .root_history()
-                .last();
-            let side_time = if root.is_black_to_move() {
-                params.btime
-            } else {
-                params.wtime
-            };
+            let root =
+                self.graph.as_ref().ok_or(EnginError::Uci("position is not configured".into()))?.root_history().last();
+            let side_time = if root.is_black_to_move() { params.btime } else { params.wtime };
             if side_time.is_none() {
                 return Err(EnginError::Uci("go clock is missing side-to-move time".into()));
             }
         }
         if params.movetime.is_some() && has_clock {
-            return Err(EnginError::Uci(
-                "go movetime cannot be combined with clock fields".into(),
-            ));
+            return Err(EnginError::Uci("go movetime cannot be combined with clock fields".into()));
         }
         if params.infinite && (params.nodes.is_some() || params.movetime.is_some() || has_clock) {
-            return Err(EnginError::Uci(
-                "go infinite cannot be combined with nodes, movetime, or clock fields".into(),
-            ));
+            return Err(EnginError::Uci("go infinite cannot be combined with nodes, movetime, or clock fields".into()));
         }
         if !params.infinite && params.nodes.is_none() && params.movetime.is_none() && !has_clock {
-            return Err(EnginError::Uci(
-                "go requires nodes, movetime, clock fields, or infinite".into(),
-            ));
+            return Err(EnginError::Uci("go requires nodes, movetime, clock fields, or infinite".into()));
         }
         Ok(())
     }
 
     /// `go searchmoves` 根着过滤。
     fn root_move_filter(&self, searchmoves: &[String]) -> Result<Vec<Move>, EnginError> {
-        let graph = self
-            .graph
-            .as_ref()
-            .ok_or(EnginError::Uci("position is not configured".into()))?;
+        let graph = self.graph.as_ref().ok_or(EnginError::Uci("position is not configured".into()))?;
         let board = graph.root_history().last().board();
         let legal_moves = board.generate_legal_moves();
         let moves: Vec<_> = searchmoves
@@ -357,11 +328,7 @@ impl Engine {
         self.validate_go(params)?;
         self.abort()?;
         let root_move_filter = self.root_move_filter(&params.searchmoves)?;
-        let backend = Arc::clone(
-            self.backend
-                .as_ref()
-                .ok_or(EnginError::Uci("position is not configured".into()))?,
-        );
+        let backend = Arc::clone(self.backend.as_ref().ok_or(EnginError::Uci("position is not configured".into()))?);
         if self.applied_nn_cache_size != Some(self.options.nn_cache_size_power_of_two) {
             backend.set_cache_size_power_of_two(self.options.nn_cache_size_power_of_two);
             self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
@@ -395,7 +362,7 @@ impl Engine {
         };
         let graph = self.graph.as_ref().expect("position creates a graph with a backend");
         let root_is_black = graph.root_history().last().is_black_to_move();
-        let search = Search::new_with_graph_in_pool(backend, graph, config, NoopObserver, pool);
+        let search = Search::new_in_pool(backend, graph, config, NoopObserver, pool);
         let snapshot = RootSnapshot {
             arena: Arc::clone(search.arena()),
             root_id: search.root_id(),
@@ -426,22 +393,9 @@ impl Engine {
         let output_options = self.options.clone();
         let output_gate = Arc::clone(&self.stdout_gate);
         let owner_thread = thread::spawn(move || {
-            run_search(
-                search,
-                snapshot,
-                output_options,
-                output_gate,
-                owner_publish_output,
-                limits,
-            )
+            run_search(search, snapshot, output_options, output_gate, owner_publish_output, limits)
         });
-        self.active = Some(ActiveSearch {
-            control,
-            publish_output,
-            owner_thread,
-            started,
-            clock_budget,
-        });
+        self.active = Some(ActiveSearch { control, publish_output, owner_thread, started, clock_budget });
         Ok(())
     }
 
@@ -474,15 +428,8 @@ impl Engine {
         let Some(active) = self.active.take() else {
             return Ok(());
         };
-        let ActiveSearch {
-            owner_thread,
-            started,
-            clock_budget,
-            ..
-        } = active;
-        let result = owner_thread
-            .join()
-            .map_err(|_| EnginError::Uci("search owner thread panicked".into()))?;
+        let ActiveSearch { owner_thread, started, clock_budget, .. } = active;
+        let result = owner_thread.join().map_err(|_| EnginError::Uci("search owner thread panicked".into()))?;
         if let Some(clock_budget) = clock_budget {
             self.time_manager.finish(clock_budget, started.elapsed());
         }
@@ -522,7 +469,7 @@ fn run_search(
 ) -> Result<(), EnginError> {
     let started = Instant::now();
     let mut published = PublishedInfo::default();
-    let result = search.run_with_limits_reporting(limits, Some(OWNER_PROGRESS_INTERVAL), |stats| {
+    let result = search.run_reporting(limits, Some(OWNER_PROGRESS_INTERVAL), |stats| {
         if !publish_output.load(Ordering::Acquire) {
             return;
         }
@@ -571,10 +518,7 @@ fn run_search(
         }
         write_stdout_best_move(&BestMoveInfo::new(best_move));
     } else if let Err(error) = &result {
-        let info = ThinkingInfo {
-            comment: format!("stream search failed: {error}"),
-            ..ThinkingInfo::default()
-        };
+        let info = ThinkingInfo { comment: format!("stream search failed: {error}"), ..ThinkingInfo::default() };
         let best_move = reported_uci_move(None, snapshot.root_history.as_ref(), &snapshot.root_move_filter);
         let _output = output_gate.lock();
         if publish_output.load(Ordering::Acquire) {
@@ -623,16 +567,8 @@ impl RootSnapshot {
     fn thinking_infos(&self, stats: Stats, started: Instant) -> Vec<ThinkingInfo> {
         let time = started.elapsed().as_millis() as i64;
         let nodes = self.initial_visits.saturating_add(stats.completed_playouts) as i64;
-        let nps = if time == 0 {
-            0
-        } else {
-            (stats.completed_playouts as i64 * 1000 / time) as i32
-        };
-        let eps = if time == 0 {
-            0
-        } else {
-            (stats.network_evaluations as i64 * 1000 / time) as i32
-        };
+        let nps = if time == 0 { 0 } else { (stats.completed_playouts as i64 * 1000 / time) as i32 };
+        let eps = if time == 0 { 0 } else { (stats.network_evaluations as i64 * 1000 / time) as i32 };
         let common = ThinkingInfo {
             depth: stats.average_depth.min(i32::MAX as u64) as i32,
             seldepth: stats.max_depth.min(i32::MAX as u64) as i32,
@@ -686,10 +622,7 @@ impl RootSnapshot {
                 let loss = ((1.0_f32 - variation.draw - variation.wl) * 0.5).clamp(0.0, 1.0);
                 ThinkingInfo {
                     mate: variation.mate,
-                    score: variation
-                        .mate
-                        .is_none()
-                        .then_some((variation.wl * 1000.0).round() as i32),
+                    score: variation.mate.is_none().then_some((variation.wl * 1000.0).round() as i32),
                     wdl: Some(Wdl {
                         w: (win * 1000.0).round() as i32,
                         d: (variation.draw * 1000.0).round() as i32,
@@ -725,12 +658,7 @@ mod tests {
     use xiangqi_core::{GameState, Move, STARTPOS_FEN};
 
     fn go_nodes(engine: &mut Engine, nodes: i32) {
-        engine
-            .go(&GoParams {
-                nodes: Some(nodes),
-                ..GoParams::default()
-            })
-            .expect("go");
+        engine.go(&GoParams { nodes: Some(nodes), ..GoParams::default() }).expect("go");
         engine.wait().expect("search owner");
     }
 
@@ -755,18 +683,14 @@ mod tests {
         ];
         for (ply, moves) in prefixes.into_iter().enumerate() {
             let moves: Vec<String> = moves.iter().map(|mv| (*mv).to_string()).collect();
-            engine
-                .set_position(fen, &moves)
-                .unwrap_or_else(|error| panic!("position at ply {ply}: {error}"));
+            engine.set_position(fen, &moves).unwrap_or_else(|error| panic!("position at ply {ply}: {error}"));
             go_nodes(&mut engine, 2000);
         }
     }
 
     #[test]
     fn unsearched_root_reports_a_legal_move_not_null() {
-        let history = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str])
-            .expect("startpos")
-            .position_history();
+        let history = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos").position_history();
         let mv = reported_uci_move(None, &history, &[]);
         assert!(!mv.is_null());
         assert!(history.last().board().generate_legal_moves().contains(&mv));
@@ -774,9 +698,7 @@ mod tests {
 
     #[test]
     fn searchmoves_fallback_stays_inside_the_filter() {
-        let history = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str])
-            .expect("startpos")
-            .position_history();
+        let history = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos").position_history();
         let filter = vec![history.last().board().parse_move("b2b3").expect("b2b3")];
         assert_eq!(legal_fallback_move(&history, &filter), filter[0]);
         assert_eq!(reported_uci_move(Some(Move::NULL), &history, &filter), filter[0]);

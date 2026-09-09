@@ -106,11 +106,7 @@ impl File {
 
     pub fn offset(self, delta: i32) -> Self {
         let idx = self.0 as i32 + delta;
-        if idx < 0 || idx >= FILE_NB as i32 {
-            Self::INVALID
-        } else {
-            Self(idx as u8)
-        }
+        if idx < 0 || idx >= FILE_NB as i32 { Self::INVALID } else { Self(idx as u8) }
     }
 
     pub const fn parse(ch: char) -> Option<Self> {
@@ -172,11 +168,7 @@ impl Rank {
 
     pub fn offset(self, delta: i32) -> Self {
         let idx = self.0 as i32 + delta;
-        if idx < 0 || idx >= RANK_NB as i32 {
-            Self::INVALID
-        } else {
-            Self(idx as u8)
-        }
+        if idx < 0 || idx >= RANK_NB as i32 { Self::INVALID } else { Self(idx as u8) }
     }
 
     pub const fn parse(ch: char) -> Option<Self> {
@@ -211,11 +203,7 @@ impl Square {
             return Self::INVALID;
         }
         let idx = rank.index() as u16 * FILE_NB as u16 + file.index() as u16;
-        if idx < SQUARE_NB as u16 {
-            Self(idx as u8)
-        } else {
-            Self::INVALID
-        }
+        if idx < SQUARE_NB as u16 { Self(idx as u8) } else { Self::INVALID }
     }
 
     pub const fn from_idx(idx: u8) -> Option<Self> {
@@ -271,11 +259,7 @@ impl Square {
             (Some(file), Some(rank)) => {
                 let file = file.offset(file_delta);
                 let rank = rank.offset(rank_delta);
-                if !file.is_valid() || !rank.is_valid() {
-                    Self::INVALID
-                } else {
-                    Self::new(file, rank)
-                }
+                if !file.is_valid() || !rank.is_valid() { Self::INVALID } else { Self::new(file, rank) }
             }
             _ => Self::INVALID,
         }

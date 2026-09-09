@@ -42,16 +42,11 @@ pub(crate) struct EvalCache {
 
 impl EvalCache {
     pub(crate) fn new(size_power_of_two: u8) -> Self {
-        Self {
-            slots: RwLock::new(Self::allocate_slots(size_power_of_two)),
-        }
+        Self { slots: RwLock::new(Self::allocate_slots(size_power_of_two)) }
     }
 
     fn allocate_slots(size_power_of_two: u8) -> Arc<[CacheSlot]> {
-        assert!(
-            size_power_of_two <= MAX_NN_CACHE_SIZE_POWER_OF_TWO,
-            "NN cache size power is out of range"
-        );
+        assert!(size_power_of_two <= MAX_NN_CACHE_SIZE_POWER_OF_TWO, "NN cache size power is out of range");
         let size = 1usize << size_power_of_two;
         let mut slots = Vec::with_capacity(size);
         slots.resize_with(size, CacheSlot::default);
@@ -112,20 +107,8 @@ mod tests {
     fn direct_slot_replaces_an_older_key() {
         let result = Arc::new(EvalResult::default());
         let cache = EvalCache::new(0);
-        cache.insert(
-            1,
-            CachedEval {
-                result: Arc::clone(&result),
-                num_moves: 1,
-            },
-        );
-        cache.insert(
-            2,
-            CachedEval {
-                result: Arc::clone(&result),
-                num_moves: 2,
-            },
-        );
+        cache.insert(1, CachedEval { result: Arc::clone(&result), num_moves: 1 });
+        cache.insert(2, CachedEval { result: Arc::clone(&result), num_moves: 2 });
         assert!(cache.get(1, 1).is_none());
         assert!(cache.get(2, 2).is_some());
         assert!(Arc::ptr_eq(&cache.get(2, 2).expect("cached value"), &result));
@@ -135,13 +118,7 @@ mod tests {
     #[test]
     fn cache_checks_the_full_key_inside_a_slot() {
         let cache = EvalCache::new(0);
-        cache.insert(
-            1,
-            CachedEval {
-                result: Arc::new(EvalResult::default()),
-                num_moves: 1,
-            },
-        );
+        cache.insert(1, CachedEval { result: Arc::new(EvalResult::default()), num_moves: 1 });
         assert!(cache.get(3, 1).is_none());
         assert!(cache.get(1, 2).is_none());
         assert!(cache.get(1, 1).is_some());
@@ -151,13 +128,7 @@ mod tests {
     #[test]
     fn cache_resize_replaces_all_entries() {
         let cache = EvalCache::new(1);
-        cache.insert(
-            1,
-            CachedEval {
-                result: Arc::new(EvalResult::default()),
-                num_moves: 0,
-            },
-        );
+        cache.insert(1, CachedEval { result: Arc::new(EvalResult::default()), num_moves: 0 });
         cache.set_size_power_of_two(0);
         assert_eq!(cache.len(), 0);
     }

@@ -7,11 +7,7 @@ pub const fn hash(val: u64) -> u64 {
 }
 
 pub const fn hash_cat(state: u64, x: u64) -> u64 {
-    state
-        ^ (0x299799adf0d95defu64
-            .wrapping_add(hash(x))
-            .wrapping_add(state << 6)
-            .wrapping_add(state >> 2))
+    state ^ (0x299799adf0d95defu64.wrapping_add(hash(x)).wrapping_add(state << 6).wrapping_add(state >> 2))
 }
 
 pub fn hash_cat_u128s(values: &[u128]) -> u64 {

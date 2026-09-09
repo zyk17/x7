@@ -45,11 +45,7 @@ fn parse_args() -> Result<Args, String> {
             "--fen" => fen = args.next().ok_or("--fen requires a quoted FEN")?,
             "--moves" => {
                 let text = args.next().ok_or("--moves requires a quoted move list")?;
-                moves = text
-                    .split_whitespace()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect();
+                moves = text.split_whitespace().filter(|s| !s.is_empty()).map(str::to_owned).collect();
             }
             "--top" => top = parse_usize(&mut args, "--top")?,
             "--bench" => bench_iters = Some(parse_usize(&mut args, "--bench")?),
@@ -66,14 +62,7 @@ fn parse_args() -> Result<Args, String> {
     if batches.contains(&0) {
         return Err("--batch sizes must be > 0".into());
     }
-    Ok(Args {
-        onnx,
-        fen,
-        moves,
-        top,
-        bench_iters,
-        batches,
-    })
+    Ok(Args { onnx, fen, moves, top, bench_iters, batches })
 }
 
 fn parse_usize(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<usize, String> {
@@ -85,11 +74,7 @@ fn parse_usize(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<us
 
 fn parse_batches(text: &str) -> Result<Vec<usize>, String> {
     text.split(',')
-        .map(|part| {
-            part.trim()
-                .parse::<usize>()
-                .map_err(|_| format!("invalid --batch entry: {part}"))
-        })
+        .map(|part| part.trim().parse::<usize>().map_err(|_| format!("invalid --batch entry: {part}")))
         .collect()
 }
 
@@ -122,11 +107,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "fen={} moves={} side={} legal={}",
         state.current_position().to_fen(),
-        if args.moves.is_empty() {
-            "-".to_owned()
-        } else {
-            args.moves.join(" ")
-        },
+        if args.moves.is_empty() { "-".to_owned() } else { args.moves.join(" ") },
         if history.is_black_to_move() { "black" } else { "red" },
         legal.len()
     );
@@ -163,7 +144,7 @@ fn run_bench(
     batches: &[usize],
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("bench iters={iters} (warmup 3, exclude from stats)");
-    let planes = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
+    let planes = encode_position_input_planes(history, FillEmptyHistory::No);
     for &batch in batches {
         for _ in 0..3 {
             timed_batch(backend, &planes, batch)?;
@@ -198,16 +179,12 @@ fn evaluate(
     history: &PositionHistory,
     legal_moves: &[Move],
 ) -> Result<std::sync::Arc<engin::neural::backend::EvalResult>, Box<dyn std::error::Error>> {
-    let sample = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
+    let sample = encode_position_input_planes(history, FillEmptyHistory::No);
     let mut logits = Vec::new();
     let mut wdl = Vec::new();
     let mut moves_left = Vec::new();
     backend.infer_input_planes_into(&[sample], &mut logits, &mut wdl, &mut moves_left)?;
-    let output = EncodedBatch {
-        logits,
-        wdl,
-        moves_left,
-    };
+    let output = EncodedBatch { logits, wdl, moves_left };
     Ok(eval_result_from_encoded_row(&output, 0, legal_moves)?)
 }
 

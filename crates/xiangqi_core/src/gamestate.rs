@@ -1,6 +1,6 @@
 //! UCI `GameState`：startpos + moves，供 `position` 命令构建完整历史。
 
-use crate::{CoreError, MoveList, Position, PositionHistory};
+use crate::{MoveList, Position, PositionHistory};
 
 /// startpos 与后续着法。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,7 +14,7 @@ impl GameState {
         Self { startpos, moves }
     }
 
-    pub fn from_fen_moves(fen: &str, move_strs: &[impl AsRef<str>]) -> Result<Self, CoreError> {
+    pub fn from_fen_moves(fen: &str, move_strs: &[impl AsRef<str>]) -> Result<Self, String> {
         let startpos = Position::from_fen(fen)?;
         let mut board = startpos.board().clone();
         let mut moves = MoveList::with_capacity(move_strs.len());

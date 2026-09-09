@@ -74,39 +74,21 @@ impl Options {
                 self.nn_cache_size_power_of_two, MAX_NN_CACHE_SIZE_POWER_OF_TWO
             ),
             format!("option name MultiPV type spin default {} min 1 max 500", self.multi_pv),
-            format!(
-                "option name NnBatchSize type spin default {} min 0 max 1024",
-                self.nn_batch_size
-            ),
+            format!("option name NnBatchSize type spin default {} min 0 max 1024", self.nn_batch_size),
             format!("option name CPuct type string default {}", self.cpuct),
             format!("option name CPuctBase type string default {}", self.cpuct_base),
             format!("option name CPuctFactor type string default {}", self.cpuct_factor),
             format!("option name FpuReduction type string default {}", self.fpu_reduction),
-            format!(
-                "option name VarianceBonusScale type string default {}",
-                self.variance_bonus_scale
-            ),
+            format!("option name VarianceBonusScale type string default {}", self.variance_bonus_scale),
             format!("option name NnWindow type string default {}", self.nn_window),
-            format!(
-                "option name VirtualMeanFpuScale type string default {}",
-                self.virtual_mean_fpu_scale
-            ),
+            format!("option name VirtualMeanFpuScale type string default {}", self.virtual_mean_fpu_scale),
             format!(
                 "option name DecisionRule type combo default {} var Auto var MaxQ var MaxN var Lcb var Ucb var MixNQ",
                 self.decision_rule.uci_name()
             ),
-            format!(
-                "option name DecisionLcbStdevs type string default {}",
-                self.decision_lcb_stdevs
-            ),
-            format!(
-                "option name DecisionUcbStdevs type string default {}",
-                self.decision_ucb_stdevs
-            ),
-            format!(
-                "option name DecisionMixNWeight type string default {}",
-                self.decision_mix_n_weight
-            ),
+            format!("option name DecisionLcbStdevs type string default {}", self.decision_lcb_stdevs),
+            format!("option name DecisionUcbStdevs type string default {}", self.decision_ucb_stdevs),
+            format!("option name DecisionMixNWeight type string default {}", self.decision_mix_n_weight),
             format!("option name UCI_ShowWDL type check default {}", self.show_wdl),
             format!("option name UCI_ShowEPS type check default {}", self.show_eps),
             format!("option name WeightsFile type string default {}", self.weights_file),
@@ -117,9 +99,7 @@ impl Options {
         let flag = |name| match value {
             value if value.eq_ignore_ascii_case("true") => Ok(true),
             value if value.eq_ignore_ascii_case("false") => Ok(false),
-            _ => Err(crate::EnginError::Uci(format!(
-                "Flag '{name}' must be either true or false"
-            ))),
+            _ => Err(crate::EnginError::Uci(format!("Flag '{name}' must be either true or false"))),
         };
         let option_name = name.to_ascii_lowercase();
         match option_name.as_str() {
@@ -186,9 +166,7 @@ fn parse_non_negative_float(name: &str, value: &str) -> Result<f32, crate::Engin
         .parse::<f32>()
         .map_err(|_| crate::EnginError::Uci(format!("{name} must be a finite non-negative number")))?;
     if !value.is_finite() || value < 0.0 {
-        return Err(crate::EnginError::Uci(format!(
-            "{name} must be a finite non-negative number"
-        )));
+        return Err(crate::EnginError::Uci(format!("{name} must be a finite non-negative number")));
     }
     Ok(value)
 }

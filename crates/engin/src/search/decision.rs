@@ -176,10 +176,7 @@ fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &Searc
         .enumerate()
         .filter(|(_, edge)| filter.is_empty() || filter.contains(&edge.mv()))
         .map(|(index, _)| {
-            let edge = EdgeHandle {
-                table: Arc::clone(&edges),
-                index,
-            };
+            let edge = EdgeHandle { table: Arc::clone(&edges), index };
             let stats = edge.stats();
             RankedEdge {
                 visits: stats.visits,
@@ -191,9 +188,7 @@ fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &Searc
         })
         .collect();
     let max_visits = ranked.iter().map(|edge| edge.visits).max().unwrap_or(0);
-    rank_by_score(arena, &mut ranked, |edge| {
-        decision_score(params.decision_rule, edge, max_visits, params)
-    });
+    rank_by_score(arena, &mut ranked, |edge| decision_score(params.decision_rule, edge, max_visits, params));
     ranked.into_iter().map(|edge| edge.edge).collect()
 }
 
@@ -311,9 +306,7 @@ mod tests {
 
     fn complete_samples(node: &super::Node, edge_index: usize, samples: &[f32]) {
         for &sample in samples {
-            node.reserve_edge(edge_index, None)
-                .expect("reservation")
-                .complete(sample);
+            node.reserve_edge(edge_index, None).expect("reservation").complete(sample);
         }
     }
 
@@ -366,14 +359,7 @@ mod tests {
         complete_samples(node, 1, &[1.0]);
 
         assert_eq!(
-            best_move_with_params(
-                &arena,
-                root,
-                false,
-                &SearchParams {
-                    ..SearchParams::default()
-                },
-            ),
+            best_move_with_params(&arena, root, false, &SearchParams { ..SearchParams::default() },),
             Some(first)
         );
     }
@@ -393,9 +379,6 @@ mod tests {
         assert!(child_node.try_claim());
         child_node.mark_terminal(1.0, 0.0, 3.0);
 
-        assert_eq!(
-            best_move_with_params(&arena, root, false, &SearchParams::default()),
-            Some(winning)
-        );
+        assert_eq!(best_move_with_params(&arena, root, false, &SearchParams::default()), Some(winning));
     }
 }

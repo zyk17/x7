@@ -23,18 +23,10 @@ pub(crate) fn classify_expand(history: &PositionHistory, depth: usize) -> Expand
     let legal_moves = board.generate_legal_moves();
     // `wl` 按 incoming edge / 上一走子方视角保存。
     if legal_moves.is_empty() {
-        return ExpandKind::Terminal {
-            wl: 1.0,
-            draw: 0.0,
-            plies_left: 0.0,
-        };
+        return ExpandKind::Terminal { wl: 1.0, draw: 0.0, plies_left: 0.0 };
     }
     if !board.has_mating_material() {
-        return ExpandKind::Terminal {
-            wl: 0.0,
-            draw: 1.0,
-            plies_left: 0.0,
-        };
+        return ExpandKind::Terminal { wl: 0.0, draw: 1.0, plies_left: 0.0 };
     }
     if let Some((wl, draw, plies_left)) = path_terminal_value(history, depth) {
         return ExpandKind::Terminal { wl, draw, plies_left };
@@ -115,14 +107,7 @@ mod tests {
             .expect("checkmate fen");
         let history = PositionHistory::from_positions(state.positions());
 
-        assert_eq!(
-            classify_expand(&history, 1),
-            ExpandKind::Terminal {
-                wl: 1.0,
-                draw: 0.0,
-                plies_left: 0.0,
-            }
-        );
+        assert_eq!(classify_expand(&history, 1), ExpandKind::Terminal { wl: 1.0, draw: 0.0, plies_left: 0.0 });
     }
 
     #[test]
@@ -131,14 +116,7 @@ mod tests {
             GameState::from_fen_moves("4k4/9/9/9/9/9/9/9/R8/4K4 w - - 120 1", &[] as &[&str]).expect("rule60 fen");
         let history = PositionHistory::from_positions(state.positions());
 
-        assert!(matches!(
-            classify_expand(&history, 0),
-            ExpandKind::Terminal {
-                wl: 0.0,
-                draw: 1.0,
-                plies_left: 0.0,
-            }
-        ));
+        assert!(matches!(classify_expand(&history, 0), ExpandKind::Terminal { wl: 0.0, draw: 1.0, plies_left: 0.0 }));
     }
 
     /// 首次重复仍可继续搜索；只有第二次重复才由 RuleJudge 裁决。
@@ -174,13 +152,6 @@ mod tests {
         assert!(history.last().repetitions() >= 2);
         let depth = history.len().saturating_sub(1).max(1);
         let (wl, draw) = super::rule_judge_wl_for_node(history.rule_judge());
-        assert_eq!(
-            classify_expand(&history, depth),
-            ExpandKind::Terminal {
-                wl,
-                draw,
-                plies_left: 0.0,
-            }
-        );
+        assert_eq!(classify_expand(&history, depth), ExpandKind::Terminal { wl, draw, plies_left: 0.0 });
     }
 }

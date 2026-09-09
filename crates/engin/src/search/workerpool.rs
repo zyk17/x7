@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
 use parking_lot::Mutex;
@@ -16,12 +17,19 @@ use crate::EnginError;
 use crate::neural::backend::{Backend, EvalCacheKey};
 use crate::neural::{EncodedBatch, InputPlanes};
 use crate::search::EdgeReservation;
+use crate::search::backprop::ValueDelta;
 
-use super::eval::{cancel_evaluation, handle_nn_reply, infer_nn_batch, process_eval_event, send_nn_reply};
-use super::observer::{NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver, observe_queue_wait};
+use super::NodeId;
+use super::eval::{handle_nn_reply_batch, infer_nn_batch, process_eval_event};
+use super::observer::{
+    ExecutionKind, ExecutionTimer, NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver,
+    observe_queue_wait,
+};
 use super::param::{ResolvedSearchConfig, SearchConfig};
 use super::pipeline::{RECEIVE_POLL, Shared, process_backprop_event, process_expand_event, process_select_event};
-use super::{NodeId, ValueDelta};
+
+/// 第一份 NN request 到达后，给并发 Eval 极短的汇聚时间；避免退化成连续 batch=1。
+const NN_BATCH_GATHER: Duration = Duration::from_micros(50);
 
 #[derive(Clone, Debug)]
 pub struct Variation {
@@ -31,10 +39,7 @@ pub struct Variation {
 
 impl Variation {
     pub fn root(root_history: Arc<PositionHistory>) -> Self {
-        Self {
-            base_history: root_history,
-            moves: smallvec::SmallVec::new(),
-        }
+        Self { base_history: root_history, moves: smallvec::SmallVec::new() }
     }
     pub fn moves(&self) -> &[Move] {
         &self.moves
@@ -79,11 +84,7 @@ pub(crate) type ExpandEvent<S = NoQueueStamp> = SelectEvent<S>;
 impl<S: QueueStamp> SelectEvent<S> {
     pub fn at_root(root_id: NodeId, root_history: Arc<PositionHistory>) -> Self {
         Self {
-            event: Event {
-                node_id: root_id,
-                node_path: vec![root_id],
-                reservations: Vec::new(),
-            },
+            event: Event { node_id: root_id, node_path: vec![root_id], reservations: Vec::new() },
             variation: Variation::root(root_history),
             queued_at: S::default(),
         }
@@ -94,9 +95,6 @@ impl<S: QueueStamp> SelectEvent<S> {
         self.event.node_path.push(child_id);
         self.event.reservations.push(reservation);
         self
-    }
-    pub fn cancel(self) {
-        self.event.cancel();
     }
     pub fn node_path(&self) -> &[NodeId] {
         self.event.node_path.as_slice()
@@ -124,7 +122,7 @@ impl<S: QueueStamp> EvalEvent<S> {
     }
 }
 
-/// 已取得 NN window slot 的设备请求。
+/// Eval worker 编码后的 cache-miss 请求；NN scheduler 按 FIFO admission。
 pub(crate) struct NnRequest<S: QueueStamp = NoQueueStamp> {
     pub(crate) event: EvalEvent<S>,
     pub(crate) planes: InputPlanes,
@@ -132,30 +130,22 @@ pub(crate) struct NnRequest<S: QueueStamp = NoQueueStamp> {
 }
 impl<S: QueueStamp> NnRequest<S> {
     pub(crate) fn new(event: EvalEvent<S>, planes: InputPlanes) -> Self {
-        Self {
-            event,
-            planes,
-            queued_at: S::default(),
-        }
+        Self { event, planes, queued_at: S::default() }
     }
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at.mark();
     }
 }
 
-/// NN worker 回交给任一 worker 的结果；其 event 持有一个 NN permit。
-pub(crate) struct NnReply<S: QueueStamp = NoQueueStamp> {
-    pub(crate) event: EvalEvent<S>,
-    pub(crate) result: Result<(Arc<EncodedBatch>, usize), EnginError>,
+/// NN worker 回交给任一 worker 的一整个物理 batch；所有 event 都持有一个 NN credit。
+pub(crate) struct NnReplyBatch<S: QueueStamp = NoQueueStamp> {
+    pub(crate) events: Vec<EvalEvent<S>>,
+    pub(crate) result: Result<Arc<EncodedBatch>, EnginError>,
     pub(crate) queued_at: S,
 }
-impl<S: QueueStamp> NnReply<S> {
-    pub(crate) fn new(event: EvalEvent<S>, result: Result<(Arc<EncodedBatch>, usize), EnginError>) -> Self {
-        Self {
-            event,
-            result,
-            queued_at: S::default(),
-        }
+impl<S: QueueStamp> NnReplyBatch<S> {
+    pub(crate) fn new(events: Vec<EvalEvent<S>>, result: Result<Arc<EncodedBatch>, EnginError>) -> Self {
+        Self { events, result, queued_at: S::default() }
     }
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at.mark();
@@ -166,27 +156,20 @@ impl<S: QueueStamp> NnReply<S> {
 pub struct BackpropEvent<S: QueueStamp = NoQueueStamp> {
     pub(crate) event: Event,
     pub(crate) value: ValueDelta,
-    /// 此 event 是否持有 NN permit；Backprop 完成后释放对应 window slot。
-    pub(crate) holds_nn_permit: bool,
+    /// 该 event 是否持有 NN scheduler credit。
+    ///
+    /// cache miss 从 NN scheduler admission 起一直持有到 Backprop 或取消；不在 NN Reply
+    /// 时提前释放，确保新的 NN 工作只在当前评估已写入树的 Evidence 后再占 slot。
+    pub(crate) holds_nn_credit: bool,
     pub(crate) queued_at: S,
 }
 
 impl<S: QueueStamp> BackpropEvent<S> {
-    pub(crate) fn with_nn_permit(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
-        Self {
-            event,
-            value: ValueDelta::with_plies_left(wl, draw, plies_left),
-            holds_nn_permit: true,
-            queued_at: S::default(),
-        }
+    pub(crate) fn with_nn_credit(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
+        Self { event, value: ValueDelta::one(wl, draw, plies_left), holds_nn_credit: true, queued_at: S::default() }
     }
-    pub(crate) fn without_nn_permit(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
-        Self {
-            event,
-            value: ValueDelta::with_plies_left(wl, draw, plies_left),
-            holds_nn_permit: false,
-            queued_at: S::default(),
-        }
+    pub(crate) fn without_nn_credit(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
+        Self { event, value: ValueDelta::one(wl, draw, plies_left), holds_nn_credit: false, queued_at: S::default() }
     }
     pub fn cancel(self) {
         self.event.cancel();
@@ -202,14 +185,14 @@ enum WorkerCommand<O: SearchObserver> {
         select_rx: Receiver<SelectEvent<O::Stamp>>,
         expand_rx: Receiver<ExpandEvent<O::Stamp>>,
         eval_rx: Receiver<EvalEvent<O::Stamp>>,
-        nn_reply_rx: Receiver<NnReply<O::Stamp>>,
+        nn_reply_rx: Receiver<NnReplyBatch<O::Stamp>>,
         nn_tx: Sender<NnRequest<O::Stamp>>,
         backprop_rx: Receiver<BackpropEvent<O::Stamp>>,
     },
     Shutdown,
 }
 enum NnCommand<O: SearchObserver> {
-    Run(Arc<Shared<O>>, Receiver<NnRequest<O::Stamp>>, Sender<NnReply<O::Stamp>>),
+    Run(Arc<Shared<O>>, Receiver<NnRequest<O::Stamp>>, Receiver<usize>, Sender<NnReplyBatch<O::Stamp>>),
     Shutdown,
 }
 
@@ -220,7 +203,7 @@ pub(crate) struct WorkerPool<O: SearchObserver = NoopObserver> {
     job_done: Receiver<()>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     eval_batch_size: usize,
-    nn_permit_limit: usize,
+    nn_credit_limit: usize,
 }
 
 impl<O: SearchObserver> WorkerPool<O> {
@@ -231,7 +214,7 @@ impl<O: SearchObserver> WorkerPool<O> {
     pub(crate) fn matches_config(&self, backend: &dyn Backend, config: &SearchConfig) -> bool {
         let config = config.resolve(backend);
         self.eval_batch_size == config.eval_batch_size
-            && self.nn_permit_limit == config.nn_permit_limit
+            && self.nn_credit_limit == config.nn_permit_limit
             && self.worker_commands.len() == config.threads
     }
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
@@ -246,9 +229,10 @@ impl<O: SearchObserver> WorkerPool<O> {
             worker_commands.push(tx);
         }
         let batch_size = config.eval_batch_size;
+        let credit_limit = config.nn_permit_limit;
         threads.push(thread::spawn({
             let done = job_done_tx.clone();
-            move || persistent_nn_worker::<O>(nn_rx, done, batch_size)
+            move || persistent_nn_worker::<O>(nn_rx, done, batch_size, credit_limit)
         }));
         Self {
             worker_commands,
@@ -256,7 +240,7 @@ impl<O: SearchObserver> WorkerPool<O> {
             job_done,
             threads: Mutex::new(threads),
             eval_batch_size: config.eval_batch_size,
-            nn_permit_limit: config.nn_permit_limit,
+            nn_credit_limit: config.nn_permit_limit,
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -266,14 +250,15 @@ impl<O: SearchObserver> WorkerPool<O> {
         select_rx: &Receiver<SelectEvent<O::Stamp>>,
         expand_rx: &Receiver<ExpandEvent<O::Stamp>>,
         eval_rx: &Receiver<EvalEvent<O::Stamp>>,
-        nn_reply_rx: &Receiver<NnReply<O::Stamp>>,
+        nn_reply_rx: &Receiver<NnReplyBatch<O::Stamp>>,
         nn_tx: &Sender<NnRequest<O::Stamp>>,
         nn_rx: &Receiver<NnRequest<O::Stamp>>,
-        nn_reply_tx: &Sender<NnReply<O::Stamp>>,
+        nn_credit_rx: &Receiver<usize>,
+        nn_reply_tx: &Sender<NnReplyBatch<O::Stamp>>,
         backprop_rx: &Receiver<BackpropEvent<O::Stamp>>,
     ) {
         self.nn_commands
-            .send(NnCommand::Run(Arc::clone(shared), nn_rx.clone(), nn_reply_tx.clone()))
+            .send(NnCommand::Run(Arc::clone(shared), nn_rx.clone(), nn_credit_rx.clone(), nn_reply_tx.clone()))
             .expect("persistent nn worker is alive");
         for sender in &self.worker_commands {
             sender
@@ -294,30 +279,11 @@ impl<O: SearchObserver> WorkerPool<O> {
             self.job_done.recv().expect("persistent worker completion");
         }
     }
-    pub(crate) fn nn_permit_limit(&self) -> usize {
-        self.nn_permit_limit
+    pub(crate) fn nn_credit_limit(&self) -> usize {
+        self.nn_credit_limit
     }
-    pub(crate) fn eval_batch_size(&self) -> usize {
-        self.eval_batch_size
-    }
-
     pub(crate) fn worker_count(&self) -> usize {
         self.worker_commands.len()
-    }
-    pub(crate) fn assert_compatible(&self, config: &ResolvedSearchConfig) {
-        debug_assert_eq!(
-            self.worker_commands.len(),
-            config.threads,
-            "worker pool capacity changed"
-        );
-        debug_assert_eq!(
-            self.eval_batch_size, config.eval_batch_size,
-            "worker pool batch size changed"
-        );
-        debug_assert_eq!(
-            self.nn_permit_limit, config.nn_permit_limit,
-            "worker pool nn window changed"
-        );
     }
 }
 impl<O: SearchObserver> Drop for WorkerPool<O> {
@@ -332,33 +298,21 @@ impl<O: SearchObserver> Drop for WorkerPool<O> {
     }
 }
 
-fn cancel_worker_queues<O: SearchObserver>(
+/// stop 后不再启动上游工作；已经得到结果的 Reply / Backprop 继续完成。
+fn cancel_pending_worker_queues<O: SearchObserver>(
     shared: &Shared<O>,
     select_rx: &Receiver<SelectEvent<O::Stamp>>,
     expand_rx: &Receiver<ExpandEvent<O::Stamp>>,
     eval_rx: &Receiver<EvalEvent<O::Stamp>>,
-    reply_rx: &Receiver<NnReply<O::Stamp>>,
-    backprop_rx: &Receiver<BackpropEvent<O::Stamp>>,
 ) {
-    shared.cancel_deferred_eval_events();
     while let Ok(event) = select_rx.try_recv() {
-        event.cancel();
-        shared.finish(1, false);
+        shared.cancel_event(event.into_event());
     }
     while let Ok(event) = expand_rx.try_recv() {
         shared.cancel_claim(event.into_event());
     }
     while let Ok(job) = eval_rx.try_recv() {
         shared.cancel_claim(job.event);
-    }
-    while let Ok(reply) = reply_rx.try_recv() {
-        cancel_evaluation(shared, reply.event.event);
-    }
-    while let Ok(event) = backprop_rx.try_recv() {
-        let held = usize::from(event.holds_nn_permit);
-        event.cancel();
-        shared.release_nn_permits(held);
-        shared.finish(1, false);
     }
 }
 
@@ -367,22 +321,40 @@ fn worker<O: SearchObserver>(
     select_rx: Receiver<SelectEvent<O::Stamp>>,
     expand_rx: Receiver<ExpandEvent<O::Stamp>>,
     eval_rx: Receiver<EvalEvent<O::Stamp>>,
-    reply_rx: Receiver<NnReply<O::Stamp>>,
+    reply_rx: Receiver<NnReplyBatch<O::Stamp>>,
     nn_tx: Sender<NnRequest<O::Stamp>>,
     backprop_rx: Receiver<BackpropEvent<O::Stamp>>,
 ) {
     loop {
         if shared.stopping.load(Ordering::Acquire) {
-            cancel_worker_queues(&shared, &select_rx, &expand_rx, &eval_rx, &reply_rx, &backprop_rx);
+            cancel_pending_worker_queues(&shared, &select_rx, &expand_rx, &eval_rx);
+            if let Ok(event) = backprop_rx.try_recv() {
+                process_backprop_event(&shared, event, &backprop_rx);
+                continue;
+            }
+            if let Ok(mut reply) = reply_rx.try_recv() {
+                if O::ENABLED {
+                    observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply);
+                }
+                if let Err(error) = handle_nn_reply_batch(&shared, reply) {
+                    shared.fail(error);
+                }
+                continue;
+            }
             if shared.outstanding.load(Ordering::Acquire) == 0 {
                 break;
             }
-            thread::yield_now();
-            continue;
-        }
-        if let Some(event) = shared.take_deferred_eval_event() {
-            if let Err(error) = process_eval_event(&shared, &nn_tx, event, true) {
-                shared.fail(error);
+            crossbeam_channel::select! {
+                recv(backprop_rx) -> result => {
+                    if let Ok(event) = result { process_backprop_event(&shared, event, &backprop_rx); }
+                },
+                recv(reply_rx) -> result => {
+                    if let Ok(mut reply) = result {
+                        if O::ENABLED { observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply); }
+                        if let Err(error) = handle_nn_reply_batch(&shared, reply) { shared.fail(error); }
+                    }
+                },
+                default(RECEIVE_POLL) => {},
             }
             continue;
         }
@@ -394,7 +366,7 @@ fn worker<O: SearchObserver>(
             if O::ENABLED {
                 observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply);
             }
-            if let Err(error) = handle_nn_reply(&shared, reply) {
+            if let Err(error) = handle_nn_reply_batch(&shared, reply) {
                 shared.fail(error);
             }
             continue;
@@ -403,7 +375,7 @@ fn worker<O: SearchObserver>(
             if O::ENABLED {
                 observe_queue_wait(&mut job.queued_at, &shared.observer, QueueKind::Eval);
             }
-            if let Err(error) = process_eval_event(&shared, &nn_tx, job, false) {
+            if let Err(error) = process_eval_event(&shared, &nn_tx, job) {
                 shared.fail(error);
             }
             continue;
@@ -429,14 +401,14 @@ fn worker<O: SearchObserver>(
             recv(reply_rx) -> result => {
                 if let Ok(mut reply) = result {
                     if O::ENABLED { observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply); }
-                    let outcome = handle_nn_reply(&shared, reply);
+                    let outcome = handle_nn_reply_batch(&shared, reply);
                     if let Err(error) = outcome { shared.fail(error); }
                 }
             },
             recv(eval_rx) -> result => {
                 if let Ok(mut job) = result {
                     if O::ENABLED { observe_queue_wait(&mut job.queued_at, &shared.observer, QueueKind::Eval); }
-                    let outcome = process_eval_event(&shared, &nn_tx, job, false);
+                    let outcome = process_eval_event(&shared, &nn_tx, job);
                     if let Err(error) = outcome { shared.fail(error); }
                 }
             },
@@ -460,15 +432,7 @@ fn worker<O: SearchObserver>(
 fn persistent_worker<O: SearchObserver>(commands: Receiver<WorkerCommand<O>>, done: Sender<()>) {
     while let Ok(command) = commands.recv() {
         match command {
-            WorkerCommand::Run {
-                shared,
-                select_rx,
-                expand_rx,
-                eval_rx,
-                nn_reply_rx,
-                nn_tx,
-                backprop_rx,
-            } => {
+            WorkerCommand::Run { shared, select_rx, expand_rx, eval_rx, nn_reply_rx, nn_tx, backprop_rx } => {
                 worker(shared, select_rx, expand_rx, eval_rx, nn_reply_rx, nn_tx, backprop_rx);
                 let _ = done.send(());
             }
@@ -479,48 +443,108 @@ fn persistent_worker<O: SearchObserver>(commands: Receiver<WorkerCommand<O>>, do
 
 fn nn_worker<O: SearchObserver>(
     shared: Arc<Shared<O>>,
-    receiver: Receiver<NnRequest<O::Stamp>>,
-    reply_tx: Sender<NnReply<O::Stamp>>,
+    request_rx: Receiver<NnRequest<O::Stamp>>,
+    credit_rx: Receiver<usize>,
+    reply_tx: Sender<NnReplyBatch<O::Stamp>>,
     batch_size: usize,
+    credit_limit: usize,
 ) {
+    let mut requests = Vec::with_capacity(batch_size);
+    let mut samples = Vec::with_capacity(batch_size);
+    let mut in_flight = 0;
     loop {
-        let mut first = match receiver.recv_timeout(RECEIVE_POLL) {
-            Ok(request) => request,
-            Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => {
-                while let Ok(request) = receiver.try_recv() {
-                    send_nn_reply(
-                        &reply_tx,
-                        NnReply::new(request.event, Err(EnginError::PortIncomplete("stream nn stopping"))),
-                    );
-                }
-                break;
+        if shared.stopping.load(Ordering::Acquire) {
+            while let Ok(request) = request_rx.try_recv() {
+                shared.cancel_claim(request.event.event);
             }
+            break;
+        }
+        while let Ok(count) = credit_rx.try_recv() {
+            debug_assert!(count <= in_flight, "NN credit underflow");
+            in_flight -= count;
+        }
+
+        if in_flight == credit_limit {
+            match credit_rx.recv_timeout(RECEIVE_POLL) {
+                Ok(count) => {
+                    debug_assert!(count <= in_flight, "NN credit underflow");
+                    in_flight -= count;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            continue;
+        }
+
+        let request = match request_rx.recv_timeout(RECEIVE_POLL) {
+            Ok(request) => request,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        if O::ENABLED {
-            observe_queue_wait(&mut first.queued_at, &shared.observer, QueueKind::Nn);
-        }
-        let mut requests = vec![first];
-        while requests.len() < batch_size {
-            match receiver.try_recv() {
-                Ok(mut request) => {
-                    if O::ENABLED {
-                        observe_queue_wait(&mut request.queued_at, &shared.observer, QueueKind::Nn);
-                    }
-                    requests.push(request);
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        requests.push(request);
+        let deadline = Instant::now() + NN_BATCH_GATHER;
+        while requests.len() < batch_size && Instant::now() < deadline {
+            while let Ok(count) = credit_rx.try_recv() {
+                debug_assert!(count <= in_flight, "NN credit underflow");
+                in_flight -= count;
+            }
+            if in_flight + requests.len() >= credit_limit {
+                std::hint::spin_loop();
+                continue;
+            }
+            match request_rx.try_recv() {
+                Ok(request) => requests.push(request),
+                Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                Err(TryRecvError::Disconnected) => break,
             }
         }
-        infer_nn_batch(&shared, requests, &reply_tx);
+        if O::ENABLED {
+            for (index, request) in requests.iter_mut().enumerate() {
+                observe_queue_wait(&mut request.queued_at, &shared.observer, QueueKind::Nn);
+                shared.observer.on_peak_inflight(in_flight + index + 1);
+            }
+        }
+        in_flight += requests.len();
+        if shared.stopping.load(Ordering::Acquire) {
+            for request in requests.drain(..) {
+                shared.cancel_evaluation(request.event.event);
+            }
+            continue;
+        }
+        let _timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Nn);
+        samples.clear();
+        samples.extend(requests.iter().map(|request| request.planes));
+        match infer_nn_batch(&shared, &samples) {
+            Ok(output) => {
+                send_nn_reply_batch(&reply_tx, requests.drain(..).map(|request| request.event).collect(), Ok(output))
+            }
+            Err(error) => {
+                send_nn_reply_batch(&reply_tx, requests.drain(..).map(|request| request.event).collect(), Err(error))
+            }
+        }
     }
 }
-fn persistent_nn_worker<O: SearchObserver>(commands: Receiver<NnCommand<O>>, done: Sender<()>, batch_size: usize) {
+
+fn send_nn_reply_batch<S: QueueStamp>(
+    reply_tx: &Sender<NnReplyBatch<S>>,
+    events: Vec<EvalEvent<S>>,
+    result: Result<Arc<EncodedBatch>, EnginError>,
+) {
+    let mut reply = NnReplyBatch::new(events, result);
+    reply.mark_queued();
+    let _ = reply_tx.send(reply);
+}
+
+fn persistent_nn_worker<O: SearchObserver>(
+    commands: Receiver<NnCommand<O>>,
+    done: Sender<()>,
+    batch_size: usize,
+    credit_limit: usize,
+) {
     while let Ok(command) = commands.recv() {
         match command {
-            NnCommand::Run(shared, receiver, reply_tx) => {
-                nn_worker(shared, receiver, reply_tx, batch_size);
+            NnCommand::Run(shared, request_rx, credit_rx, reply_tx) => {
+                nn_worker(shared, request_rx, credit_rx, reply_tx, batch_size, credit_limit);
                 let _ = done.send(());
             }
             NnCommand::Shutdown => break,

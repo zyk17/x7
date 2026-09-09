@@ -21,9 +21,7 @@ unsafe extern "C" {
 }
 
 fn check(status: i32, what: &str) -> Result<(), EnginError> {
-    (status == 0)
-        .then_some(())
-        .ok_or_else(|| EnginError::Onnx(format!("CUDA {what}: {status}")))
+    (status == 0).then_some(()).ok_or_else(|| EnginError::Neural(format!("CUDA {what}: {status}")))
 }
 
 pub struct CudaStream(*mut c_void);
@@ -70,12 +68,9 @@ impl DeviceBuffer {
 
     pub fn upload_async(&self, src: &[u8], stream: &CudaStream) -> Result<(), EnginError> {
         if src.len() > self.bytes {
-            return Err(EnginError::Onnx("CUDA H2D overflow".into()));
+            return Err(EnginError::Neural("CUDA H2D overflow".into()));
         }
-        check(
-            unsafe { x7_cuda_memcpy_h2d_async(self.ptr, src.as_ptr().cast(), src.len(), stream.as_ptr()) },
-            "H2D",
-        )
+        check(unsafe { x7_cuda_memcpy_h2d_async(self.ptr, src.as_ptr().cast(), src.len(), stream.as_ptr()) }, "H2D")
     }
 }
 
@@ -129,10 +124,7 @@ pub fn expand_planes_async(
     n_planes: u32,
     stream: &CudaStream,
 ) -> Result<(), EnginError> {
-    check(
-        unsafe { x7_expand_planes_f32(dense.ptr.cast(), sparse.ptr, n_planes, stream.as_ptr()) },
-        "expand",
-    )
+    check(unsafe { x7_expand_planes_f32(dense.ptr.cast(), sparse.ptr, n_planes, stream.as_ptr()) }, "expand")
 }
 
 /// 从任意 device 指针异步 D2H（ORT 输出 Tensor 的 data_ptr）。

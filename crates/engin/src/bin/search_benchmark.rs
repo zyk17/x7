@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use engin::neural::backend::Backend;
 use engin::neural::onnx::OnnxBackend;
-use engin::search::{Search, SearchConfig, SearchLimits, SearchParams, root_stats};
+use engin::search::{Search, SearchConfig, SearchLimits, SearchParams, SearchTree, root_stats};
 use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
 
 struct Args {
@@ -86,25 +86,16 @@ fn parse_args() -> Result<Args, String> {
             }
             "--cpuct" => cpucts = parse_float_list("--cpuct", &args.next().ok_or("--cpuct requires a number")?, false)?,
             "--cpuct-base" => {
-                cpuct_bases = parse_float_list(
-                    "--cpuct-base",
-                    &args.next().ok_or("--cpuct-base requires a number")?,
-                    true,
-                )?
+                cpuct_bases =
+                    parse_float_list("--cpuct-base", &args.next().ok_or("--cpuct-base requires a number")?, true)?
             }
             "--cpuct-factor" => {
-                cpuct_factors = parse_float_list(
-                    "--cpuct-factor",
-                    &args.next().ok_or("--cpuct-factor requires a number")?,
-                    false,
-                )?
+                cpuct_factors =
+                    parse_float_list("--cpuct-factor", &args.next().ok_or("--cpuct-factor requires a number")?, false)?
             }
             "--fpu-reduction" => {
-                fpu_reduction = parse_float(
-                    "--fpu-reduction",
-                    &args.next().ok_or("--fpu-reduction requires a number")?,
-                    false,
-                )?
+                fpu_reduction =
+                    parse_float("--fpu-reduction", &args.next().ok_or("--fpu-reduction requires a number")?, false)?
             }
             "--variance-bonus-scale" => {
                 variance_bonus_scales = parse_float_list(
@@ -166,65 +157,34 @@ fn parse_args() -> Result<Args, String> {
 fn parse_float(name: &str, value: &str, positive: bool) -> Result<f32, String> {
     let value = value.parse::<f32>().map_err(|_| format!("{name} must be finite"))?;
     if !value.is_finite() || value < 0.0 || (positive && value == 0.0) {
-        return Err(format!(
-            "{name} must be {}",
-            if positive { "positive" } else { "non-negative" }
-        ));
+        return Err(format!("{name} must be {}", if positive { "positive" } else { "non-negative" }));
     }
     Ok(value)
 }
 
 fn parse_float_list(name: &str, text: &str, positive: bool) -> Result<Vec<f32>, String> {
-    let values: Result<Vec<_>, _> = text
-        .split(',')
-        .map(|value| parse_float(name, value.trim(), positive))
-        .collect();
+    let values: Result<Vec<_>, _> = text.split(',').map(|value| parse_float(name, value.trim(), positive)).collect();
     let values = values?;
-    if values.is_empty() {
-        Err(format!("{name} requires at least one number"))
-    } else {
-        Ok(values)
-    }
+    if values.is_empty() { Err(format!("{name} requires at least one number")) } else { Ok(values) }
 }
 
 fn parse_u64_list(text: &str) -> Result<Vec<u64>, String> {
-    text.split(',')
-        .map(|part| {
-            part.trim()
-                .parse()
-                .map_err(|_| format!("invalid trace milestone: {part}"))
-        })
-        .collect()
+    text.split(',').map(|part| part.trim().parse().map_err(|_| format!("invalid trace milestone: {part}"))).collect()
 }
 
 fn parse_move_list(text: &str) -> Result<Vec<String>, String> {
-    let moves: Vec<_> = text
-        .split(',')
-        .map(str::trim)
-        .filter(|move_text| !move_text.is_empty())
-        .map(str::to_owned)
-        .collect();
-    if moves.is_empty() {
-        Err("--track requires at least one move".into())
-    } else {
-        Ok(moves)
-    }
+    let moves: Vec<_> =
+        text.split(',').map(str::trim).filter(|move_text| !move_text.is_empty()).map(str::to_owned).collect();
+    if moves.is_empty() { Err("--track requires at least one move".into()) } else { Ok(moves) }
 }
 
 /// 与 Engine 保持相同的根着过滤语义。
 fn root_filter(history: &PositionHistory, requested: &[String]) -> Result<Vec<xiangqi_core::Move>, String> {
     let board = history.last().board();
     let legal = board.generate_legal_moves();
-    let selected: Vec<_> = requested
-        .iter()
-        .filter_map(|text| board.parse_move(text).ok())
-        .filter(|mv| legal.contains(mv))
-        .collect();
-    if !requested.is_empty() && selected.is_empty() {
-        Err("No legal searchmoves.".into())
-    } else {
-        Ok(selected)
-    }
+    let selected: Vec<_> =
+        requested.iter().filter_map(|text| board.parse_move(text).ok()).filter(|mv| legal.contains(mv)).collect();
+    if !requested.is_empty() && selected.is_empty() { Err("No legal searchmoves.".into()) } else { Ok(selected) }
 }
 
 fn sorted_root_edges(search: &Search) -> Option<Vec<engin::search::RootEdgeStats>> {
@@ -244,11 +204,7 @@ fn print_roots(search: &Search, root_is_black: bool, top: usize, tracked: &[Stri
     let Some(edges) = sorted_root_edges(search) else {
         return;
     };
-    println!(
-        "    root candidates top {}/{}: move       P    done flight       Q",
-        edges.len().min(top),
-        edges.len()
-    );
+    println!("    root candidates top {}/{}: move       P    done flight       Q", edges.len().min(top), edges.len());
     for edge in edges.iter().take(top) {
         let mv = if root_is_black { edge.mv.flip() } else { edge.mv };
         println!(
@@ -326,19 +282,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "params: cpuct={cpuct:.3} cpuct_base={cpuct_base:.0} cpuct_factor={cpuct_factor:.3} fpu={:.3} variance_bonus_scale={variance_bonus_scale:.3} virtual_mean_fpu_scale={:.2} lcb={:.3}",
                         args.fpu_reduction, args.virtual_mean_fpu_scale, args.decision_lcb_stdevs
                     );
+                    let tree = SearchTree::new(Arc::clone(&history));
                     let mut search = Search::new(
                         Arc::new(OnnxBackend::from_file(&args.onnx)?) as Arc<dyn Backend>,
-                        Arc::clone(&history),
-                        SearchConfig {
-                            params,
-                            ..SearchConfig::default()
-                        },
+                        &tree,
+                        SearchConfig { params, ..SearchConfig::default() },
+                        engin::search::NoopObserver,
                     );
                     for &milestone in &args.trace {
-                        // `Search::run_playouts` 的参数是当前 Search 的累计目标；trace
+                        // `SearchLimits::max_playouts` 是当前 Search 的累计目标；trace
                         // milestone 不能再减去上一项，否则 100→1000 会错误停在 1000 而
                         // 非“额外跑 900”后的 1000。
-                        search.run_with_limits(SearchLimits {
+                        search.run(SearchLimits {
                             max_playouts: Some(milestone),
                             root_move_filter: filter.clone(),
                             ..Default::default()
@@ -347,7 +302,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         print_roots(&search, root_is_black, args.root_top, &args.track);
                     }
                     if args.trace.last().copied().unwrap_or(0) < args.playouts {
-                        search.run_with_limits(SearchLimits {
+                        search.run(SearchLimits {
                             max_playouts: Some(args.playouts),
                             root_move_filter: filter.clone(),
                             ..Default::default()
