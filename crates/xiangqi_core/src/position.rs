@@ -2,7 +2,7 @@
 
 use crate::board::board_to_fen;
 use crate::hashcat::{hash_cat, hash_cat_u128s};
-use crate::{ChessBoard, Move};
+use crate::{ChessBoard, LegalMoveList, Move};
 
 /// 对局结果。枚举顺序使 `max()` 优先选更好的结果。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
@@ -159,8 +159,8 @@ impl PositionHistory {
 
     /// 返回搜索 worker 可复制的最小历史窗口。
     ///
-    /// 吃子或兵走会将 `rule60_ply` 清零；此前局面不可能再与当前局面构成重复，
-    /// 连将/长捉也不会跨过这次零化着。因此规则只需保留最近一次零化着之后的
+    /// 吃子会将 `rule60_ply` 清零；此前局面不可能再与当前局面构成重复，
+    /// 连将/长捉也不会跨过这次吃子。因此规则只需保留最近一次零化着之后的
     /// history。另一方面，NN 需要固定数量的最近局面平面，故两者取更早的起点。
     /// 原完整 history 仍由 UCI/Engine 持有，用于跨回合定位和 root 裁决。
     pub fn search_window(&self, recent_positions: usize) -> Self {
@@ -207,15 +207,23 @@ impl PositionHistory {
     }
 
     pub fn compute_game_result(&self) -> GameResult {
+        let legal_moves = self.last().board.generate_legal_moves();
+        self.compute_game_result_after_legal_moves(&legal_moves)
+    }
+
+    /// 完整裁决当前局面；`legal_moves` 必须来自当前局面。
+    ///
+    /// Expand 已经要保留合法着供 NN policy 对齐，故可复用该结果而不重复生成。
+    pub fn compute_game_result_after_legal_moves(&self, legal_moves: &LegalMoveList) -> GameResult {
         let last = self.last();
-        if last.board.generate_legal_moves().is_empty() {
+        if legal_moves.is_empty() {
             return if self.is_black_to_move() { GameResult::WhiteWon } else { GameResult::BlackWon };
         }
         if last.repetitions >= 2 {
             let result = self.rule_judge();
             return if self.is_black_to_move() { result } else { result.negate() };
         }
-        if !last.board.has_mating_material() || last.rule60_ply >= 120 {
+        if last.rule60_ply >= 120 || !last.board.has_mating_material_after_legal_moves(legal_moves) {
             return GameResult::Draw;
         }
         GameResult::Undecided
@@ -226,12 +234,7 @@ impl PositionHistory {
     /// 对外只通过 `compute_game_result` 暴露绝对红黑胜负。
     fn rule_judge(&self) -> GameResult {
         let last = self.last();
-        if last.rule60_ply < 4 {
-            return GameResult::Undecided;
-        }
-
         let len = self.positions.len();
-        assert!(len >= 3, "RuleJudge requires a repetition history");
 
         let mut check_them = last.board.is_under_check();
         let mut check_us = self.positions[len - 2].board.is_under_check();
@@ -270,23 +273,18 @@ impl PositionHistory {
                 };
             }
 
-            if index >= 1 {
-                if self.positions[index - 1].board.is_under_check() {
-                    chase_them = 0;
-                    chase_us = 0;
-                } else {
-                    check_us = false;
-                }
-                chase_them &= position.board.them_chased() & !self.positions[index - 1].board.us_chased();
-                if index >= 2 {
-                    chase_us &=
-                        self.positions[index - 1].board.them_chased() & !self.positions[index - 2].board.us_chased();
-                }
-            }
-
             if index < 2 {
                 break;
             }
+
+            if self.positions[index - 1].board.is_under_check() {
+                chase_them = 0;
+                chase_us = 0;
+            } else {
+                check_us = false;
+            }
+            chase_them &= position.board.them_chased() & !self.positions[index - 1].board.us_chased();
+            chase_us &= self.positions[index - 1].board.them_chased() & !self.positions[index - 2].board.us_chased();
             index -= 2;
         }
 

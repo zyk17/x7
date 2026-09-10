@@ -410,11 +410,17 @@ impl ChessBoard {
     }
 
     pub fn has_mating_material(&self) -> bool {
+        let legal_moves = self.generate_legal_moves();
+        self.has_mating_material_after_legal_moves(&legal_moves)
+    }
+
+    /// 在调用方已生成当前局面的合法着时复用它，避免稀疏残局重复生成。
+    pub(crate) fn has_mating_material_after_legal_moves(&self, legal_moves: &[Move]) -> bool {
         if self.pawns.count() == 0 && self.rooks.count() == 0 && self.knights.count() == 0 {
             let level = mating_draw_level(self);
             if level != DrawLevel::No {
                 if level == DrawLevel::Mate {
-                    for mv in self.generate_legal_moves() {
+                    for &mv in legal_moves {
                         let mut after = self.clone();
                         after.apply_move(mv);
                         after.mirror();

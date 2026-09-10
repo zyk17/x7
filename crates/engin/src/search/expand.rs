@@ -1,6 +1,6 @@
 //! 叶子终局分类（不是 `publish_edges`，也不是 `ExpansionState::Expanded`）。
 //!
-//! 只回答「要不要 NN」：死/子力不足/重复/rule60 → Terminal，否则 Evaluate。
+//! 只回答「要不要 NN」：规则终局 → Terminal，否则 Evaluate。
 //! Expand task 调用；root 启动门禁复用 `game_terminal_value`。
 //!
 //! `mcts2`：`rep==1` 继续搜；`rep>=2` 才 RuleJudge。终局 `m` 用于排序。
@@ -19,29 +19,12 @@ pub(crate) enum ExpandKind {
 pub(crate) fn classify_expand(history: &PositionHistory) -> ExpandKind {
     let board = history.last().board();
     let legal_moves = board.generate_legal_moves();
-    // `wl` 按 incoming edge / 上一走子方视角保存。
-    if legal_moves.is_empty() {
-        return ExpandKind::Terminal { wl: 1.0, draw: 0.0, plies_left: 0.0 };
-    }
-    if !board.has_mating_material() {
-        return ExpandKind::Terminal { wl: 0.0, draw: 1.0, plies_left: 0.0 };
-    }
-    if let Some((wl, draw, plies_left)) = path_terminal_value(history) {
-        return ExpandKind::Terminal { wl, draw, plies_left };
+    let result = history.compute_game_result_after_legal_moves(&legal_moves);
+    if result != GameResult::Undecided {
+        let (wl, draw) = terminal_wl_for_node(result, history.last().is_black_to_move());
+        return ExpandKind::Terminal { wl, draw, plies_left: 0.0 };
     }
     ExpandKind::Evaluate { legal_moves }
-}
-
-/// 依赖完整 variation history 的终局：重复裁决与 rule60。
-///
-/// 当前路径树的 node key 已包含完整路径，故同一 node 的规则 history 不会变化；
-/// 重复与 rule60 只在首次 Eval 分类，root 则在启动门禁分类。
-pub(crate) fn path_terminal_value(history: &PositionHistory) -> Option<(f32, f32, f32)> {
-    let position = history.last();
-    if position.repetitions() < 2 && position.rule60_ply() < 120 {
-        return None;
-    }
-    game_terminal_value(history)
 }
 
 /// 将完整规则裁决转换为 incoming-edge value，供 root 启动门禁使用。

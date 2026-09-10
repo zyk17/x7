@@ -134,6 +134,8 @@ fn cycle_examples() {
             .position_history();
         assert_eq!(history.last().repetitions(), 2, "{name}: must end in a threefold repetition");
         assert_eq!(history.compute_game_result(), expected, "{name}");
+        let legal_moves = history.last().board().generate_legal_moves();
+        assert_eq!(history.compute_game_result_after_legal_moves(&legal_moves), expected, "{name}: reused legal moves");
     }
 }
 
