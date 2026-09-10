@@ -672,7 +672,6 @@ fn print_run_report(
     println!("Execution (total / avg / max)");
     print_execution("select", bench.select_execution, None);
     print_execution("expand", bench.expand_execution, None);
-    print_execution("eval", bench.eval_execution, None);
     print_execution("nn", bench.nn_execution, Some(stats.network_evaluations));
     print_execution("nn_reply", bench.nn_reply_execution, Some(stats.network_evaluations));
     print_execution("backprop", bench.backprop_execution, Some(backprop_items));
@@ -681,7 +680,6 @@ fn print_run_report(
     println!("Queues (avg/max us)");
     print_queue("select", bench.select_queue);
     print_queue("expand", bench.expand_queue);
-    print_queue("eval", bench.eval_queue);
     print_queue("nn", bench.nn_queue);
     print_queue("nn_reply", bench.nn_reply_queue);
 

@@ -2,7 +2,7 @@
 //!
 //! 树走组装（claim / collision / 选边下降）在本文件；选边公式在 `select`，
 //! 事件编排在本文件，worker 线程循环在 `workerpool`；NN 编码/回包与回传算术分别在
-//! `eval` / `backprop`。
+//! `nn` / `backprop`。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,16 +14,17 @@ use parking_lot::{Condvar, Mutex};
 use xiangqi_core::{Move, PositionHistory};
 
 use crate::EnginError;
-use crate::neural::MOVE_HISTORY;
 use crate::neural::backend::Backend;
 use crate::neural::cache::{DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, EvalCache, EvalCacheKey};
+use crate::neural::{FillEmptyHistory, MOVE_HISTORY, encode_position_input_planes};
 
-use super::backprop::{complete_batch, complete_one};
+use super::backprop::{Backprop, complete_batch, complete_one};
 use super::expand::{ExpandKind, classify_expand, game_terminal_value};
+use super::nn::publish_eval;
 use super::observer::{ExecutionKind, ExecutionTimer, NoopObserver, SearchObserver};
 use super::param::{SearchConfig, SearchParams};
 use super::select::select_edge;
-use super::workerpool::{BackpropEvent, EvalEvent, Event, ExpandEvent, NnRequest, SelectEvent, WorkerJob, WorkerPool};
+use super::workerpool::{ExpandEvent, NnItem, NnRequest, SelectEvent, Selection, WorkerJob, WorkerPool};
 use super::{EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree};
 
 pub(crate) const RECEIVE_POLL: Duration = Duration::from_millis(10);
@@ -60,10 +61,9 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) idle: Condvar,
     pub(crate) select_tx: Sender<SelectEvent<O::Stamp>>,
     pub(crate) expand_tx: Sender<ExpandEvent<O::Stamp>>,
-    pub(crate) eval_tx: Sender<EvalEvent<O::Stamp>>,
     /// 撞上 `Claimed` 叶子的 playout。先留着 reservation / μ；该叶子自己的
     /// backprop `complete` 之后再按 `node_id` 摘出来 cancel。
-    pub(crate) collision_waiters: Mutex<Vec<Event>>,
+    pub(crate) collision_waiters: Mutex<Vec<Selection>>,
 }
 
 impl<O: SearchObserver> Shared<O> {
@@ -98,23 +98,23 @@ impl<O: SearchObserver> Shared<O> {
         let _ = previous;
     }
 
-    /// 取消 owned event，并归还其 reservation。
-    pub(crate) fn cancel_event(&self, event: Event) {
-        event.cancel();
+    /// 取消 owned selection，并归还其 reservation。
+    pub(crate) fn cancel_selection(&self, selection: Selection) {
+        selection.cancel();
         self.finish(1, false);
     }
 
     /// 取消尚未取得 NN permit 的叶子，并归还其 reservation。
-    pub(crate) fn cancel_claim(&self, event: Event) {
-        self.abort_claim(event.node_id);
-        self.cancel_event(event);
+    pub(crate) fn cancel_claim(&self, selection: Selection) {
+        self.abort_claim(selection.node_id);
+        self.cancel_selection(selection);
     }
 
-    /// 取消已获 NN credit 的 Eval event。
-    pub(crate) fn cancel_evaluation(&self, event: Event) {
-        self.abort_claim(event.node_id);
+    /// 取消已获 NN credit 的叶子。
+    pub(crate) fn cancel_evaluation(&self, selection: Selection) {
+        self.abort_claim(selection.node_id);
         self.return_nn_credits(1);
-        self.cancel_event(event);
+        self.cancel_selection(selection);
     }
 
     /// 清除 Claimed 状态及其所有 collision reservation。
@@ -154,20 +154,24 @@ impl<O: SearchObserver> Shared<O> {
         if O::ENABLED {
             self.observer.on_collision(event.variation.moves().len());
         }
-        let event = event.into_event();
+        let selection = event.into_selection();
         {
             let mut waiters = self.collision_waiters.lock();
             // owner 可在本次 Select 看到 Claimed 后、waiter 入队前完成或取消；此处复查
             // 避免把永远不会再由 owner 唤醒的 reservation 留在 waiter 表。
             if !self.is_stopping()
-                && self.arena.get(event.node_id).expect("collision event node lives until drain").expansion_state()
+                && self
+                    .arena
+                    .get(selection.node_id)
+                    .expect("collision selection node lives until drain")
+                    .expansion_state()
                     == ExpansionState::Claimed
             {
-                waiters.push(event);
+                waiters.push(selection);
                 return;
             }
         }
-        self.cancel_event(event);
+        self.cancel_selection(selection);
     }
 
     pub(crate) fn cancel_collisions(&self, id: NodeId) {
@@ -183,8 +187,8 @@ impl<O: SearchObserver> Shared<O> {
         }
         drop(waiters);
         let n = parked.len();
-        for event in parked {
-            event.cancel();
+        for selection in parked {
+            selection.cancel();
         }
         self.finish(n, false);
     }
@@ -195,20 +199,6 @@ impl<O: SearchObserver> Shared<O> {
             *current = Some(error);
         }
         self.request_stop();
-    }
-
-    pub(crate) fn send_eval(&self, mut event: EvalEvent<O::Stamp>) {
-        event.mark_queued();
-        if let Err(error) = self.eval_tx.send(event) {
-            self.cancel_claim(error.0.event);
-        }
-    }
-
-    pub(crate) fn send_expand(&self, mut event: ExpandEvent<O::Stamp>) {
-        event.mark_queued();
-        if let Err(error) = self.expand_tx.send(event) {
-            self.cancel_claim(error.0.into_event());
-        }
     }
 
     pub(crate) fn stats(&self) -> Stats {
@@ -247,14 +237,15 @@ pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut ev
     let _timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Select);
     loop {
         if shared.is_stopping() {
-            shared.cancel_event(event.into_event());
+            shared.cancel_selection(event.into_selection());
             return;
         }
-        let node = shared.arena.get(event.event.node_id).expect("event node lives until job drain");
+        let node = shared.arena.get(event.selection.node_id).expect("selection node lives until job drain");
         match node.expansion_state() {
             ExpansionState::Unexpanded => {
                 if node.try_claim() {
-                    shared.send_expand(event);
+                    event.mark_queued();
+                    shared.expand_tx.send(event).expect("search workers live until finish");
                     return;
                 }
             }
@@ -265,10 +256,7 @@ pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut ev
             ExpansionState::Terminal => {
                 let (wl, draw, plies_left) = node.terminal_value().expect("terminal node has exact value");
                 drop(_timer);
-                process_backprop_one(
-                    shared,
-                    BackpropEvent::without_nn_credit(event.into_event(), wl, draw, plies_left),
-                );
+                process_backprop_one(shared, Backprop::without_nn_credit(event.into_selection(), wl, draw, plies_left));
                 return;
             }
             ExpansionState::Expanded => {
@@ -287,14 +275,18 @@ pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut ev
     }
 }
 
-/// 只处理已 claim 叶子的规则、合法着与后续任务分流。
-pub(crate) fn process_expand_event<O: SearchObserver>(shared: &Shared<O>, event: ExpandEvent<O::Stamp>) {
+/// 处理已 claim 叶子的规则、缓存与 NN 前准备。
+pub(crate) fn process_expand_event<O: SearchObserver>(
+    shared: &Shared<O>,
+    nn_tx: &Sender<NnRequest<O::Stamp>>,
+    event: ExpandEvent<O::Stamp>,
+) {
     let timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Expand);
     if shared.is_stopping() {
-        shared.cancel_claim(event.into_event());
+        shared.cancel_claim(event.into_selection());
         return;
     }
-    let node = shared.arena.get(event.event.node_id).expect("expand node lives until job drain");
+    let node = shared.arena.get(event.selection.node_id).expect("expand node lives until job drain");
     let history = event.variation.history();
     match classify_expand(&history) {
         ExpandKind::Terminal { wl, draw, plies_left } => {
@@ -302,36 +294,48 @@ pub(crate) fn process_expand_event<O: SearchObserver>(shared: &Shared<O>, event:
             let root = event.node_path()[0];
             shared.arena.propagate_proven_terminals(event.node_path(), root);
             drop(timer);
-            process_backprop_one(shared, BackpropEvent::without_nn_credit(event.into_event(), wl, draw, plies_left));
+            process_backprop_one(shared, Backprop::without_nn_credit(event.into_selection(), wl, draw, plies_left));
         }
         ExpandKind::Evaluate { legal_moves } => {
-            shared.send_eval(EvalEvent {
-                event: event.into_event(),
-                cache_key: EvalCacheKey::new(history.last(), legal_moves.len()),
-                legal_moves,
-                history,
-                queued_at: O::Stamp::default(),
-            });
+            let selection = event.into_selection();
+            if shared.is_stopping() {
+                shared.cancel_claim(selection);
+                return;
+            }
+            let cache_key = EvalCacheKey::new(history.last(), legal_moves.len());
+            if let Some(eval) = shared.cache.get_evaluation(cache_key) {
+                if O::ENABLED {
+                    shared.observer.on_cache_hit();
+                }
+                drop(timer);
+                process_backprop_one(shared, publish_eval(shared, selection, legal_moves, eval, false));
+                return;
+            }
+            let planes = encode_position_input_planes(&history, FillEmptyHistory::No);
+            let mut request = NnRequest::new(NnItem { selection, legal_moves, cache_key }, planes);
+            request.mark_queued();
+            nn_tx.send(request).expect("NN scheduler lives until finish");
         }
     }
 }
 
 /// 同一 NN batch 的回传直接进入这里，合并 node 写入。
-pub(crate) fn process_backprop_batch<O: SearchObserver>(shared: &Shared<O>, mut events: Vec<BackpropEvent>) {
-    match events.len() {
+pub(crate) fn process_backprop_batch<O: SearchObserver>(shared: &Shared<O>, mut backprops: Vec<Backprop>) {
+    match backprops.len() {
         0 => return,
         1 => {
-            process_backprop_one(shared, events.pop().expect("one backprop event"));
+            process_backprop_one(shared, backprops.pop().expect("one backprop"));
             return;
         }
         _ => {}
     }
     let _timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Backprop);
     if O::ENABLED {
-        shared.observer.on_backprop_batch(events.len());
+        shared.observer.on_backprop_batch(backprops.len());
     }
-    let claims: Vec<(bool, NodeId)> = events.iter().map(|event| (event.holds_nn_credit, event.event.node_id)).collect();
-    let result = complete_batch(events, &shared.arena);
+    let claims: Vec<(bool, NodeId)> =
+        backprops.iter().map(|backprop| (backprop.holds_nn_credit, backprop.selection.node_id)).collect();
+    let result = complete_batch(backprops, &shared.arena);
     for (_, id) in &claims {
         shared.cancel_collisions(*id);
     }
@@ -342,14 +346,14 @@ pub(crate) fn process_backprop_batch<O: SearchObserver>(shared: &Shared<O>, mut 
     shared.finish(result.completed_playouts as usize, true);
 }
 
-pub(crate) fn process_backprop_one<O: SearchObserver>(shared: &Shared<O>, event: BackpropEvent) {
+pub(crate) fn process_backprop_one<O: SearchObserver>(shared: &Shared<O>, backprop: Backprop) {
     let _timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Backprop);
     if O::ENABLED {
         shared.observer.on_backprop_batch(1);
     }
-    let held_nn_credit = event.holds_nn_credit;
-    let node_id = event.event.node_id;
-    let result = complete_one(event, &shared.arena);
+    let held_nn_credit = backprop.holds_nn_credit;
+    let node_id = backprop.selection.node_id;
+    let result = complete_one(backprop, &shared.arena);
     shared.cancel_collisions(node_id);
     shared.return_nn_credits(usize::from(held_nn_credit));
     shared.completed_depth.fetch_add(result.completed_depth, Ordering::AcqRel);
@@ -389,8 +393,8 @@ impl<O: SearchObserver> StopHandle<O> {
     }
 }
 
-/// 连续流式搜索：Select / Expand / Eval / NN / Reply / Backprop。
-/// Expand 裁决规则终局和合法着；Eval 先查 cache，仅 miss 编码并送 NN；NN 合批结果交回
+/// 连续流式搜索：Select / Expand / NN / Reply / Backprop。
+/// Expand 裁决规则终局、合法着和缓存，仅 miss 编码并送 NN；NN 合批结果交回
 /// Reply 发布 edge，再由 Backprop 完成 reservation。
 pub struct Search<O: SearchObserver = NoopObserver> {
     shared: Arc<Shared<O>>,
@@ -423,7 +427,6 @@ impl<O: SearchObserver> Search<O> {
         let resolved = config.resolve(backend.as_ref());
         let (select_tx, select_rx) = unbounded();
         let (expand_tx, expand_rx) = unbounded();
-        let (eval_tx, eval_rx) = unbounded();
         let (nn_reply_tx, nn_reply_rx) = unbounded();
         let (nn_credit_tx, nn_credit_rx) = unbounded();
         // UCI/graph 持有完整 history 用于跨回合定位；每个 event 只需要重复规则自
@@ -450,7 +453,6 @@ impl<O: SearchObserver> Search<O> {
             idle: Condvar::new(),
             select_tx,
             expand_tx,
-            eval_tx,
             collision_waiters: Mutex::new(Vec::new()),
         });
         let (nn_tx, nn_rx) = crossbeam_channel::unbounded::<NnRequest<O::Stamp>>();
@@ -458,7 +460,6 @@ impl<O: SearchObserver> Search<O> {
             shared: Arc::clone(&shared),
             select_rx,
             expand_rx,
-            eval_rx,
             nn_reply_rx,
             nn_tx,
             nn_rx,
@@ -500,15 +501,11 @@ impl<O: SearchObserver> Search<O> {
         StopHandle { shared: Arc::clone(&self.shared) }
     }
 
-    fn submit_select(&self) -> Result<(), EnginError> {
+    fn submit_select(&self) {
         self.shared.start_playout();
         let mut event = SelectEvent::at_root(self.root_id, Arc::clone(&self.search_history));
         event.mark_queued();
-        if let Err(error) = self.shared.select_tx.send(event) {
-            self.shared.cancel_event(error.0.into_event());
-            return Err(EnginError::Internal("stream select queue disconnected"));
-        }
-        Ok(())
+        self.shared.select_tx.send(event).expect("search workers live until finish");
     }
 
     /// Runs logical batches until a cumulative root-visit budget, deadline, or explicit stop.
@@ -542,29 +539,31 @@ impl<O: SearchObserver> Search<O> {
                 report(self.stats());
                 next_report = report_interval.and_then(|interval| now.checked_add(interval));
             }
-            let root_state = self.shared.arena.get(self.root_id).map(|root| root.expansion_state());
-            if root_state == Some(ExpansionState::Terminal) {
-                break;
+            match self.shared.arena.get(self.root_id).expect("search root lives until drain").expansion_state() {
+                ExpansionState::Terminal => break,
+                ExpansionState::Claimed => {
+                    self.wait_until_outstanding_below(1, limits.deadline)?;
+                    continue;
+                }
+                ExpansionState::Unexpanded => {
+                    // root 展开前只需要一个真实 leaf。
+                    self.submit_select();
+                    self.wait_until_outstanding_below(1, limits.deadline)?;
+                    continue;
+                }
+                ExpansionState::Expanded => {
+                    let outstanding = self.shared.outstanding.load(Ordering::Acquire);
+                    let dispatch_limit =
+                        self.worker_pool.nn_credit_limit().saturating_add(self.worker_pool.worker_count());
+                    if outstanding >= dispatch_limit {
+                        self.wait_until_outstanding_below(dispatch_limit, limits.deadline)?;
+                    } else {
+                        self.submit_select();
+                    }
+                }
             }
-            if root_state == Some(ExpansionState::Claimed) {
-                self.wait_until_outstanding_below(1, limits.deadline)?;
-                continue;
-            }
-            if root_state != Some(ExpansionState::Expanded) {
-                // root 展开前只需要一个真实 leaf。
-                self.submit_select()?;
-                self.wait_until_outstanding_below(1, limits.deadline)?;
-                continue;
-            }
-            let outstanding = self.shared.outstanding.load(Ordering::Acquire);
-            let dispatch_limit = self.worker_pool.nn_credit_limit().saturating_add(self.worker_pool.worker_count());
-            if outstanding >= dispatch_limit {
-                self.wait_until_outstanding_below(dispatch_limit, limits.deadline)?;
-                continue;
-            }
-            self.submit_select()?;
         }
-        // 时钟到期后必须 request_stop：否则 Eval 会等当前 GPU 整批跑完，200ms
+        // 时钟到期后必须 request_stop：否则 NN scheduler 会等当前 GPU 整批跑完，200ms
         // 的 go 就会变成一次推荐 batch 的推理时间。节点预算仍等在途完成。
         if limits.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             self.shared.request_stop();
@@ -626,7 +625,6 @@ mod tests {
     fn test_shared(arena: Arc<NodeArena>, outstanding: usize) -> (Arc<Shared>, Receiver<ExpandEvent<NoQueueStamp>>) {
         let (select_tx, _) = bounded(1);
         let (expand_tx, expand_rx) = bounded(1);
-        let (eval_tx, _) = bounded(1);
         let shared = Arc::new(Shared {
             backend: Arc::new(UniformBackend::default()) as Arc<dyn Backend>,
             cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)),
@@ -646,7 +644,6 @@ mod tests {
             idle: Condvar::new(),
             select_tx,
             expand_tx,
-            eval_tx,
             collision_waiters: Mutex::new(Vec::new()),
         });
         (shared, expand_rx)
@@ -692,7 +689,7 @@ mod tests {
         process_select_event(&shared, super::SelectEvent::at_root(root, history));
 
         assert_eq!(arena.get(root).expect("root").expansion_state(), super::ExpansionState::Claimed);
-        assert_eq!(expand_rx.try_recv().expect("expand event").event.node_id, root);
+        assert_eq!(expand_rx.try_recv().expect("expand event").selection.node_id, root);
         assert_eq!(shared.outstanding.load(Ordering::Acquire), 1);
     }
 

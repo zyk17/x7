@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use super::workerpool::BackpropEvent;
+use super::workerpool::Selection;
 use super::{NodeArena, NodeId};
 
 /// - `visits`：多份 `one()` 样本的合计，不是一次 reservation 携带的 K
@@ -43,6 +43,26 @@ impl ValueDelta {
         if self.visits == 0 { 0.0 } else { self.wl_sum / self.visits as f32 }
     }
 }
+
+/// 一条已获得 value 的回传；不经过队列。
+#[derive(Debug)]
+pub(crate) struct Backprop {
+    pub(crate) selection: Selection,
+    pub(crate) value: ValueDelta,
+    /// cache miss 从 NN scheduler admission 起一直持有到 Backprop 或取消；不在 NN Reply
+    /// 时提前释放，确保新的 NN 工作只在当前评估已写入树的 Evidence 后再占 slot。
+    pub(crate) holds_nn_credit: bool,
+}
+
+impl Backprop {
+    pub(crate) fn with_nn_credit(selection: Selection, wl: f32, draw: f32, plies_left: f32) -> Self {
+        Self { selection, value: ValueDelta::one(wl, draw, plies_left), holds_nn_credit: true }
+    }
+
+    pub(crate) fn without_nn_credit(selection: Selection, wl: f32, draw: f32, plies_left: f32) -> Self {
+        Self { selection, value: ValueDelta::one(wl, draw, plies_left), holds_nn_credit: false }
+    }
+}
 type NodeDeltaMap = HashMap<NodeId, ValueDelta>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -53,13 +73,13 @@ pub(crate) struct BackpropResult {
 }
 
 /// 一条 path 不会重复 node，因此直接完成 edge 与写回 node，不需要聚合表。
-pub(crate) fn complete_one(event: BackpropEvent, arena: &NodeArena) -> BackpropResult {
-    let BackpropEvent { event, value, .. } = event;
-    debug_assert_eq!(event.node_path.len(), event.reservations.len() + 1);
-    let depth = event.node_path.len() as u64;
+pub(crate) fn complete_one(backprop: Backprop, arena: &NodeArena) -> BackpropResult {
+    let Backprop { selection, value, .. } = backprop;
+    debug_assert_eq!(selection.node_path.len(), selection.reservations.len() + 1);
+    let depth = selection.node_path.len() as u64;
     let mut delta = value;
-    let mut reservations = event.reservations.into_iter().rev();
-    for (node_index, node_id) in event.node_path.into_iter().enumerate().rev() {
+    let mut reservations = selection.reservations.into_iter().rev();
+    for (node_index, node_id) in selection.node_path.into_iter().enumerate().rev() {
         let node = arena.get(node_id).expect("backprop node lives until job drain");
         if let Some((terminal_wl, terminal_draw, terminal_m)) = node.terminal_value() {
             delta = ValueDelta::one(terminal_wl, terminal_draw, terminal_m);
@@ -76,17 +96,17 @@ pub(crate) fn complete_one(event: BackpropEvent, arena: &NodeArena) -> BackpropR
 }
 
 /// 多条 path 的 node 增量合并后一次写入；edge 仍逐层 complete。
-pub(crate) fn complete_batch(events: impl IntoIterator<Item = BackpropEvent>, arena: &NodeArena) -> BackpropResult {
+pub(crate) fn complete_batch(events: impl IntoIterator<Item = Backprop>, arena: &NodeArena) -> BackpropResult {
     let mut node_deltas = NodeDeltaMap::default();
     let mut result = BackpropResult::default();
 
-    for event in events {
-        let BackpropEvent { event, value, .. } = event;
-        debug_assert_eq!(event.node_path.len(), event.reservations.len() + 1);
-        let depth = event.node_path.len() as u64;
+    for backprop in events {
+        let Backprop { selection, value, .. } = backprop;
+        debug_assert_eq!(selection.node_path.len(), selection.reservations.len() + 1);
+        let depth = selection.node_path.len() as u64;
         let mut delta = value;
-        let mut reservations = event.reservations.into_iter().rev();
-        for (node_index, node_id) in event.node_path.into_iter().enumerate().rev() {
+        let mut reservations = selection.reservations.into_iter().rev();
+        for (node_index, node_id) in selection.node_path.into_iter().enumerate().rev() {
             let node = arena.get(node_id).expect("backprop node lives until job drain");
             if let Some((terminal_wl, terminal_draw, terminal_m)) = node.terminal_value() {
                 delta = ValueDelta::one(terminal_wl, terminal_draw, terminal_m);
@@ -116,9 +136,9 @@ mod tests {
 
     use xiangqi_core::{GameState, Move, STARTPOS_FEN, Square};
 
-    use super::complete_one;
+    use super::{Backprop, complete_one};
     use crate::search::NodeArena;
-    use crate::search::workerpool::{BackpropEvent, SelectEvent};
+    use crate::search::workerpool::SelectEvent;
 
     #[test]
     fn backprop_completes_every_reservation_with_alternating_value() {
@@ -134,7 +154,7 @@ mod tests {
         let child = SelectEvent::<crate::search::NoQueueStamp>::at_root(root_id, Arc::clone(&history))
             .descend(child_id, root_node.reserve_edge(0, 0.0).expect("edge"));
 
-        complete_one(BackpropEvent::without_nn_credit(child.into_event(), 0.4, 0.2, 2.0), &arena);
+        complete_one(Backprop::without_nn_credit(child.into_selection(), 0.4, 0.2, 2.0), &arena);
 
         let edge = &root_node.edges()[0];
         assert_eq!(edge.visits(), 1);
