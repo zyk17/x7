@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
-NN_ROOT = Path(__file__).resolve().parents[2]
+NN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(NN_ROOT / "src"))
 
 from nn.px0_kaggle import prepare_px0_training_data

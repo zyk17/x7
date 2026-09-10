@@ -13,8 +13,8 @@ Set-Location C:\projects\77xiangqi_engine
 
 - Kaggle 数据集：`pikacat/px0data`
 - 本地目录：`C:\work\px0data\{version}\`
-- 数据准备入口：`nn\scripts\data\prepare_px0.py --config nn\configs\<name>.yaml`
-- 训练入口：`nn\scripts\train\train_px0.py --config nn\configs\<name>.yaml`
+- 数据准备入口：`nn\scripts\prepare.py --config nn\configs\<name>.yaml`
+- 训练入口：`nn\scripts\train.py --config nn\configs\<name>.yaml`
 - 准备脚本负责下载、解压、train/val 切分和固定 validation manifest；训练不会再做这些工作
 
 ## 1. 首次准备环境
@@ -32,7 +32,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install -e "nn[t
 train/validation chunk split 都在这里完成。
 
 ```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\prepare_px0.py `
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\prepare.py `
   --config nn\configs\x7_v3_01.yaml
 ```
 
@@ -40,7 +40,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\prepare
 
 ```powershell
 Copy-Item nn\configs\example.yaml nn\configs\x7_v3_01.yaml
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train.py `
   --config nn\configs\x7_v3_01.yaml
 ```
 
@@ -65,7 +65,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 width、blocks、bottleneck_channels 必须与来源 checkpoint 一致。
 
 ```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train.py `
   --config nn\configs\x7_v3_01.yaml
 ```
 
@@ -76,7 +76,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 ## 7. 导出 best checkpoint 为 ONNX
 
 ```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export.py `
   --checkpoint data\checkpoints\x7_v2_01.best.pt `
   --out data\x7.onnx `
   --precision mixed-fp16

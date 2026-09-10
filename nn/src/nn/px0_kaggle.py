@@ -183,7 +183,7 @@ def load_prepared_px0_training_data(
     ready_path = _training_ready_path(prepared)
     required_paths = (train_manifest, val_manifest, validation_manifest, ready_path)
     if any(not path.is_file() for path in required_paths):
-        raise FileNotFoundError(f"PX0 {version} 尚未准备完成；先运行 scripts/data/prepare_px0.py --config <YAML>")
+        raise FileNotFoundError(f"PX0 {version} 尚未准备完成；先运行 scripts/prepare.py --config <YAML>")
     ready = read_px0_manifest(ready_path)
     if (
         ready.get("format") != "px0_training_ready_v2"
@@ -191,9 +191,7 @@ def load_prepared_px0_training_data(
         or int(ready.get("seed", -1)) != int(seed)
         or abs(float(ready.get("val_ratio", -1.0)) - float(val_ratio)) > 1e-12
     ):
-        raise FileNotFoundError(
-            f"PX0 {version} 的准备参数与 YAML 不一致；先运行 scripts/data/prepare_px0.py --config <YAML>"
-        )
+        raise FileNotFoundError(f"PX0 {version} 的准备参数与 YAML 不一致；先运行 scripts/prepare.py --config <YAML>")
     return prepared, validation_manifest
 
 

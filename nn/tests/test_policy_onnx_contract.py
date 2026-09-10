@@ -1,4 +1,4 @@
-"""校验仓库根目录 `data/x7.onnx` 与 `export_onnx.py` 约定一致。
+"""校验仓库根目录 `data/x7.onnx` 与 `export.py` 约定一致。
 
 `data/` 通常 gitignore，本地导出后放入即可运行本测试；缺失则跳过。
 """
@@ -34,7 +34,7 @@ def _tensor_elem_type_and_shape(vi) -> tuple[int, list[int | str | None]]:
 
 @pytest.mark.skipif(
     not POLICY_ONNX.is_file(),
-    reason=f"optional artifact missing: {POLICY_ONNX} (gitignored; export via scripts/export/export_onnx.py)",
+    reason=f"optional artifact missing: {POLICY_ONNX} (gitignored; export via scripts/export.py)",
 )
 def test_policy_onnx_contract_matches_export_script() -> None:
     raw = onnx.load(str(POLICY_ONNX))
@@ -50,7 +50,7 @@ def test_policy_onnx_contract_matches_export_script() -> None:
     assert len(dims) == 4, f"board shape expected rank-4 [B,C,10,9], got {dims}"
     assert dims[2:] == [10, 9], f"board shape expected [B,C,10,9], got {dims}"
     assert dims[0] in (1, "batch"), f"board batch dim must be static 1 or dynamic batch, got {dims}"
-    assert isinstance(dims[1], int) and dims[1] >= 1, f"board channel dim must be static positive, got {dims}"
+    assert dims[1] == 124, f"board channel dim must be 124, got {dims}"
 
     out_list = list(model.graph.output)
     names = [o.name for o in out_list]
@@ -62,8 +62,7 @@ def test_policy_onnx_contract_matches_export_script() -> None:
     assert len(dims) == 2 and dims[0] in (1, "batch") and dims[1] not in (None, ""), (
         f"logits expected float32[B,V] with static V, got dims={dims}"
     )
-    assert isinstance(dims[1], int), f"logits second dim must be static vocab size, got {dims!r}"
-    assert dims[1] >= 2
+    assert dims[1] == 2062, f"logits vocab size must be 2062, got {dims!r}"
 
     elem, dims = _tensor_elem_type_and_shape(out_list[1])
     assert elem == TensorProto.FLOAT

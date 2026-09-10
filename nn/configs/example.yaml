@@ -1,5 +1,5 @@
-# X7 v3 Transformer PX0 训练配置模板。
-# 训练入口只接受：python scripts/train/train_px0.py --config <this-file>
+# Knowledge Model PX0 训练配置模板。
+# 训练入口只接受：python scripts/train.py --config <this-file>
 # 路径相对于启动命令所在目录解析；仓库根目录启动时，data/... 即为仓库 data/。
 
 # 仅写入 checkpoint 元数据和日志，建议与 training.out 的文件名一致。
@@ -15,16 +15,11 @@ dataset:
   # validation 读取该固定文件切分的完整 5%，不再二次随机抽样固定局面数。
   # 文件切分随机种子。改变它会生成另一份 train/validation manifest。
   seed: 42
-  # 仅 prepare_px0.py 使用：true 会删除此版本已准备的 chunk/archive/manifest 后重新下载；通常保持 false。
+  # 仅 prepare.py 使用：true 会删除此版本已准备的 chunk/archive/manifest 后重新下载；通常保持 false。
   force_download: false
 
 model:
-  # v3：attention-policy-map positional encoding、input MA gate、MHA + Smolgen +
-  # DeepNorm + LayerNorm + ReLU FFN，以及三正式 head。
-  # policy 由起点-终点 token pair score 收集回固定 2062 着法顺序；正式输出契约不变。
-  # 只接受本实现名：x7_v3_attentionbody 或 x7_v2_bottleneck_gbroadcast。
-  # 两者 checkpoint 不兼容，不能互相 init_from 或续训。
-  kind: x7_v3_attentionbody
+  # 唯一模型：90 token encoder、MHA、Smolgen、DeepNorm、LayerNorm 与 ReLU FFN。
   width: 512
   blocks: 12
   # 默认每个 head 为 32 channels。
@@ -37,7 +32,7 @@ training:
   out: "data/checkpoints/example.pt"
   # init_from 只载入模型权重，并从 step 0 创建新的优化器和学习率日程；需要完整续训时，先复制
   # 原 checkpoint 到新的 out 路径。
-  # init_from: "data/checkpoints/x7_v3_transformer.best.pt"
+  # init_from: "data/checkpoints/run_01.best.pt"
   # 全局总 step，不是本次增加的 step。续训时必须大于 checkpoint 的 completed_steps。
   steps: 2000
   # 每个 optimizer step 的样本数。
@@ -53,19 +48,19 @@ training:
   warmup_steps: 250
   lr: 0.0003
   min_lr_scale: 0.1
-  # Conv/Linear weights decay；BatchNorm 与 bias 不 decay。
+  # 矩阵参数做 weight decay；bias 与 LayerNorm 参数不 decay。
   weight_decay: 0.0001
   # PX0 self-play/search targets 的离线训练。`policy` 是 root-child visit
   # distribution，`root_wdl` 是完成搜索后的 root_q/root_d；final result 和
   # plies-left 是结果锚点。未来以本网络生成新数据后，才构成完整 RL 闭环。
   final_value_loss_weight: 0.6
   root_wdl_loss_weight: 0.6
-  # 剩余 ply 是 value 的间接辅助；v677 小网络对照中 0.5 优于 1.0。
+  # 剩余 ply 是 value 的间接辅助。
   moves_left_loss_weight: 0.5
   # 第二 policy head 使用同一搜索分布的 T=4 软化目标，仅训练期使用。
   soft_policy_weight: 8.0
   soft_policy_temperature: 4.0
-  # CUDA trunk FP16 autocast，heads/loss FP32。
+  # CUDA encoder FP16 autocast，heads/loss FP32。
   amp: true
   # cuda: 必须有 CUDA，缺失即失败；cpu: 强制 CPU；auto: CUDA 不可用时允许回退 CPU。
   device: cuda

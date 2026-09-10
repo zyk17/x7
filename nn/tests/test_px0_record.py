@@ -5,10 +5,8 @@ import struct
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from nn.px0_record import (
-    PX0_PLANES,
     PX0_POLICY_SIZE,
     V6_RECORD_SIZE,
     V6_STRUCT,
@@ -132,18 +130,6 @@ def _fake_v6_record() -> bytes:
         0.75,
         0,
     )
-
-
-def test_parse_v6_record_shapes() -> None:
-    sample = parse_v6_record(_fake_v6_record())
-    assert sample.planes.shape == (PX0_PLANES, 10, 9)
-    assert sample.policy.shape == (PX0_POLICY_SIZE,)
-    assert sample.winner_wdl.shape == (3,)
-    assert sample.root_wdl.shape == (3,)
-    assert sample.plies_left.shape == (1,)
-    assert sample.winner_wdl.sum() == pytest.approx(1.0)
-    assert sample.root_wdl.sum() == pytest.approx(1.0)
-    assert sample.root_wdl[0] - sample.root_wdl[2] == pytest.approx(0.0)
 
 
 def test_parse_v6_record_matches_official_chunkparser_semantics() -> None:

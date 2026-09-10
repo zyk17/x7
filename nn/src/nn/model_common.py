@@ -10,34 +10,10 @@ import torch.nn.functional as F
 BOARD_ROWS = 10
 BOARD_COLS = 9
 BOARD_SQUARES = BOARD_ROWS * BOARD_COLS
-POLICY_PLANES = 52
-CNN_TRUNK_KIND = "x7_v2_bottleneck_gbroadcast"
-TRANSFORMER_TRUNK_KIND = "x7_v3_attentionbody"
-BATCH_NORM_MOMENTUM = 0.001
-
-FILES = "abcdefghi"
-RANKS = "0123456789"
-FILE_TO_INDEX = {ch: i for i, ch in enumerate(FILES)}
-RANK_TO_INDEX = {ch: i for i, ch in enumerate(RANKS)}
-
-
-def _index_to_square(file_idx: int, rank_idx: int) -> str:
-    return FILES[file_idx] + RANKS[rank_idx]
 
 
 def _square_to_index(square: str) -> tuple[int, int]:
-    return FILE_TO_INDEX[square[0]], RANK_TO_INDEX[square[1]]
-
-
-def _valid_coord(file_idx: int, rank_idx: int) -> bool:
-    return 0 <= file_idx < BOARD_COLS and 0 <= rank_idx < BOARD_ROWS
-
-
-def _slide_move(start: str, direction: tuple[int, int], steps: int) -> str | None:
-    file_idx, rank_idx = _square_to_index(start)
-    file_idx += direction[0] * steps
-    rank_idx += direction[1] * steps
-    return _index_to_square(file_idx, rank_idx) if _valid_coord(file_idx, rank_idx) else None
+    return ord(square[0]) - ord("a"), ord(square[1]) - ord("0")
 
 
 def _load_move_vocab() -> list[str]:
@@ -49,36 +25,6 @@ def _load_move_vocab() -> list[str]:
     if len(moves) != 2062:
         raise ValueError(f"unexpected move vocab size: {len(moves)}")
     return moves
-
-
-def _build_conv_policy_index() -> torch.Tensor:
-    policy_moves = _load_move_vocab()
-    move_to_policy_idx = {move: idx for idx, move in enumerate(policy_moves)}
-    conv_moves: list[str | None] = []
-    rook_dirs = ((0, 1), (1, 0), (0, -1), (-1, 0))
-    knight_dirs = ((1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2))
-    bishop_advisor_dirs = ((1, 1), (2, 2), (1, -1), (2, -2), (-1, -1), (-2, -2), (-1, 1), (-2, 2))
-    for dx, dy in rook_dirs:
-        for steps in range(1, 10):
-            for rank in RANKS:
-                for file_ in FILES:
-                    end = _slide_move(file_ + rank, (dx, dy), steps)
-                    conv_moves.append(None if end is None else file_ + rank + end)
-    for directions in (knight_dirs, bishop_advisor_dirs):
-        for dx, dy in directions:
-            for rank in RANKS:
-                for file_ in FILES:
-                    end = _slide_move(file_ + rank, (dx, dy), 1)
-                    conv_moves.append(None if end is None else file_ + rank + end)
-    if len(conv_moves) != POLICY_PLANES * BOARD_SQUARES:
-        raise ValueError(f"unexpected conv move table size: {len(conv_moves)}")
-    policy_to_conv = [-1] * len(policy_moves)
-    for flat_idx, move in enumerate(conv_moves):
-        if move is not None and move in move_to_policy_idx:
-            policy_to_conv[move_to_policy_idx[move]] = flat_idx
-    if any(idx < 0 for idx in policy_to_conv):
-        raise ValueError("conv policy map missing PX0 moves")
-    return torch.tensor(policy_to_conv, dtype=torch.long)
 
 
 def _build_move_pair_index() -> torch.Tensor:
