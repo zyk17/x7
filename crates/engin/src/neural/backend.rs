@@ -1,38 +1,21 @@
 //! NN backend 边界：属性、cache 与批量评估结果。
 //!
-//! 接口形状历史上参考过 px0 `src/neural/backend.h`；正式推理走 ONNX，测试可用
-//! `UniformBackend`。这不是 task-worker 时代的 backend 翻译层。
-
-use std::sync::Arc;
-
-use xiangqi_core::Position;
+//! 正式推理走 ONNX，测试可用 `UniformBackend`。
 
 use crate::EnginError;
 
-use super::cache::{CachedEval, DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, EvalCache};
 use super::{InputPlanes, POLICY_SIZE};
 
-/// Backend 能力与推荐 batch 大小。
+/// Backend 的 batch 大小边界。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendAttributes {
-    pub has_mlh: bool,
-    pub has_wdl: bool,
-    pub runs_on_cpu: bool,
-    pub suggested_num_search_threads: usize,
     pub recommended_batch_size: usize,
     pub maximum_batch_size: usize,
 }
 
 impl Default for BackendAttributes {
     fn default() -> Self {
-        Self {
-            has_mlh: false,
-            has_wdl: true,
-            runs_on_cpu: true,
-            suggested_num_search_threads: 1,
-            recommended_batch_size: 1,
-            maximum_batch_size: 1,
-        }
+        Self { recommended_batch_size: 1, maximum_batch_size: 1 }
     }
 }
 
@@ -51,44 +34,9 @@ pub struct EvalResult {
     pub policies: Vec<f32>,
 }
 
-/// NN cache 命中键：当前棋盘 + 合法着数 + `Position::repetitions`。
-///
-/// `mcts2`（1A+2A）：树节点不按棋盘合并；NN cache 允许**历史路径不同**，但必须区分
-/// repetition 次数（对齐编码平面）。`num_moves` 代价很低，保留作 hash 碰撞护栏
-///（policy 长度对不上则 miss）。不纳入完整 8-ply history；规则终局在 cache 之前裁决。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EvalCacheKey {
-    board: u64,
-    num_moves: usize,
-    repetitions: u32,
-}
-
-impl EvalCacheKey {
-    pub fn new(position: &Position, num_moves: usize) -> Self {
-        Self {
-            board: position.board().hash(),
-            num_moves,
-            repetitions: position.repetitions(),
-        }
-    }
-
-    /// 直映表 u64：把 repetition 次数混进 board。
-    pub(crate) fn slot_key(self) -> u64 {
-        if self.repetitions == 0 {
-            self.board
-        } else {
-            xiangqi_core::hashcat::hash_cat(self.board, self.repetitions as u64)
-        }
-    }
-}
-
-/// Backend 评估边界：属性、cache 与 stream NN worker 的稀疏 batch 推理。
+/// Backend 评估边界：属性与 stream NN worker 的稀疏 batch 推理。
 pub trait Backend: Send + Sync {
     fn attributes(&self) -> BackendAttributes;
-
-    fn cached_evaluation(&self, _key: EvalCacheKey) -> Option<Arc<EvalResult>> {
-        None
-    }
 
     /// stream NN worker：稀疏 `InputPlanes` 合批推理。
     fn infer_input_planes_into(
@@ -98,120 +46,29 @@ pub trait Backend: Send + Sync {
         wdl: &mut Vec<f32>,
         moves_left: &mut Vec<f32>,
     ) -> Result<(), EnginError>;
-
-    /// Eval 构造完整 `EvalResult` 后可选地写入 cache。
-    fn store_evaluation(&self, _key: EvalCacheKey, _result: Arc<EvalResult>) {}
-
-    /// 非缓存 backend 的空实现。
-    fn clear_cache(&self) {}
-
-    /// 缓存容量为 `2^N` 个直映槽。
-    fn set_cache_size_power_of_two(&self, _size_power_of_two: u8) {}
 }
 
-/// 带 NN cache 的 backend 包装：查找、batch miss 转发与插入由此层负责，不在 ONNX 内实现。
-pub struct CachingBackend {
-    wrapped: Arc<dyn Backend>,
-    cache: Arc<EvalCache>,
-}
-
-impl CachingBackend {
-    pub fn new(wrapped: Box<dyn Backend>) -> Self {
-        Self::with_cache_size_power_of_two(wrapped, DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)
-    }
-
-    pub fn with_cache_size_power_of_two(wrapped: Box<dyn Backend>, size_power_of_two: u8) -> Self {
-        Self {
-            wrapped: Arc::from(wrapped),
-            cache: Arc::new(EvalCache::new(size_power_of_two)),
-        }
-    }
-
-    fn cached(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
-        self.cache.get(key.slot_key(), key.num_moves)
-    }
-
-    fn resize_cache(&self, size_power_of_two: u8) {
-        self.cache.set_size_power_of_two(size_power_of_two);
-    }
-}
-
-impl Backend for CachingBackend {
-    fn attributes(&self) -> BackendAttributes {
-        self.wrapped.attributes()
-    }
-
-    fn cached_evaluation(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
-        self.cached(key)
-    }
-
-    fn infer_input_planes_into(
-        &self,
-        samples: &[InputPlanes],
-        logits: &mut Vec<f32>,
-        wdl: &mut Vec<f32>,
-        moves_left: &mut Vec<f32>,
-    ) -> Result<(), EnginError> {
-        self.wrapped.infer_input_planes_into(samples, logits, wdl, moves_left)
-    }
-
-    fn store_evaluation(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
-        self.cache.insert(
-            key.slot_key(),
-            CachedEval {
-                result,
-                num_moves: key.num_moves,
-            },
-        );
-    }
-
-    fn clear_cache(&self) {
-        self.cache.clear();
-        self.wrapped.clear_cache();
-    }
-
-    fn set_cache_size_power_of_two(&self, size_power_of_two: u8) {
-        self.resize_cache(size_power_of_two);
-        self.wrapped.set_cache_size_power_of_two(size_power_of_two);
-    }
-}
-
-/// 测试用：均匀 policy + 固定 WDL，复用正式 NN cache 容器。
+/// 测试用：均匀 policy + 固定 WDL。
 #[derive(Clone, Debug)]
 pub struct UniformBackend {
     pub wl: f32,
     pub d: f32,
     pub plies_left: f32,
-    cache: Arc<EvalCache>,
 }
 
 impl Default for UniformBackend {
     fn default() -> Self {
-        Self {
-            wl: 0.0,
-            d: 0.0,
-            plies_left: 0.0,
-            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)),
-        }
+        Self { wl: 0.0, d: 0.0, plies_left: 0.0 }
     }
 }
 
 impl UniformBackend {
     pub fn with_wdl(wl: f32, d: f32, plies_left: f32) -> Self {
-        Self {
-            wl,
-            d,
-            plies_left,
-            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)),
-        }
+        Self { wl, d, plies_left }
     }
 }
 
 impl Backend for UniformBackend {
-    fn cached_evaluation(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
-        self.cache.get(key.slot_key(), key.num_moves)
-    }
-
     fn attributes(&self) -> BackendAttributes {
         BackendAttributes::default()
     }
@@ -229,50 +86,20 @@ impl Backend for UniformBackend {
         logits.resize(batch * POLICY_SIZE, 0.0);
         wdl.clear();
         wdl.reserve(batch * 3);
+        let win = (1.0 - self.d + self.wl) * 0.5;
+        let loss = (1.0 - self.d - self.wl) * 0.5;
         for _ in 0..batch {
-            wdl.extend_from_slice(&[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
+            wdl.extend_from_slice(&[win, self.d, loss]);
         }
         moves_left.clear();
         moves_left.resize(batch, self.plies_left);
         Ok(())
     }
-
-    fn store_evaluation(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
-        self.store_cache(key, result);
-    }
-
-    fn clear_cache(&self) {
-        self.cache.clear();
-    }
-
-    fn set_cache_size_power_of_two(&self, size_power_of_two: u8) {
-        self.cache.set_size_power_of_two(size_power_of_two);
-    }
-}
-
-impl UniformBackend {
-    pub fn store_cache(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
-        self.cache.insert(
-            key.slot_key(),
-            CachedEval {
-                result,
-                num_moves: key.num_moves,
-            },
-        );
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use xiangqi_core::STARTPOS_FEN;
-
     use super::*;
-
-    fn startpos_key(num_moves: usize) -> EvalCacheKey {
-        EvalCacheKey::new(&Position::from_fen(STARTPOS_FEN).expect("startpos"), num_moves)
-    }
 
     #[test]
     fn uniform_inference_keeps_moves_left_per_position() {
@@ -281,64 +108,18 @@ mod tests {
         let mut logits = Vec::new();
         let mut wdl = Vec::new();
         let mut moves_left = Vec::new();
-        backend
-            .infer_input_planes_into(&samples, &mut logits, &mut wdl, &mut moves_left)
-            .expect("infer");
+        backend.infer_input_planes_into(&samples, &mut logits, &mut wdl, &mut moves_left).expect("infer");
         assert_eq!(moves_left, vec![17.0, 17.0]);
     }
 
-    /// cache miss 入队，命中则立刻返回。
-    /// （`memcache.cc:101-129`）：cache hit 跳过被包装的 batch；不同合法着数量是
-    /// collision-safe miss。
     #[test]
-    fn caching_backend_returns_hits_only_after_completed_batch_and_checks_move_count() {
-        let backend = CachingBackend::new(Box::new(UniformBackend::default()));
-        let request = startpos_key(2);
-        assert!(backend.cached_evaluation(request).is_none());
-        backend.store_evaluation(request, Arc::new(EvalResult::default()));
-        assert!(backend.cached_evaluation(request).is_some());
-        assert!(backend.cached_evaluation(startpos_key(1)).is_none());
-    }
-
-    #[test]
-    fn caching_backend_new_game_clear_boundary_removes_completed_entries() {
-        let backend = CachingBackend::new(Box::new(UniformBackend::default()));
-        let request = startpos_key(1);
-        backend.store_evaluation(request, Arc::new(EvalResult::default()));
-        assert!(backend.cached_evaluation(startpos_key(1)).is_some());
-
-        backend.clear_cache();
-        assert!(backend.cached_evaluation(startpos_key(1)).is_none());
-    }
-
-    #[test]
-    fn caching_backend_distinguishes_repetition_count_not_full_history() {
-        let backend = CachingBackend::new(Box::new(UniformBackend::default()));
-        let mut pos = Position::from_fen(STARTPOS_FEN).expect("startpos");
-        let key0 = EvalCacheKey::new(&pos, 2);
-        backend.store_evaluation(key0, Arc::new(EvalResult::default()));
-        assert!(backend.cached_evaluation(key0).is_some());
-
-        pos.set_repetitions(1, 4);
-        let key1 = EvalCacheKey::new(&pos, 2);
-        assert_ne!(key0, key1);
-        assert!(backend.cached_evaluation(key1).is_none());
-        backend.store_evaluation(key1, Arc::new(EvalResult::default()));
-        assert!(backend.cached_evaluation(key1).is_some());
-        assert!(backend.cached_evaluation(key0).is_some());
-
-        // 同一棋盘、同一 repetition 次数 → 命中（不区分到达历史）。
-        let mut again = Position::from_fen(STARTPOS_FEN).expect("startpos");
-        again.set_repetitions(1, 8);
-        assert!(backend.cached_evaluation(EvalCacheKey::new(&again, 2)).is_some());
-    }
-
-    #[test]
-    fn caching_backend_can_use_a_single_cache_slot() {
-        let backend = CachingBackend::new(Box::new(UniformBackend::default()));
-        backend.set_cache_size_power_of_two(0);
-        let request = startpos_key(1);
-        backend.store_evaluation(request, Arc::new(EvalResult::default()));
-        assert!(backend.cached_evaluation(startpos_key(1)).is_some());
+    fn uniform_inference_uses_configured_wdl() {
+        let backend = UniformBackend::with_wdl(0.4, 0.2, 0.0);
+        let samples = vec![[super::super::InputPlane::default(); super::super::INPUT_PLANES]];
+        let mut logits = Vec::new();
+        let mut wdl = Vec::new();
+        let mut moves_left = Vec::new();
+        backend.infer_input_planes_into(&samples, &mut logits, &mut wdl, &mut moves_left).expect("infer");
+        assert_eq!(wdl, vec![0.6, 0.2, 0.2]);
     }
 }

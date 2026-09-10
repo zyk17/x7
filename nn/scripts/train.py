@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
-"""PX0 主线训练入口：正式 heads + 仅训练期辅助 heads。"""
+"""PX0 主线训练入口。"""
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import torch
-from torch.optim import AdamW
+from torch.optim import AdamW, Optimizer
 from torch.utils.data import DataLoader
 
-NN_ROOT = Path(__file__).resolve().parents[2]
+NN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(NN_ROOT / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nn.dataset_px0 import Px0ChunkDataset, Px0DatasetConfig
 from nn.model import (
-    CNN_TRUNK_KIND,
-    KnowledgeResNet,
-    KnowledgeTransformer,
-    build_model,
+    KnowledgeModel,
     moves_left_loss,
     soften_policy_targets,
     soft_policy_cross_entropy,
@@ -32,20 +30,47 @@ from nn.model import (
 )
 from nn.px0_kaggle import load_prepared_px0_training_data
 from nn.train_config import load_train_config
-from train_checkpoint import (
-    learning_rate_at_step,
-    save_checkpoint,
-    set_optimizer_learning_rate,
-)
-from train_common import TRAIN_SEED, default_num_workers
 
 
 OPTIMIZER_KIND = "adamw"
-KnowledgeModel = KnowledgeResNet | KnowledgeTransformer
+TRAIN_SEED = 42
+
+
+def default_num_workers() -> int:
+    cpu_count = max(1, os.cpu_count() or 1)
+    if cpu_count <= 2:
+        return 0
+    return min(4, max(2, cpu_count // 4)) if os.name == "nt" else min(8, max(2, cpu_count - 2))
+
+
+def learning_rate_at_step(
+    step: int,
+    *,
+    total_steps: int,
+    lr: float,
+    warmup_steps: int,
+    min_lr_scale: float,
+) -> float:
+    if step < 1 or total_steps < 1 or lr <= 0.0 or not 0.0 <= min_lr_scale <= 1.0:
+        raise ValueError("invalid cosine learning-rate schedule")
+    if warmup_steps > 0 and step < warmup_steps:
+        return lr * step / warmup_steps
+    progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+    return lr * (min_lr_scale + (1.0 - min_lr_scale) * 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+
+def set_optimizer_learning_rate(opt: Optimizer, lr: float) -> None:
+    for group in opt.param_groups:
+        group["lr"] = lr
+
+
+def save_checkpoint(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
 
 
 def build_optimizer(model: torch.nn.Module, *, learning_rate: float, weight_decay: float) -> AdamW:
-    """Apply decoupled decay only to convolutional and linear weights."""
+    """Apply decoupled decay to matrix parameters only."""
     decay = [param for param in model.parameters() if param.ndim >= 2]
     no_decay = [param for param in model.parameters() if param.ndim < 2]
     return AdamW(
@@ -61,18 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    model_kind = getattr(args, "model_kind", CNN_TRUNK_KIND)
-    if model_kind == CNN_TRUNK_KIND:
-        if int(args.width) < 4 or int(args.width) % 2 != 0 or int(args.blocks) < 3 or int(args.bottleneck_channels) < 1:
-            raise SystemExit("CNN model.width/blocks/bottleneck_channels 非法")
-    elif (
+    if (
         int(args.width) < 4
         or int(args.blocks) < 1
-        or int(getattr(args, "heads", 16)) < 1
-        or int(getattr(args, "ffn_channels", int(args.width) * 3 // 2)) < int(args.width)
-        or int(args.width) % int(getattr(args, "heads", 16)) != 0
+        or int(args.heads) < 1
+        or int(args.ffn_channels) < int(args.width)
+        or int(args.width) % int(args.heads) != 0
     ):
-        raise SystemExit("Transformer model.width/blocks/heads/ffn_channels 非法")
+        raise SystemExit("model.width/blocks/heads/ffn_channels 非法")
     if not str(args.px0_version).strip() or not (0.0 < float(args.px0_val_ratio) < 1.0):
         raise SystemExit("dataset.px0_version 或 dataset.val_ratio 非法")
     if int(args.shuffle_size) < 0 or int(args.full_validation_every) < 1:
@@ -106,24 +127,24 @@ def take_training_outputs(
     output: torch.Tensor | tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not isinstance(output, tuple) or len(output) != 5:
-        raise TypeError("train_px0 requires formal heads plus two auxiliary heads")
+        raise TypeError("training requires formal heads plus two auxiliary heads")
     return output  # type: ignore[return-value]
 
 
 def forward_training(
     model: KnowledgeModel, boards: torch.Tensor, *, amp_enabled: bool
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Use FP16 for the spatial trunk and explicit FP32 heads/losses.
+    """Use FP16 for the encoder and explicit FP32 heads/losses.
 
     This follows PyTorch AMP's mixed-precision pattern while preserving stable
-    policy/value reductions in FP32. KataGoMethods.md motivates the two
-    training-only heads; their tensors never enter the exporter.
+    policy/value reductions in FP32. The two training-only heads never enter
+    the exporter.
     """
     if amp_enabled:
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            trunk = model.forward_trunk(boards)
+            body = model.forward_body(boards)
         with torch.amp.autocast("cuda", enabled=False):
-            return take_training_outputs(model.forward_heads(trunk.float()))
+            return take_training_outputs(model.forward_heads(body.float()))
     return take_training_outputs(model(boards))
 
 
@@ -176,33 +197,12 @@ def validate_existing_output_checkpoint(
     *,
     width: int,
     blocks: int,
-    bottleneck_channels: int,
-    trunk_kind: str = CNN_TRUNK_KIND,
-    heads: int = 16,
-    ffn_channels: int = 0,
+    heads: int,
+    ffn_channels: int,
 ) -> None:
-    if str(ckpt.get("trunk_kind")) != trunk_kind:
-        raise SystemExit("--out 已存在，但模型架构与当前 YAML 不一致；请换新输出文件")
-    if trunk_kind != CNN_TRUNK_KIND and ckpt.get("model_format") != "px0_attentionbody_v1":
-        raise SystemExit("--out 是旧 v3 AttentionBody checkpoint；请换新输出文件")
-    keys = (
-        ("width", "blocks", "bottleneck_channels")
-        if trunk_kind == CNN_TRUNK_KIND
-        else (
-            "width",
-            "blocks",
-            "heads",
-            "ffn_channels",
-        )
-    )
-    expected = (
-        (width, blocks, bottleneck_channels) if trunk_kind == CNN_TRUNK_KIND else (width, blocks, heads, ffn_channels)
-    )
-    actual = tuple(int(ckpt.get(key, 0)) for key in keys)
-    if actual != expected:
-        if trunk_kind == CNN_TRUNK_KIND:
-            raise SystemExit("checkpoint 的 width/blocks/bottleneck_channels 与当前 YAML 不一致")
-        raise SystemExit("checkpoint 的 Transformer 模型尺寸与当前 YAML 不一致")
+    actual = tuple(int(ckpt.get(key, 0)) for key in ("width", "blocks", "heads", "ffn_channels"))
+    if actual != (width, blocks, heads, ffn_channels):
+        raise SystemExit("checkpoint 的 width/blocks/heads/ffn_channels 与当前 YAML 不一致")
     if not bool(ckpt.get("moves_left_head")) or not bool(ckpt.get("auxiliary_heads")):
         raise SystemExit("--out 已存在，但不含当前训练辅助头；请换新输出文件")
 
@@ -330,14 +330,9 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    trunk_kind = str(args.model_kind)
-    model = build_model(
-        trunk_kind=trunk_kind,
-        in_planes=int(args.in_planes),
+    model = KnowledgeModel(
         width=int(args.width),
-        blocks=int(args.blocks),
-        num_moves=int(args.num_moves),
-        bottleneck_channels=int(args.bottleneck_channels),
+        num_blocks=int(args.blocks),
         heads=int(args.heads),
         ffn_channels=int(args.ffn_channels),
         value_head=True,
@@ -356,10 +351,8 @@ def main() -> None:
         ckpt = torch.load(source, map_location=device)
         validate_existing_output_checkpoint(
             ckpt,
-            trunk_kind=trunk_kind,
             width=int(args.width),
             blocks=int(args.blocks),
-            bottleneck_channels=int(args.bottleneck_channels),
             heads=int(args.heads),
             ffn_channels=int(args.ffn_channels),
         )
@@ -377,7 +370,7 @@ def main() -> None:
     regular_validation_batches = max(1, len(val_ds.files) * 10 // int(args.batch_size))
     print(
         f"px0: train_files={len(train_ds.files)} val_files={len(val_ds.files)} "
-        f"batch={args.batch_size} steps={args.steps} {args.model_kind} b{args.blocks}c{args.width} "
+        f"batch={args.batch_size} steps={args.steps} b{args.blocks}c{args.width} "
         f"h{args.heads}ffn{args.ffn_channels} val_batches={regular_validation_batches} "
         f"loss_weights=(final={args.final_value_loss_weight}, root={args.root_wdl_loss_weight}, "
         f"moves={args.moves_left_loss_weight}, soft=T{args.soft_policy_temperature}/w{args.soft_policy_weight})"
@@ -461,17 +454,11 @@ def main() -> None:
                 "optimizer_kind": OPTIMIZER_KIND,
                 "width": int(args.width),
                 "blocks": int(args.blocks),
-                "bottleneck_channels": int(args.bottleneck_channels),
                 "heads": int(args.heads),
                 "ffn_channels": int(args.ffn_channels),
-                "in_planes": int(args.in_planes),
-                "n_moves": int(args.num_moves),
-                "format": "px0_v7",
                 "value_head": True,
                 "moves_left_head": True,
                 "auxiliary_heads": True,
-                "trunk_kind": model.trunk_kind,
-                "model_format": "px0_attentionbody_v1" if trunk_kind != CNN_TRUNK_KIND else "x7_v2",
                 "value_head_format": "wdl",
                 "value_target_kind": "final_wdl_plus_root_wdl",
                 "soft_policy_temperature": float(args.soft_policy_temperature),

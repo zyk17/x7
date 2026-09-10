@@ -8,7 +8,7 @@
 - root WDL（已完成搜索的 target）
 - plies_left
 
-这里不试图兼容 lc0/px0 全部历史版本，也不引入 proto 依赖。
+只读取当前训练主线需要的 PX0 v6 record，不引入 proto 依赖。
 """
 
 from __future__ import annotations

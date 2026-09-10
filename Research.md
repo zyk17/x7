@@ -3,8 +3,8 @@
 这里记录已经完成、但未进入正式主线的研究尝试。每条记录只回答：问题是什么、为什么值得试、
 实验如何做、结果是什么、还不能说明什么。它不是待办列表，也不把失败结果包装成结论。
 
-当前正式搜索是独立的 X7 stream 路径树，不是 px0 等价实现。早期的按棋盘合并 MCGS 图实验已经
-结束；其实现细节不再保留。下列实验说明：cache-only prefetch，以及“碰撞时额外保留 reservation”
+当前正式搜索是独立的 X7 stream 路径树。早期的按棋盘合并 MCGS 图实验已经结束；其实现细节不再保留。
+下列实验说明：cache-only prefetch，以及“碰撞时额外保留 reservation”
 的最小 virtual visit 变体未被保留；正式搜索仍保留真实异步 playout 的 in-flight reservation
 作为 virtual visit（计入 edge started N）。batch-budget multivisit 也已否决，见 2026-08-17。
 
@@ -21,15 +21,15 @@ stream 的 Gather 产生叶子的速度可以高于 NN 消费速度。深而窄�
 
 ### 目标
 
-验证两项与 px0 思路相邻的工程尝试是否值得保留：
+验证两项工程尝试是否值得保留：
 
 - **cache-only prefetch**：正常 NN 请求不足时，从当前 tree 按 PUCT 递归挑选未展开叶子，额外
   评估并只写入 NN cache；不创建 node、不更新 N/Q，也不直接改变 bestmove。
 - **最小 virtual visit**：碰撞到同一 evaluating leaf 时，临时保留该路径的 edge reservation，
   让其 started visit 影响后续 PUCT；叶子完成、失败或 stop 后再归还。
 
-两者都不是 px0 的完整 batch-budget multivisit：没有一次 Gather batch 的访问预算分配，也没有
-一次评估按多次 visit 加权回传。
+两者都不做 batch-budget multivisit：没有一次 Gather batch 的访问预算分配，也没有一次评估按多次
+visit 加权回传。
 
 ### 实验方法
 
@@ -73,8 +73,7 @@ reservation：它计入 edge started N（PUCT virtual visit），并保证每条
 
 ## 2026-08-17：不采用 batch-budget multivisit
 
-classic lc0 的 collision/terminal multivisit 是一次评估按 K 次 visit 加权回传，用来填 batch、
-补偿纯 virtual visit 分流弱。X7 不采用：
+一次评估按 K 次 visit 加权回传的 multivisit 可用来填 batch、补偿纯 virtual visit 分流弱。X7 不采用：
 
 1. Gather 每次采集一个叶子，不是一批；GPU 合批在 NN 队列完成。
 2. 实战 `μ=FPU` virtual mean 已比纯 virtual visit 更明显且更温和。一次打入 K 份 FPU 会破坏

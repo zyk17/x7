@@ -43,9 +43,7 @@ pub struct OnnxBackend {
     provider: OnnxProvider,
 }
 
-/// ONNX backend 选择配置的 provider，并报告实际 CPU
-/// 能力（`src/neural/backends/onnx/network_onnx.cc:140-176`、
-/// `src/neural/wrapper.cc:49-68`）。
+/// ONNX backend 实际启用的 execution provider。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnnxProvider {
     #[cfg(feature = "tensorrt")]
@@ -69,7 +67,7 @@ impl OnnxProvider {
 
 #[cfg(feature = "tensorrt")]
 const TRT_PROFILE_MIN_BATCH: usize = 1;
-/// recommended / opt / max 对齐 stream 稳态合批。
+/// TensorRT profile 的最小、最优与最大 batch。
 #[cfg(feature = "tensorrt")]
 const TRT_MAX_BATCH: usize = 256;
 #[cfg(feature = "directml")]
@@ -176,20 +174,12 @@ impl OnnxSessions {
 
     #[cfg(feature = "tensorrt")]
     fn tensor_rt(session: Session, gpu: TrtGpu) -> Self {
-        Self {
-            sessions: vec![(usize::MAX, session)],
-            input_scratch: Vec::new(),
-            trt_gpu: Some(gpu),
-        }
+        Self { sessions: vec![(usize::MAX, session)], input_scratch: Vec::new(), trt_gpu: Some(gpu) }
     }
 
     #[cfg(feature = "directml")]
     fn direct_ml(sessions: Vec<(usize, Session)>) -> Self {
-        Self {
-            provider: OnnxProvider::DirectMl,
-            sessions,
-            input_scratch: Vec::new(),
-        }
+        Self { provider: OnnxProvider::DirectMl, sessions, input_scratch: Vec::new() }
     }
 
     fn validation_session(&self) -> &Session {
@@ -199,19 +189,11 @@ impl OnnxSessions {
     fn chunk_size(&self) -> usize {
         #[cfg(feature = "tensorrt")]
         {
-            if self.trt_gpu.is_some() {
-                TRT_MAX_BATCH
-            } else {
-                usize::MAX
-            }
+            if self.trt_gpu.is_some() { TRT_MAX_BATCH } else { usize::MAX }
         }
         #[cfg(feature = "directml")]
         {
-            if self.provider == OnnxProvider::DirectMl {
-                DML_MAX_BATCH
-            } else {
-                usize::MAX
-            }
+            if self.provider == OnnxProvider::DirectMl { DML_MAX_BATCH } else { usize::MAX }
         }
         #[cfg(not(any(feature = "tensorrt", feature = "directml")))]
         {
@@ -242,17 +224,13 @@ impl OnnxSessions {
         #[cfg(feature = "tensorrt")]
         let expected = usize::MAX;
         #[cfg(feature = "directml")]
-        let expected = if self.provider == OnnxProvider::DirectMl {
-            batch_size
-        } else {
-            usize::MAX
-        };
+        let expected = if self.provider == OnnxProvider::DirectMl { batch_size } else { usize::MAX };
         #[cfg(not(any(feature = "tensorrt", feature = "directml")))]
         let expected = usize::MAX;
         self.sessions
             .iter()
             .position(|(size, _)| *size == expected)
-            .ok_or_else(|| EnginError::Onnx(format!("missing ONNX session for batch size {batch_size}")))
+            .ok_or_else(|| EnginError::Neural(format!("missing ONNX session for batch size {batch_size}")))
     }
 }
 
@@ -264,10 +242,6 @@ impl OnnxBackend {
         Ok(Self {
             sessions: Arc::new(Mutex::new(sessions)),
             attributes: BackendAttributes {
-                has_mlh: true,
-                has_wdl: true,
-                runs_on_cpu: provider == OnnxProvider::Cpu,
-                suggested_num_search_threads: 1,
                 recommended_batch_size: recommended_batch_size(provider),
                 maximum_batch_size: maximum_batch_size(provider),
             },
@@ -285,10 +259,7 @@ fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginErr
     match create_tensorrt_sessions(path) {
         Ok(sessions) => Ok((sessions, OnnxProvider::TensorRt)),
         Err(trt_error) => {
-            let session = Session::builder()
-                .map_err(onnx_error)?
-                .commit_from_file(path)
-                .map_err(onnx_error)?;
+            let session = Session::builder().map_err(onnx_error)?.commit_from_file(path).map_err(onnx_error)?;
             eprintln!("ONNX TensorRT unavailable; using CPUExecutionProvider: {trt_error}");
             Ok((OnnxSessions::single(session), OnnxProvider::Cpu))
         }
@@ -300,10 +271,7 @@ fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginErr
     match create_direct_ml_sessions(path) {
         Ok(sessions) => Ok((OnnxSessions::direct_ml(sessions), OnnxProvider::DirectMl)),
         Err(direct_ml_error) => {
-            let session = Session::builder()
-                .map_err(onnx_error)?
-                .commit_from_file(path)
-                .map_err(onnx_error)?;
+            let session = Session::builder().map_err(onnx_error)?.commit_from_file(path).map_err(onnx_error)?;
             eprintln!("ONNX DirectML unavailable; using CPUExecutionProvider: {direct_ml_error}");
             Ok((OnnxSessions::single(session), OnnxProvider::Cpu))
         }
@@ -312,35 +280,27 @@ fn create_sessions(path: &Path) -> Result<(OnnxSessions, OnnxProvider), EnginErr
 
 #[cfg(feature = "tensorrt")]
 fn recommended_batch_size(provider: OnnxProvider) -> usize {
-    if provider == OnnxProvider::TensorRt {
-        TRT_MAX_BATCH
-    } else {
-        256
-    }
+    if provider == OnnxProvider::TensorRt { TRT_MAX_BATCH } else { 256 }
 }
 
 #[cfg(feature = "directml")]
 fn recommended_batch_size(provider: OnnxProvider) -> usize {
-    if provider == OnnxProvider::DirectMl {
-        DML_MAX_BATCH
-    } else {
-        256
-    }
+    if provider == OnnxProvider::DirectMl { DML_MAX_BATCH } else { 256 }
 }
 
-/// UCI `NnBatchSize` 硬顶与 option spin 对齐；单次 ORT run 仍按 provider 内部分块。
+/// UCI `NnBatchSize` 硬顶；单次 ORT run 仍按 provider 内部分块。
 fn maximum_batch_size(_provider: OnnxProvider) -> usize {
     1024
 }
 
-/// ORT TensorRT EP：选项语义对齐 px0 `network_onnx.cc` TRT 段，并适配 X7 mixed-fp16 图。
+/// ORT TensorRT EP：适配 X7 mixed-fp16 图。
 ///
-/// - `builder_optimization_level=5` ↔ px0 `optimize` 钳到 0..5 后的 builder 等级
+/// - `builder_optimization_level=5`：启用 TensorRT 的最高 builder 优化等级
 /// - 默认 **开** `trt_fp16_enable`：ORT 在关 fp16 时走 STRONGLY_TYPED，开时走弱类型
 ///   `BuilderFlag::kFP16`。X7 图已是 FP16 trunk + FP32 heads，但本栈关 EP-fp16 实测
-///   吞吐差约 3×；px0 能默认关是因为其 ONNX 是**整网统一 FP16**，形态不同。
+///   吞吐差约 3×。
 /// - `layer_norm_fp32_fallback`：弱类型下保护 LN（仅 `fp16_enable` 时生效）
-/// - 不设 `max_workspace_size`：与 px0 / KataGo 一样走 TRT 设备默认
+/// - 不设 `max_workspace_size`：使用 TRT 设备默认
 /// - 不启用 `cuda_graph`：动态 batch 下 ORT 要求 shape 固定，曾出现均匀 policy
 #[cfg(feature = "tensorrt")]
 fn create_tensorrt_sessions(path: &Path) -> Result<OnnxSessions, EnginError> {
@@ -378,10 +338,7 @@ fn create_tensorrt_sessions(path: &Path) -> Result<OnnxSessions, EnginError> {
         MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default).map_err(onnx_error)?,
     )
     .map_err(onnx_error)?;
-    Ok(OnnxSessions::tensor_rt(
-        session,
-        TrtGpu::new(stream, allocator, TRT_MAX_BATCH)?,
-    ))
+    Ok(OnnxSessions::tensor_rt(session, TrtGpu::new(stream, allocator, TRT_MAX_BATCH)?))
 }
 
 #[cfg(feature = "tensorrt")]
@@ -390,7 +347,7 @@ fn trt_cache_dir() -> Result<std::path::PathBuf, EnginError> {
         .ok()
         .and_then(|exe| exe.parent().map(|parent| parent.join("trt_cache")))
         .unwrap_or_else(|| Path::new("trt_cache").to_path_buf());
-    std::fs::create_dir_all(&dir).map_err(|error| EnginError::Onnx(format!("create trt_cache: {error}")))?;
+    std::fs::create_dir_all(&dir).map_err(|error| EnginError::Neural(format!("create trt_cache: {error}")))?;
     Ok(dir)
 }
 
@@ -458,14 +415,7 @@ fn infer_input_planes(
         let chunk = gpu.max_batch.max(1);
         for chunk_start in (0..batch).step_by(chunk) {
             let end = (chunk_start + chunk).min(batch);
-            infer_input_planes_trt(
-                session,
-                gpu,
-                &samples[chunk_start..end],
-                all_logits,
-                all_wdl,
-                all_moves_left,
-            )?;
+            infer_input_planes_trt(session, gpu, &samples[chunk_start..end], all_logits, all_wdl, all_moves_left)?;
         }
         return Ok(());
     }
@@ -493,10 +443,8 @@ fn infer_input_planes(
         {
             let input = &scratch[..need];
             let tensor = TensorRef::from_array_view((shape, input)).map_err(onnx_error)?;
-            let outputs = sessions.sessions[session_index]
-                .1
-                .run(ort::inputs!["board" => tensor])
-                .map_err(onnx_error)?;
+            let outputs =
+                sessions.sessions[session_index].1.run(ort::inputs!["board" => tensor]).map_err(onnx_error)?;
             append_tensor_rows(&outputs, "logits", run_batch, POLICY_SIZE, actual_batch, all_logits)?;
             append_tensor_rows(&outputs, "value", run_batch, 3, actual_batch, all_wdl)?;
             append_tensor_rows(&outputs, "moves_left", run_batch, 1, actual_batch, all_moves_left)?;
@@ -517,13 +465,12 @@ fn infer_input_planes_trt(
 ) -> Result<(), EnginError> {
     let batch = samples.len();
     if batch > gpu.max_batch {
-        return Err(EnginError::Onnx(format!("TRT batch {batch} > {}", gpu.max_batch)));
+        return Err(EnginError::Neural(format!("TRT batch {batch} > {}", gpu.max_batch)));
     }
     let sparse_bytes = pack_sparse_planes(samples, gpu.sparse_host.as_bytes_mut())?;
     let n_planes = (batch * INPUT_PLANES) as u32;
     // user compute stream：expand → TRT → D2H 同流串联，expand 后不必 sync。
-    gpu.sparse_dev
-        .upload_async(&gpu.sparse_host.as_bytes()[..sparse_bytes], &gpu.stream)?;
+    gpu.sparse_dev.upload_async(&gpu.sparse_host.as_bytes()[..sparse_bytes], &gpu.stream)?;
     expand_planes_async(&gpu.dense_dev, &gpu.sparse_dev, n_planes, &gpu.stream)?;
 
     let board = unsafe {
@@ -553,34 +500,22 @@ fn infer_input_planes_trt(
         {
             let logits = outputs
                 .get("logits")
-                .ok_or_else(|| EnginError::Onnx("missing logits".into()))?
+                .ok_or_else(|| EnginError::Neural("missing logits".into()))?
                 .downcast_ref::<TensorValueType<f32>>()
                 .map_err(onnx_error)?;
             let value = outputs
                 .get("value")
-                .ok_or_else(|| EnginError::Onnx("missing value".into()))?
+                .ok_or_else(|| EnginError::Neural("missing value".into()))?
                 .downcast_ref::<TensorValueType<f32>>()
                 .map_err(onnx_error)?;
             let mlh = outputs
                 .get("moves_left")
-                .ok_or_else(|| EnginError::Onnx("missing moves_left".into()))?
+                .ok_or_else(|| EnginError::Neural("missing moves_left".into()))?
                 .downcast_ref::<TensorValueType<f32>>()
                 .map_err(onnx_error)?;
-            download_device_async(
-                &mut gpu.logits_host.as_bytes_mut()[..logits_bytes],
-                logits.data_ptr(),
-                &gpu.stream,
-            )?;
-            download_device_async(
-                &mut gpu.value_host.as_bytes_mut()[..value_bytes],
-                value.data_ptr(),
-                &gpu.stream,
-            )?;
-            download_device_async(
-                &mut gpu.moves_left_host.as_bytes_mut()[..mlh_bytes],
-                mlh.data_ptr(),
-                &gpu.stream,
-            )?;
+            download_device_async(&mut gpu.logits_host.as_bytes_mut()[..logits_bytes], logits.data_ptr(), &gpu.stream)?;
+            download_device_async(&mut gpu.value_host.as_bytes_mut()[..value_bytes], value.data_ptr(), &gpu.stream)?;
+            download_device_async(&mut gpu.moves_left_host.as_bytes_mut()[..mlh_bytes], mlh.data_ptr(), &gpu.stream)?;
             gpu.stream.sync()?;
         }
 
@@ -590,17 +525,17 @@ fn infer_input_planes_trt(
 
         let logits_t = outputs
             .remove("logits")
-            .ok_or_else(|| EnginError::Onnx("missing logits".into()))?
+            .ok_or_else(|| EnginError::Neural("missing logits".into()))?
             .downcast::<TensorValueType<f32>>()
             .map_err(onnx_error)?;
         let value_t = outputs
             .remove("value")
-            .ok_or_else(|| EnginError::Onnx("missing value".into()))?
+            .ok_or_else(|| EnginError::Neural("missing value".into()))?
             .downcast::<TensorValueType<f32>>()
             .map_err(onnx_error)?;
         let mlh_t = outputs
             .remove("moves_left")
-            .ok_or_else(|| EnginError::Onnx("missing moves_left".into()))?
+            .ok_or_else(|| EnginError::Neural("missing moves_left".into()))?
             .downcast::<TensorValueType<f32>>()
             .map_err(onnx_error)?;
         Ok((logits_t, value_t, mlh_t))
@@ -623,22 +558,13 @@ fn pack_sparse_planes(samples: &[InputPlanes], dest: &mut [u8]) -> Result<usize,
     let n = samples.len() * INPUT_PLANES;
     let need = n * (size_of::<u128>() + size_of::<f32>());
     if dest.len() < need {
-        return Err(EnginError::Onnx(format!(
-            "sparse host too small: need {need}, have {}",
-            dest.len()
-        )));
+        return Err(EnginError::Neural(format!("sparse host too small: need {need}, have {}", dest.len())));
     }
     let (mask_bytes, value_bytes) = dest[..need].split_at_mut(n * size_of::<u128>());
-    for (slot, plane) in mask_bytes
-        .chunks_exact_mut(size_of::<u128>())
-        .zip(samples.iter().flat_map(|s| s.iter()))
-    {
+    for (slot, plane) in mask_bytes.chunks_exact_mut(size_of::<u128>()).zip(samples.iter().flat_map(|s| s.iter())) {
         slot.copy_from_slice(&plane.mask.to_le_bytes());
     }
-    for (slot, plane) in value_bytes
-        .chunks_exact_mut(size_of::<f32>())
-        .zip(samples.iter().flat_map(|s| s.iter()))
-    {
+    for (slot, plane) in value_bytes.chunks_exact_mut(size_of::<f32>()).zip(samples.iter().flat_map(|s| s.iter())) {
         slot.copy_from_slice(&plane.value.to_le_bytes());
     }
     Ok(need)
@@ -647,13 +573,11 @@ fn pack_sparse_planes(samples: &[InputPlanes], dest: &mut [u8]) -> Result<usize,
 fn validate_model_io(session: &Session) -> Result<(), EnginError> {
     let inputs = session.inputs();
     if inputs.len() != 1 || inputs[0].name() != "board" {
-        return Err(EnginError::Onnx("expected one ONNX input named board".into()));
+        return Err(EnginError::Neural("expected one ONNX input named board".into()));
     }
     let output_names: Vec<_> = session.outputs().iter().map(|output| output.name()).collect();
     if output_names != ["logits", "value", "moves_left"] {
-        return Err(EnginError::Onnx(
-            "expected ONNX outputs logits, value, and moves_left".into(),
-        ));
+        return Err(EnginError::Neural("expected ONNX outputs logits, value, and moves_left".into()));
     }
     Ok(())
 }
@@ -667,63 +591,18 @@ fn append_tensor_rows(
     actual_batch: usize,
     dest: &mut Vec<f32>,
 ) -> Result<(), EnginError> {
-    let value = outputs
-        .get(name)
-        .ok_or_else(|| EnginError::Onnx(format!("ONNX output missing {name}")))?;
+    let value = outputs.get(name).ok_or_else(|| EnginError::Neural(format!("ONNX output missing {name}")))?;
     let (shape, data) = value.try_extract_tensor::<f32>().map_err(onnx_error)?;
     if **shape != [run_batch as i64, width as i64] {
-        return Err(EnginError::Onnx(format!(
-            "{name} shape must be [{run_batch},{width}], got {shape:?}"
-        )));
+        return Err(EnginError::Neural(format!("{name} shape must be [{run_batch},{width}], got {shape:?}")));
     }
     if actual_batch > run_batch {
-        return Err(EnginError::Onnx(format!(
-            "{name}: actual_batch {actual_batch} > run_batch {run_batch}"
-        )));
+        return Err(EnginError::Neural(format!("{name}: actual_batch {actual_batch} > run_batch {run_batch}")));
     }
     dest.extend_from_slice(&data[..actual_batch * width]);
     Ok(())
 }
 
 fn onnx_error<T>(error: ort::Error<T>) -> EnginError {
-    EnginError::Onnx(error.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::*;
-    use crate::neural::{EncodedBatch, FillEmptyHistory, encode_position_input_planes, eval_result_from_encoded_row};
-    use xiangqi_core::PositionHistory;
-
-    #[test]
-    fn local_x7_onnx_smoke_if_present() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx");
-        if !path.is_file() {
-            eprintln!("skip: {} is absent", path.display());
-            return;
-        }
-        let backend = OnnxBackend::from_file(&path).expect("load local x7.onnx");
-        let history = PositionHistory::from_positions(vec![
-            xiangqi_core::Position::from_fen(xiangqi_core::STARTPOS_FEN).unwrap(),
-        ]);
-        let legal = history.last().board().generate_legal_moves();
-        let sample = encode_position_input_planes(&history, FillEmptyHistory::FenOnly);
-        let mut logits = Vec::new();
-        let mut wdl = Vec::new();
-        let mut moves_left = Vec::new();
-        backend
-            .infer_input_planes_into(&[sample], &mut logits, &mut wdl, &mut moves_left)
-            .expect("infer local x7.onnx");
-        let output = EncodedBatch {
-            logits,
-            wdl,
-            moves_left,
-        };
-        let eval = eval_result_from_encoded_row(&output, 0, &legal).expect("decode local x7.onnx");
-        assert_eq!(eval.policies.len(), legal.len());
-        assert!((eval.policies.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        assert!(eval.wl.is_finite() && eval.d.is_finite() && eval.plies_left.is_finite());
-    }
+    EnginError::Neural(error.to_string())
 }

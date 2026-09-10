@@ -13,8 +13,8 @@ Set-Location C:\projects\77xiangqi_engine
 
 - Kaggle 数据集：`pikacat/px0data`
 - 本地目录：`C:\work\px0data\{version}\`
-- 数据准备入口：`nn\scripts\data\prepare_px0.py --config nn\configs\<name>.yaml`
-- 训练入口：`nn\scripts\train\train_px0.py --config nn\configs\<name>.yaml`
+- 数据准备入口：`nn\scripts\prepare.py --config nn\configs\<name>.yaml`
+- 训练入口：`nn\scripts\train.py --config nn\configs\<name>.yaml`
 - 准备脚本负责下载、解压、train/val 切分和固定 validation manifest；训练不会再做这些工作
 
 ## 1. 首次准备环境
@@ -32,7 +32,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe -m pip install -e "nn[t
 train/validation chunk split 都在这里完成。
 
 ```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\prepare_px0.py `
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\prepare.py `
   --config nn\configs\x7_v3_01.yaml
 ```
 
@@ -40,13 +40,12 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\data\prepare
 
 ```powershell
 Copy-Item nn\configs\example.yaml nn\configs\x7_v3_01.yaml
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train.py `
   --config nn\configs\x7_v3_01.yaml
 ```
 
-配置分为 `dataset`、`model`、`training` 三段，格式参考
-`C:\Users\Administrator\projects\pxzero-training\tf\configs\example.yaml`，但只保留当前 PyTorch/PX0
-主线需要的字段。正式契约固定为 `124x10x9 -> 2062 + WDL + moves-left`；x7 v2 的纯 CNN trunk、
+配置分为 `dataset`、`model`、`training` 三段，只保留当前 PyTorch/PX0 主线需要的字段。正式契约固定为
+`124x10x9 -> 2062 + WDL + moves-left`；x7 v2 的纯 CNN trunk、
 正式 head 和 loss 语义不能通过配置切换。训练期 Auxiliary Soft Policy 与 root-WDL head 不进入 ONNX。
 优化器固定为 AdamW：Conv/Linear weights 使用 decoupled weight decay，BatchNorm 与 bias 不 decay；学习率为
 线性 warmup 后 cosine decay。
@@ -66,7 +65,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 width、blocks、bottleneck_channels 必须与来源 checkpoint 一致。
 
 ```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_px0.py `
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train.py `
   --config nn\configs\x7_v3_01.yaml
 ```
 
@@ -77,7 +76,7 @@ C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\train\train_
 ## 7. 导出 best checkpoint 为 ONNX
 
 ```powershell
-C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export\export_onnx.py `
+C:\projects\77xiangqi_engine\nn\.venv\Scripts\python.exe nn\scripts\export.py `
   --checkpoint data\checkpoints\x7_v2_01.best.pt `
   --out data\x7.onnx `
   --precision mixed-fp16
@@ -147,7 +146,8 @@ terminal、样本数或候选比例作额外覆盖或过滤。未满两个样本
 
 相关公式为：`score = Q_mean + U + VarianceBonusScale * SE`，其中 `SE=std/sqrt(N)`，
 `std=sqrt(max(0, mean(w²)-Q_mean²))`，全部来自同一 edge 的原始 completed `wl` 样本。
-`Threads=8` 只在 Gather/Eval 间近似平分，NN 与 Backprop 固定各一条线程。option 名称和布尔值大小写不敏感。
+`Threads=8` 是八条通用 worker；它们按队列就绪情况处理 Select、Expand、Eval、NN 回包和 Backprop，NN
+另有一条设备线程。`NnWindow` 只限制已承诺 Eval/NN 流程的 cache miss；terminal、cache hit 和等待 claim 的 job 不占该窗口。option 名称和布尔值大小写不敏感。
 
 当前支持 `go nodes`、`movetime`、`wtime/btime/winc/binc/movestogo`、`infinite` 与 `searchmoves`。
 `movetime` 不可与时钟字段混用；`infinite` 不可与其他预算混用。`depth`、`mate`、`ponder` 仍会明确报错。
@@ -191,13 +191,13 @@ quit
 ```powershell
 cargo run --release -p engin --bin benchmark -- `
   --movetime 3000 --repeat 3 `
-  --gathers 3 --evals 5
+  --threads 8
 ```
 
 它也可在同一 fresh-tree 批次内固定 `--cpuct`、`--cpuct-factor`、`--fpu-reduction`、`--nn-window` 与
 `--virtual-mean-fpu-scale`；这用于联合观察基础树形和流水线窗口，不替代 `search_benchmark` 的参数扫描。
 
-`search_benchmark` 固定 `4/4` Search/Eval worker 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-tree 根部分流。使用完整历史诊断评分拐点：
+`search_benchmark` 使用固定 `Threads` 和 backend 默认 batch，只比较 cPUCT/FPU 下的 fresh-tree 根部分流。使用完整历史诊断评分拐点：
 
 ```powershell
 cargo run --release -p engin --bin search_benchmark -- `
@@ -217,7 +217,7 @@ cargo run --release -p engin --bin search_benchmark -- `
 ```powershell
 cargo run --release -p engin --bin benchmark -- `
   --fen "2bak4/3PaP1P1/9/4n4/2b6/6B2/3p5/4BA3/5C3/3K1A3 w - - 0 1" `
-  --playouts 20000 --repeat 3 --gathers 4 --evals 4 `
+  --playouts 20000 --repeat 3 --threads 8 `
   --variance-bonus-scale 0.1 `
   --root-top 8 --tree-depth 3 --tree-top 3
 ```

@@ -1,12 +1,9 @@
-//! classical NN 编码：`124 x 10 x 9` 输入平面与 `2062` policy 映射。
-//!
-//! 平面布局与 policy 表历史上源于 px0 classical encoder；本模块由 X7 维护。
+//! X7 NN 编码：`124 x 10 x 9` 输入平面与 `2062` policy 映射。
 //! 热路径保持稀疏 `InputPlane`；DirectML 在 host expand，TensorRT 在 GPU expand。
 
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use xiangqi_core::{ChessBoard, Move, Position, PositionHistory, startpos_board};
+use xiangqi_core::{ChessBoard, Move, Position, PositionHistory, Square, startpos_board};
 
 use crate::EnginError;
 
@@ -24,12 +21,10 @@ pub const PLANES_PER_BOARD: usize = 15;
 pub const AUX_PLANE_BASE: usize = MOVE_HISTORY * PLANES_PER_BOARD;
 /// 单样本编码后的 f32 个数。
 pub const ENCODED_PLANE_FLOATS: usize = INPUT_PLANES * BOARD_SQUARES;
-/// 棋盘 90 格 bitmask；对齐 px0 `kAllSquares`（`src/neural/network.h`）。
+/// 棋盘 90 格 bitmask。
 pub const ALL_SQUARES: u128 = (1_u128 << BOARD_SQUARES) - 1;
 
 /// 稀疏输入平面：mask 标出写入位置，value 为该平面统一取值。
-///
-/// 参考：px0 `InputPlane`（`src/neural/network.h`）。
 #[derive(Clone, Copy, Debug)]
 pub struct InputPlane {
     pub mask: u128,
@@ -73,27 +68,16 @@ pub struct EncodedBatch {
 }
 
 impl EncodedBatch {
-    /// 从 NN worker 的可复用缓冲中取出本批结果（缓冲变空，容量随所有权移走）。
+    /// 取走本批 NN 输出，交给 reply 持有。
     pub fn take_from(logits: &mut Vec<f32>, wdl: &mut Vec<f32>, moves_left: &mut Vec<f32>) -> Self {
-        Self {
-            logits: std::mem::take(logits),
-            wdl: std::mem::take(wdl),
-            moves_left: std::mem::take(moves_left),
-        }
+        Self { logits: std::mem::take(logits), wdl: std::mem::take(wdl), moves_left: std::mem::take(moves_left) }
     }
 
     pub fn ensure_batch_len(&self, batch: usize) -> Result<(), EnginError> {
         if self.logits.len() != batch * POLICY_SIZE || self.wdl.len() != batch * 3 || self.moves_left.len() != batch {
-            return Err(EnginError::PortIncomplete("stream nn output shape"));
+            return Err(EnginError::Internal("stream nn output shape"));
         }
         Ok(())
-    }
-
-    /// 为下一轮稀疏 batch 推理预留容量。
-    pub fn reserve_scratch(logits: &mut Vec<f32>, wdl: &mut Vec<f32>, moves_left: &mut Vec<f32>, batch: usize) {
-        logits.reserve(batch * POLICY_SIZE);
-        wdl.reserve(batch * 3);
-        moves_left.reserve(batch);
     }
 }
 
@@ -102,12 +86,9 @@ fn gather_legal_logits(logits: &[f32], legal_moves: &[Move]) -> Result<smallvec:
     let mut selected = smallvec::SmallVec::new();
     for &mv in legal_moves {
         let index = move_to_nn_index(mv)
-            .ok_or_else(|| EnginError::Onnx(format!("legal move absent from px0 policy table: {mv}")))?;
+            .ok_or_else(|| EnginError::Neural(format!("legal move absent from policy vocabulary: {mv}")))?;
         if index >= logits.len() {
-            return Err(EnginError::Onnx(format!(
-                "policy logit index {index} out of range {}",
-                logits.len()
-            )));
+            return Err(EnginError::Neural(format!("policy logit index {index} out of range {}", logits.len())));
         }
         selected.push(logits[index]);
     }
@@ -128,7 +109,7 @@ fn softmax_inplace(logits: &mut [f32]) -> Result<(), EnginError> {
         })
         .sum();
     if !total.is_finite() || total <= 0.0 {
-        return Err(EnginError::Onnx("legal policy softmax is invalid".into()));
+        return Err(EnginError::Neural("legal policy softmax is invalid".into()));
     }
     for value in logits.iter_mut() {
         *value /= total;
@@ -150,28 +131,20 @@ const STREAM_MOVES_LEFT_LOOSE: f32 = 1.0;
 /// 将 EP 原始 WDL / moves_left 收敛为契约内数值；真正坏值仍硬失败并带明细。
 fn sanitize_stream_value(wdl: &[f32], moves_left: f32) -> Result<([f32; 3], f32), EnginError> {
     if wdl.len() != 3 {
-        return Err(EnginError::Onnx(format!("stream nn wdl width {} != 3", wdl.len())));
+        return Err(EnginError::Neural(format!("stream nn wdl width {} != 3", wdl.len())));
     }
     if !wdl.iter().all(|value| value.is_finite()) || !moves_left.is_finite() {
-        return Err(EnginError::Onnx(format!(
-            "stream nn values are invalid: wdl={wdl:?} moves_left={moves_left}"
-        )));
+        return Err(EnginError::Neural(format!("stream nn values are invalid: wdl={wdl:?} moves_left={moves_left}")));
     }
-    if wdl
-        .iter()
-        .any(|value| *value < -STREAM_WDL_LOOSE || *value > 1.0 + STREAM_WDL_LOOSE)
+    if wdl.iter().any(|value| *value < -STREAM_WDL_LOOSE || *value > 1.0 + STREAM_WDL_LOOSE)
         || moves_left < -STREAM_MOVES_LEFT_LOOSE
     {
-        return Err(EnginError::Onnx(format!(
-            "stream nn values are invalid: wdl={wdl:?} moves_left={moves_left}"
-        )));
+        return Err(EnginError::Neural(format!("stream nn values are invalid: wdl={wdl:?} moves_left={moves_left}")));
     }
     let mut normalized = [wdl[0].max(0.0), wdl[1].max(0.0), wdl[2].max(0.0)];
     let sum = normalized[0] + normalized[1] + normalized[2];
     if sum <= 1e-3 {
-        return Err(EnginError::Onnx(format!(
-            "stream nn values are invalid: wdl={wdl:?} moves_left={moves_left}"
-        )));
+        return Err(EnginError::Neural(format!("stream nn values are invalid: wdl={wdl:?} moves_left={moves_left}")));
     }
     normalized[0] /= sum;
     normalized[1] /= sum;
@@ -190,23 +163,12 @@ pub fn eval_result_from_encoded_row(
     let logits = batch
         .logits
         .get(row * POLICY_SIZE..(row + 1) * POLICY_SIZE)
-        .ok_or(EnginError::PortIncomplete("stream nn logits row"))?;
-    let wdl = batch
-        .wdl
-        .get(row * 3..(row + 1) * 3)
-        .ok_or(EnginError::PortIncomplete("stream nn wdl row"))?;
-    let moves_left = *batch
-        .moves_left
-        .get(row)
-        .ok_or(EnginError::PortIncomplete("stream nn moves_left row"))?;
+        .ok_or(EnginError::Internal("stream nn logits row"))?;
+    let wdl = batch.wdl.get(row * 3..(row + 1) * 3).ok_or(EnginError::Internal("stream nn wdl row"))?;
+    let moves_left = *batch.moves_left.get(row).ok_or(EnginError::Internal("stream nn moves_left row"))?;
     let policies = softmax_legal_policy(logits, legal_moves)?;
     let (wdl, moves_left) = sanitize_stream_value(wdl, moves_left)?;
-    Ok(Arc::new(EvalResult {
-        wl: wdl[0] - wdl[2],
-        d: wdl[1],
-        plies_left: moves_left,
-        policies,
-    }))
+    Ok(Arc::new(EvalResult { wl: wdl[0] - wdl[2], d: wdl[1], plies_left: moves_left, policies }))
 }
 
 /// 历史平面填充策略。
@@ -219,7 +181,7 @@ pub enum FillEmptyHistory {
 
 /// 将 PositionHistory 编码为稀疏 `InputPlanes`。
 ///
-/// 布局与填充语义对齐 px0 classical encoder（`src/neural/encoder.cc`）。
+/// 布局与填充语义遵守 PX0 classical 网络契约。
 /// 搜索只传真实 `PositionHistory`；孤立 FEN 由调用方构造长度为一的 history，再用 `FenOnly`。
 pub fn encode_position_input_planes(history: &PositionHistory, fill: FillEmptyHistory) -> InputPlanes {
     assert!(!history.is_empty(), "EncodePositionForNN requires a position");
@@ -258,7 +220,7 @@ pub fn encode_position_input_planes(history: &PositionHistory, fill: FillEmptyHi
 
 /// 稀疏平面 → dense NCHW `[124][10][9]`。
 ///
-/// 对齐 px0 ONNX 非 CUDA 分支的 CPU expand（`network_onnx.cc` `PrepareInputs`）。
+/// 展开为网络所需的 dense NCHW 输入。
 pub fn expand_input_planes(planes: &[InputPlane], dest: &mut [f32]) {
     assert_eq!(planes.len(), INPUT_PLANES, "expand expects {INPUT_PLANES} planes");
     assert_eq!(dest.len(), ENCODED_PLANE_FLOATS, "expand dest must be NCHW floats");
@@ -283,7 +245,7 @@ pub fn expand_input_planes_into_zeroed(planes: &[InputPlane], dest: &mut [f32]) 
     }
 }
 
-/// 将 PositionHistory 编码为 dense classical NCHW planes（测试 / 兼容路径）。
+/// 将 PositionHistory 编码为 dense classical NCHW planes（测试路径）。
 pub fn encode_position_for_nn(history: &PositionHistory, fill: FillEmptyHistory) -> Vec<f32> {
     let sparse = encode_position_input_planes(history, fill);
     let mut dense = vec![0.0; ENCODED_PLANE_FLOATS];
@@ -294,15 +256,24 @@ pub fn encode_position_for_nn(history: &PositionHistory, fill: FillEmptyHistory)
 /// 着法到 policy 下标映射。
 /// 表来自固定 2062 词表，禁止改排序。
 pub fn move_to_nn_index(mv: Move) -> Option<usize> {
-    static MOVE_INDEX: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
+    const NO_INDEX: u16 = u16::MAX;
+    static MOVE_INDEX: OnceLock<[u16; BOARD_SQUARES * BOARD_SQUARES]> = OnceLock::new();
     let index = MOVE_INDEX.get_or_init(|| {
-        include_str!("px0_policy_moves.txt")
-            .lines()
-            .enumerate()
-            .map(|(idx, uci)| (uci, idx))
-            .collect()
+        let mut index = [NO_INDEX; BOARD_SQUARES * BOARD_SQUARES];
+        for (policy_index, uci) in include_str!("px0_policy_moves.txt").lines().enumerate() {
+            let from = Square::parse(&uci[..2]).expect("policy move from square");
+            let to = Square::parse(&uci[2..]).expect("policy move to square");
+            index[from.index() as usize * BOARD_SQUARES + to.index() as usize] = policy_index as u16;
+        }
+        index
     });
-    index.get(mv.to_uci().as_str()).copied()
+    let from = mv.from().index() as usize;
+    let to = mv.to().index() as usize;
+    if from >= BOARD_SQUARES || to >= BOARD_SQUARES {
+        return None;
+    }
+    let policy_index = index[from * BOARD_SQUARES + to];
+    (policy_index != NO_INDEX).then_some(policy_index as usize)
 }
 
 fn write_board_planes(planes: &mut InputPlanes, base: usize, board: &ChessBoard, position: &Position) {
@@ -373,11 +344,10 @@ mod tests {
         );
     }
 
-    /// 直接移植 px0 `src/neural/encoder_test.cc:25-137` 的 classical 基线：
-    /// square layout、黑方 auxiliary plane、rule60 与历史交替 mirror 都不能靠
-    /// 当前实现自身生成期望值。
+    /// 固定网络契约的 classical 基线：square layout、黑方 auxiliary plane、rule60 与
+    /// 历史交替 mirror 都不能靠当前实现自身生成期望值。
     #[test]
-    fn px0_classical_startpos_and_two_ply_history() {
+    fn classical_startpos_and_two_ply_history() {
         fn mask(planes: &[f32], plane: usize) -> u128 {
             planes[plane * BOARD_ROWS * BOARD_COLS..(plane + 1) * BOARD_ROWS * BOARD_COLS]
                 .iter()
@@ -397,16 +367,13 @@ mod tests {
         assert_eq!(mask(&planes, 0), (1_u128 << 0) | (1 << 8));
         assert_eq!(mask(&planes, 1), (1_u128 << 3) | (1 << 5));
         assert_eq!(mask(&planes, 2), (1_u128 << 19) | (1 << 25));
-        assert_eq!(
-            mask(&planes, 3),
-            (1_u128 << 27) | (1 << 29) | (1 << 31) | (1 << 33) | (1 << 35)
-        );
+        assert_eq!(mask(&planes, 3), (1_u128 << 27) | (1 << 29) | (1 << 31) | (1 << 33) | (1 << 35));
         assert_eq!(mask(&planes, 4), (1_u128 << 1) | (1 << 7));
         assert_eq!(mask(&planes, 5), (1_u128 << 2) | (1 << 6));
         assert_eq!(mask(&planes, 6), 1_u128 << 4);
         assert_eq!(mask(&planes, 13), 1_u128 << 85);
         assert_eq!(mask(&planes, AUX_PLANE_BASE), 0);
-        // px0 的 sparse plane 此时是“全 mask + value 0”；dense ONNX 输入中等价为全零。
+        // 稀疏 plane 的全 mask + value 0 在 dense ONNX 输入中等价为全零。
         assert!(is_filled_with(&planes, AUX_PLANE_BASE + 1, 0.0));
 
         let game = GameState::from_fen_moves(xiangqi_core::STARTPOS_FEN, &["h2e2"]).unwrap();
@@ -431,23 +398,21 @@ mod tests {
         let mut logits = vec![f32::NEG_INFINITY; POLICY_SIZE];
         logits[move_to_nn_index(xiangqi_core::Move::new(a0, a1)).unwrap()] = 0.0;
         logits[move_to_nn_index(xiangqi_core::Move::new(a0, a2)).unwrap()] = 1.0;
-        let policy = softmax_legal_policy(
-            &logits,
-            &[xiangqi_core::Move::new(a0, a1), xiangqi_core::Move::new(a0, a2)],
-        )
-        .unwrap();
+        let policy =
+            softmax_legal_policy(&logits, &[xiangqi_core::Move::new(a0, a1), xiangqi_core::Move::new(a0, a2)]).unwrap();
         assert!((policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         assert!(policy[1] > policy[0]);
     }
 
     #[test]
-    fn px0_policy_table_is_complete_and_stable() {
-        let move_count = include_str!("px0_policy_moves.txt").lines().count();
-        assert_eq!(move_count, POLICY_SIZE);
-        let mv = xiangqi_core::Move::new(
-            xiangqi_core::Square::parse("a0").unwrap(),
-            xiangqi_core::Square::parse("a1").unwrap(),
-        );
-        assert_eq!(move_to_nn_index(mv), Some(0));
+    fn policy_table_is_complete_and_stable() {
+        for (index, uci) in include_str!("px0_policy_moves.txt").lines().enumerate() {
+            let mv = xiangqi_core::Move::new(
+                xiangqi_core::Square::parse(&uci[..2]).unwrap(),
+                xiangqi_core::Square::parse(&uci[2..]).unwrap(),
+            );
+            assert_eq!(move_to_nn_index(mv), Some(index));
+        }
+        assert_eq!(include_str!("px0_policy_moves.txt").lines().count(), POLICY_SIZE);
     }
 }

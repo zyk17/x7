@@ -1,54 +1,177 @@
-"""Public NN factory and compatibility imports.
-
-Architecture implementations live in `model_v2` and `model_v3`; shared model
-contract and losses live in `model_common`.
-"""
+"""Knowledge model, policy map, and training losses."""
 
 from __future__ import annotations
 
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from .model_common import *  # noqa: F403
-from .model_common import CNN_TRUNK_KIND, TRANSFORMER_TRUNK_KIND, _load_move_vocab  # noqa: F401
-from .model_v2 import GlobalBroadcast, KnowledgeResNet, PreActBottleneck, ValueAuxHead  # noqa: F401
-from .model_v3 import KnowledgeTransformer
+from .model_common import BOARD_SQUARES, _build_move_pair_index, _load_move_vocab  # noqa: F401
+
+SMOLGEN_CHANNELS = 16
+SMOLGEN_HIDDEN = 128
+SMOLGEN_GENERATED = 128
 
 
-def build_model(
-    *,
-    trunk_kind: str,
-    in_planes: int,
-    width: int,
-    blocks: int,
-    num_moves: int,
-    bottleneck_channels: int | None = None,
-    heads: int | None = None,
-    ffn_channels: int | None = None,
-    value_head: bool = False,
-    moves_left_head: bool = False,
-    auxiliary_heads: bool = False,
-) -> KnowledgeResNet | KnowledgeTransformer:
-    if trunk_kind == CNN_TRUNK_KIND:
-        return KnowledgeResNet(
-            in_planes=in_planes,
-            width=width,
-            num_blocks=blocks,
-            num_moves=num_moves,
-            bottleneck_channels=bottleneck_channels,
-            value_head=value_head,
-            moves_left_head=moves_left_head,
-            auxiliary_heads=auxiliary_heads,
-            trunk_kind=trunk_kind,
+def _attention_position_encoding() -> torch.Tensor:
+    """Policy move-pair positional encoding, [90, 90]."""
+    index = _build_move_pair_index()
+    encoding = torch.zeros((BOARD_SQUARES, BOARD_SQUARES), dtype=torch.float32)
+    encoding.diagonal().fill_(-1.0)
+    encoding.flatten().index_fill_(0, index, 1.0)
+    return encoding
+
+
+def _xavier_init(module: nn.Module, *, gain: float = 1.0) -> None:
+    for layer in module.modules():
+        if isinstance(layer, nn.Linear):
+            nn.init.xavier_normal_(layer.weight, gain=gain)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
+
+
+class Smolgen(nn.Module):
+    def __init__(self, channels: int, *, heads: int) -> None:
+        super().__init__()
+        self.compress = nn.Linear(channels, SMOLGEN_CHANNELS, bias=False)
+        self.hidden = nn.Linear(BOARD_SQUARES * SMOLGEN_CHANNELS, SMOLGEN_HIDDEN)
+        self.hidden_norm = nn.LayerNorm(SMOLGEN_HIDDEN, eps=1e-3)
+        self.generate = nn.Linear(SMOLGEN_HIDDEN, SMOLGEN_GENERATED * heads)
+        self.generated_norm = nn.LayerNorm(SMOLGEN_GENERATED * heads, eps=1e-3)
+        self.heads = heads
+
+    def forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        batch = x.shape[0]
+        encoded = self.compress(x).reshape(batch, BOARD_SQUARES * SMOLGEN_CHANNELS)
+        encoded = self.hidden_norm(F.relu(self.hidden(encoded)))
+        encoded = self.generated_norm(F.relu(self.generate(encoded)))
+        return F.linear(encoded.reshape(batch, self.heads, SMOLGEN_GENERATED), weight).reshape(
+            batch, self.heads, BOARD_SQUARES, BOARD_SQUARES
         )
-    if trunk_kind == TRANSFORMER_TRUNK_KIND:
-        return KnowledgeTransformer(
-            in_planes=in_planes,
-            width=width,
-            num_blocks=blocks,
-            num_moves=num_moves,
-            heads=16 if heads is None else heads,
-            ffn_channels=width * 3 // 2 if ffn_channels is None else ffn_channels,
-            value_head=value_head,
-            moves_left_head=moves_left_head,
-            auxiliary_heads=auxiliary_heads,
-            trunk_kind=trunk_kind,
+
+
+class AttentionBodyBlock(nn.Module):
+    def __init__(self, channels: int, *, heads: int, ffn_channels: int, alpha: float) -> None:
+        super().__init__()
+        self.heads, self.head_dim, self.alpha = heads, channels // heads, alpha
+        self.q, self.k, self.v = (nn.Linear(channels, channels) for _ in range(3))
+        self.out = nn.Linear(channels, channels)
+        self.smolgen = Smolgen(channels, heads=heads)
+        self.attention_norm = nn.LayerNorm(channels, eps=1e-6)
+        self.ffn_in = nn.Linear(channels, ffn_channels)
+        self.ffn_out = nn.Linear(ffn_channels, channels)
+        self.ffn_norm = nn.LayerNorm(channels, eps=1e-6)
+
+    def forward(self, x: torch.Tensor, smolgen_weight: torch.Tensor) -> torch.Tensor:
+        batch, squares, channels = x.shape
+        q = self.q(x).reshape(batch, squares, self.heads, self.head_dim).transpose(1, 2)
+        k = self.k(x).reshape(batch, squares, self.heads, self.head_dim).permute(0, 2, 3, 1)
+        v = self.v(x).reshape(batch, squares, self.heads, self.head_dim).transpose(1, 2)
+        scores = torch.matmul(q, k) * (self.head_dim**-0.5) + self.smolgen(x, smolgen_weight)
+        mixed = torch.matmul(F.softmax(scores, dim=-1), v).transpose(1, 2).reshape(batch, squares, channels)
+        x = self.attention_norm(x + self.alpha * self.out(mixed))
+        return self.ffn_norm(x + self.alpha * self.ffn_out(F.relu(self.ffn_in(x))))
+
+
+class PolicyHead(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.embedding = nn.Linear(channels, channels)
+        self.q, self.k = nn.Linear(channels, channels), nn.Linear(channels, channels)
+        self.scale = channels**-0.5
+        self.register_buffer("move_pair_index", _build_move_pair_index(), persistent=False)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        tokens = F.relu(self.embedding(tokens))
+        scores = torch.matmul(self.q(tokens), self.k(tokens).transpose(1, 2)) * self.scale
+        return scores.flatten(1).index_select(1, self.move_pair_index)
+
+
+class ValueHead(nn.Module):
+    def __init__(self, channels: int, *, output_size: int, embedding_size: int) -> None:
+        super().__init__()
+        self.embedding = nn.Linear(channels, embedding_size)
+        self.hidden = nn.Linear(BOARD_SQUARES * embedding_size, 128)
+        self.output = nn.Linear(128, output_size)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        features = F.relu(self.embedding(tokens)).flatten(1)
+        return self.output(F.relu(self.hidden(features)))
+
+
+class KnowledgeModel(nn.Module):
+    """Fixed 124x10x9 Knowledge model; auxiliary heads exist only during training."""
+
+    def __init__(
+        self,
+        width: int = 512,
+        num_blocks: int = 12,
+        *,
+        heads: int = 16,
+        ffn_channels: int = 768,
+        value_head: bool = False,
+        moves_left_head: bool = False,
+        auxiliary_heads: bool = False,
+    ) -> None:
+        super().__init__()
+        if width < 4 or num_blocks < 1 or heads < 1 or ffn_channels < width or width % heads:
+            raise ValueError("invalid Knowledge model dimensions")
+        if auxiliary_heads and (not value_head or not moves_left_head):
+            raise ValueError("auxiliary_heads 须与 value_head、moves_left_head 一起启用")
+        self.in_planes, self.num_moves, self.num_blocks = 124, 2062, num_blocks
+        self.width, self.heads, self.ffn_channels = width, heads, ffn_channels
+        self.value_head, self.moves_left_head, self.auxiliary_heads = value_head, moves_left_head, auxiliary_heads
+        self.register_buffer("position_encoding", _attention_position_encoding(), persistent=False)
+        self.input_embedding = nn.Linear(self.in_planes + BOARD_SQUARES, width)
+        self.input_mult_gate = nn.Parameter(torch.ones(BOARD_SQUARES, width))
+        self.input_add_gate = nn.Parameter(torch.zeros(BOARD_SQUARES, width))
+        self.smolgen_weight = nn.Parameter(torch.empty(BOARD_SQUARES * BOARD_SQUARES, SMOLGEN_GENERATED))
+        alpha = math.pow(2.0 * num_blocks, -0.25)
+        self.blocks = nn.ModuleList(
+            AttentionBodyBlock(width, heads=heads, ffn_channels=ffn_channels, alpha=alpha) for _ in range(num_blocks)
         )
-    raise ValueError(f"未知 trunk_kind: {trunk_kind}")
+        self.policy_head = PolicyHead(width)
+        self.soft_policy_head = PolicyHead(width) if auxiliary_heads else None
+        if value_head:
+            self.value_head_module = ValueHead(width, output_size=3, embedding_size=32)
+        if moves_left_head:
+            self.moves_left_head_module = ValueHead(width, output_size=1, embedding_size=8)
+        self.root_value_head = ValueHead(width, output_size=3, embedding_size=32) if auxiliary_heads else None
+        _xavier_init(self)
+        beta = math.pow(8.0 * num_blocks, -0.25)
+        for block in self.blocks:
+            for layer in (block.q, block.k, block.v, block.out, block.ffn_in, block.ffn_out):
+                nn.init.xavier_normal_(layer.weight, gain=math.sqrt(beta))
+        nn.init.xavier_normal_(self.smolgen_weight)
+
+    def forward_body(self, x: torch.Tensor) -> torch.Tensor:
+        tokens = x.permute(0, 2, 3, 1).reshape(x.shape[0], BOARD_SQUARES, self.in_planes)
+        position = self.position_encoding.to(dtype=tokens.dtype).expand(x.shape[0], -1, -1)
+        tokens = self.input_embedding(torch.cat((tokens, position), dim=2))
+        tokens = F.relu(tokens) * self.input_mult_gate.to(tokens.dtype) + self.input_add_gate.to(tokens.dtype)
+        for block in self.blocks:
+            tokens = block(tokens, self.smolgen_weight.to(tokens.dtype))
+        return tokens
+
+    def forward_heads(self, body: torch.Tensor, *, include_auxiliary: bool = True) -> tuple[torch.Tensor, ...]:
+        outputs: list[torch.Tensor] = [self.policy_head(body)]
+        if self.value_head:
+            outputs.append(self.value_head_module(body))
+        if self.moves_left_head:
+            outputs.append(F.relu(self.moves_left_head_module(body)))
+        if self.auxiliary_heads and include_auxiliary:
+            assert self.soft_policy_head is not None and self.root_value_head is not None
+            outputs.extend((self.soft_policy_head(body), self.root_value_head(body)))
+        return tuple(outputs)
+
+    def forward_formal_heads(self, body: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.value_head or not self.moves_left_head:
+            raise RuntimeError("formal ONNX export requires WDL and moves-left heads")
+        return self.policy_head(body), self.value_head_module(body), F.relu(self.moves_left_head_module(body))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        outputs = self.forward_heads(self.forward_body(x))
+        return outputs[0] if len(outputs) == 1 else outputs

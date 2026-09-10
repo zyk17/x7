@@ -1,4 +1,4 @@
-//! 棋盘表示、FEN 与合法着。来源：px0 board。
+//! 棋盘表示、FEN 与合法着。
 
 use std::sync::OnceLock;
 
@@ -6,7 +6,7 @@ use crate::bitboard::BitBoard;
 use crate::board_attacks::get_attacks;
 use crate::board_masks::{ADVISOR_SQUARES, PALACE, bishop_bb, pawn_bb};
 use crate::hashcat::hash_cat_u128s;
-use crate::{CoreError, File, LegalMoveList, Move, PieceType, Rank, Square};
+use crate::{File, LegalMoveList, Move, PieceType, Rank, Square};
 
 pub use crate::board_attacks::initialize_magic_bitboards;
 
@@ -38,6 +38,7 @@ pub struct ChessBoard {
     our_king: Square,
     their_king: Square,
     flipped: bool,
+    /// 长捉裁决用的棋子身份；不参与局面相等或 hash。
     rule_id: [u8; 90],
 }
 
@@ -79,32 +80,24 @@ impl Default for ChessBoard {
 }
 
 impl ChessBoard {
-    pub fn from_fen(fen: &str) -> Result<(Self, FenState), CoreError> {
+    pub fn from_fen(fen: &str) -> Result<(Self, FenState), String> {
         initialize_magic_bitboards();
         let mut board = Self::default();
-        let mut state = FenState {
-            rule60_ply: 0,
-            game_ply: 1,
-        };
+        let mut state = FenState { rule60_ply: 0, game_ply: 1 };
 
         let mut rank = Rank::R9;
         let mut file_idx = 0i32;
         let mut pos = 0usize;
         let bytes = fen.as_bytes();
 
-        let complain = |msg: &str| CoreError::InvalidFen(format!("{msg}: {fen}"));
+        let complain = |msg: &str| format!("invalid FEN: {msg}: {fen}");
 
-        fn skip_whitespace(
-            bytes: &[u8],
-            pos: &mut usize,
-            where_at: Option<&str>,
-            fen: &str,
-        ) -> Result<bool, CoreError> {
+        fn skip_whitespace(bytes: &[u8], pos: &mut usize, where_at: Option<&str>, fen: &str) -> Result<bool, String> {
             if let Some(where_at) = where_at
                 && *pos < bytes.len()
                 && bytes[*pos] != b' '
             {
-                return Err(CoreError::InvalidFen(format!("space expected {where_at}: {fen}")));
+                return Err(format!("invalid FEN: space expected {where_at}: {fen}"));
             }
             while *pos < bytes.len() && bytes[*pos] == b' ' {
                 *pos += 1;
@@ -146,15 +139,11 @@ impl ChessBoard {
             let file = file.unwrap();
             let sq = Square::new(file, rank);
             if piece == PieceType::Advisor
-                && BitBoard::from_square(sq)
-                    .intersection(BitBoard::from_bits(ADVISOR_SQUARES))
-                    .is_empty()
+                && BitBoard::from_square(sq).intersection(BitBoard::from_bits(ADVISOR_SQUARES)).is_empty()
             {
                 return Err(complain("advisor not on an advisor square"));
             } else if piece == PieceType::King
-                && BitBoard::from_square(sq)
-                    .intersection(BitBoard::from_bits(PALACE))
-                    .is_empty()
+                && BitBoard::from_square(sq).intersection(BitBoard::from_bits(PALACE)).is_empty()
             {
                 return Err(complain("king not in palace"));
             } else if piece == PieceType::Pawn {
@@ -171,12 +160,8 @@ impl ChessBoard {
             pos += 1;
         }
 
-        fn validate_board(board: &ChessBoard, fen: &str) -> Result<(), CoreError> {
-            if board.is_valid() {
-                Ok(())
-            } else {
-                Err(CoreError::InvalidFen(format!("inconsistent board: {fen}")))
-            }
+        fn validate_board(board: &ChessBoard, fen: &str) -> Result<(), String> {
+            if board.is_valid() { Ok(()) } else { Err(format!("invalid FEN: inconsistent board: {fen}")) }
         }
 
         if skip_whitespace(bytes, &mut pos, Some("after the board"), fen)? {
@@ -226,12 +211,10 @@ impl ChessBoard {
             return Ok((board, state));
         }
 
-        fn parse_int(fen: &str, pos: &mut usize, error_msg: &str) -> Result<u32, CoreError> {
+        fn parse_int(fen: &str, pos: &mut usize, error_msg: &str) -> Result<u32, String> {
             let end = fen[*pos..].find(' ').map(|idx| *pos + idx).unwrap_or(fen.len());
             let num = &fen[*pos..end];
-            let value: u32 = num
-                .parse()
-                .map_err(|_| CoreError::InvalidFen(format!("{error_msg}: {fen}")))?;
+            let value: u32 = num.parse().map_err(|_| format!("invalid FEN: {error_msg}: {fen}"))?;
             *pos = end;
             Ok(value)
         }
@@ -278,18 +261,14 @@ impl ChessBoard {
 
         for source in self.ours.into_iter() {
             if self.rooks.contains(source) {
-                for destination in get_attacks(PieceType::Rook, source, occupied)
-                    .difference(self.ours)
-                    .into_iter()
-                {
+                for destination in get_attacks(PieceType::Rook, source, occupied).difference(self.ours).into_iter() {
                     result.push(Move::new(source, destination));
                 }
                 continue;
             }
             if self.advisors.contains(source) {
-                for destination in get_attacks(PieceType::Advisor, source, BitBoard::EMPTY)
-                    .difference(self.ours)
-                    .into_iter()
+                for destination in
+                    get_attacks(PieceType::Advisor, source, BitBoard::EMPTY).difference(self.ours).into_iter()
                 {
                     result.push(Move::new(source, destination));
                 }
@@ -305,36 +284,28 @@ impl ChessBoard {
                 continue;
             }
             if self.pawns.contains(source) {
-                for destination in get_attacks(PieceType::Pawn, source, BitBoard::EMPTY)
-                    .difference(self.ours)
-                    .into_iter()
+                for destination in
+                    get_attacks(PieceType::Pawn, source, BitBoard::EMPTY).difference(self.ours).into_iter()
                 {
                     result.push(Move::new(source, destination));
                 }
                 continue;
             }
             if self.knights.contains(source) {
-                for destination in get_attacks(PieceType::Knight, source, occupied)
-                    .difference(self.ours)
-                    .into_iter()
-                {
+                for destination in get_attacks(PieceType::Knight, source, occupied).difference(self.ours).into_iter() {
                     result.push(Move::new(source, destination));
                 }
                 continue;
             }
             if self.bishops.contains(source) {
-                for destination in get_attacks(PieceType::Bishop, source, occupied)
-                    .difference(self.ours)
-                    .into_iter()
-                {
+                for destination in get_attacks(PieceType::Bishop, source, occupied).difference(self.ours).into_iter() {
                     result.push(Move::new(source, destination));
                 }
                 continue;
             }
             if source == self.our_king {
-                for destination in get_attacks(PieceType::King, source, BitBoard::EMPTY)
-                    .difference(self.ours)
-                    .into_iter()
+                for destination in
+                    get_attacks(PieceType::King, source, BitBoard::EMPTY).difference(self.ours).into_iter()
                 {
                     result.push(Move::new(source, destination));
                 }
@@ -412,19 +383,13 @@ impl ChessBoard {
     }
 
     pub fn is_under_check(&self) -> bool {
-        !self
-            .checkers_to::<true>(self.our_king, self.ours.union(self.theirs))
-            .is_empty()
+        !self.checkers_to::<true>(self.our_king, self.ours.union(self.theirs)).is_empty()
     }
 
     fn checkers_to<const OUR: bool>(&self, ksq: Square, occupied: BitBoard) -> BitBoard {
         let mut checkers = get_attacks(PieceType::Rook, ksq, occupied).intersection(self.rooks);
         checkers = checkers.union(get_attacks(PieceType::Cannon, ksq, occupied).intersection(self.cannons));
-        let pawn_pt = if OUR {
-            PieceType::PawnToOurs
-        } else {
-            PieceType::PawnToTheirs
-        };
+        let pawn_pt = if OUR { PieceType::PawnToOurs } else { PieceType::PawnToTheirs };
         checkers = checkers.union(get_attacks(pawn_pt, ksq, BitBoard::EMPTY).intersection(self.pawns));
         checkers = checkers.union(get_attacks(PieceType::KnightTo, ksq, occupied).intersection(self.knights));
         checkers.intersection(if OUR { self.theirs } else { self.ours })
@@ -445,11 +410,17 @@ impl ChessBoard {
     }
 
     pub fn has_mating_material(&self) -> bool {
+        let legal_moves = self.generate_legal_moves();
+        self.has_mating_material_after_legal_moves(&legal_moves)
+    }
+
+    /// 在调用方已生成当前局面的合法着时复用它，避免稀疏残局重复生成。
+    pub(crate) fn has_mating_material_after_legal_moves(&self, legal_moves: &[Move]) -> bool {
         if self.pawns.count() == 0 && self.rooks.count() == 0 && self.knights.count() == 0 {
             let level = mating_draw_level(self);
             if level != DrawLevel::No {
                 if level == DrawLevel::Mate {
-                    for mv in self.generate_legal_moves() {
+                    for &mv in legal_moves {
                         let mut after = self.clone();
                         after.apply_move(mv);
                         after.mirror();
@@ -472,10 +443,8 @@ impl ChessBoard {
                 let mut attacks =
                     get_attacks(attacker_type, from, self.ours.union(self.theirs)).intersection(self.theirs);
                 attacks = attacks.difference(self.kings());
-                attacks = attacks.difference(
-                    self.pawns
-                        .intersection(BitBoard::from_bits(crate::board_masks::HALF_BB[1])),
-                );
+                attacks =
+                    attacks.difference(self.pawns.intersection(BitBoard::from_bits(crate::board_masks::HALF_BB[1])));
 
                 let mut candidates = BitBoard::EMPTY;
                 if matches!(attacker_type, PieceType::Knight | PieceType::Cannon) {
@@ -543,21 +512,17 @@ impl ChessBoard {
         1u16 << self.rule_id[to.index() as usize]
     }
 
-    pub fn parse_move(&self, move_str: &str) -> Result<Move, CoreError> {
+    pub fn parse_move(&self, move_str: &str) -> Result<Move, String> {
         if move_str.len() != 4 {
-            return Err(CoreError::InvalidFen(format!("invalid move: {move_str}")));
+            return Err(format!("invalid move: {move_str}"));
         }
         let bytes = move_str.as_bytes();
-        let from_file =
-            File::parse(bytes[0] as char).ok_or_else(|| CoreError::InvalidFen(format!("invalid move: {move_str}")))?;
-        let mut from_rank =
-            Rank::parse(bytes[1] as char).ok_or_else(|| CoreError::InvalidFen(format!("invalid move: {move_str}")))?;
-        let to_file =
-            File::parse(bytes[2] as char).ok_or_else(|| CoreError::InvalidFen(format!("invalid move: {move_str}")))?;
-        let mut to_rank =
-            Rank::parse(bytes[3] as char).ok_or_else(|| CoreError::InvalidFen(format!("invalid move: {move_str}")))?;
+        let from_file = File::parse(bytes[0] as char).ok_or_else(|| format!("invalid move: {move_str}"))?;
+        let mut from_rank = Rank::parse(bytes[1] as char).ok_or_else(|| format!("invalid move: {move_str}"))?;
+        let to_file = File::parse(bytes[2] as char).ok_or_else(|| format!("invalid move: {move_str}"))?;
+        let mut to_rank = Rank::parse(bytes[3] as char).ok_or_else(|| format!("invalid move: {move_str}"))?;
         if !from_file.is_valid() || !from_rank.is_valid() || !to_file.is_valid() || !to_rank.is_valid() {
-            return Err(CoreError::InvalidFen(format!("invalid move: {move_str}")));
+            return Err(format!("invalid move: {move_str}"));
         }
         if self.flipped {
             from_rank = from_rank.flip();
@@ -566,7 +531,7 @@ impl ChessBoard {
         let from = Square::new(from_file, from_rank);
         let to = Square::new(to_file, to_rank);
         if !self.ours.contains(from) {
-            return Err(CoreError::InvalidFen(format!("invalid move: {move_str}")));
+            return Err(format!("invalid move: {move_str}"));
         }
         Ok(Move::new(from, to))
     }
@@ -676,24 +641,13 @@ impl ChessBoard {
 
     fn is_valid(&self) -> bool {
         let all = self.ours().union(self.theirs());
-        let bbs = [
-            self.rooks(),
-            self.advisors(),
-            self.cannons(),
-            self.pawns(),
-            self.knights(),
-            self.bishops(),
-            self.kings(),
-        ];
+        let bbs =
+            [self.rooks(), self.advisors(), self.cannons(), self.pawns(), self.knights(), self.bishops(), self.kings()];
         let union: BitBoard = bbs.iter().copied().fold(BitBoard::EMPTY, |a, b| a.union(b));
         if union != all {
             return false;
         }
-        if !self
-            .advisors()
-            .difference(BitBoard::from_bits(ADVISOR_SQUARES))
-            .is_empty()
-        {
+        if !self.advisors().difference(BitBoard::from_bits(ADVISOR_SQUARES)).is_empty() {
             return false;
         }
         for i in 0..bbs.len() {
@@ -744,11 +698,7 @@ fn mating_draw_level(board: &ChessBoard) -> DrawLevel {
         && board.cannons().intersection(board.theirs()).count() == 1
         && board.advisors().count() == 0
     {
-        return if board.bishops().count() == 0 {
-            DrawLevel::Direct
-        } else {
-            DrawLevel::Mate
-        };
+        return if board.bishops().count() == 0 { DrawLevel::Direct } else { DrawLevel::Mate };
     }
     DrawLevel::No
 }

@@ -2,20 +2,45 @@
 //!
 //! key 由 `EvalCacheKey::slot_key()` 提供：棋盘 hash 混入 `repetitions`；
 //! 命中时再校验 `num_moves`（廉价碰撞护栏）。**不**纳入完整 history。
-//! 容量与替换：固定 `2^N` 直映表，槽内新结果替换旧结果（KataGo 风格）。
-//!
-//! 历史参考：px0 `neural/memcache.cc`；KataGo `neuralnet/nneval.cpp`。
+//! 容量与替换：固定 `2^N` 直映表，槽内新结果替换旧结果。
 
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
+use xiangqi_core::Position;
 
 use super::backend::EvalResult;
 
-/// KataGo GTP 默认值（`cpp/program/setup.cpp:248-255`）：`2^20 = 1,048,576` 槽。
+/// 默认 `2^20 = 1,048,576` 槽。
 pub const DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO: u8 = 20;
-/// KataGo `setup.cpp` 对该配置接受 `0..=48`。超大值仍受实际可分配内存约束。
+/// 可设范围为 `0..=48`；超大值仍受实际可分配内存约束。
 pub const MAX_NN_CACHE_SIZE_POWER_OF_TWO: u8 = 48;
+
+/// NN cache 命中键：当前棋盘 + 合法着数 + `Position::repetitions`。
+///
+/// 树节点不按棋盘合并；cache 允许历史路径不同，但须区分编码平面中的 repetition 次数。
+/// `num_moves` 用作 policy 长度的廉价护栏。为提高命中率，刻意不纳入完整 history 与
+/// rule60；规则终局在读取 cache 前裁决。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EvalCacheKey {
+    board_hash: u64,
+    num_moves: usize,
+    repetitions: u32,
+}
+
+impl EvalCacheKey {
+    pub(crate) fn new(position: &Position, num_moves: usize) -> Self {
+        Self { board_hash: position.board().hash(), num_moves, repetitions: position.repetitions() }
+    }
+
+    fn slot_key(self) -> u64 {
+        if self.repetitions == 0 {
+            self.board_hash
+        } else {
+            xiangqi_core::hashcat::hash_cat(self.board_hash, self.repetitions as u64)
+        }
+    }
+}
 
 /// cache 中保存的评估结果。
 #[derive(Clone, Debug)]
@@ -33,74 +58,56 @@ struct CacheEntry {
 #[derive(Debug, Default)]
 struct CacheSlot(Mutex<Option<CacheEntry>>);
 
-/// KataGo 风格的直映 NN cache。每个槽只保留一个完整 key；不同 key 映射到同一槽时，
+/// 直映 NN cache。每个槽只保留一个完整 key；不同 key 映射到同一槽时，
 /// 后写结果替换先前结果。表大小只在 UCI option 改动时重建，查找只锁定目标槽。
 #[derive(Debug)]
 pub(crate) struct EvalCache {
-    slots: RwLock<Arc<[CacheSlot]>>,
+    slots: Arc<[CacheSlot]>,
 }
 
 impl EvalCache {
     pub(crate) fn new(size_power_of_two: u8) -> Self {
-        Self {
-            slots: RwLock::new(Self::allocate_slots(size_power_of_two)),
-        }
+        Self { slots: Self::allocate_slots(size_power_of_two) }
     }
 
     fn allocate_slots(size_power_of_two: u8) -> Arc<[CacheSlot]> {
-        assert!(
-            size_power_of_two <= MAX_NN_CACHE_SIZE_POWER_OF_TWO,
-            "NN cache size power is out of range"
-        );
+        assert!(size_power_of_two <= MAX_NN_CACHE_SIZE_POWER_OF_TWO, "NN cache size power is out of range");
         let size = 1usize << size_power_of_two;
         let mut slots = Vec::with_capacity(size);
         slots.resize_with(size, CacheSlot::default);
         slots.into()
     }
 
-    fn slots(&self) -> Arc<[CacheSlot]> {
-        Arc::clone(&self.slots.read())
-    }
-
     /// 查找 cache；key 冲突时校验完整 key / 合法着数。
-    /// （`memcache.cc:130-150`）。空合法着列表可接受缓存结果；否则只有相同 policy
-    /// 长度才安全。
+    /// 空合法着列表可接受缓存结果；否则只有相同 policy 长度才安全。
     pub(crate) fn get(&self, key: u64, requested_moves: usize) -> Option<Arc<EvalResult>> {
-        let slots = self.slots();
-        let slot = slots[key as usize & (slots.len() - 1)].0.lock();
+        let slot = self.slots[key as usize & (self.slots.len() - 1)].0.lock();
         let entry = slot.as_ref()?;
         (entry.key == key && (requested_moves == 0 || entry.value.num_moves == requested_moves))
             .then(|| Arc::clone(&entry.value.result))
     }
 
-    /// KataGo `NNCacheTable::set`：同一槽内的新结果替换旧结果。旧 `Arc` 在离开锁后
+    pub(crate) fn get_evaluation(&self, key: EvalCacheKey) -> Option<Arc<EvalResult>> {
+        self.get(key.slot_key(), key.num_moves)
+    }
+
+    /// 同一槽内的新结果替换旧结果。旧 `Arc` 在离开锁后
     /// 才释放，避免析构占用槽锁。
     pub(crate) fn insert(&self, key: u64, value: CachedEval) {
-        let slots = self.slots();
         let previous = {
-            let mut slot = slots[key as usize & (slots.len() - 1)].0.lock();
+            let mut slot = self.slots[key as usize & (self.slots.len() - 1)].0.lock();
             slot.replace(CacheEntry { key, value })
         };
         drop(previous);
     }
 
-    /// 仅供 Engine 生命周期 option 调用。先分配新表再交换，已有查找继续持有旧表快照。
-    pub(crate) fn set_size_power_of_two(&self, size_power_of_two: u8) {
-        let slots = Self::allocate_slots(size_power_of_two);
-        *self.slots.write() = slots;
-    }
-
-    /// 清空时直接交换同尺寸空表，避免逐槽加锁。
-    pub(crate) fn clear(&self) {
-        let size = self.slots.read().len();
-        let mut slots = Vec::with_capacity(size);
-        slots.resize_with(size, CacheSlot::default);
-        *self.slots.write() = slots.into();
+    pub(crate) fn insert_evaluation(&self, key: EvalCacheKey, result: Arc<EvalResult>) {
+        self.insert(key.slot_key(), CachedEval { result, num_moves: key.num_moves });
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.slots.read().iter().filter(|slot| slot.0.lock().is_some()).count()
+        self.slots.iter().filter(|slot| slot.0.lock().is_some()).count()
     }
 }
 
@@ -112,20 +119,8 @@ mod tests {
     fn direct_slot_replaces_an_older_key() {
         let result = Arc::new(EvalResult::default());
         let cache = EvalCache::new(0);
-        cache.insert(
-            1,
-            CachedEval {
-                result: Arc::clone(&result),
-                num_moves: 1,
-            },
-        );
-        cache.insert(
-            2,
-            CachedEval {
-                result: Arc::clone(&result),
-                num_moves: 2,
-            },
-        );
+        cache.insert(1, CachedEval { result: Arc::clone(&result), num_moves: 1 });
+        cache.insert(2, CachedEval { result: Arc::clone(&result), num_moves: 2 });
         assert!(cache.get(1, 1).is_none());
         assert!(cache.get(2, 2).is_some());
         assert!(Arc::ptr_eq(&cache.get(2, 2).expect("cached value"), &result));
@@ -135,30 +130,10 @@ mod tests {
     #[test]
     fn cache_checks_the_full_key_inside_a_slot() {
         let cache = EvalCache::new(0);
-        cache.insert(
-            1,
-            CachedEval {
-                result: Arc::new(EvalResult::default()),
-                num_moves: 1,
-            },
-        );
+        cache.insert(1, CachedEval { result: Arc::new(EvalResult::default()), num_moves: 1 });
         assert!(cache.get(3, 1).is_none());
         assert!(cache.get(1, 2).is_none());
         assert!(cache.get(1, 1).is_some());
         assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn cache_resize_replaces_all_entries() {
-        let cache = EvalCache::new(1);
-        cache.insert(
-            1,
-            CachedEval {
-                result: Arc::new(EvalResult::default()),
-                num_moves: 0,
-            },
-        );
-        cache.set_size_power_of_two(0);
-        assert_eq!(cache.len(), 0);
     }
 }

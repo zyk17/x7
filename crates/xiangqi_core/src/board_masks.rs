@@ -1,4 +1,4 @@
-//! 几何 mask 与距离辅助。来源：px0 board.cc。
+//! 几何 mask 与距离辅助。
 
 use crate::bitboard::BitBoard;
 use crate::types::{Direction, EAST, NORTH, SOUTH, Square, WEST, file_distance, rank_distance};
@@ -6,7 +6,7 @@ use crate::types::{Direction, EAST, NORTH, SOUTH, Square, WEST, file_distance, r
 pub const PALACE: u128 = (0x0000_0000_0070_381Cu128 << 64) | 0x0000_0000_00E0_7038u128;
 /// 士只能停在九宫的五个斜线交点；`PALACE` 还包含将可走、但士不可停的四个边点。
 ///
-/// px0 的 FEN 校验只要求士在九宫内。x7 在合法着生成前额外区分士位，防止
+/// FEN 校验只要求士在九宫内。合法着生成前额外区分士位，防止
 /// `f1e0` 这类从九宫边点出发的非法士着进入 policy 与搜索。
 pub const ADVISOR_SQUARES: u128 = (1u128 << 3)
     | (1u128 << 5)
@@ -58,18 +58,12 @@ pub fn bishop_bb() -> BitBoard {
 
 pub const PAWN_FILE_BB: u128 = FILE_A_BB | FILE_C_BB | FILE_E_BB | FILE_G_BB | FILE_I_BB;
 
-pub const HALF_BB: [u128; 2] = [
-    RANK0_BB | RANK1_BB | RANK2_BB | RANK3_BB | RANK4_BB,
-    RANK5_BB | RANK6_BB | RANK7_BB | RANK8_BB | RANK9_BB,
-];
+pub const HALF_BB: [u128; 2] =
+    [RANK0_BB | RANK1_BB | RANK2_BB | RANK3_BB | RANK4_BB, RANK5_BB | RANK6_BB | RANK7_BB | RANK8_BB | RANK9_BB];
 
 pub fn pawn_bb(for_theirs: bool) -> BitBoard {
     let half = if for_theirs { HALF_BB[0] } else { HALF_BB[1] };
-    let extra = if for_theirs {
-        (RANK6_BB | RANK5_BB) & PAWN_FILE_BB
-    } else {
-        (RANK3_BB | RANK4_BB) & PAWN_FILE_BB
-    };
+    let extra = if for_theirs { (RANK6_BB | RANK5_BB) & PAWN_FILE_BB } else { (RANK3_BB | RANK4_BB) & PAWN_FILE_BB };
     BitBoard::from_bits(half | extra)
 }
 
@@ -90,11 +84,7 @@ pub fn distance(a: Square, b: Square) -> i32 {
 
 pub fn safe_destination(s: Square, step: Direction) -> BitBoard {
     let to = s.offset_by(step);
-    if to.is_valid() && distance(s, to) <= 2 {
-        BitBoard::from_square(to)
-    } else {
-        BitBoard::EMPTY
-    }
+    if to.is_valid() && distance(s, to) <= 2 { BitBoard::from_square(to) } else { BitBoard::EMPTY }
 }
 
 pub fn shift(direction: Direction, board: BitBoard) -> BitBoard {

@@ -8,12 +8,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engin::neural::backend::{Backend, CachingBackend, EvalResult};
+use engin::neural::backend::{Backend, EvalResult};
 use engin::neural::onnx::OnnxBackend;
 use engin::neural::{EncodedBatch, FillEmptyHistory, encode_position_input_planes, eval_result_from_encoded_row};
 use engin::search::{
-    BenchObserver, BenchStats, DecisionRule, NodeId, QueueStats, RootEdgeStats, Search, SearchConfig, SearchLimits,
-    SearchParams, Stats, best_move, best_move_with_params, compute_cpuct, root_stats, variance_bonus_from_se,
+    BenchObserver, BenchStats, DecisionRule, ExecutionStats, NodeId, QueueStats, RootEdgeStats, Search, SearchConfig,
+    SearchLimits, SearchParams, SearchTree, Stats, best_move, best_move_with_params, compute_cpuct, root_stats,
+    variance_bonus_from_se,
 };
 use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
@@ -25,8 +26,7 @@ struct Args {
     playouts: Option<u64>,
     movetime: Option<u64>,
     repeat: usize,
-    gathers: Vec<usize>,
-    evals: Vec<usize>,
+    threads: usize,
     eval_batch: Option<usize>,
     cpuct: f32,
     cpuct_factor: f32,
@@ -46,7 +46,7 @@ type BackendSetup = (Arc<dyn Backend>, &'static str, usize);
 
 fn usage() -> &'static str {
     "usage: benchmark [--onnx data/x7.onnx] [--fen \"...\" | --positions data/benchmark_positions.txt] [--moves \"c3c4 h7h3 ...\"] [--playouts 20000 | --movetime 3000] \\
-     [--repeat 1] [--gathers 2,4] [--evals 4,6] [--eval-batch 64] [--cpuct 2.4] [--cpuct-factor 0] [--fpu-reduction 0.225] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 1.5] [--decision-lcb-stdevs 0] \\
+     [--repeat 1] [--threads 8] [--eval-batch 64] [--cpuct 2.4] [--cpuct-factor 0] [--fpu-reduction 0.225] [--nn-window 2.25] [--virtual-mean-fpu-scale 1.0] [--variance-bonus-scale 1.5] [--decision-lcb-stdevs 0] \\
      [--root-top 8] [--trace 128,256,512] [--collision-dist] [--tree-depth 4] [--tree-top 4]"
 }
 
@@ -58,8 +58,7 @@ fn parse_args() -> Result<Args, String> {
     let mut playouts = Some(20_000);
     let mut movetime = None;
     let mut repeat = 1;
-    let mut gathers = vec![3];
-    let mut evals = vec![5];
+    let mut threads = 8;
     let mut eval_batch = None;
     let defaults = SearchParams::default();
     let mut cpuct = defaults.cpuct;
@@ -113,8 +112,13 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--repeat must be an unsigned integer")?
             }
-            "--gathers" => gathers = parse_list(&args.next().ok_or("--gathers requires list like 4,8")?)?,
-            "--evals" => evals = parse_list(&args.next().ok_or("--evals requires list like 1,2")?)?,
+            "--threads" => {
+                threads = args
+                    .next()
+                    .ok_or("--threads requires a positive integer")?
+                    .parse()
+                    .map_err(|_| "--threads must be a positive integer")?
+            }
             "--eval-batch" => {
                 eval_batch = Some(
                     args.next()
@@ -213,10 +217,8 @@ fn parse_args() -> Result<Args, String> {
             return Err("--trace milestones must be strictly increasing and within --playouts".into());
         }
     }
-    for (name, values) in [("--gathers", &gathers), ("--evals", &evals)] {
-        if values.contains(&0) {
-            return Err(format!("{name} entries must be > 0"));
-        }
+    if threads == 0 {
+        return Err("--threads must be > 0".into());
     }
     Ok(Args {
         onnx,
@@ -226,8 +228,7 @@ fn parse_args() -> Result<Args, String> {
         playouts,
         movetime,
         repeat,
-        gathers,
-        evals,
+        threads,
         eval_batch,
         cpuct,
         cpuct_factor,
@@ -252,16 +253,8 @@ fn parse_non_negative_float(name: &str, text: &str) -> Result<f32, String> {
     Ok(value)
 }
 
-fn parse_list(text: &str) -> Result<Vec<usize>, String> {
-    text.split(',')
-        .map(|part| part.trim().parse().map_err(|_| format!("invalid list entry: {part}")))
-        .collect()
-}
-
 fn parse_u64_list(text: &str) -> Result<Vec<u64>, String> {
-    text.split(',')
-        .map(|part| part.trim().parse().map_err(|_| format!("invalid list entry: {part}")))
-        .collect()
+    text.split(',').map(|part| part.trim().parse().map_err(|_| format!("invalid list entry: {part}"))).collect()
 }
 
 /// `data/benchmark_positions.txt` 的 `名称 | FEN` 格式。
@@ -302,7 +295,7 @@ fn make_backend(path: &PathBuf) -> Result<BackendSetup, Box<dyn std::error::Erro
     let onnx = OnnxBackend::from_file(path)?;
     let provider = onnx.provider().name();
     let recommended = onnx.attributes().recommended_batch_size;
-    let backend: Arc<dyn Backend> = Arc::new(CachingBackend::new(Box::new(onnx)));
+    let backend: Arc<dyn Backend> = Arc::new(onnx);
     Ok((backend, provider, recommended))
 }
 
@@ -311,16 +304,12 @@ fn evaluate_root(
     history: &PositionHistory,
 ) -> Result<Arc<EvalResult>, Box<dyn std::error::Error>> {
     let legal = history.last().board().generate_legal_moves();
-    let sample = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
+    let sample = encode_position_input_planes(history, FillEmptyHistory::No);
     let mut logits = Vec::new();
     let mut wdl = Vec::new();
     let mut moves_left = Vec::new();
     backend.infer_input_planes_into(&[sample], &mut logits, &mut wdl, &mut moves_left)?;
-    let output = EncodedBatch {
-        logits,
-        wdl,
-        moves_left,
-    };
+    let output = EncodedBatch { logits, wdl, moves_left };
     Ok(eval_result_from_encoded_row(&output, 0, &legal)?)
 }
 
@@ -330,7 +319,7 @@ fn warmup_position(
     history: &PositionHistory,
     batch: usize,
 ) -> Result<RootNnProbe, Box<dyn std::error::Error>> {
-    let planes = encode_position_input_planes(history, FillEmptyHistory::FenOnly);
+    let planes = encode_position_input_planes(history, FillEmptyHistory::No);
     let samples = vec![planes; batch.max(1)];
     let mut logits = Vec::new();
     let mut wdl = Vec::new();
@@ -346,7 +335,6 @@ fn warmup_position(
         }
     }
     let eval = evaluate_root(backend, history)?;
-    backend.clear_cache();
     let legal = history.last().board().generate_legal_moves();
     let policies: Vec<(Move, f32)> = legal.into_iter().zip(eval.policies.iter().copied()).collect();
     println!(
@@ -355,23 +343,23 @@ fn warmup_position(
         eval.plies_left,
         started.elapsed().as_secs_f64() * 1e3
     );
-    Ok(RootNnProbe {
-        wl: eval.wl,
-        plies_left: eval.plies_left,
-        policies,
-    })
+    Ok(RootNnProbe { wl: eval.wl, plies_left: eval.plies_left, policies })
 }
 
 fn average_wait_us(queue: QueueStats) -> f64 {
-    if queue.samples == 0 {
-        0.0
-    } else {
-        queue.total_wait_ns as f64 / queue.samples as f64 / 1e3
-    }
+    if queue.samples == 0 { 0.0 } else { queue.total_wait_ns as f64 / queue.samples as f64 / 1e3 }
 }
 
 fn max_wait_us(queue: QueueStats) -> f64 {
     queue.max_wait_ns as f64 / 1e3
+}
+
+fn average_execution_us(stage: ExecutionStats) -> f64 {
+    if stage.samples == 0 { 0.0 } else { stage.total_elapsed_ns as f64 / stage.samples as f64 / 1e3 }
+}
+
+fn max_execution_us(stage: ExecutionStats) -> f64 {
+    stage.max_elapsed_ns as f64 / 1e3
 }
 
 fn sorted_root_edges(search: &Search<BenchObserver>) -> Option<Vec<RootEdgeStats>> {
@@ -401,14 +389,8 @@ struct RootReliability {
 }
 
 fn root_reliability(edges: &[RootEdgeStats], parent_completed_visits: u32, params: &SearchParams) -> RootReliability {
-    let mut result = RootReliability {
-        edges: 0,
-        total_se: 0.0,
-        mean_se: 0.0,
-        max_se: 0.0,
-        total_bonus: 0.0,
-        total_u: 0.0,
-    };
+    let mut result =
+        RootReliability { edges: 0, total_se: 0.0, mean_se: 0.0, max_se: 0.0, total_bonus: 0.0, total_u: 0.0 };
     let children_visits = edges.iter().map(|edge| edge.started_visits).sum::<u32>().max(1);
     let u_coeff = compute_cpuct(*params, parent_completed_visits) * (children_visits as f32).sqrt();
     for edge in edges {
@@ -439,6 +421,10 @@ fn format_batch_dist(batches_by_size: &[u64]) -> String {
     if parts.is_empty() { "-".into() } else { parts.join(" ") }
 }
 
+fn batch_items(batches_by_size: &[u64]) -> u64 {
+    batches_by_size.iter().enumerate().map(|(size, count)| size as u64 * count).sum()
+}
+
 fn format_collision_dist(counts: &[u64]) -> String {
     let parts: Vec<_> = counts
         .iter()
@@ -458,6 +444,29 @@ fn print_queue(label: &str, queue: QueueStats) {
     );
 }
 
+fn print_execution(label: &str, stage: ExecutionStats, items: Option<u64>) {
+    if let Some(items) = items {
+        let avg_item_us = if items == 0 { 0.0 } else { stage.total_elapsed_ns as f64 / items as f64 / 1e3 };
+        println!(
+            "  {label:<8} batches={:<5} items={:<7} total_ms={:>8.1} avg_batch_us={:>7.1} avg_item_us={:>5.1} max_batch_us={:>7.1}",
+            stage.samples,
+            items,
+            stage.total_elapsed_ns as f64 / 1e6,
+            average_execution_us(stage),
+            avg_item_us,
+            max_execution_us(stage)
+        );
+    } else {
+        println!(
+            "  {label:<8} events={:<7} total_ms={:>8.1} avg_us={:>7.1} max_us={:>7.1}",
+            stage.samples,
+            stage.total_elapsed_ns as f64 / 1e6,
+            average_execution_us(stage),
+            max_execution_us(stage)
+        );
+    }
+}
+
 fn print_root_block(
     search: &Search<BenchObserver>,
     root_is_black: bool,
@@ -470,22 +479,10 @@ fn print_root_block(
         return;
     };
     let root = root_stats(search.arena(), search.root_id());
-    let root_n = edges
-        .iter()
-        .map(|edge| edge.completed_visits as u64)
-        .sum::<u64>()
-        .max(1);
-    let top1 = edges
-        .first()
-        .map(|edge| edge.completed_visits as f64 * 100.0 / root_n as f64)
-        .unwrap_or(0.0);
-    let top3 = edges
-        .iter()
-        .take(3)
-        .map(|edge| edge.completed_visits as u64)
-        .sum::<u64>() as f64
-        * 100.0
-        / root_n as f64;
+    let root_n = edges.iter().map(|edge| edge.completed_visits as u64).sum::<u64>().max(1);
+    let top1 = edges.first().map(|edge| edge.completed_visits as f64 * 100.0 / root_n as f64).unwrap_or(0.0);
+    let top3 =
+        edges.iter().take(3).map(|edge| edge.completed_visits as u64).sum::<u64>() as f64 * 100.0 / root_n as f64;
     println!("{heading}");
     if let Some(nn) = nn {
         println!("  nn:     Q={:.4} M={:.1}", nn.wl, nn.plies_left);
@@ -511,24 +508,14 @@ fn print_root_block(
         let baseline = best_move(search.arena(), search.root_id(), root_is_black)
             .map(|mv| mv.to_uci())
             .unwrap_or_else(|| "-".into());
-        let lcb_params = SearchParams {
-            decision_rule: DecisionRule::Lcb,
-            ..*params
-        };
+        let lcb_params = SearchParams { decision_rule: DecisionRule::Lcb, ..*params };
         let selected = best_move_with_params(search.arena(), search.root_id(), root_is_black, &lcb_params)
             .map(|mv| mv.to_uci())
             .unwrap_or_else(|| "-".into());
-        println!(
-            "  LCB: z={:.3}; LCB=Qmean-z*SE (final decision only)",
-            params.decision_lcb_stdevs,
-        );
+        println!("  LCB: z={:.3}; LCB=Qmean-z*SE (final decision only)", params.decision_lcb_stdevs,);
         println!("       N baseline={baseline}; LCB selected={selected}");
     }
-    println!(
-        "  candidates top {}/{} (by search N; P is nn prior)",
-        edges.len().min(top),
-        edges.len()
-    );
+    println!("  candidates top {}/{} (by search N; P is nn prior)", edges.len().min(top), edges.len());
     let child_n = edges.iter().map(|edge| edge.started_visits).sum::<u32>().max(1);
     let u_coeff =
         compute_cpuct(*params, root.as_ref().map_or(0, |node| node.completed_visits)) * (child_n as f32).sqrt();
@@ -569,16 +556,7 @@ fn print_root_block(
 fn print_tree_funnel(search: &Search<BenchObserver>, root_is_black: bool, max_depth: usize, top: usize) {
     println!("Tree funnel (depth<={max_depth}, top={top}/node; path-local cycle stop)");
     let mut path = HashSet::new();
-    print_tree_node(
-        search,
-        search.root_id(),
-        root_is_black,
-        0,
-        max_depth,
-        top,
-        None,
-        &mut path,
-    );
+    print_tree_node(search, search.root_id(), root_is_black, 0, max_depth, top, None, &mut path);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -606,12 +584,7 @@ fn print_tree_node(
             node.completed_visits(),
             node.m()
         ),
-        None => println!(
-            "{indent}root     N={:<6} Q={:.4} M={:.1}",
-            node.completed_visits(),
-            node.q(),
-            node.m()
-        ),
+        None => println!("{indent}root     N={:<6} Q={:.4} M={:.1}", node.completed_visits(), node.q(), node.m()),
     }
     if depth == max_depth {
         path.remove(&node_id);
@@ -650,8 +623,7 @@ fn print_tree_node(
 
 #[allow(clippy::too_many_arguments)]
 fn print_run_report(
-    gather_workers: usize,
-    eval_workers: usize,
+    threads: usize,
     run_index: usize,
     seconds: f64,
     stats: &Stats,
@@ -669,13 +641,11 @@ fn print_run_report(
     let collision_rate = bench.collisions as f64 * 100.0 / attempts as f64;
     let cache_denom = (stats.network_evaluations + bench.cache_hits).max(1);
     let cache_hit_rate = bench.cache_hits as f64 * 100.0 / cache_denom as f64;
-    let batch_avg = if bench.network_batches == 0 {
-        0.0
-    } else {
-        stats.network_evaluations as f64 / bench.network_batches as f64
-    };
+    let batch_avg =
+        if bench.network_batches == 0 { 0.0 } else { stats.network_evaluations as f64 / bench.network_batches as f64 };
+    let backprop_items = batch_items(&bench.backprop_batches_by_size);
 
-    println!("=== G={gather_workers} E={eval_workers} run={run_index} ===");
+    println!("=== Threads={threads} NN=1 run={run_index} ===");
     println!("Throughput");
     println!(
         "  ms={ms:.1}  nps={nps:.0}  eps={eps:.0}  completed={}  submitted={}  peak_inflight={}",
@@ -687,10 +657,7 @@ fn print_run_report(
     );
 
     println!("Collisions");
-    println!(
-        "  count={}  rate={collision_rate:.1}%  (of submitted={})",
-        bench.collisions, bench.submitted_playouts
-    );
+    println!("  count={}  rate={collision_rate:.1}%  (of submitted={})", bench.collisions, bench.submitted_playouts);
     if args.show_collision_dist {
         println!("  depth dist  {}", format_collision_dist(&bench.collisions_by_depth));
     }
@@ -700,16 +667,21 @@ fn print_run_report(
         "  n_eval={}  cache_hits={} ({cache_hit_rate:.1}%)  batches={}  batch avg={batch_avg:.2} max={}",
         stats.network_evaluations, bench.cache_hits, bench.network_batches, bench.network_batch_size_max
     );
-    println!(
-        "  batch dist (size×times)  {}",
-        format_batch_dist(&bench.batches_by_size)
-    );
+    println!("  batch dist (size×times)  {}", format_batch_dist(&bench.batches_by_size));
+
+    println!("Execution (total / avg / max)");
+    print_execution("select", bench.select_execution, None);
+    print_execution("expand", bench.expand_execution, None);
+    print_execution("nn", bench.nn_execution, Some(stats.network_evaluations));
+    print_execution("nn_reply", bench.nn_reply_execution, Some(stats.network_evaluations));
+    print_execution("backprop", bench.backprop_execution, Some(backprop_items));
+    println!("  backprop batch dist (size×times)  {}", format_batch_dist(&bench.backprop_batches_by_size));
 
     println!("Queues (avg/max us)");
-    print_queue("gather", bench.gather_queue);
-    print_queue("eval", bench.eval_queue);
+    print_queue("select", bench.select_queue);
+    print_queue("expand", bench.expand_queue);
     print_queue("nn", bench.nn_queue);
-    print_queue("backprop", bench.backprop_queue);
+    print_queue("nn_reply", bench.nn_reply_queue);
 
     println!("Search depth");
     println!("  avg={}  max={}", stats.average_depth, stats.max_depth);
@@ -730,7 +702,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target_batch = args.eval_batch.unwrap_or(recommended).max(1);
     let positions = load_positions(&args)?;
     println!(
-        "onnx={} provider={} cpuct={:.3} cpuct_factor={:.3} fpu_reduction={:.3} virtual_mean_fpu_scale={:.2} variance_bonus_scale={:.3} lcb={:.3} recommended_batch={} target_batch={} nn_window={} budget={} repeat={} worker_matrix={} positions={}",
+        "onnx={} provider={} cpuct={:.3} cpuct_factor={:.3} fpu_reduction={:.3} virtual_mean_fpu_scale={:.2} variance_bonus_scale={:.3} lcb={:.3} recommended_batch={} target_batch={} nn_window={} budget={} repeat={} threads={} positions={}",
         args.onnx.display(),
         provider,
         args.cpuct,
@@ -746,12 +718,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map(|n| format!("playouts={n}"))
             .unwrap_or_else(|| format!("movetime={}ms", args.movetime.unwrap_or(0))),
         args.repeat,
-        args.gathers.len() * args.evals.len(),
+        args.threads,
         positions.len(),
     );
     println!(
         "note: warmup each bench position (also captures nn P/Q/M); shared backend; \
-         fresh tree + clear_cache each run; collisions + depth + root always printed; \
+         fresh tree and cache each run; collisions + depth + root always printed; \
          --collision-dist / --tree-depth only for distribution shapes; \
          nps=completed/s, eps=nn_eval/s, submitted includes collisions"
     );
@@ -761,81 +733,74 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let root_is_black = history.is_black_to_move();
         println!("position: {name}");
         let nn_probe = warmup_position(backend.as_ref(), history.as_ref(), target_batch)?;
-        for &gather_workers in &args.gathers {
-            for &eval_workers in &args.evals {
-                for run_index in 1..=args.repeat {
-                    backend.clear_cache();
-                    let params = SearchParams {
-                        cpuct: args.cpuct,
-                        cpuct_factor: args.cpuct_factor,
-                        fpu_reduction: args.fpu_reduction,
-                        virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
-                        variance_bonus_scale: args.variance_bonus_scale,
-                        decision_lcb_stdevs: args.decision_lcb_stdevs,
-                        ..SearchParams::default()
-                    };
-                    let mut search = Search::new_with_observer(
-                        Arc::clone(&backend),
-                        Arc::clone(&history),
-                        SearchConfig {
-                            eval_batch_size: target_batch,
-                            nn_window: args.nn_window,
-                            gather_workers,
-                            eval_workers,
-                            params,
-                            ..SearchConfig::default()
-                        },
-                        BenchObserver::new(),
-                    );
+        for run_index in 1..=args.repeat {
+            let params = SearchParams {
+                cpuct: args.cpuct,
+                cpuct_factor: args.cpuct_factor,
+                fpu_reduction: args.fpu_reduction,
+                virtual_mean_fpu_scale: args.virtual_mean_fpu_scale,
+                variance_bonus_scale: args.variance_bonus_scale,
+                decision_lcb_stdevs: args.decision_lcb_stdevs,
+                ..SearchParams::default()
+            };
+            let tree = SearchTree::new(Arc::clone(&history));
+            let mut search = Search::start(
+                Arc::clone(&backend),
+                &tree,
+                SearchConfig {
+                    eval_batch_size: target_batch,
+                    nn_window: args.nn_window,
+                    threads: args.threads,
+                    params,
+                },
+                BenchObserver::default(),
+            );
 
-                    let started = Instant::now();
-                    let stats = if args.trace.is_empty() {
-                        search.run_with_limits(SearchLimits {
-                            max_playouts: args.playouts,
-                            deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
-                            ..Default::default()
-                        })?
-                    } else {
-                        let playouts = args.playouts.expect("trace requires playouts");
-                        for &milestone in &args.trace {
-                            search.run_playouts(milestone)?;
-                            println!("--- trace completed={milestone} ---");
-                            print_root_block(
-                                &search,
-                                root_is_black,
-                                args.root_top,
-                                &format!("Root snapshot @ completed={milestone}"),
-                                Some(&nn_probe),
-                                &params,
-                            );
-                            if let Some(depth) = args.tree_depth {
-                                print_tree_funnel(&search, root_is_black, depth, args.tree_top);
-                            }
-                        }
-                        if args.trace.last().copied().unwrap_or(0) < playouts {
-                            search.run_playouts(playouts)?
-                        } else {
-                            search.stats()
-                        }
-                    };
-                    let seconds = started.elapsed().as_secs_f64().max(1e-9);
-                    let bench = search.observer().snapshot();
-                    print_run_report(
-                        gather_workers,
-                        eval_workers,
-                        run_index,
-                        seconds,
-                        &stats,
-                        &bench,
+            let started = Instant::now();
+            let stats = if args.trace.is_empty() {
+                search.run(SearchLimits {
+                    max_playouts: args.playouts,
+                    deadline: args.movetime.map(|ms| Instant::now() + Duration::from_millis(ms)),
+                    ..Default::default()
+                })?
+            } else {
+                let playouts = args.playouts.expect("trace requires playouts");
+                for &milestone in &args.trace {
+                    search.run(SearchLimits { max_playouts: Some(milestone), ..Default::default() })?;
+                    println!("--- trace completed={milestone} ---");
+                    print_root_block(
                         &search,
                         root_is_black,
-                        &args,
-                        &nn_probe,
+                        args.root_top,
+                        &format!("Root snapshot @ completed={milestone}"),
+                        Some(&nn_probe),
                         &params,
                     );
-                    search.stop_and_finish();
+                    if let Some(depth) = args.tree_depth {
+                        print_tree_funnel(&search, root_is_black, depth, args.tree_top);
+                    }
                 }
-            }
+                if args.trace.last().copied().unwrap_or(0) < playouts {
+                    search.run(SearchLimits { max_playouts: Some(playouts), ..Default::default() })?
+                } else {
+                    search.stats()
+                }
+            };
+            let seconds = started.elapsed().as_secs_f64().max(1e-9);
+            let bench = search.observer().snapshot();
+            print_run_report(
+                args.threads,
+                run_index,
+                seconds,
+                &stats,
+                &bench,
+                &search,
+                root_is_black,
+                &args,
+                &nn_probe,
+                &params,
+            );
+            search.finish();
         }
     }
     Ok(())
@@ -845,17 +810,5 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("benchmark: {error}");
         std::process::exit(2);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::standard_error;
-
-    #[test]
-    fn standard_error_requires_two_completed_samples() {
-        assert_eq!(standard_error(0, 1.0), None);
-        assert_eq!(standard_error(1, 1.0), None);
-        assert!((standard_error(4, 0.36).expect("evidence") - 0.3).abs() < 1e-6);
     }
 }

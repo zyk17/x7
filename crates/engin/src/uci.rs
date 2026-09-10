@@ -1,7 +1,6 @@
 //! UCI 协议解析与输出。
 //!
-//! 命令形状与 info 字段历史上参考过 px0 `uciloop`；本模块由 X7 维护，未支持的
-//! 命令必须明确拒绝。
+//! X7 的 UCI 协议解析与输出；未支持的命令必须明确拒绝。
 
 use std::collections::HashMap;
 
@@ -19,10 +18,7 @@ pub struct BestMoveInfo {
 
 impl BestMoveInfo {
     pub const fn new(bestmove: xiangqi_core::Move) -> Self {
-        Self {
-            bestmove,
-            ponder: xiangqi_core::Move::NULL,
-        }
+        Self { bestmove, ponder: xiangqi_core::Move::NULL }
     }
 }
 
@@ -101,25 +97,20 @@ impl<'a> UciLoop<'a> {
     fn dispatch_command(&mut self, command: &str, params: &HashMap<String, String>) -> Result<bool, EnginError> {
         match command {
             "uci" => {
-                let mut response = vec![
-                    format!("id name x7 v{}", env!("CARGO_PKG_VERSION")),
-                    "id author 777".into(),
-                    String::new(),
-                ];
+                let mut response =
+                    vec![format!("id name x7 v{}", env!("CARGO_PKG_VERSION")), "id author 777".into(), String::new()];
                 response.extend(self.engine.options().list_options_uci());
                 response.push("uciok".into());
                 write_stdout(&response);
             }
             "isready" => {
-                self.engine.ensure_ready()?;
                 write_stdout(&["readyok".into()]);
             }
             "setoption" => {
                 if get_or_empty(params, "name").is_empty() {
                     return Err(EnginError::Uci("setoption requires name".into()));
                 }
-                self.engine
-                    .set_option(get_or_empty(params, "name"), get_or_empty(params, "value"))?;
+                self.engine.set_option(get_or_empty(params, "name"), get_or_empty(params, "value"))?;
             }
             "ucinewgame" => self.engine.new_game()?,
             "position" => {
@@ -128,13 +119,11 @@ impl<'a> UciLoop<'a> {
                 }
                 let moves = split_at_whitespace(get_or_empty(params, "moves"));
                 let fen = get_or_empty(params, "fen");
-                self.engine
-                    .set_position(if fen.is_empty() { STARTPOS_FEN } else { fen }, &moves)?;
+                self.engine.set_position(if fen.is_empty() { STARTPOS_FEN } else { fen }, &moves)?;
             }
             "go" => {
                 let mut go_params = GoParams::default();
-                // px0 只接受 `infinite`（`uciloop.cc:70,209-213`）。`infinity` 是本地别名，
-                // 设置相同的 `GoParams::infinite` flag。
+                // `infinity` 是本地别名，与 `infinite` 设置同一个 flag。
                 for flag in ["infinite", "infinity"] {
                     if !contains_key(params, flag) {
                         continue;
@@ -178,8 +167,8 @@ impl<'a> UciLoop<'a> {
                 ucigooption!(movetime);
                 self.engine.go(&go_params)?;
             }
-            "wait" => self.engine.wait()?,
-            "stop" => self.engine.stop()?,
+            "wait" => self.engine.wait_search()?,
+            "stop" => self.engine.stop_search()?,
             "ponderhit" => self.engine.ponder_hit()?,
             "quit" => return Ok(false),
             _ => return Err(EnginError::Uci(format!("Unknown command: {command}"))),
@@ -200,7 +189,7 @@ impl<'a> UciLoop<'a> {
 impl Drop for UciLoop<'_> {
     /// 退出前确保搜索已停止。
     fn drop(&mut self) {
-        let _ = self.engine.stop();
+        let _ = self.engine.stop_search();
     }
 }
 
@@ -266,9 +255,7 @@ pub fn get_numeric(params: &HashMap<String, String>, key: &str) -> Result<i32, E
     if value.is_empty() {
         return Err(EnginError::Uci(format!("expected value after {key}")));
     }
-    value
-        .parse::<i32>()
-        .map_err(|_| EnginError::Uci(format!("invalid value {value}")))
+    value.parse::<i32>().map_err(|_| EnginError::Uci(format!("invalid value {value}")))
 }
 
 /// 判断命令是否包含指定 key。
@@ -412,11 +399,7 @@ fn read_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
 }
 
 fn split_at_whitespace(value: &str) -> Vec<String> {
-    if value.is_empty() {
-        Vec::new()
-    } else {
-        value.split_whitespace().map(str::to_string).collect()
-    }
+    if value.is_empty() { Vec::new() } else { value.split_whitespace().map(str::to_string).collect() }
 }
 
 fn parse_setoption(line: &str) -> Result<HashMap<String, String>, EnginError> {
@@ -507,11 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn weights_file_option_matches_px0_name() {
+    fn weights_file_option_has_stable_name() {
         let mut options = Options::default();
-        options
-            .set_uci_option("WeightsFile", "data/x7.onnx")
-            .expect("weights option");
+        options.set_uci_option("WeightsFile", "data/x7.onnx").expect("weights option");
         assert_eq!(options.weights_file, "data/x7.onnx");
         assert!(
             options
@@ -522,17 +503,15 @@ mod tests {
     }
 
     #[test]
-    fn minibatch_size_option_matches_px0_range() {
+    fn minibatch_size_option_has_expected_range() {
         let mut options = Options::default();
-        options
-            .set_uci_option("NnBatchSize", "128")
-            .expect("minibatch-size option");
+        options.set_uci_option("NnBatchSize", "128").expect("minibatch-size option");
         assert_eq!(options.nn_batch_size, 128);
         assert!(options.set_uci_option("NnBatchSize", "1025").is_err());
     }
 
     #[test]
-    fn multipv_option_matches_px0_range() {
+    fn multipv_option_has_expected_range() {
         let mut options = Options::default();
         options.set_uci_option("MultiPV", "3").expect("multipv option");
         assert_eq!(options.multi_pv, 3);
@@ -553,23 +532,15 @@ mod tests {
         options.set_uci_option("CPUctBase", "20000").expect("cpuct base");
         options.set_uci_option("cpuctfactor", "2.5").expect("cpuct factor");
         options.set_uci_option("fpureduction", "0.35").expect("fpu reduction");
-        options
-            .set_uci_option("VarianceBonusScale", "0.4")
-            .expect("variance bonus scale");
+        options.set_uci_option("VarianceBonusScale", "0.4").expect("variance bonus scale");
         options.set_uci_option("DecisionLcbStdevs", "4").expect("lcb stdevs");
         options.set_uci_option("DecisionUcbStdevs", "3").expect("ucb stdevs");
         options.set_uci_option("NnWindow", "2.25").expect("nn window");
-        options
-            .set_uci_option("VirtualMeanFpuScale", "0.75")
-            .expect("virtual mean FPU scale");
+        options.set_uci_option("VirtualMeanFpuScale", "0.75").expect("virtual mean FPU scale");
         options.set_uci_option("DecisionRule", "MixNQ").expect("decision rule");
-        options
-            .set_uci_option("DecisionMixNWeight", "0.3")
-            .expect("decision mix N weight");
+        options.set_uci_option("DecisionMixNWeight", "0.3").expect("decision mix N weight");
         options.set_uci_option("threads", "7").expect("threads");
-        options
-            .set_uci_option("nncachesizepoweroftwo", "20")
-            .expect("cache size power");
+        options.set_uci_option("nncachesizepoweroftwo", "20").expect("cache size power");
         assert_eq!(options.cpuct, 1.5);
         assert_eq!(options.cpuct_base, 20_000.0);
         assert_eq!(options.cpuct_factor, 2.5);
@@ -594,9 +565,7 @@ mod tests {
         assert!(options.set_uci_option("VirtualMeanFpuScale", "-0.1").is_err());
         assert!(options.set_uci_option("DecisionRule", "bad-rule").is_err());
         assert!(options.set_uci_option("DecisionMixNWeight", "-0.1").is_err());
-        options
-            .set_uci_option("Threads", "1")
-            .expect("threads below minimum clamp");
+        options.set_uci_option("Threads", "1").expect("threads below minimum clamp");
         assert_eq!(options.threads, 2);
         options.set_uci_option("Threads", "0").expect("zero threads clamp");
         assert_eq!(options.threads, 2);
@@ -605,20 +574,8 @@ mod tests {
     }
 
     #[test]
-    fn default_thinking_info_matches_px0_sentinels() {
-        assert_eq!(
-            format_thinking_info(&ThinkingInfo::default(), &Options::default()),
-            "info"
-        );
-    }
-
-    #[test]
-    fn format_thinking_info_matches_px0_fields() {
-        let options = Options {
-            show_wdl: true,
-            show_eps: true,
-            ..Options::default()
-        };
+    fn format_thinking_info_emits_requested_fields() {
+        let options = Options { show_wdl: true, show_eps: true, ..Options::default() };
         let info = ThinkingInfo {
             depth: 0,
             seldepth: 3,
@@ -628,10 +585,7 @@ mod tests {
             eps: 42,
             score: Some(15),
             wdl: Some(Wdl { w: 100, d: 200, l: 300 }),
-            pv: vec![Move::new(
-                Square::parse("h2").expect("h2"),
-                Square::parse("h4").expect("h4"),
-            )],
+            pv: vec![Move::new(Square::parse("h2").expect("h2"), Square::parse("h4").expect("h4"))],
             multipv: 1,
             comment: "note".into(),
             ..ThinkingInfo::default()

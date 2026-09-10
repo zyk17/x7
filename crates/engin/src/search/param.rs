@@ -51,14 +51,8 @@ impl Default for SearchParams {
 
 impl SearchParams {
     pub(crate) fn validate(self) {
-        assert!(
-            self.cpuct.is_finite() && self.cpuct >= 0.0,
-            "stream cpuct must be finite and non-negative"
-        );
-        assert!(
-            self.cpuct_base.is_finite() && self.cpuct_base > 0.0,
-            "stream cpuct base must be finite and positive"
-        );
+        assert!(self.cpuct.is_finite() && self.cpuct >= 0.0, "stream cpuct must be finite and non-negative");
+        assert!(self.cpuct_base.is_finite() && self.cpuct_base > 0.0, "stream cpuct base must be finite and positive");
         assert!(
             self.cpuct_factor.is_finite() && self.cpuct_factor >= 0.0,
             "stream cpuct factor must be finite and non-negative"
@@ -90,95 +84,53 @@ impl SearchParams {
     }
 }
 
-/// 当前固定 worker pool 的 job 配置。算法旋钮在 `params`；`searchmoves` 在 `SearchLimits`。
-/// Gather/Eval 的静态比例来自当前实验；后续动态调度可按队列压力在二者及 proof 间分配 CPU，
-/// 而不改变搜索语义。
+/// 当前 worker pool 的 job 配置。算法旋钮在 `params`；`searchmoves` 在 `SearchLimits`。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchConfig {
-    /// Search/Eval/NN 队列深度。`0` 表示 `max(4096, 64 * resolved_batch)`。
-    pub queue_capacity: usize,
     /// 已有多个编码局面时的 NN GPU 合批大小。`0` 表示 backend 的
     /// `recommended_batch_size`。
     pub eval_batch_size: usize,
-    /// Eval claim 并发上限：`limit = ceil(NnBatchSize × nn_window)`。
-    /// Claim 在 backprop 写完 N/Q 后释放；调大可能提高eps、调小让 Gather 更贴最新统计。
+    /// NN permit 并发上限：`limit = ceil(NnBatchSize × nn_window)`。
+    /// cache/terminal 与等待 permit 的 event 不占 slot；NN 结果完成 backprop 后才释放。调大可能提高 eps，调小让
+    /// Select 更贴最新统计。
     pub nn_window: f32,
     pub params: SearchParams,
-    /// 当前固定 pool 的 Gather worker 数。
-    pub gather_workers: usize,
-    /// 当前固定 pool 的 Eval worker 数。它负责准备、缓存、合法着；NN inference 是单独的单 worker。
-    pub eval_workers: usize,
+    /// 通用 worker 数；每个 worker 按就绪队列处理 Select、Expand、Eval、NN 回包、Backprop，
+    /// 后续也承接 Proof。
+    pub threads: usize,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self {
-            queue_capacity: 0,
-            eval_batch_size: 0,
-            nn_window: 2.25,
-            params: SearchParams::default(),
-            gather_workers: 3,
-            eval_workers: 5,
-        }
+        Self { eval_batch_size: 0, nn_window: 2.25, params: SearchParams::default(), threads: 8 }
     }
 }
 
 impl SearchConfig {
     pub(crate) fn validate(&self) {
         self.params.validate();
-        assert!(self.gather_workers > 0, "stream requires at least one gather worker");
-        assert!(self.eval_workers > 0, "stream requires at least one eval worker");
+        assert!(self.threads > 0, "stream requires at least one worker");
         assert!(
             self.nn_window.is_finite() && self.nn_window > 0.0,
             "stream nn window factor must be finite and positive"
         );
     }
 
-    /// UCI `Threads` 尽量按 Gather:Eval = 1:2；除不尽时多给 Gather。
-    pub(crate) fn gather_eval_from_threads(threads: usize) -> (usize, usize) {
-        let eval = ((threads * 2) / 3).max(1);
-        let gather = threads.saturating_sub(eval).max(1);
-        (gather, eval)
-    }
-
-    /// 填充0配置, 推算具体队列/批量大小。
+    /// 填充 0 配置，推算具体批量大小。
     pub(crate) fn resolve(&self, backend: &dyn Backend) -> ResolvedSearchConfig {
         let recommended = backend.attributes().recommended_batch_size.max(1);
         let maximum = backend.attributes().maximum_batch_size.max(1);
-        let eval_batch_size = if self.eval_batch_size == 0 {
-            recommended
-        } else {
-            self.eval_batch_size.min(maximum)
-        };
-        let queue_capacity = if self.queue_capacity == 0 {
-            (eval_batch_size.saturating_mul(64)).max(4096)
-        } else {
-            self.queue_capacity
-        };
-        assert!(queue_capacity > 0, "stream queue capacity must be non-zero");
+        let eval_batch_size = if self.eval_batch_size == 0 { recommended } else { self.eval_batch_size.min(maximum) };
         assert!(eval_batch_size > 0, "stream eval batch size must be non-zero");
-        assert!(
-            eval_batch_size <= queue_capacity,
-            "stream eval batch size must fit the queue capacity"
-        );
-        let eval_claim_limit = ((eval_batch_size as f32) * self.nn_window).ceil().max(1.0) as usize;
-        ResolvedSearchConfig {
-            queue_capacity,
-            eval_batch_size,
-            eval_claim_limit,
-            params: self.params,
-            gather_workers: self.gather_workers,
-            eval_workers: self.eval_workers,
-        }
+        let nn_permit_limit = ((eval_batch_size as f32) * self.nn_window).ceil().max(1.0) as usize;
+        ResolvedSearchConfig { eval_batch_size, nn_permit_limit, params: self.params, threads: self.threads }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResolvedSearchConfig {
-    pub(crate) queue_capacity: usize,
     pub(crate) eval_batch_size: usize,
-    pub(crate) eval_claim_limit: usize,
+    pub(crate) nn_permit_limit: usize,
     pub(crate) params: SearchParams,
-    pub(crate) gather_workers: usize,
-    pub(crate) eval_workers: usize,
+    pub(crate) threads: usize,
 }

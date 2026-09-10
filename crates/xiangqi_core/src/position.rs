@@ -1,8 +1,8 @@
-//! Position / PositionHistory / GameResult。来源：px0 position。
+//! Position / PositionHistory / GameResult。
 
 use crate::board::board_to_fen;
 use crate::hashcat::{hash_cat, hash_cat_u128s};
-use crate::{ChessBoard, CoreError, Move};
+use crate::{ChessBoard, LegalMoveList, Move};
 
 /// 对局结果。枚举顺序使 `max()` 优先选更好的结果。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
@@ -39,18 +39,10 @@ pub struct Position {
 
 impl Position {
     pub fn new(board: ChessBoard, rule60_ply: u32, game_ply: u32) -> Self {
-        Self {
-            board,
-            rule60_ply,
-            us_check: 0,
-            them_check: 0,
-            repetitions: 0,
-            cycle_length: 0,
-            game_ply,
-        }
+        Self { board, rule60_ply, us_check: 0, them_check: 0, repetitions: 0, cycle_length: 0, game_ply }
     }
 
-    pub fn from_fen(fen: &str) -> Result<Self, CoreError> {
+    pub fn from_fen(fen: &str) -> Result<Self, String> {
         let (board, state) = ChessBoard::from_fen(fen)?;
         Ok(Self::new(board, state.rule60_ply, state.game_ply))
     }
@@ -167,25 +159,19 @@ impl PositionHistory {
 
     /// 返回搜索 worker 可复制的最小历史窗口。
     ///
-    /// 吃子或兵走会将 `rule60_ply` 清零；此前局面不可能再与当前局面构成重复，
-    /// 连将/长捉也不会跨过这次零化着。因此规则只需保留最近一次零化着之后的
+    /// 吃子会将 `rule60_ply` 清零；此前局面不可能再与当前局面构成重复，
+    /// 连将/长捉也不会跨过这次吃子。因此规则只需保留最近一次零化着之后的
     /// history。另一方面，NN 需要固定数量的最近局面平面，故两者取更早的起点。
     /// 原完整 history 仍由 UCI/Engine 持有，用于跨回合定位和 root 裁决。
     pub fn search_window(&self, recent_positions: usize) -> Self {
         assert!(!self.positions.is_empty(), "PositionHistory is empty");
-        let rule_start = self
-            .positions
-            .iter()
-            .rposition(|position| position.rule60_ply == 0)
-            .unwrap_or(0);
+        let rule_start = self.positions.iter().rposition(|position| position.rule60_ply == 0).unwrap_or(0);
         let nn_start = self.positions.len().saturating_sub(recent_positions.max(1));
         let start = rule_start.min(nn_start);
         Self::from_positions(self.positions[start..].to_vec())
     }
 
-    /// Copies a root history without discarding this instance's reserved DFS
-    /// capacity. px0 gives every search workspace a persistent
-    /// `PositionHistory` and reuses it through `Trim`/`Append`
+    /// Copies a root history without discarding this instance's reserved DFS capacity.
     pub fn copy_from_history(&mut self, source: &Self) {
         self.positions.clear();
         self.positions.extend_from_slice(source.positions());
@@ -209,10 +195,7 @@ impl PositionHistory {
         let next = Position::after(self.last(), mv);
         self.positions.push(next);
         let (repetitions, cycle_length) = self.compute_last_move_repetitions();
-        self.positions
-            .last_mut()
-            .expect("position appended")
-            .set_repetitions(repetitions, cycle_length);
+        self.positions.last_mut().expect("position appended").set_repetitions(repetitions, cycle_length);
     }
 
     pub fn pop(&mut self) {
@@ -224,39 +207,34 @@ impl PositionHistory {
     }
 
     pub fn compute_game_result(&self) -> GameResult {
+        let legal_moves = self.last().board.generate_legal_moves();
+        self.compute_game_result_after_legal_moves(&legal_moves)
+    }
+
+    /// 完整裁决当前局面；`legal_moves` 必须来自当前局面。
+    ///
+    /// Expand 已经要保留合法着供 NN policy 对齐，故可复用该结果而不重复生成。
+    pub fn compute_game_result_after_legal_moves(&self, legal_moves: &LegalMoveList) -> GameResult {
         let last = self.last();
-        if last.board.generate_legal_moves().is_empty() {
-            return if self.is_black_to_move() {
-                GameResult::WhiteWon
-            } else {
-                GameResult::BlackWon
-            };
+        if legal_moves.is_empty() {
+            return if self.is_black_to_move() { GameResult::WhiteWon } else { GameResult::BlackWon };
         }
         if last.repetitions >= 2 {
             let result = self.rule_judge();
-            return if self.is_black_to_move() {
-                result
-            } else {
-                result.negate()
-            };
+            return if self.is_black_to_move() { result } else { result.negate() };
         }
-        if !last.board.has_mating_material() || last.rule60_ply >= 120 {
+        if last.rule60_ply >= 120 || !last.board.has_mating_material_after_legal_moves(legal_moves) {
             return GameResult::Draw;
         }
         GameResult::Undecided
     }
 
-    /// 返回值按 px0 `MakeTerminal` 约定解释：`WhiteWon`→node `wl=+1`，
-    /// `BlackWon`→`wl=-1`（incoming-edge 视角），**不是**绝对红黑胜负。
-    /// 绝对结果见 [`Self::compute_game_result`]（白走时会取反）。
-    pub fn rule_judge(&self) -> GameResult {
+    /// 重复局面的内部裁决，结果先按当前归一化棋盘视角表示。
+    ///
+    /// 对外只通过 `compute_game_result` 暴露绝对红黑胜负。
+    fn rule_judge(&self) -> GameResult {
         let last = self.last();
-        if last.rule60_ply < 4 {
-            return GameResult::Undecided;
-        }
-
         let len = self.positions.len();
-        assert!(len >= 3, "RuleJudge requires a repetition history");
 
         let mut check_them = last.board.is_under_check();
         let mut check_us = self.positions[len - 2].board.is_under_check();
@@ -295,27 +273,22 @@ impl PositionHistory {
                 };
             }
 
-            if index >= 1 {
-                if self.positions[index - 1].board.is_under_check() {
-                    chase_them = 0;
-                    chase_us = 0;
-                } else {
-                    check_us = false;
-                }
-                chase_them &= position.board.them_chased() & !self.positions[index - 1].board.us_chased();
-                if index >= 2 {
-                    chase_us &=
-                        self.positions[index - 1].board.them_chased() & !self.positions[index - 2].board.us_chased();
-                }
-            }
-
             if index < 2 {
                 break;
             }
+
+            if self.positions[index - 1].board.is_under_check() {
+                chase_them = 0;
+                chase_us = 0;
+            } else {
+                check_us = false;
+            }
+            chase_them &= position.board.them_chased() & !self.positions[index - 1].board.us_chased();
+            chase_us &= self.positions[index - 1].board.them_chased() & !self.positions[index - 2].board.us_chased();
             index -= 2;
         }
 
-        panic!("px0 RuleJudge called without a repeat");
+        panic!("RuleJudge called without a repeat");
     }
 
     pub fn did_repeat_since_last_zeroing_move(&self) -> bool {
@@ -379,11 +352,7 @@ mod tests {
         let (board, _) = ChessBoard::from_fen("4k4/9/9/9/9/9/9/9/9/4K4 w - - 0 1").expect("board");
         let positions = (0..12)
             .map(|index| {
-                Position::new(
-                    board.clone(),
-                    if index < 5 { index as u32 + 1 } else { index as u32 - 5 },
-                    index as u32,
-                )
+                Position::new(board.clone(), if index < 5 { index as u32 + 1 } else { index as u32 - 5 }, index as u32)
             })
             .collect();
         let history = PositionHistory::from_positions(positions);
@@ -392,10 +361,6 @@ mod tests {
         assert_eq!(window.len(), 8, "NN keeps the latest eight positions");
         assert_eq!(window.starting().game_ply(), 4);
         assert_eq!(window.last().game_ply(), 11);
-        assert_eq!(
-            window.get(1).rule60_ply(),
-            0,
-            "the latest zeroing position stays in the window"
-        );
+        assert_eq!(window.get(1).rule60_ply(), 0, "the latest zeroing position stays in the window");
     }
 }

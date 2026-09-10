@@ -23,11 +23,7 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"));
     let nvcc = cuda.join("bin/nvcc.exe");
-    assert!(
-        nvcc.is_file(),
-        "nvcc missing: {} (set CUDA_PATH / X7_CUDA_PATH)",
-        nvcc.display()
-    );
+    assert!(nvcc.is_file(), "nvcc missing: {} (set CUDA_PATH / X7_CUDA_PATH)", nvcc.display());
 
     let obj = out_dir.join("onnx_kernels.obj");
     let mut cmd = Command::new(&nvcc);

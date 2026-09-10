@@ -9,9 +9,20 @@ use parking_lot::Mutex;
 /// 队列等待所属阶段。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueKind {
-    Gather,
-    Eval,
+    Select,
+    Expand,
     Nn,
+    /// NN 结果已回到 worker 队列，等待发布 edge / 送 Backprop。
+    NnReply,
+}
+
+/// 实际执行所属阶段；只由 benchmark 记录。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionKind {
+    Select,
+    Expand,
+    Nn,
+    NnReply,
     Backprop,
 }
 
@@ -62,9 +73,33 @@ pub trait SearchObserver: Send + Sync + 'static {
     fn on_collision(&self, _depth: usize) {}
     fn on_peak_inflight(&self, _n: usize) {}
     fn on_queue_wait(&self, _kind: QueueKind, _wait: Duration) {}
+    fn on_execution(&self, _kind: ExecutionKind, _elapsed: Duration) {}
     fn on_cache_hit(&self) {}
     /// 一次 NN 合批推理的实际 batch size。
     fn on_batch(&self, _size: usize) {}
+    fn on_backprop_batch(&self, _size: usize) {}
+}
+
+/// 覆盖一个 event 的实际处理区间；正式路径不读取时钟。
+pub(crate) struct ExecutionTimer<'a, O: SearchObserver> {
+    observer: &'a O,
+    kind: ExecutionKind,
+    started: Option<Instant>,
+}
+
+impl<'a, O: SearchObserver> ExecutionTimer<'a, O> {
+    #[inline(always)]
+    pub(crate) fn new(observer: &'a O, kind: ExecutionKind) -> Self {
+        Self { observer, kind, started: O::ENABLED.then(Instant::now) }
+    }
+}
+
+impl<O: SearchObserver> Drop for ExecutionTimer<'_, O> {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            self.observer.on_execution(self.kind, started.elapsed());
+        }
+    }
 }
 
 #[inline(always)]
@@ -114,6 +149,30 @@ impl QueueMetrics {
     }
 }
 
+#[derive(Debug, Default)]
+struct ExecutionMetrics {
+    samples: AtomicU64,
+    total_elapsed_ns: AtomicU64,
+    max_elapsed_ns: AtomicU64,
+}
+
+impl ExecutionMetrics {
+    fn record(&self, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        self.total_elapsed_ns.fetch_add(nanos, Ordering::Relaxed);
+        self.max_elapsed_ns.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ExecutionStats {
+        ExecutionStats {
+            samples: self.samples.load(Ordering::Relaxed),
+            total_elapsed_ns: self.total_elapsed_ns.load(Ordering::Relaxed),
+            max_elapsed_ns: self.max_elapsed_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// bench 用的诊断观察者。
 #[derive(Debug, Default)]
 pub struct BenchObserver {
@@ -125,17 +184,19 @@ pub struct BenchObserver {
     network_batch_size_max: AtomicU64,
     collisions_by_depth: Mutex<Vec<u64>>,
     batches_by_size: Mutex<Vec<u64>>,
-    gather_queue: QueueMetrics,
-    eval_queue: QueueMetrics,
+    backprop_batches_by_size: Mutex<Vec<u64>>,
+    select_queue: QueueMetrics,
+    expand_queue: QueueMetrics,
     nn_queue: QueueMetrics,
-    backprop_queue: QueueMetrics,
+    nn_reply_queue: QueueMetrics,
+    select_execution: ExecutionMetrics,
+    expand_execution: ExecutionMetrics,
+    nn_execution: ExecutionMetrics,
+    nn_reply_execution: ExecutionMetrics,
+    backprop_execution: ExecutionMetrics,
 }
 
 impl BenchObserver {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn snapshot(&self) -> BenchStats {
         BenchStats {
             submitted_playouts: self.submitted.load(Ordering::Acquire),
@@ -146,10 +207,16 @@ impl BenchObserver {
             network_batch_size_max: self.network_batch_size_max.load(Ordering::Acquire),
             collisions_by_depth: self.collisions_by_depth.lock().clone(),
             batches_by_size: self.batches_by_size.lock().clone(),
-            gather_queue: self.gather_queue.snapshot(),
-            eval_queue: self.eval_queue.snapshot(),
+            backprop_batches_by_size: self.backprop_batches_by_size.lock().clone(),
+            select_queue: self.select_queue.snapshot(),
+            expand_queue: self.expand_queue.snapshot(),
             nn_queue: self.nn_queue.snapshot(),
-            backprop_queue: self.backprop_queue.snapshot(),
+            nn_reply_queue: self.nn_reply_queue.snapshot(),
+            select_execution: self.select_execution.snapshot(),
+            expand_execution: self.expand_execution.snapshot(),
+            nn_execution: self.nn_execution.snapshot(),
+            nn_reply_execution: self.nn_reply_execution.snapshot(),
+            backprop_execution: self.backprop_execution.snapshot(),
         }
     }
 }
@@ -177,10 +244,20 @@ impl SearchObserver for BenchObserver {
 
     fn on_queue_wait(&self, kind: QueueKind, wait: Duration) {
         match kind {
-            QueueKind::Gather => self.gather_queue.record(wait),
-            QueueKind::Eval => self.eval_queue.record(wait),
+            QueueKind::Select => self.select_queue.record(wait),
+            QueueKind::Expand => self.expand_queue.record(wait),
             QueueKind::Nn => self.nn_queue.record(wait),
-            QueueKind::Backprop => self.backprop_queue.record(wait),
+            QueueKind::NnReply => self.nn_reply_queue.record(wait),
+        }
+    }
+
+    fn on_execution(&self, kind: ExecutionKind, elapsed: Duration) {
+        match kind {
+            ExecutionKind::Select => self.select_execution.record(elapsed),
+            ExecutionKind::Expand => self.expand_execution.record(elapsed),
+            ExecutionKind::Nn => self.nn_execution.record(elapsed),
+            ExecutionKind::NnReply => self.nn_reply_execution.record(elapsed),
+            ExecutionKind::Backprop => self.backprop_execution.record(elapsed),
         }
     }
 
@@ -200,6 +277,14 @@ impl SearchObserver for BenchObserver {
         }
         counts[size] += 1;
     }
+
+    fn on_backprop_batch(&self, size: usize) {
+        let mut counts = self.backprop_batches_by_size.lock();
+        if counts.len() <= size {
+            counts.resize(size + 1, 0);
+        }
+        counts[size] += 1;
+    }
 }
 
 /// [`BenchObserver::snapshot`] 的诊断汇总。
@@ -214,8 +299,23 @@ pub struct BenchStats {
     pub collisions_by_depth: Vec<u64>,
     /// 下标 = batch size，值 = 该 size 出现次数；`[0]` 恒为 0。
     pub batches_by_size: Vec<u64>,
-    pub gather_queue: QueueStats,
-    pub eval_queue: QueueStats,
+    /// 下标 = complete_batch 的 event 数，值 = 出现次数；`[0]` 恒为 0。
+    pub backprop_batches_by_size: Vec<u64>,
+    pub select_queue: QueueStats,
+    pub expand_queue: QueueStats,
     pub nn_queue: QueueStats,
-    pub backprop_queue: QueueStats,
+    pub nn_reply_queue: QueueStats,
+    pub select_execution: ExecutionStats,
+    pub expand_execution: ExecutionStats,
+    pub nn_execution: ExecutionStats,
+    pub nn_reply_execution: ExecutionStats,
+    pub backprop_execution: ExecutionStats,
+}
+
+/// 单个阶段的实际执行时间快照。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutionStats {
+    pub samples: u64,
+    pub total_elapsed_ns: u64,
+    pub max_elapsed_ns: u64,
 }

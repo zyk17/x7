@@ -5,7 +5,7 @@ use std::sync::Arc;
 use xiangqi_core::Move;
 
 use super::param::SearchParams;
-use super::{Edge, ExpansionState, Node, NodeArena, NodeId};
+use super::{Edge, ExpansionState, Node, NodeArena, NodeEdges, NodeId};
 
 /// 根节点在既有 completed evidence 上的最终选边规则；不参与 PUCT。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -78,7 +78,7 @@ pub(crate) struct RootVariation {
 }
 
 struct EdgeHandle {
-    table: Arc<[Edge]>,
+    table: Arc<NodeEdges>,
     index: usize,
 }
 
@@ -176,10 +176,7 @@ fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &Searc
         .enumerate()
         .filter(|(_, edge)| filter.is_empty() || filter.contains(&edge.mv()))
         .map(|(index, _)| {
-            let edge = EdgeHandle {
-                table: Arc::clone(&edges),
-                index,
-            };
+            let edge = EdgeHandle { table: Arc::clone(&edges), index };
             let stats = edge.stats();
             RankedEdge {
                 visits: stats.visits,
@@ -191,9 +188,7 @@ fn ranked_edges(arena: &NodeArena, root: NodeId, filter: &[Move], params: &Searc
         })
         .collect();
     let max_visits = ranked.iter().map(|edge| edge.visits).max().unwrap_or(0);
-    rank_by_score(arena, &mut ranked, |edge| {
-        decision_score(params.decision_rule, edge, max_visits, params)
-    });
+    rank_by_score(arena, &mut ranked, |edge| decision_score(params.decision_rule, edge, max_visits, params));
     ranked.into_iter().map(|edge| edge.edge).collect()
 }
 
@@ -311,7 +306,7 @@ mod tests {
 
     fn complete_samples(node: &super::Node, edge_index: usize, samples: &[f32]) {
         for &sample in samples {
-            node.reserve_edge(edge_index).expect("reservation").complete(sample);
+            node.edges().reserve(edge_index, 0.0).expect("reservation").complete(sample);
         }
     }
 
@@ -320,7 +315,7 @@ mod tests {
         let arena = NodeArena::default();
         let root = arena.allocate();
         let node = arena.get(root).expect("root");
-        assert!(node.try_begin_evaluation());
+        assert!(node.try_claim());
         let first = mv("a0", "a1");
         let second = mv("b0", "b1");
         let third = mv("c0", "c1");
@@ -356,7 +351,7 @@ mod tests {
         let arena = NodeArena::default();
         let root = arena.allocate();
         let node = arena.get(root).expect("root");
-        assert!(node.try_begin_evaluation());
+        assert!(node.try_claim());
         let first = mv("a0", "a1");
         let second = mv("b0", "b1");
         node.publish_edges(vec![(first, 0.5), (second, 0.5)]);
@@ -364,14 +359,7 @@ mod tests {
         complete_samples(node, 1, &[1.0]);
 
         assert_eq!(
-            best_move_with_params(
-                &arena,
-                root,
-                false,
-                &SearchParams {
-                    ..SearchParams::default()
-                },
-            ),
+            best_move_with_params(&arena, root, false, &SearchParams { ..SearchParams::default() },),
             Some(first)
         );
     }
@@ -381,19 +369,16 @@ mod tests {
         let arena = NodeArena::default();
         let root = arena.allocate();
         let node = arena.get(root).expect("root");
-        assert!(node.try_begin_evaluation());
+        assert!(node.try_claim());
         let ordinary = mv("a0", "a1");
         let winning = mv("b0", "b1");
         node.publish_edges(vec![(ordinary, 0.5), (winning, 0.5)]);
         complete_samples(node, 0, &[0.9; 8]);
         let child = arena.child_or_create(&node.edges()[1]);
         let child_node = arena.get(child).expect("winning child");
-        assert!(child_node.try_begin_evaluation());
+        assert!(child_node.try_claim());
         child_node.mark_terminal(1.0, 0.0, 3.0);
 
-        assert_eq!(
-            best_move_with_params(&arena, root, false, &SearchParams::default()),
-            Some(winning)
-        );
+        assert_eq!(best_move_with_params(&arena, root, false, &SearchParams::default()), Some(winning));
     }
 }

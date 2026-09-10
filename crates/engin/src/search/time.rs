@@ -1,13 +1,13 @@
 //! UCI 时钟预算。
 //!
-//! 分配形状历史上参考过 px0 legacy stopper；stream 只在搜索启动时取得 deadline、
-//! 在 drain 后归还未用时间，不保留通用停止链或可调进攻/保守倍率。
+//! stream 只在搜索启动时取得 deadline、在 drain 后归还未用时间，
+//! 不保留通用停止链或可调进攻/保守倍率。
 
 use std::time::{Duration, Instant};
 
 use xiangqi_core::Position;
 
-use crate::uci_loop::GoParams;
+use crate::uci::GoParams;
 
 const MOVE_OVERHEAD_MS: i64 = 200;
 const DEFAULT_MIDPOINT: f32 = 51.5;
@@ -24,31 +24,18 @@ pub(crate) struct TimeManager {
 
 impl Default for TimeManager {
     fn default() -> Self {
-        Self {
-            first_move_of_game: true,
-            time_spared_ms: 0,
-        }
+        Self { first_move_of_game: true, time_spared_ms: 0 }
     }
 }
 
 impl TimeManager {
     /// 计算当前一手的固定中性预算。
     pub(crate) fn budget(&mut self, params: &GoParams, position: &Position) -> Option<TimeBudget> {
-        let time = if position.is_black_to_move() {
-            params.btime
-        } else {
-            params.wtime
-        }?;
+        let time = if position.is_black_to_move() { params.btime } else { params.wtime }?;
         if params.infinite || params.ponder {
             return None;
         }
-        let increment = if position.is_black_to_move() {
-            params.binc
-        } else {
-            params.winc
-        }
-        .unwrap_or(0)
-        .max(0);
+        let increment = if position.is_black_to_move() { params.binc } else { params.winc }.unwrap_or(0).max(0);
 
         let mut moves_to_go = estimated_moves_to_go(position.game_ply());
         if let Some(value) = params.movestogo.filter(|&value| value > 0) {
@@ -70,17 +57,12 @@ impl TimeManager {
             self.first_move_of_game = false;
         }
         this_move_time += time_to_squander as f32;
-        Some(TimeBudget {
-            limit_ms: (this_move_time as i64).min(time - MOVE_OVERHEAD_MS),
-        })
+        Some(TimeBudget { limit_ms: (this_move_time as i64).min(time - MOVE_OVERHEAD_MS) })
     }
 
-    /// 新对局清除 legacy 预算中保留的首手与剩余时间状态。
+    /// 新对局清除首手与剩余时间状态。
     pub(crate) fn reset(&mut self) {
-        *self = Self {
-            first_move_of_game: true,
-            time_spared_ms: 0,
-        };
+        *self = Self { first_move_of_game: true, time_spared_ms: 0 };
     }
 
     /// 搜索 drain 后归还未用预算。
@@ -116,10 +98,10 @@ mod tests {
     use xiangqi_core::{Position, STARTPOS_FEN};
 
     use super::{TimeManager, estimated_moves_to_go};
-    use crate::uci_loop::GoParams;
+    use crate::uci::GoParams;
 
     #[test]
-    fn estimated_moves_matches_px0_curve() {
+    fn estimated_moves_stays_positive_after_midpoint() {
         assert!((estimated_moves_to_go(0) - 51.5).abs() < 0.001);
         assert!(estimated_moves_to_go(100) > 0.0);
     }
@@ -127,10 +109,7 @@ mod tests {
     #[test]
     fn unused_clock_time_is_available_to_the_next_move() {
         let position = Position::from_fen(STARTPOS_FEN).expect("startpos");
-        let params = GoParams {
-            wtime: Some(10_000),
-            ..GoParams::default()
-        };
+        let params = GoParams { wtime: Some(10_000), ..GoParams::default() };
         let mut manager = TimeManager::default();
         let budget = manager.budget(&params, &position).expect("clock budget");
         manager.finish(budget, Duration::from_millis(1));

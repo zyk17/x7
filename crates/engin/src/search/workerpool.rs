@@ -1,32 +1,36 @@
-//! 事件定义 + WorkerPool + 当前固定拓扑的 Gather/Eval/NN/Backprop 线程循环壳。
+//! 事件定义与固定任务池。
 //!
-//! 循环只调度；算法在 `pipeline`（Gather 树走）/ `eval` / `backprop`。
+//! worker 不再绑定 Select/Expand 角色：每次只取一个就绪任务，优先让 NN 回包
+//! 释放 reservation；NN inference 仍是独立设备 worker。Proof 的任务位
+//! 留在这个调度边界，暂不赋予搜索语义。
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
 use parking_lot::Mutex;
 use xiangqi_core::{LegalMoveList, Move, PositionHistory};
 
 use crate::EnginError;
-use crate::neural::backend::{Backend, EvalCacheKey};
+use crate::neural::backend::Backend;
+use crate::neural::cache::EvalCacheKey;
 use crate::neural::{EncodedBatch, InputPlanes};
 use crate::search::EdgeReservation;
 
-use super::backprop::complete_batch;
-use super::eval::{
-    cancel_evaluation, drain_waiting, handle_eval_event, infer_nn_batch, poll_nn_completions, wait_one_nn_completion,
+use super::NodeId;
+use super::nn::{handle_nn_reply_batch, infer_nn_batch};
+use super::observer::{
+    ExecutionKind, ExecutionTimer, NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver,
+    observe_queue_wait,
 };
-use super::observer::{NoQueueStamp, NoopObserver, QueueKind, QueueStamp, SearchObserver, observe_queue_wait};
 use super::param::{ResolvedSearchConfig, SearchConfig};
-use super::pipeline::{RECEIVE_POLL, Shared, process_gather_event};
-use super::{NodeId, ValueDelta};
+use super::pipeline::{RECEIVE_POLL, Shared, process_expand_event, process_select_event};
 
-// --- Event -------------------------------------------------------------------
+/// 第一份 NN request 到达后，给并发 Expand 极短的汇聚时间；避免退化成连续 batch=1。
+const NN_BATCH_GATHER: Duration = Duration::from_micros(50);
 
-/// root history 加上从 root 到 repository node 的走法。
 #[derive(Clone, Debug)]
 pub struct Variation {
     base_history: Arc<PositionHistory>,
@@ -35,16 +39,11 @@ pub struct Variation {
 
 impl Variation {
     pub fn root(root_history: Arc<PositionHistory>) -> Self {
-        Self {
-            base_history: root_history,
-            moves: smallvec::SmallVec::new(),
-        }
+        Self { base_history: root_history, moves: smallvec::SmallVec::new() }
     }
-
     pub fn moves(&self) -> &[Move] {
         &self.moves
     }
-
     pub(crate) fn history(&self) -> PositionHistory {
         let mut history = self.base_history.as_ref().clone();
         for &mv in &self.moves {
@@ -52,190 +51,138 @@ impl Variation {
         }
         history
     }
-
     pub fn push(&mut self, mv: Move) {
         self.moves.push(mv);
     }
 }
 
-/// Eval 后仍需的路径。它不携带 Gather 专用的规则上下文。
 #[derive(Debug)]
-pub struct Event {
+pub struct Selection {
     pub(crate) node_id: NodeId,
     pub(crate) node_path: Vec<NodeId>,
     pub(crate) reservations: Vec<EdgeReservation>,
 }
 
-impl Event {
+impl Selection {
     pub fn cancel(self) {
         for reservation in self.reservations.into_iter().rev() {
             reservation.cancel();
         }
     }
-
-    pub fn node_path(&self) -> &[NodeId] {
-        &self.node_path
-    }
 }
 
-/// Gather 到 Eval 前的完整 playout：路径、reservation 与规则上下文。
 #[derive(Debug)]
-pub struct GatherEvent<S: QueueStamp = NoQueueStamp> {
-    pub(crate) event: Event,
+pub struct SelectEvent<S: QueueStamp = NoQueueStamp> {
+    pub(crate) selection: Selection,
     pub variation: Variation,
+    pub(crate) root_move_filter: Arc<[Move]>,
     pub(crate) queued_at: S,
 }
 
-impl<S: QueueStamp> GatherEvent<S> {
-    pub fn at_root(root_id: NodeId, root_history: Arc<PositionHistory>) -> Self {
+/// Select 已 claim 的未展开叶子；保留完整 variation，供规则裁决和后续 forced 展开使用。
+pub(crate) type ExpandEvent<S = NoQueueStamp> = SelectEvent<S>;
+
+impl<S: QueueStamp> SelectEvent<S> {
+    pub fn at_root(root_id: NodeId, root_history: Arc<PositionHistory>, root_move_filter: Arc<[Move]>) -> Self {
         Self {
-            event: Event {
-                node_id: root_id,
-                node_path: vec![root_id],
-                reservations: Vec::new(),
-            },
+            selection: Selection { node_id: root_id, node_path: vec![root_id], reservations: Vec::new() },
             variation: Variation::root(root_history),
+            root_move_filter,
             queued_at: S::default(),
         }
     }
-
     pub fn descend(mut self, child_id: NodeId, reservation: EdgeReservation) -> Self {
         self.variation.push(reservation.mv());
-        self.event.node_id = child_id;
-        self.event.node_path.push(child_id);
-        self.event.reservations.push(reservation);
+        self.selection.node_id = child_id;
+        self.selection.node_path.push(child_id);
+        self.selection.reservations.push(reservation);
         self
     }
-
-    pub fn cancel(self) {
-        self.event.cancel();
-    }
-
     pub fn node_path(&self) -> &[NodeId] {
-        self.event.node_path()
+        self.selection.node_path.as_slice()
     }
-
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at.mark();
     }
-
-    pub(crate) fn into_event(self) -> Event {
-        self.event
+    pub(crate) fn into_selection(self) -> Selection {
+        self.selection
     }
 }
 
-pub(crate) type NnReply = Result<(Arc<EncodedBatch>, usize), EnginError>;
-
-/// 同一 NN 事务的发送半边：NN worker 输入与其排队时间。
-pub(crate) struct NnRequest<S: QueueStamp = NoQueueStamp> {
-    pub(crate) planes: InputPlanes,
-    pub(crate) reply: Sender<NnReply>,
-    pub(crate) queued_at: S,
-}
-
-impl<S: QueueStamp> NnRequest<S> {
-    pub(crate) fn new(planes: InputPlanes, reply: Sender<NnReply>) -> Self {
-        Self {
-            planes,
-            reply,
-            queued_at: S::default(),
-        }
-    }
-
-    pub(crate) fn mark_queued(&mut self) {
-        self.queued_at.mark();
-    }
-}
-
-/// 同一 NN 事务的等待半边：Eval 收到 reply 后据此发布 edge 或回传。
-pub(crate) struct NnPending {
-    pub(crate) event: Event,
+/// 已完成 NN 前准备的叶子元数据；在 NN request 与 reply 间转交。
+#[derive(Debug)]
+pub(crate) struct NnItem {
+    pub(crate) selection: Selection,
     pub(crate) legal_moves: LegalMoveList,
     pub(crate) cache_key: EvalCacheKey,
-    pub(crate) reply: Receiver<NnReply>,
 }
-
-/// 由 Gather/Eval 路由给 Backprop 的结果（算法在 `backprop::complete_batch`）。
-#[derive(Debug)]
-pub struct BackpropEvent<S: QueueStamp = NoQueueStamp> {
-    pub(crate) event: Event,
-    pub(crate) value: ValueDelta,
-    /// 走过 `send_eval` 的叶子；backprop 完成后释放对应 claim slot。
-    pub(crate) held_eval_claim: bool,
+/// Expand 编码后的 cache-miss 请求；NN scheduler 按 FIFO admission。
+pub(crate) struct NnRequest<S: QueueStamp = NoQueueStamp> {
+    pub(crate) item: NnItem,
+    pub(crate) planes: InputPlanes,
     pub(crate) queued_at: S,
 }
-
-impl<S: QueueStamp> BackpropEvent<S> {
-    /// Eval 路径：走过 `send_eval`，backprop 后释放 claim。
-    pub(crate) fn from_eval(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
-        Self {
-            event,
-            value: ValueDelta::with_plies_left(wl, draw, plies_left),
-            held_eval_claim: true,
-            queued_at: S::default(),
-        }
+impl<S: QueueStamp> NnRequest<S> {
+    pub(crate) fn new(item: NnItem, planes: InputPlanes) -> Self {
+        Self { item, planes, queued_at: S::default() }
     }
-
-    /// Gather 直发：未占 eval claim。
-    pub(crate) fn from_gather(event: Event, wl: f32, draw: f32, plies_left: f32) -> Self {
-        Self {
-            event,
-            value: ValueDelta::with_plies_left(wl, draw, plies_left),
-            held_eval_claim: false,
-            queued_at: S::default(),
-        }
-    }
-
-    pub fn cancel(self) {
-        self.event.cancel();
-    }
-
     pub(crate) fn mark_queued(&mut self) {
         self.queued_at.mark();
     }
 }
 
-// --- Pool --------------------------------------------------------------------
-
-enum GatherCommand<O: SearchObserver> {
-    Run(Arc<Shared<O>>, Receiver<GatherEvent<O::Stamp>>),
-    Shutdown,
+/// NN worker 回交给任一 worker 的一整个物理 batch；所有 event 都持有一个 NN credit。
+pub(crate) struct NnReplyBatch<S: QueueStamp = NoQueueStamp> {
+    pub(crate) items: Vec<NnItem>,
+    pub(crate) result: Result<Arc<EncodedBatch>, EnginError>,
+    pub(crate) queued_at: S,
+}
+impl<S: QueueStamp> NnReplyBatch<S> {
+    pub(crate) fn new(items: Vec<NnItem>, result: Result<Arc<EncodedBatch>, EnginError>) -> Self {
+        Self { items, result, queued_at: S::default() }
+    }
+    pub(crate) fn mark_queued(&mut self) {
+        self.queued_at.mark();
+    }
 }
 
-enum EvalCommand<O: SearchObserver> {
-    Run(
-        Arc<Shared<O>>,
-        Receiver<GatherEvent<O::Stamp>>,
-        Sender<NnRequest<O::Stamp>>,
-    ),
+enum WorkerCommand<O: SearchObserver> {
+    Run {
+        shared: Arc<Shared<O>>,
+        select_rx: Receiver<SelectEvent<O::Stamp>>,
+        expand_rx: Receiver<ExpandEvent<O::Stamp>>,
+        nn_reply_rx: Receiver<NnReplyBatch<O::Stamp>>,
+        nn_tx: Sender<NnRequest<O::Stamp>>,
+    },
     Shutdown,
 }
-
 enum NnCommand<O: SearchObserver> {
-    Run(Arc<Shared<O>>, Receiver<NnRequest<O::Stamp>>),
+    Run(Arc<Shared<O>>, Receiver<NnRequest<O::Stamp>>, Receiver<usize>, Sender<NnReplyBatch<O::Stamp>>),
     Shutdown,
 }
 
-enum BackpropCommand<O: SearchObserver> {
-    Run(Arc<Shared<O>>, Receiver<BackpropEvent<O::Stamp>>),
-    Shutdown,
-}
-
-/// Engine 持有的当前固定 worker 拓扑。
+/// 一次 Search 启动时交给固定 worker 的全部队列端点。
 ///
-/// 每个 job 独占树视图与队列；线程池只跨 job 保留线程。NN 与 Backprop
-/// 各固定一个 worker；Gather/Eval 的数量也在建池时固定。这只是当前实验配置：两者会彼此
-/// 受队列、claim 与回传速度制约，未来调度器可按实时压力在 Gather、Eval、proof 等工作间
-/// 分配 CPU worker，而不把静态线程数量当作 job 契约。
+/// 这些端点只属于一个 job；pool 只负责让常驻线程运行它，不保存 job 状态。
+pub(crate) struct WorkerJob<O: SearchObserver> {
+    pub(crate) shared: Arc<Shared<O>>,
+    pub(crate) select_rx: Receiver<SelectEvent<O::Stamp>>,
+    pub(crate) expand_rx: Receiver<ExpandEvent<O::Stamp>>,
+    pub(crate) nn_reply_rx: Receiver<NnReplyBatch<O::Stamp>>,
+    pub(crate) nn_tx: Sender<NnRequest<O::Stamp>>,
+    pub(crate) nn_rx: Receiver<NnRequest<O::Stamp>>,
+    pub(crate) nn_credit_rx: Receiver<usize>,
+    pub(crate) nn_reply_tx: Sender<NnReplyBatch<O::Stamp>>,
+}
+
+/// 固定容量的任务池；NN 另占一个设备 worker。
 pub(crate) struct WorkerPool<O: SearchObserver = NoopObserver> {
-    gather_commands: Vec<Sender<GatherCommand<O>>>,
-    eval_commands: Vec<Sender<EvalCommand<O>>>,
+    worker_commands: Vec<Sender<WorkerCommand<O>>>,
     nn_commands: Sender<NnCommand<O>>,
-    backprop_commands: Vec<Sender<BackpropCommand<O>>>,
     job_done: Receiver<()>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     eval_batch_size: usize,
-    eval_claim_limit: usize,
+    nn_credit_limit: usize,
 }
 
 impl<O: SearchObserver> WorkerPool<O> {
@@ -243,406 +190,270 @@ impl<O: SearchObserver> WorkerPool<O> {
         config.validate();
         Self::from_resolved(&config.resolve(backend))
     }
-
-    /// 当前固定拓扑实现中，batch 或 Gather/Eval worker 数改变时必须换新 pool。
-    /// 动态调度器落地后可将静态比例改为总 CPU 容量与调度策略，而非 pool 兼容性条件。
     pub(crate) fn matches_config(&self, backend: &dyn Backend, config: &SearchConfig) -> bool {
         let config = config.resolve(backend);
         self.eval_batch_size == config.eval_batch_size
-            && self.eval_claim_limit == config.eval_claim_limit
-            && self.gather_commands.len() == config.gather_workers
-            && self.eval_commands.len() == config.eval_workers
+            && self.nn_credit_limit == config.nn_permit_limit
+            && self.worker_commands.len() == config.threads
     }
-
     fn from_resolved(config: &ResolvedSearchConfig) -> Self {
         let (job_done_tx, job_done) = unbounded();
-        let eval_batch_size = config.eval_batch_size;
-        let eval_claim_limit = config.eval_claim_limit;
-        let mut gather_commands = Vec::with_capacity(config.gather_workers);
-        let mut eval_commands = Vec::with_capacity(config.eval_workers);
         let (nn_commands, nn_rx) = unbounded();
-        let (backprop_commands, backprop_rx) = unbounded();
-        let mut threads = Vec::with_capacity(config.gather_workers + config.eval_workers + 2);
-        for _ in 0..config.gather_workers {
+        let mut worker_commands = Vec::with_capacity(config.threads);
+        let mut threads = Vec::with_capacity(config.threads + 1);
+        for _ in 0..config.threads {
             let (tx, rx) = unbounded();
-            let job_done = job_done_tx.clone();
-            threads.push(thread::spawn(move || {
-                persistent_gather_worker::<O>(rx, job_done, eval_claim_limit)
-            }));
-            gather_commands.push(tx);
+            let done = job_done_tx.clone();
+            threads.push(thread::spawn(move || persistent_worker::<O>(rx, done)));
+            worker_commands.push(tx);
         }
-        for _ in 0..config.eval_workers {
-            let (tx, rx) = unbounded();
-            let job_done = job_done_tx.clone();
-            threads.push(thread::spawn(move || persistent_eval_worker::<O>(rx, job_done)));
-            eval_commands.push(tx);
-        }
+        let batch_size = config.eval_batch_size;
+        let credit_limit = config.nn_permit_limit;
         threads.push(thread::spawn({
-            let job_done = job_done_tx.clone();
-            move || persistent_nn_worker::<O>(nn_rx, job_done, eval_batch_size)
-        }));
-        threads.push(thread::spawn({
-            let job_done = job_done_tx.clone();
-            move || persistent_backprop_worker::<O>(backprop_rx, job_done)
+            let done = job_done_tx.clone();
+            move || persistent_nn_worker::<O>(nn_rx, done, batch_size, credit_limit)
         }));
         Self {
-            gather_commands,
-            eval_commands,
+            worker_commands,
             nn_commands,
-            backprop_commands: vec![backprop_commands],
             job_done,
             threads: Mutex::new(threads),
             eval_batch_size: config.eval_batch_size,
-            eval_claim_limit: config.eval_claim_limit,
+            nn_credit_limit: config.nn_permit_limit,
         }
     }
-
-    pub(crate) fn start_job(
-        &self,
-        shared: &Arc<Shared<O>>,
-        gather_rx: &Receiver<GatherEvent<O::Stamp>>,
-        eval_rx: &Receiver<GatherEvent<O::Stamp>>,
-        nn_tx: &Sender<NnRequest<O::Stamp>>,
-        nn_rx: &Receiver<NnRequest<O::Stamp>>,
-        backprop_rx: &Receiver<BackpropEvent<O::Stamp>>,
-    ) {
-        for sender in &self.gather_commands {
-            sender
-                .send(GatherCommand::Run(Arc::clone(shared), gather_rx.clone()))
-                .expect("persistent search worker is alive");
-        }
+    /// 让所有常驻 worker 开始处理一个完整的 Search job。
+    pub(crate) fn start(&self, job: WorkerJob<O>) {
+        let WorkerJob { shared, select_rx, expand_rx, nn_reply_rx, nn_tx, nn_rx, nn_credit_rx, nn_reply_tx } = job;
         self.nn_commands
-            .send(NnCommand::Run(Arc::clone(shared), nn_rx.clone()))
+            .send(NnCommand::Run(Arc::clone(&shared), nn_rx, nn_credit_rx, nn_reply_tx))
             .expect("persistent nn worker is alive");
-        for sender in &self.eval_commands {
+        for sender in &self.worker_commands {
             sender
-                .send(EvalCommand::Run(Arc::clone(shared), eval_rx.clone(), nn_tx.clone()))
-                .expect("persistent eval worker is alive");
-        }
-        for sender in &self.backprop_commands {
-            sender
-                .send(BackpropCommand::Run(Arc::clone(shared), backprop_rx.clone()))
-                .expect("persistent backprop worker is alive");
+                .send(WorkerCommand::Run {
+                    shared: Arc::clone(&shared),
+                    select_rx: select_rx.clone(),
+                    expand_rx: expand_rx.clone(),
+                    nn_reply_rx: nn_reply_rx.clone(),
+                    nn_tx: nn_tx.clone(),
+                })
+                .expect("persistent worker is alive");
         }
     }
-
-    pub(crate) fn finish_job(&self) {
-        for _ in 0..self.gather_commands.len() + self.eval_commands.len() + self.backprop_commands.len() + 1 {
+    /// 等待本 job 的全部 CPU worker 与 NN worker 退出。
+    pub(crate) fn finish(&self) {
+        for _ in 0..self.worker_commands.len() + 1 {
             self.job_done.recv().expect("persistent worker completion");
         }
     }
-
-    pub(crate) fn eval_claim_limit(&self) -> usize {
-        self.eval_claim_limit
+    pub(crate) fn nn_credit_limit(&self) -> usize {
+        self.nn_credit_limit
     }
-
-    pub(crate) fn eval_batch_size(&self) -> usize {
-        self.eval_batch_size
-    }
-
-    pub(crate) fn assert_compatible(&self, config: &ResolvedSearchConfig) {
-        debug_assert_eq!(
-            self.gather_commands.len(),
-            config.gather_workers,
-            "worker pool gather topology changed"
-        );
-        debug_assert_eq!(
-            self.eval_commands.len(),
-            config.eval_workers,
-            "worker pool eval topology changed"
-        );
-        debug_assert_eq!(
-            self.eval_batch_size, config.eval_batch_size,
-            "worker pool batch size changed"
-        );
-        debug_assert_eq!(
-            self.eval_claim_limit, config.eval_claim_limit,
-            "worker pool nn window changed"
-        );
+    pub(crate) fn worker_count(&self) -> usize {
+        self.worker_commands.len()
     }
 }
-
 impl<O: SearchObserver> Drop for WorkerPool<O> {
     fn drop(&mut self) {
-        for sender in &self.gather_commands {
-            let _ = sender.send(GatherCommand::Shutdown);
+        for sender in &self.worker_commands {
+            let _ = sender.send(WorkerCommand::Shutdown);
         }
         let _ = self.nn_commands.send(NnCommand::Shutdown);
-        for sender in &self.eval_commands {
-            let _ = sender.send(EvalCommand::Shutdown);
-        }
-        for sender in &self.backprop_commands {
-            let _ = sender.send(BackpropCommand::Shutdown);
-        }
         for worker in self.threads.get_mut().drain(..) {
             let _ = worker.join();
         }
     }
 }
 
-// --- Gather / Eval / NN / Backprop loops
-
-fn gather_worker<O: SearchObserver>(
-    shared: Arc<Shared<O>>,
-    receiver: Receiver<GatherEvent<O::Stamp>>,
-    eval_claim_limit: usize,
+/// stop 后不再启动上游工作；已经得到结果的 NN reply 仍完成并写入缓存。
+fn cancel_pending_worker_queues<O: SearchObserver>(
+    shared: &Shared<O>,
+    select_rx: &Receiver<SelectEvent<O::Stamp>>,
+    expand_rx: &Receiver<ExpandEvent<O::Stamp>>,
 ) {
-    loop {
-        match receiver.recv_timeout(RECEIVE_POLL) {
-            Ok(mut event) => {
-                if O::ENABLED {
-                    observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Gather);
-                }
-                if shared.stopping.load(Ordering::Acquire) {
-                    event.cancel();
-                    shared.finish(1, false);
-                } else {
-                    process_gather_event(&shared, event, eval_claim_limit);
-                }
-            }
-            Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
+    while let Ok(event) = select_rx.try_recv() {
+        shared.cancel_selection(event.into_selection());
+    }
+    while let Ok(event) = expand_rx.try_recv() {
+        shared.cancel_claim(event.into_selection());
     }
 }
 
-fn persistent_gather_worker<O: SearchObserver>(
-    commands: Receiver<GatherCommand<O>>,
-    job_done: Sender<()>,
-    eval_claim_limit: usize,
-) {
-    while let Ok(command) = commands.recv() {
-        match command {
-            GatherCommand::Run(shared, receiver) => {
-                gather_worker(shared, receiver, eval_claim_limit);
-                let _ = job_done.send(());
-            }
-            GatherCommand::Shutdown => break,
-        }
+fn process_nn_reply<O: SearchObserver>(shared: &Shared<O>, mut reply: NnReplyBatch<O::Stamp>) {
+    if O::ENABLED {
+        observe_queue_wait(&mut reply.queued_at, &shared.observer, QueueKind::NnReply);
+    }
+    if let Err(error) = handle_nn_reply_batch(shared, reply) {
+        shared.fail(error);
     }
 }
 
-fn eval_worker<O: SearchObserver>(
+fn worker<O: SearchObserver>(
     shared: Arc<Shared<O>>,
-    receiver: Receiver<GatherEvent<O::Stamp>>,
+    select_rx: Receiver<SelectEvent<O::Stamp>>,
+    expand_rx: Receiver<ExpandEvent<O::Stamp>>,
+    reply_rx: Receiver<NnReplyBatch<O::Stamp>>,
     nn_tx: Sender<NnRequest<O::Stamp>>,
 ) {
-    let mut waiting = Vec::<NnPending>::new();
     loop {
-        if shared.stopping.load(Ordering::Acquire) {
-            drain_waiting(&shared, &mut waiting);
-            while let Ok(event) = receiver.try_recv() {
-                cancel_evaluation(&shared, event.into_event());
+        if shared.is_stopping() {
+            cancel_pending_worker_queues(&shared, &select_rx, &expand_rx);
+            if let Ok(reply) = reply_rx.try_recv() {
+                process_nn_reply(&shared, reply);
+                continue;
             }
-            shared.cancel_all_collisions();
-            break;
-        }
-
-        poll_nn_completions(&shared, &mut waiting);
-
-        match receiver.recv_timeout(RECEIVE_POLL) {
-            Ok(mut event) => {
-                if O::ENABLED {
-                    observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Eval);
-                }
-                if let Err(error) = handle_eval_event(&shared, &nn_tx, &mut waiting, event) {
-                    shared.fail(error);
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if waiting.is_empty() || shared.stopping.load(Ordering::Acquire) {
-                    continue;
-                }
-                wait_one_nn_completion(&shared, &mut waiting);
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                drain_waiting(&shared, &mut waiting);
-                while let Ok(event) = receiver.try_recv() {
-                    cancel_evaluation(&shared, event.into_event());
-                }
-                shared.cancel_all_collisions();
+            if shared.outstanding.load(Ordering::Acquire) == 0 {
                 break;
             }
+            if let Ok(reply) = reply_rx.recv_timeout(RECEIVE_POLL) {
+                process_nn_reply(&shared, reply);
+            }
+            continue;
+        }
+        if let Ok(reply) = reply_rx.try_recv() {
+            process_nn_reply(&shared, reply);
+            continue;
+        }
+        if let Ok(mut event) = expand_rx.try_recv() {
+            if O::ENABLED {
+                observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Expand);
+            }
+            process_expand_event(&shared, &nn_tx, event);
+            continue;
+        }
+        if let Ok(mut event) = select_rx.try_recv() {
+            if O::ENABLED {
+                observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Select);
+            }
+            process_select_event(&shared, event);
+            continue;
+        }
+        crossbeam_channel::select! {
+            recv(reply_rx) -> result => {
+                if let Ok(reply) = result { process_nn_reply(&shared, reply); }
+            },
+            recv(expand_rx) -> result => {
+                if let Ok(mut event) = result {
+                    if O::ENABLED { observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Expand); }
+                    process_expand_event(&shared, &nn_tx, event);
+                }
+            },
+            recv(select_rx) -> result => {
+                if let Ok(mut event) = result {
+                    if O::ENABLED { observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Select); }
+                    process_select_event(&shared, event);
+                }
+            },
+            default(RECEIVE_POLL) => {},
         }
     }
 }
 
-fn persistent_eval_worker<O: SearchObserver>(commands: Receiver<EvalCommand<O>>, job_done: Sender<()>) {
+fn persistent_worker<O: SearchObserver>(commands: Receiver<WorkerCommand<O>>, done: Sender<()>) {
     while let Ok(command) = commands.recv() {
         match command {
-            EvalCommand::Run(shared, receiver, nn_tx) => {
-                eval_worker(shared, receiver, nn_tx);
-                let _ = job_done.send(());
+            WorkerCommand::Run { shared, select_rx, expand_rx, nn_reply_rx, nn_tx } => {
+                worker(shared, select_rx, expand_rx, nn_reply_rx, nn_tx);
+                let _ = done.send(());
             }
-            EvalCommand::Shutdown => break,
+            WorkerCommand::Shutdown => break,
         }
     }
 }
 
-fn nn_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver<NnRequest<O::Stamp>>, batch_size: usize) {
+fn nn_worker<O: SearchObserver>(
+    shared: Arc<Shared<O>>,
+    request_rx: Receiver<NnRequest<O::Stamp>>,
+    credit_rx: Receiver<usize>,
+    reply_tx: Sender<NnReplyBatch<O::Stamp>>,
+    batch_size: usize,
+    credit_limit: usize,
+) {
+    let mut requests = Vec::with_capacity(batch_size);
+    let mut samples = Vec::with_capacity(batch_size);
+    let mut in_flight = 0;
     loop {
-        let mut first = match receiver.recv_timeout(RECEIVE_POLL) {
+        if shared.is_stopping() {
+            while let Ok(request) = request_rx.try_recv() {
+                shared.cancel_claim(request.item.selection);
+            }
+            break;
+        }
+        while let Ok(count) = credit_rx.try_recv() {
+            debug_assert!(count <= in_flight, "NN credit underflow");
+            in_flight -= count;
+        }
+
+        if in_flight == credit_limit {
+            match credit_rx.recv_timeout(RECEIVE_POLL) {
+                Ok(count) => {
+                    debug_assert!(count <= in_flight, "NN credit underflow");
+                    in_flight -= count;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            continue;
+        }
+
+        let request = match request_rx.recv_timeout(RECEIVE_POLL) {
             Ok(request) => request,
-            Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        if O::ENABLED {
-            observe_queue_wait(&mut first.queued_at, &shared.observer, QueueKind::Nn);
-        }
-        let mut requests = vec![first];
-        while requests.len() < batch_size {
-            match receiver.try_recv() {
-                Ok(mut request) => {
-                    if O::ENABLED {
-                        observe_queue_wait(&mut request.queued_at, &shared.observer, QueueKind::Nn);
-                    }
-                    requests.push(request);
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        requests.push(request);
+        let deadline = Instant::now() + NN_BATCH_GATHER;
+        while requests.len() < batch_size && Instant::now() < deadline {
+            while let Ok(count) = credit_rx.try_recv() {
+                debug_assert!(count <= in_flight, "NN credit underflow");
+                in_flight -= count;
+            }
+            if in_flight + requests.len() >= credit_limit {
+                std::hint::spin_loop();
+                continue;
+            }
+            match request_rx.try_recv() {
+                Ok(request) => requests.push(request),
+                Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                Err(TryRecvError::Disconnected) => break,
             }
         }
-        infer_nn_batch(&shared, requests);
+        if O::ENABLED {
+            for (index, request) in requests.iter_mut().enumerate() {
+                observe_queue_wait(&mut request.queued_at, &shared.observer, QueueKind::Nn);
+                shared.observer.on_peak_inflight(in_flight + index + 1);
+            }
+        }
+        in_flight += requests.len();
+        if shared.is_stopping() {
+            for request in requests.drain(..) {
+                shared.cancel_evaluation(request.item.selection);
+            }
+            continue;
+        }
+        let _timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Nn);
+        samples.clear();
+        samples.extend(requests.iter().map(|request| request.planes));
+        let result = infer_nn_batch(&shared, &samples);
+        let mut reply = NnReplyBatch::new(requests.drain(..).map(|request| request.item).collect(), result);
+        reply.mark_queued();
+        reply_tx.send(reply).expect("search workers live until finish");
     }
 }
 
-fn persistent_nn_worker<O: SearchObserver>(commands: Receiver<NnCommand<O>>, job_done: Sender<()>, batch_size: usize) {
+fn persistent_nn_worker<O: SearchObserver>(
+    commands: Receiver<NnCommand<O>>,
+    done: Sender<()>,
+    batch_size: usize,
+    credit_limit: usize,
+) {
     while let Ok(command) = commands.recv() {
         match command {
-            NnCommand::Run(shared, receiver) => {
-                nn_worker(shared, receiver, batch_size);
-                let _ = job_done.send(());
+            NnCommand::Run(shared, request_rx, credit_rx, reply_tx) => {
+                nn_worker(shared, request_rx, credit_rx, reply_tx, batch_size, credit_limit);
+                let _ = done.send(());
             }
             NnCommand::Shutdown => break,
         }
-    }
-}
-
-fn backprop_worker<O: SearchObserver>(shared: Arc<Shared<O>>, receiver: Receiver<BackpropEvent<O::Stamp>>) {
-    loop {
-        let first = match receiver.recv_timeout(RECEIVE_POLL) {
-            Ok(event) => event,
-            Err(RecvTimeoutError::Timeout) if shared.stopping.load(Ordering::Acquire) => break,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        let mut events = Vec::with_capacity(1 + receiver.len());
-        events.push(first);
-        events.extend(receiver.try_iter());
-        if events.is_empty() {
-            continue;
-        }
-        if shared.stopping.load(Ordering::Acquire) {
-            let n = events.len();
-            let held = events.iter().filter(|event| event.held_eval_claim).count();
-            for event in events {
-                event.cancel();
-            }
-            shared.release_eval_claims(held);
-            shared.finish(n, false);
-            continue;
-        }
-        if O::ENABLED {
-            for event in &mut events {
-                observe_queue_wait(&mut event.queued_at, &shared.observer, QueueKind::Backprop);
-            }
-        }
-        let claims: Vec<(bool, NodeId)> = events
-            .iter()
-            .map(|event| (event.held_eval_claim, event.event.node_id))
-            .collect();
-        let result = complete_batch(events, &shared.arena);
-        for (_, id) in &claims {
-            shared.cancel_collisions(*id);
-        }
-        let held = claims.iter().filter(|(held, _)| *held).count();
-        shared.release_eval_claims(held);
-        shared
-            .completed_depth
-            .fetch_add(result.completed_depth, Ordering::AcqRel);
-        shared.max_depth.fetch_max(result.max_depth, Ordering::AcqRel);
-        shared.finish(result.completed_playouts as usize, true);
-    }
-}
-
-fn persistent_backprop_worker<O: SearchObserver>(commands: Receiver<BackpropCommand<O>>, job_done: Sender<()>) {
-    while let Ok(command) = commands.recv() {
-        match command {
-            BackpropCommand::Run(shared, receiver) => {
-                backprop_worker(shared, receiver);
-                let _ = job_done.send(());
-            }
-            BackpropCommand::Shutdown => break,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::thread;
-
-    use crossbeam_channel::bounded;
-    use parking_lot::{Condvar, Mutex};
-    use xiangqi_core::{GameState, PositionHistory, STARTPOS_FEN};
-
-    use super::{BackpropEvent, GatherEvent, backprop_worker};
-    use crate::neural::backend::{Backend, UniformBackend};
-    use crate::search::observer::NoopObserver;
-    use crate::search::param::SearchParams;
-    use crate::search::pipeline::Shared;
-    use crate::search::{NoQueueStamp, NodeArena};
-
-    #[test]
-    fn backprop_completion_releases_the_eval_claim() {
-        let state = GameState::from_fen_moves(STARTPOS_FEN, &[] as &[&str]).expect("startpos");
-        let history = Arc::new(PositionHistory::from_positions(state.positions()));
-        let arena = Arc::new(NodeArena::default());
-        let root = arena.allocate();
-        let (gather_tx, _) = bounded(1);
-        let (eval_tx, _) = bounded(1);
-        let (backprop_tx, backprop_rx) = bounded(1);
-        let shared = Arc::new(Shared {
-            backend: Arc::new(UniformBackend::default()) as Arc<dyn Backend>,
-            arena: Arc::clone(&arena),
-            params: SearchParams::default(),
-            root_move_filter: Mutex::new(Vec::new()),
-            stopping: AtomicBool::new(false),
-            outstanding: AtomicUsize::new(1),
-            nn_inflight: AtomicUsize::new(1),
-            completed: AtomicU64::new(0),
-            completed_depth: AtomicU64::new(0),
-            max_depth: AtomicU64::new(0),
-            network_evaluations: AtomicU64::new(0),
-            observer: NoopObserver,
-            error: Mutex::new(None),
-            idle_lock: Mutex::new(()),
-            idle: Condvar::new(),
-            gather_tx,
-            eval_tx,
-            backprop_tx: backprop_tx.clone(),
-            collision_waiters: Mutex::new(Vec::new()),
-        });
-        backprop_tx
-            .send(BackpropEvent::from_eval(
-                GatherEvent::<NoQueueStamp>::at_root(root, history).into_event(),
-                0.4,
-                0.2,
-                2.0,
-            ))
-            .expect("backprop event");
-        let worker_shared = Arc::clone(&shared);
-        let worker = thread::spawn(move || backprop_worker(worker_shared, backprop_rx));
-        while shared.completed.load(Ordering::Acquire) == 0 {
-            thread::yield_now();
-        }
-        shared.stopping.store(true, Ordering::Release);
-        worker.join().expect("backprop worker");
-
-        assert_eq!(arena.get(root).expect("root").completed_visits(), 1);
-        assert_eq!(shared.nn_inflight.load(Ordering::Acquire), 0);
-        assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);
     }
 }

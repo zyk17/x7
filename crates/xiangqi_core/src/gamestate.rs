@@ -1,6 +1,6 @@
 //! UCI `GameState`：startpos + moves，供 `position` 命令构建完整历史。
 
-use crate::{CoreError, MoveList, Position, PositionHistory};
+use crate::{MoveList, Position, PositionHistory};
 
 /// startpos 与后续着法。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,7 +14,7 @@ impl GameState {
         Self { startpos, moves }
     }
 
-    pub fn from_fen_moves(fen: &str, move_strs: &[impl AsRef<str>]) -> Result<Self, CoreError> {
+    pub fn from_fen_moves(fen: &str, move_strs: &[impl AsRef<str>]) -> Result<Self, String> {
         let startpos = Position::from_fen(fen)?;
         let mut board = startpos.board().clone();
         let mut moves = MoveList::with_capacity(move_strs.len());
@@ -34,9 +34,7 @@ impl GameState {
     /// 从 UCI 的初始局面和完整 moves 重放规则历史。
     ///
     /// 不能只连续调用 `Position::after`：重复次数与 cycle length 只能由
-    /// `PositionHistory::append` 在完整路径中计算。参考 px0
-    /// `GameState` + `PositionHistory::Append`（`gamestate.cc:35-55`、
-    /// `position.cc:113-124,171-186`）。
+    /// `PositionHistory::append` 在完整路径中计算。
     pub fn position_history(&self) -> PositionHistory {
         let mut history = PositionHistory::default();
         history.reset_position(self.startpos.clone());

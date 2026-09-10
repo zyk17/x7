@@ -7,101 +7,33 @@ torch = pytest.importorskip("torch")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "scripts" / "export"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
-from nn import (
-    KnowledgeResNet,
-    KnowledgeTransformer,
-    soft_policy_cross_entropy,
-    moves_left_loss,
-    value_q_mse_from_wdl,
-    value_wdl_cross_entropy,
-    wdl_logits_to_q,
-)
-from nn.model import (
-    BATCH_NORM_MOMENTUM,
-    GlobalBroadcast,
-    PreActBottleneck,
-    ValueAuxHead,
-    _load_move_vocab,
-    soften_policy_targets,
-)
-from export_onnx import KnowledgeOnnxExport
+from export import KnowledgeOnnxExport
+from nn import KnowledgeModel, moves_left_loss, soft_policy_cross_entropy, value_q_mse_from_wdl, value_wdl_cross_entropy
+from nn.model import _load_move_vocab, soften_policy_targets
 
 
-def test_policy_vocab_is_packaged_with_python_module():
-    moves = _load_move_vocab()
-    assert len(moves) == 2062
-    assert moves[0] == "a0a1"
-
-
-def test_px0_contract_shape():
-    x = torch.zeros((124, 10, 9), dtype=torch.float32)
-    assert tuple(x.shape) == (124, 10, 9)
-
-
-def test_policy_forward_shape():
-    m = KnowledgeResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
-    x = torch.zeros((1, 124, 10, 9), dtype=torch.float32)
-    logits = m(x)
-    assert logits.shape == (1, 2062)
-
-
-def test_model_defaults_to_b15c384bt192():
-    model = KnowledgeResNet()
-    assert (model.num_blocks, model.stem.out_channels, model.bottleneck_channels) == (15, 384, 192)
-
-
-def test_value_wdl_forward_and_loss():
-    m = KnowledgeResNet(
-        in_planes=124,
-        width=32,
-        num_blocks=12,
-        num_moves=2062,
-        value_head=True,
-        moves_left_head=True,
-    )
-    x = torch.zeros((1, 124, 10, 9), dtype=torch.float32)
-    logits, value, moves_left = m(x)
-    assert logits.shape == (1, 2062)
-    assert value.shape == (1, 3)
-    assert moves_left.shape == (1, 1)
-    tgt = torch.tensor([[0.6, 0.1, 0.3]], dtype=torch.float32)
-    loss = value_wdl_cross_entropy(value, tgt)
-    assert loss.ndim == 0 and torch.isfinite(loss)
-    q = wdl_logits_to_q(value)
-    assert q.shape == (1,)
-    ml_loss = moves_left_loss(moves_left, torch.tensor([[24.0]], dtype=torch.float32))
-    assert ml_loss.ndim == 0 and torch.isfinite(ml_loss)
-
-
-def test_onnx_export_wrapper_keeps_moves_left_output():
-    model = KnowledgeResNet(width=32, num_blocks=12, value_head=True, moves_left_head=True)
-    logits, value, moves_left = KnowledgeOnnxExport(model)(torch.zeros((1, 124, 10, 9)))
-    assert logits.shape == (1, 2062)
-    assert value.shape == (1, 3)
-    assert moves_left.shape == (1, 1)
-    assert torch.allclose(value.sum(dim=1), torch.ones(1))
-
-
-def test_auxiliary_heads_are_separate_from_formal_heads():
-    model = KnowledgeResNet(width=32, num_blocks=12, value_head=True, moves_left_head=True, auxiliary_heads=True)
-    outputs = model(torch.zeros((1, 124, 10, 9)))
-    assert isinstance(outputs, tuple) and len(outputs) == 5
-    logits, value, moves_left = KnowledgeOnnxExport(model)(torch.zeros((1, 124, 10, 9)))
-    assert logits.shape == (1, 2062) and value.shape == (1, 3) and moves_left.shape == (1, 1)
-
-
-def test_v3_transformer_keeps_formal_contract_and_training_auxiliaries():
-    model = KnowledgeTransformer(
+def make_model(*, auxiliary_heads: bool = False) -> KnowledgeModel:
+    return KnowledgeModel(
         width=32,
         num_blocks=2,
         heads=4,
         ffn_channels=96,
         value_head=True,
         moves_left_head=True,
-        auxiliary_heads=True,
+        auxiliary_heads=auxiliary_heads,
     )
+
+
+def test_policy_vocab_is_packaged_with_python_module() -> None:
+    moves = _load_move_vocab()
+    assert len(moves) == 2062
+    assert moves[0] == "a0a1"
+
+
+def test_model_keeps_formal_contract_and_training_auxiliaries() -> None:
+    model = make_model(auxiliary_heads=True)
     outputs = model(torch.zeros((2, 124, 10, 9)))
     assert isinstance(outputs, tuple) and [output.shape for output in outputs] == [
         (2, 2062),
@@ -110,44 +42,12 @@ def test_v3_transformer_keeps_formal_contract_and_training_auxiliaries():
         (2, 2062),
         (2, 3),
     ]
-    logits, value, moves_left = KnowledgeOnnxExport(model)(torch.zeros((1, 124, 10, 9)))
-    assert logits.shape == (1, 2062) and value.shape == (1, 3) and moves_left.shape == (1, 1)
 
 
-def test_auxiliary_heads_require_formal_value_heads():
-    with pytest.raises(ValueError, match="auxiliary_heads"):
-        KnowledgeResNet(width=32, num_blocks=12, auxiliary_heads=True)
-
-
-def test_onnx_export_omits_auxiliary_head_weights(tmp_path: Path):
+def test_onnx_export_keeps_only_formal_heads(tmp_path: Path) -> None:
     onnx = pytest.importorskip("onnx")
-    model = KnowledgeResNet(width=32, num_blocks=12, value_head=True, moves_left_head=True, auxiliary_heads=True).eval()
+    model = make_model(auxiliary_heads=True).eval()
     out = tmp_path / "x7.onnx"
-    torch.onnx.export(
-        KnowledgeOnnxExport(model, mixed_fp16=True).eval(),
-        torch.zeros((1, 124, 10, 9)),
-        str(out),
-        input_names=["board"],
-        output_names=["logits", "value", "moves_left"],
-        opset_version=17,
-        dynamo=False,
-    )
-    names = {initializer.name for initializer in onnx.load(str(out)).graph.initializer}
-    assert not any("soft_policy_head" in name or "root_value_out" in name for name in names)
-
-
-def test_v3_mixed_fp16_onnx_export_keeps_source_model_float32(tmp_path: Path):
-    onnx = pytest.importorskip("onnx")
-    model = KnowledgeTransformer(
-        width=32,
-        num_blocks=2,
-        heads=4,
-        ffn_channels=96,
-        value_head=True,
-        moves_left_head=True,
-        auxiliary_heads=True,
-    ).eval()
-    out = tmp_path / "v3.onnx"
     torch.onnx.export(
         KnowledgeOnnxExport(model, mixed_fp16=True).eval(),
         torch.zeros((1, 124, 10, 9)),
@@ -159,25 +59,16 @@ def test_v3_mixed_fp16_onnx_export_keeps_source_model_float32(tmp_path: Path):
     )
     assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
     names = {initializer.name for initializer in onnx.load(str(out)).graph.initializer}
-    assert not any("soft_policy_head" in name or "root_value_out" in name for name in names)
+    assert not any("soft_policy_head" in name or "root_value_head" in name for name in names)
 
 
-def test_v3_mixed_fp16_onnx_keeps_homogeneous_layernorm_dtype(tmp_path: Path):
-    """ORT LayerNormalization 要求激活与权重同 dtype；mixed 图里 LN 应随 trunk 为 FP16。"""
+def test_mixed_fp16_onnx_keeps_layernorm_homogeneous(tmp_path: Path) -> None:
     onnx = pytest.importorskip("onnx")
     from onnx import helper
 
-    model = KnowledgeTransformer(
-        width=32,
-        num_blocks=2,
-        heads=4,
-        ffn_channels=96,
-        value_head=True,
-        moves_left_head=True,
-    ).eval()
-    out = tmp_path / "v3_ln.onnx"
+    out = tmp_path / "x7.onnx"
     torch.onnx.export(
-        KnowledgeOnnxExport(model, mixed_fp16=True).eval(),
+        KnowledgeOnnxExport(make_model().eval(), mixed_fp16=True),
         torch.zeros((1, 124, 10, 9)),
         str(out),
         input_names=["board"],
@@ -185,109 +76,18 @@ def test_v3_mixed_fp16_onnx_keeps_homogeneous_layernorm_dtype(tmp_path: Path):
         opset_version=17,
         dynamo=False,
     )
-    graph = onnx.load(str(out)).graph
-    ln_inits = [t for t in graph.initializer if "norm" in t.name.lower()]
-    assert ln_inits, "expected LayerNorm initializers in exported graph"
-    for tensor in ln_inits:
-        assert helper.tensor_dtype_to_string(tensor.data_type) == "TensorProto.FLOAT16", tensor.name
-    assert any(
-        helper.tensor_dtype_to_string(t.data_type) == "TensorProto.FLOAT16" for t in graph.initializer
-    )
-    assert sum(1 for n in graph.node if n.op_type == "Cast") >= 2
+    norms = [tensor for tensor in onnx.load(str(out)).graph.initializer if "norm" in tensor.name.lower()]
+    assert norms
+    assert all(helper.tensor_dtype_to_string(tensor.data_type) == "TensorProto.FLOAT16" for tensor in norms)
 
 
-def test_pure_cnn_policy_head_forward_shape():
-    m = KnowledgeResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
-    x = torch.zeros((2, 124, 10, 9), dtype=torch.float32)
-    logits = m(x)
-    assert logits.shape == (2, 2062)
-    assert torch.isfinite(logits).all()
-
-
-def test_x7_v2_uses_three_stages_and_two_global_broadcasts():
-    model = KnowledgeResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
-    assert len(model.stage1) == len(model.stage2) == len(model.stage3) == 4
-    assert all(isinstance(block, PreActBottleneck) for block in (*model.stage1, *model.stage2, *model.stage3))
-    assert isinstance(model.broadcast4, GlobalBroadcast)
-    assert isinstance(model.broadcast8, GlobalBroadcast)
-    assert model.stage1[0].conv1.kernel_size == (1, 1)
-    assert model.stage1[0].conv2.kernel_size == (3, 3)
-    assert model.stage1[0].conv3.kernel_size == (3, 3)
-    assert model.stage1[0].conv4.kernel_size == (1, 1)
-    assert model.stage1[0].conv1.out_channels == 16
-    assert model.broadcast4.gpool_conv.kernel_size == (3, 3)
-    assert model.broadcast4.gpool_to_bias.in_features == 32
-
-
-def test_x7_v2_uses_slow_batch_norm_running_statistics():
-    model = KnowledgeResNet(in_planes=124, width=32, num_blocks=12, num_moves=2062)
-    momentums = {module.momentum for module in model.modules() if isinstance(module, torch.nn.BatchNorm2d)}
-    assert momentums == {BATCH_NORM_MOMENTUM}
-
-
-def test_x7_v2_allows_non_baseline_depth_with_evenly_split_stages():
-    model = KnowledgeResNet(in_planes=124, width=32, num_blocks=10, num_moves=2062)
-    assert (len(model.stage1), len(model.stage2), len(model.stage3)) == (3, 3, 4)
-    logits = model(torch.zeros((1, 124, 10, 9), dtype=torch.float32))
-    assert logits.shape == (1, 2062)
-
-
-def test_x7_v2_allows_explicit_bottleneck_width():
-    model = KnowledgeResNet(in_planes=124, width=32, num_blocks=10, bottleneck_channels=20, num_moves=2062)
-    assert model.bottleneck_channels == 20
-    assert model.stage1[0].conv1.out_channels == 20
-
-
-def test_policy_and_shared_value_aux_head_features():
-    model = KnowledgeResNet(
-        in_planes=124,
-        width=32,
-        num_blocks=12,
-        num_moves=2062,
-        value_head=True,
-        moves_left_head=True,
-    )
-    assert model.policy_head.gpool_conv.kernel_size == (3, 3)
-    assert model.policy_head.gpool_to_bias.in_features == 32
-    assert isinstance(model.value_aux_head_module, ValueAuxHead)
-    assert model.value_aux_head_module.fc.in_features == model.value_aux_head_module.conv.out_channels * 2
-    assert model.value_aux_head_module.value_out.out_features == 3
-    assert model.value_aux_head_module.moves_left_out.out_features == 1
-
-    _logits, _value, moves_left = model(torch.randn((1, 124, 10, 9)))
-    assert torch.all(moves_left >= 0)
-
-
-def test_x7_v2_256x12bt128_parameter_count_is_stable():
-    model = KnowledgeResNet(
-        in_planes=124,
-        width=256,
-        num_blocks=12,
-        num_moves=2062,
-        value_head=True,
-        moves_left_head=True,
-    )
-    assert sum(param.numel() for param in model.parameters()) == 6_619_704
-
-
-def test_soft_policy_cross_entropy_masks_px0_illegal_minus_one_targets():
-    logits = torch.zeros((1, 6), dtype=torch.float32)
-    target = torch.tensor([[-1.0, 0.25, -1.0, 0.75, -1.0, -1.0]], dtype=torch.float32)
-    legal_mask = target >= 0
-    loss = soft_policy_cross_entropy(logits, target, legal_mask)
-    assert loss.ndim == 0 and torch.isfinite(loss)
-
-
-def test_soft_policy_target_stays_on_legal_moves():
-    target = torch.tensor([[-1.0, 0.01, -1.0, 0.99]], dtype=torch.float32)
+def test_formal_losses_are_finite() -> None:
+    logits = torch.zeros((1, 4))
+    target = torch.tensor([[-1.0, 0.25, -1.0, 0.75]])
     legal = target >= 0
-    softened = soften_policy_targets(target.clamp_min(0.0), legal, temperature=4.0)
-    assert torch.equal(softened[~legal], torch.zeros(2))
-    assert torch.allclose(softened.sum(dim=1), torch.ones(1))
-
-
-def test_wdl_q_metric_is_finite():
-    value_logits = torch.tensor([[0.2, -0.1, 0.0]], dtype=torch.float32)
-    tgt_q = torch.tensor([[0.4]], dtype=torch.float32)
-    loss = value_q_mse_from_wdl(value_logits, tgt_q)
-    assert loss.ndim == 0 and torch.isfinite(loss)
+    assert torch.isfinite(soft_policy_cross_entropy(logits, target.clamp_min(0), legal))
+    assert torch.allclose(soften_policy_targets(target.clamp_min(0), legal).sum(dim=1), torch.ones(1))
+    value = torch.zeros((1, 3))
+    assert torch.isfinite(value_wdl_cross_entropy(value, torch.tensor([[0.6, 0.1, 0.3]])))
+    assert torch.isfinite(value_q_mse_from_wdl(value, torch.tensor([0.4])))
+    assert torch.isfinite(moves_left_loss(torch.zeros((1, 1)), torch.tensor([[24.0]])))

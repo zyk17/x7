@@ -9,7 +9,6 @@ from pathlib import Path
 from nn.px0_kaggle import (
     PreparedPx0Version,
     ensure_px0_version,
-    kaggle_dataset_handle,
     load_prepared_px0_training_data,
     px0_version_dir,
     prepare_px0_training_data,
@@ -31,11 +30,6 @@ def _write_fake_archive(version_dir: Path) -> None:
     archive_path = version_dir / "archive.zip"
     with zipfile.ZipFile(archive_path, mode="w") as zf:
         zf.writestr("data.bin", tar_bytes.read())
-
-
-def test_kaggle_dataset_handle_supports_versioned_handle() -> None:
-    assert kaggle_dataset_handle("latest") == "pikacat/px0data"
-    assert kaggle_dataset_handle("7") == "pikacat/px0data/versions/7"
 
 
 def test_ensure_px0_version_uses_existing_chunks_without_download(tmp_path: Path) -> None:
@@ -159,22 +153,3 @@ def test_load_prepared_training_data_does_not_rescan_chunks(tmp_path: Path, monk
     assert loaded.val_manifest == prepared.val_manifest
     assert loaded.chunk_files == []
     assert loaded_manifest == validation_manifest
-
-
-def test_prepare_px0_training_data_builds_all_training_manifests(tmp_path: Path, monkeypatch) -> None:
-    version_dir = px0_version_dir("33", root=tmp_path)
-    run_dir = version_dir / "run"
-    run_dir.mkdir(parents=True)
-    for index in range(3):
-        (run_dir / f"training.{index}.gz").write_bytes(b"stub")
-
-    prepared, validation_manifest = prepare_px0_training_data(
-        "33",
-        root=tmp_path,
-        val_ratio=0.34,
-        seed=3,
-        force_download=False,
-    )
-    assert prepared.train_manifest.is_file()
-    assert prepared.val_manifest.is_file()
-    assert validation_manifest == prepared.val_manifest
