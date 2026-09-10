@@ -23,9 +23,9 @@ use super::expand::{ExpandKind, classify_expand, game_terminal_value};
 use super::nn::publish_eval;
 use super::observer::{ExecutionKind, ExecutionTimer, NoopObserver, SearchObserver};
 use super::param::{SearchConfig, SearchParams};
-use super::select::select_edge;
+use super::select::{select_edge, select_root_edge};
 use super::workerpool::{ExpandEvent, NnItem, NnRequest, SelectEvent, Selection, WorkerJob, WorkerPool};
-use super::{EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree};
+use super::{ExpansionState, NodeArena, NodeId, SearchTree};
 
 pub(crate) const RECEIVE_POLL: Duration = Duration::from_millis(10);
 
@@ -45,7 +45,6 @@ pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) cache: Arc<EvalCache>,
     pub(crate) arena: Arc<NodeArena>,
     pub(crate) params: SearchParams,
-    pub(crate) root_move_filter: Mutex<Vec<Move>>,
     stopping: AtomicBool,
     /// 未 `finish` 的 owned event：drain 与派发上限。
     pub(crate) outstanding: AtomicUsize,
@@ -214,25 +213,6 @@ impl<O: SearchObserver> Shared<O> {
 
 // --- Select / Expand ---------------------------------------------------------
 
-fn branch_at_expanded_node<O: SearchObserver>(
-    shared: &Shared<O>,
-    node: &Node,
-    depth: usize,
-) -> Option<(NodeId, EdgeReservation)> {
-    let (edge_index, virtual_mean) = select_edge(
-        &node.edges(),
-        node.completed_visits(),
-        node.q(),
-        depth,
-        &shared.params,
-        &shared.root_move_filter.lock(),
-    )?;
-    let edge = &node.edges()[edge_index];
-    let child = shared.arena.child_or_create(edge);
-    let reservation = node.reserve_edge(edge_index, virtual_mean).expect("selected stream edge");
-    Some((child, reservation))
-}
-
 pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut event: SelectEvent<O::Stamp>) {
     let _timer = ExecutionTimer::new(&shared.observer, ExecutionKind::Select);
     loop {
@@ -260,8 +240,12 @@ pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut ev
                 return;
             }
             ExpansionState::Expanded => {
-                let depth = event.variation.moves().len();
-                let Some((child, reservation)) = branch_at_expanded_node(shared, node, depth) else {
+                let selected = if event.node_path().len() == 1 {
+                    select_root_edge(node, &shared.params, event.root_move_filter.as_ref())
+                } else {
+                    select_edge(node, &shared.params)
+                };
+                let Some((edge_index, virtual_mean)) = selected else {
                     // 非 root 没有空 edges；root 只有被 searchmoves 排空时才会走到这里。
                     if event.node_path().len() == 1 {
                         shared.request_stop();
@@ -269,6 +253,10 @@ pub(crate) fn process_select_event<O: SearchObserver>(shared: &Shared<O>, mut ev
                     thread::yield_now();
                     continue;
                 };
+                let edges = node.edges();
+                let edge = &edges[edge_index];
+                let child = shared.arena.child_or_create(edge);
+                let reservation = edges.reserve(edge_index, virtual_mean).expect("selected stream edge");
                 event = event.descend(child, reservation);
             }
         }
@@ -439,7 +427,6 @@ impl<O: SearchObserver> Search<O> {
             cache,
             arena: Arc::clone(graph.arena()),
             params: resolved.params,
-            root_move_filter: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
             nn_credit_tx,
@@ -501,9 +488,9 @@ impl<O: SearchObserver> Search<O> {
         StopHandle { shared: Arc::clone(&self.shared) }
     }
 
-    fn submit_select(&self) {
+    fn submit_select(&self, root_move_filter: Arc<[Move]>) {
         self.shared.start_playout();
-        let mut event = SelectEvent::at_root(self.root_id, Arc::clone(&self.search_history));
+        let mut event = SelectEvent::at_root(self.root_id, Arc::clone(&self.search_history), root_move_filter);
         event.mark_queued();
         self.shared.select_tx.send(event).expect("search workers live until finish");
     }
@@ -521,7 +508,7 @@ impl<O: SearchObserver> Search<O> {
         report_interval: Option<Duration>,
         mut report: impl FnMut(Stats),
     ) -> Result<Stats, EnginError> {
-        *self.shared.root_move_filter.lock() = limits.root_move_filter.clone();
+        let root_move_filter: Arc<[Move]> = limits.root_move_filter.clone().into();
         // root 终局 / 共享 Terminal：不进流水线，避免 Select 再特判。
         if self.root_is_terminal() {
             return Ok(self.stats());
@@ -547,7 +534,7 @@ impl<O: SearchObserver> Search<O> {
                 }
                 ExpansionState::Unexpanded => {
                     // root 展开前只需要一个真实 leaf。
-                    self.submit_select();
+                    self.submit_select(Arc::clone(&root_move_filter));
                     self.wait_until_outstanding_below(1, limits.deadline)?;
                     continue;
                 }
@@ -558,7 +545,7 @@ impl<O: SearchObserver> Search<O> {
                     if outstanding >= dispatch_limit {
                         self.wait_until_outstanding_below(dispatch_limit, limits.deadline)?;
                     } else {
-                        self.submit_select();
+                        self.submit_select(Arc::clone(&root_move_filter));
                     }
                 }
             }
@@ -630,7 +617,6 @@ mod tests {
             cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)),
             arena,
             params: SearchParams::default(),
-            root_move_filter: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
             outstanding: AtomicUsize::new(outstanding),
             nn_credit_tx: crossbeam_channel::unbounded().0,
@@ -666,8 +652,8 @@ mod tests {
         terminal.mark_terminal(1.0, 0.0, 1.0);
 
         let (shared, _) = test_shared(Arc::clone(&arena), 1);
-        let event = super::SelectEvent::<NoQueueStamp>::at_root(root_id, history)
-            .descend(terminal_id, root.reserve_edge(0, 0.0).expect("reservation"));
+        let event = super::SelectEvent::<NoQueueStamp>::at_root(root_id, history, Arc::from([]))
+            .descend(terminal_id, root.edges().reserve(0, 0.0).expect("reservation"));
 
         process_select_event(&shared, event);
         assert_eq!(root.edges()[0].visits(), 1);
@@ -686,7 +672,7 @@ mod tests {
         let history = Arc::new(PositionHistory::from_positions(state.positions()));
         let (shared, expand_rx) = test_shared(Arc::clone(&arena), 1);
 
-        process_select_event(&shared, super::SelectEvent::at_root(root, history));
+        process_select_event(&shared, super::SelectEvent::at_root(root, history, Arc::from([])));
 
         assert_eq!(arena.get(root).expect("root").expansion_state(), super::ExpansionState::Claimed);
         assert_eq!(expand_rx.try_recv().expect("expand event").selection.node_id, root);

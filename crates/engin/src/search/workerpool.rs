@@ -75,6 +75,7 @@ impl Selection {
 pub struct SelectEvent<S: QueueStamp = NoQueueStamp> {
     pub(crate) selection: Selection,
     pub variation: Variation,
+    pub(crate) root_move_filter: Arc<[Move]>,
     pub(crate) queued_at: S,
 }
 
@@ -82,10 +83,11 @@ pub struct SelectEvent<S: QueueStamp = NoQueueStamp> {
 pub(crate) type ExpandEvent<S = NoQueueStamp> = SelectEvent<S>;
 
 impl<S: QueueStamp> SelectEvent<S> {
-    pub fn at_root(root_id: NodeId, root_history: Arc<PositionHistory>) -> Self {
+    pub fn at_root(root_id: NodeId, root_history: Arc<PositionHistory>, root_move_filter: Arc<[Move]>) -> Self {
         Self {
             selection: Selection { node_id: root_id, node_path: vec![root_id], reservations: Vec::new() },
             variation: Variation::root(root_history),
+            root_move_filter,
             queued_at: S::default(),
         }
     }

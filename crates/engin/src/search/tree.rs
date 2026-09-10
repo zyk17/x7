@@ -4,6 +4,7 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
@@ -43,7 +44,54 @@ pub struct Edge {
     started: AtomicU32,
     child: OnceLock<NodeId>,
     /// 已完成 N/Q 与尚未完成的 virtual mean；选边要一起读。
-    stats: Mutex<EdgeStats>,
+    stats: EdgeState,
+}
+
+/// 一个 node 已发布的全部出边及其 started-N 聚合。
+#[derive(Debug, Default)]
+pub struct NodeEdges {
+    edges: Arc<[Edge]>,
+    outgoing_started_visits: AtomicU32,
+    visited_policy: AtomicU32,
+}
+
+impl Deref for NodeEdges {
+    type Target = [Edge];
+
+    fn deref(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+impl NodeEdges {
+    pub(crate) fn outgoing_started_visits(&self) -> u32 {
+        self.outgoing_started_visits.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn visited_policy(&self) -> f32 {
+        f32::from_bits(self.visited_policy.load(Ordering::Acquire))
+    }
+
+    fn add_visited_policy(&self, delta: f32) {
+        let mut previous = self.visited_policy.load(Ordering::Relaxed);
+        loop {
+            let next = (f32::from_bits(previous) + delta).to_bits();
+            match self.visited_policy.compare_exchange_weak(previous, next, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(current) => previous = current,
+            }
+        }
+    }
+
+    pub(crate) fn reserve(self: &Arc<Self>, edge_index: usize, virtual_mean: f32) -> Option<EdgeReservation> {
+        let edge = self.get(edge_index)?;
+        let (virtual_wl_sum, first_visit) = edge.reserve(virtual_mean);
+        self.outgoing_started_visits.fetch_add(1, Ordering::AcqRel);
+        if first_visit {
+            self.add_visited_policy(edge.prior());
+        }
+        Some(EdgeReservation { edges: Arc::clone(self), edge_index, virtual_wl_sum })
+    }
 }
 
 /// edge 聚合。completed 原始矩是 action-Q、方差与 SE 的唯一真相。
@@ -53,6 +101,93 @@ pub(crate) struct EdgeStats {
     pub wl_sum: f32,
     pub wl_sq_sum: f32,
     pub virtual_wl_sum: f32,
+}
+
+/// Select 只读、reservation / backprop 才写的 edge stats。
+///
+/// version 让读者只接受同一笔写入前后的完整 snapshot；字段本身均为原子，因而没有
+/// 非原子 seqlock 的数据竞争。
+#[derive(Debug, Default)]
+struct EdgeState {
+    version: AtomicU32,
+    visits: AtomicU32,
+    wl_sum: AtomicU32,
+    wl_sq_sum: AtomicU32,
+    virtual_wl_sum: AtomicU32,
+}
+
+impl EdgeState {
+    #[inline]
+    fn spin_or_yield(spins: &mut u8) {
+        if *spins < 32 {
+            *spins += 1;
+            std::hint::spin_loop();
+        } else {
+            *spins = 0;
+            std::thread::yield_now();
+        }
+    }
+
+    fn snapshot(&self, started: &AtomicU32) -> (EdgeStats, u32) {
+        let mut spins = 0;
+        loop {
+            let version = self.version.load(Ordering::Acquire);
+            if version & 1 != 0 {
+                Self::spin_or_yield(&mut spins);
+                continue;
+            }
+            spins = 0;
+            let stats = EdgeStats {
+                visits: self.visits.load(Ordering::Relaxed),
+                wl_sum: f32::from_bits(self.wl_sum.load(Ordering::Relaxed)),
+                wl_sq_sum: f32::from_bits(self.wl_sq_sum.load(Ordering::Relaxed)),
+                virtual_wl_sum: f32::from_bits(self.virtual_wl_sum.load(Ordering::Relaxed)),
+            };
+            let started = started.load(Ordering::Relaxed);
+            if self.version.load(Ordering::Acquire) == version {
+                return (stats, started);
+            }
+        }
+    }
+
+    fn update<R>(&self, started: &AtomicU32, update: impl FnOnce(&mut EdgeStats, &AtomicU32) -> R) -> R {
+        let mut spins = 0;
+        let version = loop {
+            let version = self.version.load(Ordering::Acquire);
+            if version & 1 != 0 {
+                Self::spin_or_yield(&mut spins);
+                continue;
+            }
+            spins = 0;
+            if self
+                .version
+                .compare_exchange_weak(version, version.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break version;
+            }
+        };
+        let (mut stats, _) = self.snapshot_unchecked(started);
+        let result = update(&mut stats, started);
+        self.visits.store(stats.visits, Ordering::Relaxed);
+        self.wl_sum.store(stats.wl_sum.to_bits(), Ordering::Relaxed);
+        self.wl_sq_sum.store(stats.wl_sq_sum.to_bits(), Ordering::Relaxed);
+        self.virtual_wl_sum.store(stats.virtual_wl_sum.to_bits(), Ordering::Relaxed);
+        self.version.store(version.wrapping_add(2), Ordering::Release);
+        result
+    }
+
+    fn snapshot_unchecked(&self, started: &AtomicU32) -> (EdgeStats, u32) {
+        (
+            EdgeStats {
+                visits: self.visits.load(Ordering::Relaxed),
+                wl_sum: f32::from_bits(self.wl_sum.load(Ordering::Relaxed)),
+                wl_sq_sum: f32::from_bits(self.wl_sq_sum.load(Ordering::Relaxed)),
+                virtual_wl_sum: f32::from_bits(self.virtual_wl_sum.load(Ordering::Relaxed)),
+            },
+            started.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl EdgeStats {
@@ -73,7 +208,7 @@ impl EdgeStats {
 impl Edge {
     fn new(mv: Move, prior: f32) -> Self {
         debug_assert!((0.0..=1.0).contains(&prior), "policy prior must be normalized");
-        Self { mv, prior, started: AtomicU32::new(0), child: OnceLock::new(), stats: Mutex::new(EdgeStats::default()) }
+        Self { mv, prior, started: AtomicU32::new(0), child: OnceLock::new(), stats: EdgeState::default() }
     }
 
     pub fn mv(&self) -> Move {
@@ -98,63 +233,66 @@ impl Edge {
     }
 
     pub fn completed_visits(&self) -> u32 {
-        self.stats.lock().visits
+        self.stats.snapshot(&self.started).0.visits
     }
 
     pub fn in_flight_visits(&self) -> u32 {
-        let completed = self.stats.lock().visits;
-        self.started.load(Ordering::Acquire).saturating_sub(completed)
+        let (stats, started) = self.stats.snapshot(&self.started);
+        started.saturating_sub(stats.visits)
     }
 
     pub(crate) fn stats(&self) -> EdgeStats {
-        *self.stats.lock()
+        self.stats.snapshot(&self.started).0
     }
 
     pub(crate) fn selection_snapshot(&self) -> (EdgeStats, u32) {
-        let stats = *self.stats.lock();
-        (stats, self.started.load(Ordering::Acquire))
+        self.stats.snapshot(&self.started)
     }
 
     pub fn q(&self) -> f32 {
-        self.stats.lock().q()
+        self.stats.snapshot(&self.started).0.q()
     }
 
-    fn reserve(&self, virtual_mean: f32) -> f32 {
+    fn reserve(&self, virtual_mean: f32) -> (f32, bool) {
         let virtual_wl_sum = virtual_mean;
-        let mut stats = self.stats.lock();
-        self.started.fetch_add(1, Ordering::AcqRel);
-        stats.virtual_wl_sum += virtual_wl_sum;
-        virtual_wl_sum
+        self.stats.update(&self.started, |stats, started| {
+            let first_visit = started.fetch_add(1, Ordering::AcqRel) == 0;
+            stats.virtual_wl_sum += virtual_wl_sum;
+            (virtual_wl_sum, first_visit)
+        })
     }
 
-    fn cancel(&self, virtual_wl_sum: f32) {
-        let mut stats = self.stats.lock();
-        let started = self.started.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(started > stats.visits, "stream edge reservation underflow");
-        stats.virtual_wl_sum -= virtual_wl_sum;
-        if started - 1 == stats.visits {
-            stats.virtual_wl_sum = 0.0;
-        }
+    fn cancel(&self, virtual_wl_sum: f32) -> bool {
+        self.stats.update(&self.started, |stats, started| {
+            let started = started.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(started > stats.visits, "stream edge reservation underflow");
+            stats.virtual_wl_sum -= virtual_wl_sum;
+            if started - 1 == stats.visits {
+                stats.virtual_wl_sum = 0.0;
+            }
+            started == 1
+        })
     }
 
     fn complete(&self, virtual_wl_sum: f32, wl: f32) {
-        let mut stats = self.stats.lock();
-        let started = self.started.load(Ordering::Acquire);
-        debug_assert!(started > stats.visits, "stream edge completion without reservation");
-        stats.virtual_wl_sum -= virtual_wl_sum;
-        stats.visits += 1;
-        stats.wl_sum += wl;
-        stats.wl_sq_sum += wl * wl;
-        if started == stats.visits {
-            stats.virtual_wl_sum = 0.0;
-        }
+        self.stats.update(&self.started, |stats, started| {
+            let started = started.load(Ordering::Acquire);
+            debug_assert!(started > stats.visits, "stream edge completion without reservation");
+            stats.virtual_wl_sum -= virtual_wl_sum;
+            stats.visits += 1;
+            stats.wl_sum += wl;
+            stats.wl_sq_sum += wl * wl;
+            if started == stats.visits {
+                stats.virtual_wl_sum = 0.0;
+            }
+        });
     }
 }
 
 /// 一次待完成访问。它必须恰好被 `complete` 或 `cancel` 消费一次。
 #[derive(Debug)]
 pub struct EdgeReservation {
-    edges: Arc<[Edge]>,
+    edges: Arc<NodeEdges>,
     edge_index: usize,
     virtual_wl_sum: f32,
 }
@@ -169,7 +307,11 @@ impl EdgeReservation {
     }
 
     pub fn cancel(self) {
-        self.edges[self.edge_index].cancel(self.virtual_wl_sum);
+        let became_unvisited = self.edges[self.edge_index].cancel(self.virtual_wl_sum);
+        self.edges.outgoing_started_visits.fetch_sub(1, Ordering::AcqRel);
+        if became_unvisited {
+            self.edges.add_visited_policy(-self.edges[self.edge_index].prior());
+        }
     }
 }
 
@@ -211,7 +353,7 @@ struct NodeStats {
 pub struct Node {
     /// 生命周期：Unexpanded → Claimed → Expanded|Terminal
     expansion: AtomicU8,
-    edges: OnceLock<Arc<[Edge]>>,
+    edges: OnceLock<Arc<NodeEdges>>,
     ///node 保留其 completed 聚合值。in-flight visit 保持在 edge-local
     stats: Mutex<NodeStats>,
     /// `(wl, draw≡d, plies_left≡m)`。`m` 以 ply（半回合）保存，
@@ -228,6 +370,12 @@ impl Node {
     pub fn q(&self) -> f32 {
         let stats = self.stats.lock();
         if stats.visits == 0 { 0.0 } else { stats.wl_sum / stats.visits as f32 }
+    }
+
+    pub(crate) fn selection_snapshot(&self) -> (u32, f32) {
+        let stats = self.stats.lock();
+        let q = if stats.visits == 0 { 0.0 } else { stats.wl_sum / stats.visits as f32 };
+        (stats.visits, q)
     }
 
     pub fn draw(&self) -> f32 {
@@ -270,7 +418,11 @@ impl Node {
         debug_assert_eq!(self.expansion_state(), ExpansionState::Claimed, "node must be claimed");
         let mut edges: smallvec::SmallVec<[(Move, f32); 64]> = edges.into_iter().collect();
         edges.sort_unstable_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal));
-        let edges: Arc<[Edge]> = edges.into_iter().map(|(mv, prior)| Edge::new(mv, prior)).collect();
+        let edges = Arc::new(NodeEdges {
+            edges: edges.into_iter().map(|(mv, prior)| Edge::new(mv, prior)).collect(),
+            outgoing_started_visits: AtomicU32::new(0),
+            visited_policy: AtomicU32::new(0.0_f32.to_bits()),
+        });
         let published = self.edges.set(edges).is_ok();
         debug_assert!(published, "stream node publishes edges once");
         self.expansion.store(ExpansionState::Expanded as u8, Ordering::Release);
@@ -342,15 +494,8 @@ impl Node {
         (*self.terminal.lock()).map(|(_, _, plies)| plies)
     }
 
-    pub fn edges(&self) -> Arc<[Edge]> {
+    pub fn edges(&self) -> Arc<NodeEdges> {
         self.edges.get().cloned().unwrap_or_default()
-    }
-
-    pub(crate) fn reserve_edge(&self, edge_index: usize, virtual_mean: f32) -> Option<EdgeReservation> {
-        let edges = self.edges();
-        let edge = edges.get(edge_index)?;
-        let virtual_wl_sum = edge.reserve(virtual_mean);
-        Some(EdgeReservation { edges, edge_index, virtual_wl_sum })
     }
 }
 

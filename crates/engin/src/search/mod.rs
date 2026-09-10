@@ -44,6 +44,6 @@ pub(crate) use pipeline::StopHandle;
 pub use pipeline::{Search, SearchLimits, Stats};
 pub use select::{compute_cpuct, variance_bonus_from_se};
 pub(crate) use time::{TimeBudget, TimeManager};
-pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree};
+pub use tree::{Edge, EdgeReservation, ExpansionState, Node, NodeArena, NodeEdges, NodeId, SearchTree};
 pub(crate) use workerpool::WorkerPool;
 pub use workerpool::{SelectEvent, Selection, Variation};

@@ -151,8 +151,8 @@ mod tests {
         let mv = Move::new(Square::parse("b2").expect("b2"), Square::parse("b3").expect("b3"));
         root_node.publish_edges(vec![(mv, 1.0)]);
         let child_id = arena.child_or_create(&root_node.edges()[0]);
-        let child = SelectEvent::<crate::search::NoQueueStamp>::at_root(root_id, Arc::clone(&history))
-            .descend(child_id, root_node.reserve_edge(0, 0.0).expect("edge"));
+        let child = SelectEvent::<crate::search::NoQueueStamp>::at_root(root_id, Arc::clone(&history), Arc::from([]))
+            .descend(child_id, root_node.edges().reserve(0, 0.0).expect("edge"));
 
         complete_one(Backprop::without_nn_credit(child.into_selection(), 0.4, 0.2, 2.0), &arena);
 

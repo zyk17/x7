@@ -1,6 +1,6 @@
 //! PUCT / FPU / virtual mean。只算该选哪条边与挂多少 μ；不 `reserve`、不 `descend`。
-use super::Edge;
 use super::param::SearchParams;
+use super::{Edge, Node, NodeEdges};
 use crate::search::tree::EdgeStats;
 use crate::utils::fastmath::fast_log;
 use xiangqi_core::Move;
@@ -11,25 +11,19 @@ use xiangqi_core::Move;
 /// 默认参数为常数 `C(N)=2.4`；`cpuct_factor` 非零时才随访问数增长。
 /// `cpuct_base` 越小，增长越早开始；`cpuct_factor` 控制增长幅度。
 pub fn compute_cpuct(params: SearchParams, visits: u32) -> f32 {
-    params.cpuct + params.cpuct_factor * fast_log((visits as f32 + params.cpuct_base) / params.cpuct_base)
+    if params.cpuct_factor == 0.0 {
+        params.cpuct
+    } else {
+        params.cpuct + params.cpuct_factor * fast_log((visits as f32 + params.cpuct_base) / params.cpuct_base)
+    }
 }
 
 /// reduction 越大，未知 edge 的 FPU 越低，越晚获得首次选择。
-fn get_fpu(params: &SearchParams, parent_q: f32, edges: &[Edge]) -> f32 {
-    -parent_q - params.fpu_reduction * visited_policy(edges).sqrt()
+fn get_fpu(params: &SearchParams, parent_q: f32, edges: &NodeEdges) -> f32 {
+    -parent_q - params.fpu_reduction * edges.visited_policy().sqrt()
 }
 
-/// 已访问边的 prior 之和，供 FPU 缩放使用。
-fn visited_policy(edges: &[Edge]) -> f32 {
-    edges
-        .iter()
-        .filter(|edge| edge.completed_visits() > 0 || edge.in_flight_visits() > 0)
-        .map(|edge| edge.prior())
-        .sum()
-}
-
-fn action_q(stats: EdgeStats, started_visits: u32, fpu: f32) -> f32 {
-    let completed_q = if stats.visits == 0 { fpu } else { stats.q() };
+fn action_q(stats: EdgeStats, started_visits: u32, completed_q: f32) -> f32 {
     let in_flight = started_visits.saturating_sub(stats.visits);
     if in_flight == 0 {
         completed_q
@@ -49,52 +43,70 @@ fn virtual_mean_for_reservation(params: &SearchParams, fpu: f32) -> f32 {
     params.virtual_mean_fpu_scale * fpu
 }
 
+#[inline(always)]
+fn edge_score(edge: &Edge, fpu: f32, u_coeff: f32, params: &SearchParams) -> f32 {
+    let (stats, started_visits) = edge.selection_snapshot();
+    let completed_q = if stats.visits == 0 { fpu } else { stats.q() };
+    let q = action_q(stats, started_visits, completed_q);
+    let u = u_coeff * edge.prior() / (1 + started_visits) as f32;
+    let variance_bonus = if stats.visits < 2 || params.variance_bonus_scale == 0.0 {
+        0.0
+    } else {
+        let visits = stats.visits as f32;
+        let variance = (stats.wl_sq_sum / visits - completed_q * completed_q).max(0.0);
+        params.variance_bonus_scale * (variance / visits).sqrt()
+    };
+    q + u + variance_bonus
+}
+
 /// 选择 PUCT 最高的 edge，并给出该边应挂的 virtual mean。
 ///
 /// completed N 决定 cPUCT 曲线；started N（含虚拟损失）进入实际 PUCT。
-pub(crate) fn select_edge(
-    edges: &[Edge],
-    parent_completed_visits: u32,
-    parent_q: f32,
-    depth: usize,
-    params: &SearchParams,
-    root_move_filter: &[Move],
-) -> Option<(usize, f32)> {
-    if edges.is_empty() {
-        return None;
-    }
-    let is_root = depth == 0;
-    // todo: 1a
-    let children_visits = edges.iter().map(|edge| edge.visits()).sum::<u32>();
+pub(crate) fn select_edge(node: &Node, params: &SearchParams) -> Option<(usize, f32)> {
+    let edges = node.edges();
+    let (parent_completed_visits, parent_q) = node.selection_snapshot();
     let cpuct = compute_cpuct(*params, parent_completed_visits);
-    let u_coeff = cpuct * (children_visits.max(1) as f32).sqrt();
-    // todo: 1b
-    let fpu = get_fpu(params, parent_q, edges);
-    let mut best: Option<(usize, f32)> = None;
-    let filter_root_moves = is_root && !root_move_filter.is_empty();
-    // todo: 1c
-    // 一次select太重了   select   events=10736   total_ms=   638.8 avg_us=   59.5 max_us=  945.5
-    // 假如平均深度d 30, 平均branchs = 40, 则一次扩展大约需要30*40*3 次遍历. 这个代价显然不免费, 最大us接近1ms
-    for (index, edge) in edges.iter().enumerate() {
-        if filter_root_moves && !root_move_filter.contains(&edge.mv()) {
-            continue;
-        }
-        let (stats, started_visits) = edge.selection_snapshot();
-        let q = action_q(stats, started_visits, fpu);
-        let u = u_coeff * edge.prior() / (1 + started_visits) as f32;
-        let score = q + u + variance_bonus_from_se(stats.visits, stats.standard_error(), params);
-        if best.is_none_or(|(_, best_score)| score > best_score) {
-            best = Some((index, score));
+    let u_coeff = cpuct * (edges.outgoing_started_visits().max(1) as f32).sqrt();
+    let fpu = get_fpu(params, parent_q, &edges);
+    let (first, rest) = edges.split_first()?;
+    let mut best = (0, edge_score(first, fpu, u_coeff, params));
+    for (offset, edge) in rest.iter().enumerate() {
+        let score = edge_score(edge, fpu, u_coeff, params);
+        if score > best.1 {
+            best = (offset + 1, score);
         }
     }
-    best.map(|(index, _)| (index, virtual_mean_for_reservation(params, fpu)))
+    Some((best.0, virtual_mean_for_reservation(params, fpu)))
+}
+
+/// 根的 `searchmoves` 过滤只在此处处理；非根 Select 不承担该判断。
+pub(crate) fn select_root_edge(node: &Node, params: &SearchParams, root_move_filter: &[Move]) -> Option<(usize, f32)> {
+    if root_move_filter.is_empty() {
+        return select_edge(node, params);
+    }
+    let edges = node.edges();
+    let (parent_completed_visits, parent_q) = node.selection_snapshot();
+    let cpuct = compute_cpuct(*params, parent_completed_visits);
+    let u_coeff = cpuct * (edges.outgoing_started_visits().max(1) as f32).sqrt();
+    let fpu = get_fpu(params, parent_q, &edges);
+    let mut candidates = edges.iter().enumerate().filter(|(_, edge)| root_move_filter.contains(&edge.mv()));
+    let (mut best_index, first) = candidates.next()?;
+    let mut best_score = edge_score(first, fpu, u_coeff, params);
+    for (index, edge) in candidates {
+        let score = edge_score(edge, fpu, u_coeff, params);
+        if score > best_score {
+            best_index = index;
+            best_score = score;
+        }
+    }
+    Some((best_index, virtual_mean_for_reservation(params, fpu)))
 }
 
 #[cfg(test)]
 mod tests {
     use xiangqi_core::{Move, Square};
 
-    use super::{action_q, select_edge, variance_bonus_from_se, visited_policy};
+    use super::{action_q, select_edge, select_root_edge, variance_bonus_from_se};
     use crate::search::param::SearchParams;
     use crate::search::{Edge, NodeArena};
 
@@ -104,7 +116,7 @@ mod tests {
 
     fn edge_utility(edge: &Edge, fpu: f32) -> f32 {
         let (stats, started_visits) = edge.selection_snapshot();
-        action_q(stats, started_visits, fpu)
+        action_q(stats, started_visits, if stats.visits == 0 { fpu } else { stats.q() })
     }
 
     #[test]
@@ -122,14 +134,17 @@ mod tests {
         let node = arena.get(arena.allocate()).expect("node");
         assert!(node.try_claim());
         node.publish_edges(vec![(mv("b2", "b3"), 0.6), (mv("c3", "c4"), 0.4)]);
-        let edges = node.edges();
         let params = SearchParams { virtual_mean_fpu_scale: 0.0, ..SearchParams::default() };
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index), Some(0));
+        assert_eq!(select_edge(node, &params).map(|(index, _)| index), Some(0));
 
-        let reservation = node.reserve_edge(0, 0.0).expect("first edge");
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &[]).map(|(index, _)| index), Some(1));
+        let reservation = node.edges().reserve(0, 0.0).expect("first edge");
+        assert_eq!(node.edges().outgoing_started_visits(), 1);
+        assert!((node.edges().visited_policy() - 0.6).abs() < f32::EPSILON);
+        assert_eq!(select_edge(node, &params).map(|(index, _)| index), Some(1));
         reservation.cancel();
-        assert_eq!(edges[0].completed_visits(), 0);
+        assert_eq!(node.edges().outgoing_started_visits(), 0);
+        assert_eq!(node.edges().visited_policy(), 0.0);
+        assert_eq!(node.edges()[0].completed_visits(), 0);
     }
 
     #[test]
@@ -138,10 +153,9 @@ mod tests {
         let node = arena.get(arena.allocate()).expect("node");
         assert!(node.try_claim());
         node.publish_edges(vec![(mv("b2", "b3"), 0.9), (mv("c3", "c4"), 0.1)]);
-        let edges = node.edges();
         let params = SearchParams::default();
         let filter = [mv("c3", "c4")];
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &params, &filter).map(|(index, _)| index), Some(1));
+        assert_eq!(select_root_edge(node, &params, &filter).map(|(index, _)| index), Some(1));
     }
 
     #[test]
@@ -156,7 +170,7 @@ mod tests {
         assert!(terminal.try_claim());
         terminal.mark_terminal(-1.0, 0.0, 1.0);
 
-        assert_eq!(select_edge(&edges, 0, 0.0, 0, &SearchParams::default(), &[]).map(|(index, _)| index), Some(0));
+        assert_eq!(select_edge(node, &SearchParams::default()).map(|(index, _)| index), Some(0));
     }
 
     #[test]
@@ -167,9 +181,9 @@ mod tests {
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edges = node.edges();
         let edge = &edges[0];
-        node.reserve_edge(0, 0.0).expect("res").complete(0.5);
+        node.edges().reserve(0, 0.0).expect("res").complete(0.5);
         assert!((edge_utility(edge, 0.0) - 0.5).abs() < 1e-6);
-        assert!((visited_policy(std::slice::from_ref(edge)) - 1.0).abs() < f32::EPSILON);
+        assert!((node.edges().visited_policy() - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -180,10 +194,11 @@ mod tests {
         node.publish_edges(vec![(mv("a0", "a1"), 1.0)]);
         let edges = node.edges();
         let edge = &edges[0];
-        node.reserve_edge(0, 0.0).expect("completed evidence").complete(0.8);
+        node.edges().reserve(0, 0.0).expect("completed evidence").complete(0.8);
+        assert_eq!(node.edges().outgoing_started_visits(), 1);
         assert!((edge_utility(edge, -0.3) - 0.8).abs() < 1e-6);
 
-        let reservation = node.reserve_edge(0, -0.3).expect("virtual mean reservation");
+        let reservation = node.edges().reserve(0, -0.3).expect("virtual mean reservation");
         assert!((edge_utility(edge, -0.3) - 0.25).abs() < 1e-6);
         reservation.cancel();
 

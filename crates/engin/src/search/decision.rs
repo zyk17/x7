@@ -5,7 +5,7 @@ use std::sync::Arc;
 use xiangqi_core::Move;
 
 use super::param::SearchParams;
-use super::{Edge, ExpansionState, Node, NodeArena, NodeId};
+use super::{Edge, ExpansionState, Node, NodeArena, NodeEdges, NodeId};
 
 /// 根节点在既有 completed evidence 上的最终选边规则；不参与 PUCT。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -78,7 +78,7 @@ pub(crate) struct RootVariation {
 }
 
 struct EdgeHandle {
-    table: Arc<[Edge]>,
+    table: Arc<NodeEdges>,
     index: usize,
 }
 
@@ -306,7 +306,7 @@ mod tests {
 
     fn complete_samples(node: &super::Node, edge_index: usize, samples: &[f32]) {
         for &sample in samples {
-            node.reserve_edge(edge_index, 0.0).expect("reservation").complete(sample);
+            node.edges().reserve(edge_index, 0.0).expect("reservation").complete(sample);
         }
     }
 
