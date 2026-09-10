@@ -16,6 +16,7 @@ use xiangqi_core::{Move, PositionHistory};
 use crate::EnginError;
 use crate::neural::MOVE_HISTORY;
 use crate::neural::backend::Backend;
+use crate::neural::cache::{DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, EvalCache, EvalCacheKey};
 
 use super::backprop::{complete_batch, complete_one};
 use super::expand::{ExpandKind, classify_expand, game_terminal_value};
@@ -24,7 +25,6 @@ use super::param::{SearchConfig, SearchParams};
 use super::select::select_edge;
 use super::workerpool::{BackpropEvent, EvalEvent, Event, ExpandEvent, NnRequest, SelectEvent, WorkerJob, WorkerPool};
 use super::{EdgeReservation, ExpansionState, Node, NodeArena, NodeId, SearchTree};
-use crate::neural::backend::EvalCacheKey;
 
 pub(crate) const RECEIVE_POLL: Duration = Duration::from_millis(10);
 
@@ -41,6 +41,7 @@ pub struct Stats {
 
 pub(crate) struct Shared<O: SearchObserver = NoopObserver> {
     pub(crate) backend: Arc<dyn Backend>,
+    pub(crate) cache: Arc<EvalCache>,
     pub(crate) arena: Arc<NodeArena>,
     pub(crate) params: SearchParams,
     pub(crate) root_move_filter: Mutex<Vec<Move>>,
@@ -405,12 +406,14 @@ impl<O: SearchObserver> Search<O> {
     /// 启动一次独立 Search job；该 job 自己创建并持有 worker pool。
     pub fn start(backend: Arc<dyn Backend>, graph: &SearchTree, config: SearchConfig, observer: O) -> Self {
         let worker_pool = Arc::new(WorkerPool::new(backend.as_ref(), &config));
-        Self::start_with_pool(backend, graph, config, observer, worker_pool)
+        let cache = Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO));
+        Self::start_with_pool(backend, cache, graph, config, observer, worker_pool)
     }
 
     /// 启动一次 job，复用 Engine 持有的固定 worker pool。
     pub(crate) fn start_with_pool(
         backend: Arc<dyn Backend>,
+        cache: Arc<EvalCache>,
         graph: &SearchTree,
         config: SearchConfig,
         observer: O,
@@ -430,6 +433,7 @@ impl<O: SearchObserver> Search<O> {
         let initial_visits = graph.arena().get(root_id).map_or(0, |root| root.completed_visits() as u64);
         let shared = Arc::new(Shared {
             backend,
+            cache,
             arena: Arc::clone(graph.arena()),
             params: resolved.params,
             root_move_filter: Mutex::new(Vec::new()),
@@ -612,6 +616,7 @@ mod tests {
 
     use super::{Search, SearchLimits, Shared, process_select_event};
     use crate::neural::backend::{Backend, UniformBackend};
+    use crate::neural::cache::{DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO, EvalCache};
     use crate::search::decision::{best_move, root_stats};
     use crate::search::observer::NoopObserver;
     use crate::search::param::{SearchConfig, SearchParams};
@@ -624,6 +629,7 @@ mod tests {
         let (eval_tx, _) = bounded(1);
         let shared = Arc::new(Shared {
             backend: Arc::new(UniformBackend::default()) as Arc<dyn Backend>,
+            cache: Arc::new(EvalCache::new(DEFAULT_NN_CACHE_SIZE_POWER_OF_TWO)),
             arena,
             params: SearchParams::default(),
             root_move_filter: Mutex::new(Vec::new()),

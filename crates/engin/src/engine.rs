@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use xiangqi_core::{GameState, Move, PositionHistory, STARTPOS_FEN};
 
-use crate::neural::backend::{Backend, CachingBackend};
+use crate::neural::backend::Backend;
+use crate::neural::cache::EvalCache;
 use crate::neural::onnx::OnnxBackend;
 use crate::search::{
     NodeArena, NodeId, NoopObserver, Search, SearchConfig, SearchLimits, SearchParams, SearchTree, Stats, StopHandle,
@@ -22,6 +23,7 @@ use crate::{EnginError, Options};
 pub struct Engine {
     // UCI 进程已启动时 ONNX 初始化仍可能失败；`None` 表示没有可用 backend，刻意不回退到 UniformBackend。
     backend: Option<Arc<dyn Backend>>,
+    cache: Option<Arc<EvalCache>>,
     graph: Option<SearchTree>,
     graph_reaper: GraphReaper,
     worker_pool: Option<Arc<WorkerPool>>,
@@ -160,6 +162,7 @@ impl Engine {
     pub fn new() -> Self {
         Self {
             backend: None,
+            cache: None,
             graph: None,
             graph_reaper: GraphReaper::new(),
             worker_pool: None,
@@ -175,6 +178,7 @@ impl Engine {
     /// 丢弃绑定旧 backend 的资源；树由 position 维护，换权重成功后才重建。
     fn clear_backend(&mut self) {
         self.backend = None;
+        self.cache = None;
         self.worker_pool = None;
         self.applied_nn_cache_size = None;
     }
@@ -201,10 +205,8 @@ impl Engine {
         self.clear_backend();
         match OnnxBackend::from_file(&path) {
             Ok(backend) => {
-                self.backend = Some(Arc::new(CachingBackend::with_cache_size_power_of_two(
-                    Box::new(backend),
-                    self.options.nn_cache_size_power_of_two,
-                )));
+                self.backend = Some(Arc::new(backend));
+                self.cache = Some(Arc::new(EvalCache::new(self.options.nn_cache_size_power_of_two)));
                 self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
                 self.loaded_weights_file = Some(path);
                 self.backend_error = None;
@@ -350,7 +352,7 @@ impl Engine {
         };
         let root_move_filter = self.root_move_filter(&params.searchmoves)?;
         if self.applied_nn_cache_size != Some(self.options.nn_cache_size_power_of_two) {
-            backend.set_cache_size_power_of_two(self.options.nn_cache_size_power_of_two);
+            self.cache = Some(Arc::new(EvalCache::new(self.options.nn_cache_size_power_of_two)));
             self.applied_nn_cache_size = Some(self.options.nn_cache_size_power_of_two);
         }
         let config = self.search_config();
@@ -358,7 +360,8 @@ impl Engine {
         let pool = self.ensure_worker_pool(&backend, &config);
         let graph = self.graph.as_ref().expect("position creates a tree");
         let root_is_black = graph.root_history().last().is_black_to_move();
-        let search = Search::start_with_pool(backend, graph, config, NoopObserver, pool);
+        let cache = Arc::clone(self.cache.as_ref().expect("backend and cache are created together"));
+        let search = Search::start_with_pool(backend, cache, graph, config, NoopObserver, pool);
         let snapshot = RootSnapshot {
             arena: Arc::clone(search.arena()),
             root_id: search.root_id(),

@@ -68,7 +68,7 @@ pub struct EncodedBatch {
 }
 
 impl EncodedBatch {
-    /// 从 NN worker 的可复用缓冲中取出本批结果（缓冲变空，容量随所有权移走）。
+    /// 取走本批 NN 输出，交给 reply 持有。
     pub fn take_from(logits: &mut Vec<f32>, wdl: &mut Vec<f32>, moves_left: &mut Vec<f32>) -> Self {
         Self { logits: std::mem::take(logits), wdl: std::mem::take(wdl), moves_left: std::mem::take(moves_left) }
     }
@@ -78,13 +78,6 @@ impl EncodedBatch {
             return Err(EnginError::Internal("stream nn output shape"));
         }
         Ok(())
-    }
-
-    /// 为下一轮稀疏 batch 推理预留容量。
-    pub fn reserve_scratch(logits: &mut Vec<f32>, wdl: &mut Vec<f32>, moves_left: &mut Vec<f32>, batch: usize) {
-        logits.reserve(batch * POLICY_SIZE);
-        wdl.reserve(batch * 3);
-        moves_left.reserve(batch);
     }
 }
 

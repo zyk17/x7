@@ -92,13 +92,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let size_mb = args.onnx.metadata()?.len() as f64 / (1024.0 * 1024.0);
     let backend = OnnxBackend::from_file(&args.onnx)?;
-    println!(
-        "onnx={} size_mb={size_mb:.2} provider={} has_wdl={} has_mlh={}",
-        args.onnx.display(),
-        backend.provider().name(),
-        backend.attributes().has_wdl,
-        backend.attributes().has_mlh
-    );
+    println!("onnx={} size_mb={size_mb:.2} provider={}", args.onnx.display(), backend.provider().name());
 
     let move_refs: Vec<&str> = args.moves.iter().map(String::as_str).collect();
     let state = GameState::from_fen_moves(&args.fen, &move_refs)?;

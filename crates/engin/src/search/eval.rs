@@ -30,7 +30,7 @@ pub(crate) fn process_eval_event<O: SearchObserver>(
         shared.cancel_claim(event.event);
         return Ok(());
     }
-    if let Some(eval) = shared.backend.cached_evaluation(event.cache_key) {
+    if let Some(eval) = shared.cache.get_evaluation(event.cache_key) {
         if O::ENABLED {
             shared.observer.on_cache_hit();
         }
@@ -96,7 +96,7 @@ pub(crate) fn handle_nn_reply_batch<O: SearchObserver>(
                 return Err(error);
             }
         };
-        shared.backend.store_evaluation(event.cache_key, Arc::clone(&eval));
+        shared.cache.insert_evaluation(event.cache_key, Arc::clone(&eval));
         if shared.is_stopping() {
             shared.cancel_evaluation(event.event);
         } else {

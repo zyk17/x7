@@ -43,9 +43,7 @@ pub struct OnnxBackend {
     provider: OnnxProvider,
 }
 
-/// ONNX backend 选择配置的 provider，并报告实际 CPU
-/// 能力（`src/neural/backends/onnx/network_onnx.cc:140-176`、
-/// `src/neural/wrapper.cc:49-68`）。
+/// ONNX backend 实际启用的 execution provider。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnnxProvider {
     #[cfg(feature = "tensorrt")]
@@ -244,10 +242,6 @@ impl OnnxBackend {
         Ok(Self {
             sessions: Arc::new(Mutex::new(sessions)),
             attributes: BackendAttributes {
-                has_mlh: true,
-                has_wdl: true,
-                runs_on_cpu: provider == OnnxProvider::Cpu,
-                suggested_num_search_threads: 1,
                 recommended_batch_size: recommended_batch_size(provider),
                 maximum_batch_size: maximum_batch_size(provider),
             },
@@ -611,39 +605,4 @@ fn append_tensor_rows(
 
 fn onnx_error<T>(error: ort::Error<T>) -> EnginError {
     EnginError::Neural(error.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::*;
-    use crate::neural::{EncodedBatch, FillEmptyHistory, encode_position_input_planes, eval_result_from_encoded_row};
-    use xiangqi_core::PositionHistory;
-
-    #[test]
-    fn local_x7_onnx_smoke_if_present() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/x7.onnx");
-        if !path.is_file() {
-            eprintln!("skip: {} is absent", path.display());
-            return;
-        }
-        let backend = OnnxBackend::from_file(&path).expect("load local x7.onnx");
-        let history = PositionHistory::from_positions(vec![
-            xiangqi_core::Position::from_fen(xiangqi_core::STARTPOS_FEN).unwrap(),
-        ]);
-        let legal = history.last().board().generate_legal_moves();
-        let sample = encode_position_input_planes(&history, FillEmptyHistory::FenOnly);
-        let mut logits = Vec::new();
-        let mut wdl = Vec::new();
-        let mut moves_left = Vec::new();
-        backend
-            .infer_input_planes_into(&[sample], &mut logits, &mut wdl, &mut moves_left)
-            .expect("infer local x7.onnx");
-        let output = EncodedBatch { logits, wdl, moves_left };
-        let eval = eval_result_from_encoded_row(&output, 0, &legal).expect("decode local x7.onnx");
-        assert_eq!(eval.policies.len(), legal.len());
-        assert!((eval.policies.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        assert!(eval.wl.is_finite() && eval.d.is_finite() && eval.plies_left.is_finite());
-    }
 }

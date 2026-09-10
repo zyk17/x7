@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engin::neural::backend::{Backend, CachingBackend, EvalResult};
+use engin::neural::backend::{Backend, EvalResult};
 use engin::neural::onnx::OnnxBackend;
 use engin::neural::{EncodedBatch, FillEmptyHistory, encode_position_input_planes, eval_result_from_encoded_row};
 use engin::search::{
@@ -295,7 +295,7 @@ fn make_backend(path: &PathBuf) -> Result<BackendSetup, Box<dyn std::error::Erro
     let onnx = OnnxBackend::from_file(path)?;
     let provider = onnx.provider().name();
     let recommended = onnx.attributes().recommended_batch_size;
-    let backend: Arc<dyn Backend> = Arc::new(CachingBackend::new(Box::new(onnx)));
+    let backend: Arc<dyn Backend> = Arc::new(onnx);
     Ok((backend, provider, recommended))
 }
 
@@ -335,7 +335,6 @@ fn warmup_position(
         }
     }
     let eval = evaluate_root(backend, history)?;
-    backend.clear_cache();
     let legal = history.last().board().generate_legal_moves();
     let policies: Vec<(Move, f32)> = legal.into_iter().zip(eval.policies.iter().copied()).collect();
     println!(
@@ -726,7 +725,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "note: warmup each bench position (also captures nn P/Q/M); shared backend; \
-         fresh tree + clear_cache each run; collisions + depth + root always printed; \
+         fresh tree and cache each run; collisions + depth + root always printed; \
          --collision-dist / --tree-depth only for distribution shapes; \
          nps=completed/s, eps=nn_eval/s, submitted includes collisions"
     );
@@ -737,7 +736,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("position: {name}");
         let nn_probe = warmup_position(backend.as_ref(), history.as_ref(), target_batch)?;
         for run_index in 1..=args.repeat {
-            backend.clear_cache();
             let params = SearchParams {
                 cpuct: args.cpuct,
                 cpuct_factor: args.cpuct_factor,

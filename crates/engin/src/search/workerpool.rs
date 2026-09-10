@@ -14,7 +14,8 @@ use parking_lot::Mutex;
 use xiangqi_core::{LegalMoveList, Move, PositionHistory};
 
 use crate::EnginError;
-use crate::neural::backend::{Backend, EvalCacheKey};
+use crate::neural::backend::Backend;
+use crate::neural::cache::EvalCacheKey;
 use crate::neural::{EncodedBatch, InputPlanes};
 use crate::search::EdgeReservation;
 use crate::search::backprop::ValueDelta;

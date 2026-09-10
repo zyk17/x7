@@ -1,7 +1,7 @@
 /* X7 TensorRT path: sparse InputPlane expand on GPU.
  *
- * Layout follows px0/lc0 onnx_kernels.cu (xiangqi: 128-bit mask + 90 squares).
- * Device code uses two uint64 words instead of MSVC host-only std::_Unsigned128.
+ * Xiangqi uses a 128-bit mask over 90 squares. Device code uses two uint64 words
+ * instead of MSVC host-only std::_Unsigned128.
  */
 
 #include "onnx_kernels.h"
