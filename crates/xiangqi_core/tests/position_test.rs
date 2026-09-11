@@ -1,6 +1,6 @@
 use std::sync::Once;
 
-use xiangqi_core::{ChessBoard, GameResult, Position, PositionHistory, initialize_magic_bitboards};
+use xiangqi_core::{ChessBoard, GameResult, Move, Position, PositionHistory, initialize_magic_bitboards};
 
 static INIT: Once = Once::new();
 
@@ -8,16 +8,18 @@ fn ensure_init() {
     INIT.call_once(initialize_magic_bitboards);
 }
 
-fn history_from_fen(fen: &str, rule60_ply: u32, game_ply: u32) -> PositionHistory {
-    let (board, _) = ChessBoard::from_fen(fen).expect("valid test FEN");
-    let mut history = PositionHistory::default();
-    history.reset(board, rule60_ply, game_ply);
-    history
-}
-
-fn append(history: &mut PositionHistory, text: &str) {
-    let mv = history.last().board().parse_move(text).expect("test move");
-    history.append(mv);
+fn history(fen: &str, moves: &[&str]) -> PositionHistory {
+    let start = Position::from_fen(fen).expect("valid test FEN");
+    let mut position = start.clone();
+    let moves = moves
+        .iter()
+        .map(|text| {
+            let mv: Move = position.board().parse_move(text).expect("test move");
+            position = Position::after(&position, mv);
+            mv
+        })
+        .collect::<Vec<_>>();
+    PositionHistory::from_position_and_moves(start, &moves)
 }
 
 #[test]
@@ -51,50 +53,57 @@ fn from_fen_converts_fullmove_to_game_ply() {
 #[test]
 fn compute_last_move_repetitions() {
     ensure_init();
-    let mut history = history_from_fen("3k5/9/9/6c2/9/9/9/6R2/9/5K3 b", 2, 30);
-    for mv in ["g6h6", "g2h2", "h6g6", "h2g2"] {
-        append(&mut history, mv);
-    }
-    assert_eq!(history.last().repetitions(), 1);
+    let once = history("3k5/9/9/6c2/9/9/9/6R2/9/5K3 b - - 2 30", &["g6h6", "g2h2", "h6g6", "h2g2"]);
+    assert_eq!(once.last().repetitions(), 1);
 
-    for mv in ["g6h6", "g2h2", "h6g6", "h2g2"] {
-        append(&mut history, mv);
+    let twice = history(
+        "3k5/9/9/6c2/9/9/9/6R2/9/5K3 b - - 2 30",
+        &["g6h6", "g2h2", "h6g6", "h2g2", "g6h6", "g2h2", "h6g6", "h2g2"],
+    );
+    assert_eq!(twice.last().repetitions(), 2);
+}
+
+#[test]
+fn indexed_bulk_replay_preserves_repetitions() {
+    ensure_init();
+    let start = Position::from_fen("3k5/9/9/6c2/9/9/9/6R2/9/5K3 b - - 2 30").expect("start");
+    let mut position = start.clone();
+    let mut moves = Vec::new();
+    for text in ["g6h6", "g2h2", "h6g6", "h2g2", "g6h6", "g2h2", "h6g6", "h2g2"] {
+        let mv = position.board().parse_move(text).expect("move");
+        position = Position::after(&position, mv);
+        moves.push(mv);
     }
-    assert_eq!(history.last().repetitions(), 2);
+
+    let bulk = PositionHistory::from_position_and_moves(start, &moves);
+    let prefix = PositionHistory::from_positions(bulk.positions()[..5].to_vec());
+    let extended = PositionHistory::from_prefix_and_moves(&prefix, &moves[4..]);
+
+    assert_eq!(extended, bulk);
+    assert_eq!(bulk.last().repetitions(), 2);
 }
 
 #[test]
 fn detects_repetitions_since_last_zeroing_move() {
     ensure_init();
 
-    let mut current = history_from_fen("3k5/9/9/6rC1/9/9/9/6R2/9/5K3 b - - 2 30", 2, 30);
-    for mv in ["g6h6", "g2h2", "h6g6", "h2g2", "g6h6"] {
-        append(&mut current, mv);
-    }
+    let current = history("3k5/9/9/6rC1/9/9/9/6R2/9/5K3 b - - 2 30", &["g6h6", "g2h2", "h6g6", "h2g2", "g6h6"]);
     assert!(current.did_repeat_since_last_zeroing_move());
 
-    let mut before = history_from_fen("3k5/9/9/6rC1/9/9/9/5R3/9/5K3 b - - 2 30", 2, 30);
-    for mv in ["g6h6", "f2h2", "h6g6", "h2g2", "g6h6", "g2h2"] {
-        append(&mut before, mv);
-    }
+    let before = history("3k5/9/9/6rC1/9/9/9/5R3/9/5K3 b - - 2 30", &["g6h6", "f2h2", "h6g6", "h2g2", "g6h6", "g2h2"]);
     assert!(before.did_repeat_since_last_zeroing_move());
 
-    let mut older = history_from_fen("3k5/9/9/6rC1/9/9/9/5R3/9/5K3 b - - 2 30", 2, 30);
-    for mv in ["g6b6", "f2b2", "b6h6", "b2h2", "h6g6", "h2g2", "g6h6", "g2h2"] {
-        append(&mut older, mv);
-    }
+    let older = history(
+        "3k5/9/9/6rC1/9/9/9/5R3/9/5K3 b - - 2 30",
+        &["g6b6", "f2b2", "b6h6", "b2h2", "h6g6", "h2g2", "g6h6", "g2h2"],
+    );
     assert!(older.did_repeat_since_last_zeroing_move());
 
-    let mut before_zero = history_from_fen("3k5/9/9/6rC1/9/9/9/6R2/9/5K3 b - - 2 30", 2, 30);
-    for mv in ["g6f6", "g2f2", "f6g6", "f2g2", "g6h6", "g2h2"] {
-        append(&mut before_zero, mv);
-    }
+    let before_zero =
+        history("3k5/9/9/6rC1/9/9/9/6R2/9/5K3 b - - 2 30", &["g6f6", "g2f2", "f6g6", "f2g2", "g6h6", "g2h2"]);
     assert!(!before_zero.did_repeat_since_last_zeroing_move());
 
-    let mut never = history_from_fen("3k5/9/9/6rC1/9/9/9/6R2/9/5K3 b - - 2 30", 2, 30);
-    for mv in ["g6c6", "g2f2"] {
-        append(&mut never, mv);
-    }
+    let never = history("3k5/9/9/6rC1/9/9/9/6R2/9/5K3 b - - 2 30", &["g6c6", "g2f2"]);
     assert!(!never.did_repeat_since_last_zeroing_move());
 }
 
@@ -102,36 +111,28 @@ fn detects_repetitions_since_last_zeroing_move() {
 fn game_result_covers_repetition_cases() {
     ensure_init();
 
-    let mut white_chase = history_from_fen("3k5/9/9/6c2/9/9/9/6R2/9/5K3 b - - 2 30", 2, 30);
-    for _ in 0..2 {
-        for mv in ["g6h6", "g2h2", "h6g6", "h2g2"] {
-            append(&mut white_chase, mv);
-        }
-    }
+    let white_chase = history(
+        "3k5/9/9/6c2/9/9/9/6R2/9/5K3 b - - 2 30",
+        &["g6h6", "g2h2", "h6g6", "h2g2", "g6h6", "g2h2", "h6g6", "h2g2"],
+    );
     assert_eq!(white_chase.compute_game_result(), GameResult::BlackWon);
 
-    let mut black_chase = history_from_fen("3k5/9/7r1/9/9/9/9/6C2/9/5K3 b - - 2 30", 2, 30);
-    for _ in 0..2 {
-        for mv in ["h7g7", "g2h2", "g7h7", "h2g2"] {
-            append(&mut black_chase, mv);
-        }
-    }
+    let black_chase = history(
+        "3k5/9/7r1/9/9/9/9/6C2/9/5K3 b - - 2 30",
+        &["h7g7", "g2h2", "g7h7", "h2g2", "h7g7", "g2h2", "g7h7", "h2g2"],
+    );
     assert_eq!(black_chase.compute_game_result(), GameResult::WhiteWon);
 
-    let mut white_check = history_from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30", 2, 30);
-    for _ in 0..2 {
-        for mv in ["d9e9", "d2e2", "e9d9", "e2d2"] {
-            append(&mut white_check, mv);
-        }
-    }
+    let white_check = history(
+        "3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30",
+        &["d9e9", "d2e2", "e9d9", "e2d2", "d9e9", "d2e2", "e9d9", "e2d2"],
+    );
     assert_eq!(white_check.compute_game_result(), GameResult::BlackWon);
 
-    let mut black_check = history_from_fen("3k5/9/4r4/9/9/9/9/9/9/5K3 b - - 2 30", 2, 30);
-    for _ in 0..2 {
-        for mv in ["e7f7", "f0e0", "f7e7", "e0f0"] {
-            append(&mut black_check, mv);
-        }
-    }
+    let black_check = history(
+        "3k5/9/4r4/9/9/9/9/9/9/5K3 b - - 2 30",
+        &["e7f7", "f0e0", "f7e7", "e0f0", "e7f7", "f0e0", "f7e7", "e0f0"],
+    );
     assert_eq!(black_check.compute_game_result(), GameResult::WhiteWon);
 
     for (fen, moves) in [
@@ -139,12 +140,8 @@ fn game_result_covers_repetition_cases() {
         ("4c4/3k5/4b3b/9/9/2B4N1/4p4/3A5/2p1A4/5K3 w - - 2 30", ["h4g2", "e3f3", "g2h4", "f3e3"]),
         ("3k5/9/9/9/9/9/9/9/1r2ARn2/4K4 b", ["b1b0", "e1d0", "b0b1", "d0e1"]),
     ] {
-        let mut history = history_from_fen(fen, 2, 30);
-        for _ in 0..2 {
-            for mv in moves {
-                append(&mut history, mv);
-            }
-        }
+        let moves = [moves, moves].concat();
+        let history = history(fen, &moves);
         assert_eq!(history.compute_game_result(), GameResult::Draw, "fen={fen}");
     }
 }

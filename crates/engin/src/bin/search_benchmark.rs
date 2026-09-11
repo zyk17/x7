@@ -246,7 +246,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("onnx missing: {}", args.onnx.display()).into());
     }
     let state = GameState::from_fen_moves(&args.fen, &args.moves)?;
-    let history = Arc::new(PositionHistory::from_positions(state.positions()));
+    let history = Arc::new(state.position_history());
     let root_is_black = history.is_black_to_move();
     let filter = root_filter(&history, &args.searchmoves)?;
     let backend = OnnxBackend::from_file(&args.onnx)?;

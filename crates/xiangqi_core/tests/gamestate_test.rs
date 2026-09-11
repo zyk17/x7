@@ -1,6 +1,6 @@
 use std::sync::Once;
 
-use xiangqi_core::{GameState, Position, PositionHistory, STARTPOS_FEN, initialize_magic_bitboards};
+use xiangqi_core::{GameState, Move, Position, PositionHistory, STARTPOS_FEN, initialize_magic_bitboards};
 
 static INIT: Once = Once::new();
 
@@ -8,16 +8,16 @@ fn ensure_init() {
     INIT.call_once(initialize_magic_bitboards);
 }
 
-fn history_from_moves(fen: &str, move_strs: &[&str]) -> PositionHistory {
-    let (board, state) = xiangqi_core::ChessBoard::from_fen(fen).expect("valid fen");
-    let game_ply = 2 * state.game_ply - if board.flipped() { 1 } else { 2 };
-    let mut history = PositionHistory::default();
-    history.reset(board, state.rule60_ply, game_ply);
-    for mv in move_strs {
-        let parsed = history.last().board().parse_move(mv).expect("valid move");
-        history.append(parsed);
-    }
-    history
+fn parse_moves(start: &Position, move_strs: &[&str]) -> Vec<Move> {
+    let mut position = start.clone();
+    move_strs
+        .iter()
+        .map(|mv| {
+            let parsed = position.board().parse_move(mv).expect("valid move");
+            position = Position::after(&position, parsed);
+            parsed
+        })
+        .collect()
 }
 
 #[test]
@@ -25,7 +25,8 @@ fn current_position_replays_moves() {
     ensure_init();
     let moves = ["h2h4", "h9h7", "h4h5", "h7h6"];
     let state = GameState::from_fen_moves(STARTPOS_FEN, &moves).expect("game state");
-    let expected = history_from_moves(STARTPOS_FEN, &moves).last().clone();
+    let start = Position::from_fen(STARTPOS_FEN).expect("start position");
+    let expected = PositionHistory::from_position_and_moves(start.clone(), &parse_moves(&start, &moves)).last().clone();
     assert_eq!(state.current_position().board(), expected.board(), "current board mismatch");
     assert_eq!(state.current_position().rule60_ply(), expected.rule60_ply(), "rule60 mismatch");
 }
@@ -53,7 +54,8 @@ fn complex_fen_move_sequence_matches_history_boards() {
     let fen = "3k5/9/9/6c2/9/9/9/6R2/9/5K3 b - - 2 30";
     let moves = ["g6h6", "g2h2", "h6g6"];
     let state = GameState::from_fen_moves(fen, &moves).expect("game state");
-    let history = history_from_moves(fen, &moves);
+    let start = Position::from_fen(fen).expect("start position");
+    let history = PositionHistory::from_position_and_moves(start.clone(), &parse_moves(&start, &moves));
     for (game_state_pos, history_pos) in state.positions().iter().zip(history.positions()) {
         assert_eq!(game_state_pos.board(), history_pos.board());
     }

@@ -55,7 +55,7 @@ fn terminal_wl_for_node(result: GameResult, black_to_move: bool) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
-    use xiangqi_core::{ChessBoard, GameResult, GameState, PositionHistory};
+    use xiangqi_core::{GameResult, GameState, Position};
 
     use super::{ExpandKind, classify_expand};
 
@@ -65,7 +65,7 @@ mod tests {
         // incoming-edge 价值契约。
         let state = GameState::from_fen_moves("4k4/3RPR3/4C4/9/9/9/9/9/9/4K4 b - - 0 1", &[] as &[&str])
             .expect("checkmate fen");
-        let history = PositionHistory::from_positions(state.positions());
+        let history = state.position_history();
 
         assert_eq!(classify_expand(&history), ExpandKind::Terminal { wl: 1.0, draw: 0.0, plies_left: 0.0 });
     }
@@ -74,7 +74,7 @@ mod tests {
     fn rule60_terminal_at_root() {
         let state =
             GameState::from_fen_moves("4k4/9/9/9/9/9/9/9/R8/4K4 w - - 120 1", &[] as &[&str]).expect("rule60 fen");
-        let history = PositionHistory::from_positions(state.positions());
+        let history = state.position_history();
 
         assert!(matches!(classify_expand(&history), ExpandKind::Terminal { wl: 0.0, draw: 1.0, plies_left: 0.0 }));
     }
@@ -82,14 +82,10 @@ mod tests {
     /// 首次重复仍可继续搜索；只有第二次重复才由 RuleJudge 裁决。
     #[test]
     fn first_perpetual_check_cycle_remains_evaluable() {
-        let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
-        let mut history = PositionHistory::default();
-        history.reset(board, 2, 30);
+        let start = Position::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
         // 两轮半循环，停在与首个白方行棋局面相同的位置（rep >= 1，白走）。
-        for mv in ["d9e9", "d2e2", "e9d9", "e2d2", "d9e9"] {
-            let parsed = history.last().board().parse_move(mv).expect(mv);
-            history.append(parsed);
-        }
+        let moves = ["d9e9", "d2e2", "e9d9", "e2d2", "d9e9"];
+        let history = GameState::from_fen_moves(&start.to_fen(), &moves).expect("moves").position_history();
         assert!(!history.last().is_black_to_move());
         assert!(history.last().repetitions() >= 1);
 
@@ -99,14 +95,10 @@ mod tests {
 
     #[test]
     fn second_perpetual_check_cycle_is_rule_judge_terminal() {
-        let (board, _) = ChessBoard::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
-        let mut history = PositionHistory::default();
-        history.reset(board, 2, 30);
+        let start = Position::from_fen("3k5/9/9/9/9/9/9/3R5/9/5K3 b - - 2 30").expect("fen");
         // 再走一轮半，使当前白走局面 repetitions >= 2。
-        for mv in ["d9e9", "d2e2", "e9d9", "e2d2", "d9e9", "d2e2", "e9d9", "e2d2", "d9e9"] {
-            let parsed = history.last().board().parse_move(mv).expect(mv);
-            history.append(parsed);
-        }
+        let moves = ["d9e9", "d2e2", "e9d9", "e2d2", "d9e9", "d2e2", "e9d9", "e2d2", "d9e9"];
+        let history = GameState::from_fen_moves(&start.to_fen(), &moves).expect("moves").position_history();
         assert!(!history.last().is_black_to_move());
         assert!(history.last().repetitions() >= 2);
         let result = history.compute_game_result();

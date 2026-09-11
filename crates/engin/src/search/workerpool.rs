@@ -45,11 +45,7 @@ impl Variation {
         &self.moves
     }
     pub(crate) fn history(&self) -> PositionHistory {
-        let mut history = self.base_history.as_ref().clone();
-        for &mv in &self.moves {
-            history.append(mv);
-        }
-        history
+        PositionHistory::from_prefix_and_moves(self.base_history.as_ref(), &self.moves)
     }
     pub fn push(&mut self, mv: Move) {
         self.moves.push(mv);

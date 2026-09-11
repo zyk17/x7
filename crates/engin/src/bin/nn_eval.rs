@@ -96,7 +96,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let move_refs: Vec<&str> = args.moves.iter().map(String::as_str).collect();
     let state = GameState::from_fen_moves(&args.fen, &move_refs)?;
-    let history = PositionHistory::from_positions(state.positions());
+    let history = state.position_history();
     let legal = history.last().board().generate_legal_moves();
     println!(
         "fen={} moves={} side={} legal={}",
