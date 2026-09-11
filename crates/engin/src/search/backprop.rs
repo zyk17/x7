@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use super::workerpool::Selection;
-use super::{NodeArena, NodeId};
+use super::{ExpansionState, NodeArena, NodeId};
 
 /// - `visits`：多份 `one()` 样本的合计，不是一次 reservation 携带的 K
 /// - `wl_sum`：走子方 / incoming-edge 视角（非 NN 原始 STM）
@@ -81,7 +81,9 @@ pub(crate) fn complete_one(backprop: Backprop, arena: &NodeArena) -> BackpropRes
     let mut reservations = selection.reservations.into_iter().rev();
     for (node_index, node_id) in selection.node_path.into_iter().enumerate().rev() {
         let node = arena.get(node_id).expect("backprop node lives until job drain");
-        if let Some((terminal_wl, terminal_draw, terminal_m)) = node.terminal_value() {
+        if node.expansion_state() == ExpansionState::Terminal {
+            let (terminal_wl, terminal_draw, terminal_m) =
+                node.terminal_value().expect("terminal node has exact value");
             delta = ValueDelta::one(terminal_wl, terminal_draw, terminal_m);
         }
         node.add_delta(delta);
@@ -108,7 +110,9 @@ pub(crate) fn complete_batch(events: impl IntoIterator<Item = Backprop>, arena: 
         let mut reservations = selection.reservations.into_iter().rev();
         for (node_index, node_id) in selection.node_path.into_iter().enumerate().rev() {
             let node = arena.get(node_id).expect("backprop node lives until job drain");
-            if let Some((terminal_wl, terminal_draw, terminal_m)) = node.terminal_value() {
+            if node.expansion_state() == ExpansionState::Terminal {
+                let (terminal_wl, terminal_draw, terminal_m) =
+                    node.terminal_value().expect("terminal node has exact value");
                 delta = ValueDelta::one(terminal_wl, terminal_draw, terminal_m);
             }
             node_deltas.entry(node_id).and_modify(|aggregate| *aggregate = aggregate.merge(delta)).or_insert(delta);
