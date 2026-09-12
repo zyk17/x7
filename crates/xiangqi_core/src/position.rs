@@ -1,5 +1,10 @@
 //! Position / PositionHistory / GameResult。
 
+use std::collections::HashMap;
+
+use nohash_hasher::BuildNoHashHasher;
+use smallvec::SmallVec;
+
 use crate::board::board_to_fen;
 use crate::hashcat::{hash_cat, hash_cat_u128s};
 use crate::{ChessBoard, LegalMoveList, Move};
@@ -33,13 +38,12 @@ pub struct Position {
     us_check: u32,
     them_check: u32,
     repetitions: u32,
-    cycle_length: u32,
     game_ply: u32,
 }
 
 impl Position {
     pub fn new(board: ChessBoard, rule60_ply: u32, game_ply: u32) -> Self {
-        Self { board, rule60_ply, us_check: 0, them_check: 0, repetitions: 0, cycle_length: 0, game_ply }
+        Self { board, rule60_ply, us_check: 0, them_check: 0, repetitions: 0, game_ply }
     }
 
     pub fn from_fen(fen: &str) -> Result<Self, String> {
@@ -54,7 +58,6 @@ impl Position {
             us_check: parent.them_check,
             them_check: parent.us_check,
             repetitions: 0,
-            cycle_length: 0,
             game_ply: parent.game_ply + 1,
         };
 
@@ -106,9 +109,6 @@ impl Position {
     pub const fn repetitions(&self) -> u32 {
         self.repetitions
     }
-    pub const fn cycle_length(&self) -> u32 {
-        self.cycle_length
-    }
     pub const fn game_ply(&self) -> u32 {
         self.game_ply
     }
@@ -116,9 +116,8 @@ impl Position {
         self.board.flipped()
     }
 
-    pub fn set_repetitions(&mut self, repetitions: u32, cycle_length: u32) {
+    pub fn set_repetitions(&mut self, repetitions: u32) {
         self.repetitions = repetitions;
-        self.cycle_length = cycle_length;
     }
 }
 
@@ -130,6 +129,37 @@ pub struct PositionHistory {
 
 impl PositionHistory {
     pub fn from_positions(positions: Vec<Position>) -> Self {
+        Self { positions }
+    }
+
+    /// 一次性重放起始局面后的着法。重复索引只在本次构建期间存在，避免逐着回扫。
+    pub fn from_position_and_moves(start: Position, moves: &[Move]) -> Self {
+        Self::from_prefix_and_moves(&Self::from_positions(vec![start]), moves)
+    }
+
+    /// 在完整前缀后一次性追加着法。用于 UCI 重放和搜索 variation 重建。
+    pub fn from_prefix_and_moves(prefix: &Self, moves: &[Move]) -> Self {
+        assert!(!prefix.positions.is_empty(), "PositionHistory is empty");
+        let mut positions = prefix.positions.clone();
+        positions.reserve(moves.len());
+        let start = positions.iter().rposition(|position| position.rule60_ply == 0).unwrap_or(0);
+        let mut occurrences = HashMap::<u64, SmallVec<[usize; 2]>, BuildNoHashHasher<u64>>::default();
+        for (index, position) in positions.iter().enumerate().skip(start) {
+            occurrences.entry(position.board.hash()).or_default().push(index);
+        }
+        for &mv in moves {
+            let mut next = Position::after(positions.last().expect("PositionHistory is not empty"), mv);
+            if next.rule60_ply == 0 {
+                occurrences.clear();
+            }
+            next.repetitions = occurrences
+                .get(&next.board.hash())
+                .and_then(|indices| indices.iter().rev().copied().find(|&index| positions[index].board == next.board))
+                .map_or(0, |previous| 1 + positions[previous].repetitions);
+            let index = positions.len();
+            occurrences.entry(next.board.hash()).or_default().push(index);
+            positions.push(next);
+        }
         Self { positions }
     }
 
@@ -194,8 +224,8 @@ impl PositionHistory {
     pub fn append(&mut self, mv: Move) {
         let next = Position::after(self.last(), mv);
         self.positions.push(next);
-        let (repetitions, cycle_length) = self.compute_last_move_repetitions();
-        self.positions.last_mut().expect("position appended").set_repetitions(repetitions, cycle_length);
+        let repetitions = self.compute_last_move_repetitions();
+        self.positions.last_mut().expect("position appended").set_repetitions(repetitions);
     }
 
     pub fn pop(&mut self) {
@@ -316,25 +346,24 @@ impl PositionHistory {
         hash_cat(hash, self.last().rule60_ply as u64)
     }
 
-    fn compute_last_move_repetitions(&self) -> (u32, u32) {
+    fn compute_last_move_repetitions(&self) -> u32 {
         let last = self.last();
         if last.rule60_ply < 4 {
-            return (0, 0);
+            return 0;
         }
 
         let mut index = self.positions.len() as isize - 5;
         while index >= 0 {
             let position = &self.positions[index as usize];
             if position.board == last.board {
-                let cycle_length = self.positions.len() as u32 - 1 - index as u32;
-                return (1 + position.repetitions, cycle_length);
+                return 1 + position.repetitions;
             }
             if position.rule60_ply < 2 {
-                return (0, 0);
+                return 0;
             }
             index -= 2;
         }
-        (0, 0)
+        0
     }
 
     pub fn is_black_to_move(&self) -> bool {

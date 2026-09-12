@@ -33,15 +33,9 @@ impl GameState {
 
     /// 从 UCI 的初始局面和完整 moves 重放规则历史。
     ///
-    /// 不能只连续调用 `Position::after`：重复次数与 cycle length 只能由
-    /// `PositionHistory::append` 在完整路径中计算。
+    /// 批量重放时仍须携带完整路径，才能正确计算重复次数。
     pub fn position_history(&self) -> PositionHistory {
-        let mut history = PositionHistory::default();
-        history.reset_position(self.startpos.clone());
-        for &mv in &self.moves {
-            history.append(mv);
-        }
-        history
+        PositionHistory::from_position_and_moves(self.startpos.clone(), &self.moves)
     }
 
     /// 包含初始局面与每一步后的完整规则 position。

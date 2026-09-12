@@ -729,7 +729,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     for (name, fen) in positions {
         let state = GameState::from_fen_moves(&fen, &args.moves)?;
-        let history = Arc::new(PositionHistory::from_positions(state.positions()));
+        let history = Arc::new(state.position_history());
         let root_is_black = history.is_black_to_move();
         println!("position: {name}");
         let nn_probe = warmup_position(backend.as_ref(), history.as_ref(), target_batch)?;
